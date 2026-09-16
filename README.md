@@ -12,7 +12,7 @@
 
 **Dein eigener KI-Agent im Terminal – Cloud & lokal, mit Werkzeugen, Gedächtnis und Herz.** ✦
 
-**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5 (Anthropic)**
+**Entwickelt von VibeCoder · gebaut mit Claude Opus 5 (Anthropic)**
 
 </div>
 
