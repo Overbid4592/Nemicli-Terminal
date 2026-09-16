@@ -1,0 +1,20 @@
+anthropic
+openai
+httpx
+rich
+# Vollbild-Oberflaeche (ui/screen_tx.py); prompt_toolkit bleibt fuer den alten Screen + Menues.
+textual>=8.2,<9
+prompt_toolkit
+python-dotenv
+# Gesichts-Erkennung fürs automatische Nachbessern nach /bild.
+# Muss die 4er-Reihe sein: OpenCV 5 hat die Haar-Cascades entfernt.
+opencv-python<5
+# Bild-Pipeline braucht transformers 4.x (diffusers).
+transformers<5
+# CPU-Gedächtnis (Qwen3-Embedding-0.6B) – bleibt auf der CPU, GPU für Bilder.
+# Läuft über tools/embedder.py direkt auf transformers. sentence-transformers
+# stand hier bis zum 15.09.2026 – es zieht scikit-learn zwingend mit, und dessen
+# unsignierte DLL blockiert Windows Smart App Control. Gebraucht wurde es nur
+# für zwei Handgriffe (letztes Token, normieren), die jetzt selbst dastehen.
+# PDF per Drag & Drop in den Chat ziehen: Text wird herausgezogen (reines Python, klein).
+pypdf
