@@ -14,6 +14,8 @@
 
 **Entwickelt von VibeCoder · gebaut mit Claude Opus 5 (Anthropic)**
 
+![NemiCLI Screenshot](nemicli.png)
+
 </div>
 
 ---
@@ -329,4 +331,4 @@ Das Tagebuch aller Änderungen steht in [CHANGELOG.md](CHANGELOG.md).
 NemiCLI steht unter der **GNU General Public License v3.0** – siehe [LICENSE](LICENSE).
 Du darfst es frei nutzen, ändern und weitergeben. Wer es verändert weitergibt, muss den Quellcode ebenfalls offenlegen.
 
-Copyright © 2026 D. Hoffmann (Vibecoder)
+Copyright © 2026 VibeCoder
