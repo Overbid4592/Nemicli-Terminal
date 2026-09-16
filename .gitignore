@@ -1,0 +1,69 @@
+# NemiCLI repository hygiene
+# Generated/local files should stay out of Git.
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments and isolated runtime
+venv/
+.venv/
+env/
+.envrc
+.runtime/
+
+# Local secrets and credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.crt
+*.cer
+
+# NemiCLI local configuration and user data
+nemicli.config.json
+learned/
+Gespraeche/
+Models/
+Bilder/
+NemiSandbox/
+.workspace/
+
+# Local databases and logs
+*.db
+*.sqlite
+*.sqlite3
+*.log
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.spec.bak
+
+# IDE/editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS clutter
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.old
+~$*
