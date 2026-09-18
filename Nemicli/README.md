@@ -83,6 +83,21 @@ Ollama Cloud.
 ### ⚙ Handeln – mit Bestätigung
 - **Werkzeuge:** Dateien lesen/schreiben/bearbeiten, Ordner, Suche, PowerShell-Befehle, PDF erzeugen,
   Web (Suche · Wikipedia · Seiten lesen, nur ~230 vertrauenswürdige Domains), Bilder malen/ansehen.
+- **Systemwache** (`abfragen`): PowerShell, das **nur liest** – ohne Rückfrage. Prozesse, Netzverbindungen,
+  Dienste, Autostart, geplante Aufgaben, Ereignisse, Virenschutz-Status, Adapter-Zähler, Signaturen … was
+  die Persönlichkeit braucht, um „schau mal, was da läuft" zu beantworten. Durch kommen nur Lese-Cmdlets
+  (`Get-`, `Test-`, `Measure-`, `Select-` …) und Lese-Programme (`netstat`, `ipconfig`, `tasklist` …);
+  alles, was ändert, startet, schreibt oder selbst ins Netz geht, wird abgewiesen – dafür bleibt `befehl`,
+  und das fragt. **Was** geprüft wird, steht nicht im Code, sondern in einer Anleitung in `Agenten/`.
+- **Zeitplan** (`zeitplan`): Die Persönlichkeit trägt sich selbst in die **Windows-Aufgabenplanung** ein –
+  „täglich 09:00", „alle 2 stunden", „wöchentlich montag 08:30", „anmeldung", „einmal 20.09.2026 14:00".
+  Zur Zeit startet NemiCLI ohne Fenster, arbeitet den Auftrag im Nur-Lesen-Modus ab und legt die Antwort als
+  Bericht in `Berichte/` ab; beim nächsten Start siehst du die erste Zeile („✅ Alles OK" / „⚠️ 2 Auffälligkeiten").
+  Anlegen und Löschen fragen dich, ansehen (`zeitplan_anzeigen`) nicht. Nur im Ordner `\NemiCLI\` der
+  Aufgabenplanung – fremde Aufgaben fasst sie nie an.
+- **Anleitungen** (`Agenten/*.md`): Arbeitsanweisungen, die die Persönlichkeit selbst abarbeitet. Jede
+  `.md` dort steht ab der nächsten Antwort im Prompt (Pfad + erste Zeile); passt eine, liest sie sie und
+  folgt ihr. Nichts fest verdrahtet – neue Datei, neue Fähigkeit.
 - **Lesende Aktionen laufen sofort, verändernde fragen** (Ja · Ja & nicht mehr fragen · Nein).
   Bei Dateiänderungen zeigt eine Vorschau den kompletten Inhalt – **F8 gibt frei**, Enter nie.
 - **Arbeitsmodi** (`Shift+Tab`): 💬 Chatten (alles fragt) · 👁 Nur Lesen (Ändern gesperrt) ·
@@ -225,15 +240,18 @@ Tippe `/` – ein Menü mit Vervollständigung erscheint. `/help` zeigt alle.
 `F8` Änderung freigeben · **`F12` ganzes Gespräch sichern** · `Shift+Tab` Modus ·
 `Bild ↑/↓`, Mausrad scrollen · `Strg+C` markierten Text kopieren.
 
-**Ohne Oberfläche:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"`.
+**Ohne Oberfläche:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"` ·
+`--auftrag <name>` (Zeitplan-Auftrag ohne Fenster, Antwort wird Bericht).
 
 ---
 
 ## 🔒 Sicherheit
 
 - **Verändernde Aktionen fragen immer** – oder du sagst bewusst „nicht mehr fragen" für diese Sitzung.
-- **Systemordner sind komplett tabu**, auch zum Lesen: `C:\Windows`, `Program Files`, `ProgramData`,
-  `Recovery`, `EFI`, `Boot`, die System-Registry. Umwege (`..\..`, `%windir%`, `\\?\`) werden aufgelöst.
+- **Systemordner: nachschauen ja, ändern nie.** `C:\Windows`, `Program Files`, `ProgramData`, `Recovery`,
+  `EFI`, `Boot` und die System-Registry darf sie **lesen** (datei_lesen, auflisten, suchen, `abfragen` – für die
+  Systemwache: Signatur von `svchost.exe`, Autostart in HKLM). **Ändern** dort ist ausgeschlossen, und `befehl`
+  darf diese Orte nicht einmal nennen. Umwege (`..\..`, `%windir%`, `\\?\`) werden aufgelöst.
   `format`, `diskpart`, `vssadmin`, Virenschutz abschalten, Base64-/`iex`-Verschleierung: immer gesperrt.
   Ein Selbsttest prüft 40+ Umgehungsversuche. Dein Profil (`C:\Users\<du>`) bleibt frei.
 - **Eigene Sperren** (`schreibsperre.json`): Orte, die dir gehören, aber trotzdem aus der Hand der
@@ -242,6 +260,11 @@ Tippe `/` – ein Menü mit Vervollständigung erscheint. `/help` zeigt alle.
   kann sich nicht selbst umbauen. **Dein** Daten-Ordner ist davon ausgenommen – sonst käme sie
   nicht an ihre eigenen Chats. Die Sperre gilt auch für PowerShell-Befehle, und jeder genannte
   Pfad wird einzeln geprüft: `Copy-Item <frei> <gesperrt>` kommt nicht durch.
+- **`abfragen` darf nur lesen.** Jedes Cmdlet muss ein Lese-Verb tragen, native Programme stehen auf einer
+  Allowlist, Umleitungen (`>`), `& "programm"`, Dot-Sourcing, .NET-Schreib-/Start-Methoden, `Add-Type`,
+  `New-Object` und eigener Netz-Zugriff sind gesperrt. Unbekannter Befehlsanfang = nein. 75 Fälle im Test.
+- **Hintergrund-Läufe** (Zeitplan) laufen fest im Modus „Nur Lesen": ändernde Aktionen sind gesperrt, jede
+  Rückfrage ist automatisch ein Nein. Es kann also nachts nichts „aus Versehen" geschrieben werden.
 - **Netz nur über HTTPS und Allowlist**, Schutz gegen SSRF und Prompt-Injection – Web-Inhalte,
   Seitentexte aus Chrome und Erinnerungen gelten im Prompt als Daten, nie als Anweisungen.
 - **Alles, was auf einen Port hört, hört nur auf `127.0.0.1`** – WebUI, Chrome-Empfang, Ollama,
@@ -292,6 +315,8 @@ NemiCli/
 ├─ Persoenlichkeiten/    eigene Persönlichkeiten (.md)
 ├─ NemiSandbox/          Spielwiese des Übungsmodus
 ├─ Befehle/              dauerhafte Hilfs-Skripte
+├─ Zeitplan/             Aufträge für die Windows-Aufgabenplanung (<name>.json)
+├─ Berichte/             was der Hintergrund-Lauf herausgefunden hat (+ Log)
 └─ Vorschläge/           was die Persönlichkeit von sich aus vorschlägt
 ```
 
@@ -323,10 +348,3 @@ das** – statt stillschweigend mit leerem Gedächtnis hochzufahren.
 - [ ] Gedächtnis-Einlesen im Hintergrund, ohne die Eingabe zu sperren
 
 Das Tagebuch aller Änderungen steht in [CHANGELOG.md](CHANGELOG.md).
-
-## 📜 Lizenz
-
-NemiCLI steht unter der **GNU General Public License v3.0** – siehe [LICENSE](LICENSE).
-Du darfst es frei nutzen, ändern und weitergeben. Wer es verändert weitergibt, muss den Quellcode ebenfalls offenlegen.
-
-Copyright © 2026 D. Hoffmann (Vibecoder)
