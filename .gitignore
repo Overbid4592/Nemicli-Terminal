@@ -1,69 +1,53 @@
-# NemiCLI repository hygiene
-# Generated/local files should stay out of Git.
-
-# Python bytecode and caches
-__pycache__/
-*.py[cod]
-*$py.class
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
-# Virtual environments and isolated runtime
-venv/
-.venv/
-env/
-.envrc
-.runtime/
-
-# Local secrets and credentials
+# Sensible Daten & Umgebung
 .env
-.env.*
-!.env.example
-*.key
-*.pem
-*.p12
-*.pfx
-*.crt
-*.cer
+# .env.example bleibt im Repo – die README verweist darauf.
 
-# NemiCLI local configuration and user data
-nemicli.config.json
-learned/
-Gespraeche/
-Models/
-Bilder/
-NemiSandbox/
-.workspace/
+# Python
+venv/
+.runtime/
+__pycache__/
+*.pyc
 
-# Local databases and logs
-*.db
-*.sqlite
-*.sqlite3
-*.log
-
-# Build artifacts
+# Builds (NemiCLI.spec bleibt im Repo – das ist der Bauplan der exe)
 build/
 dist/
-*.egg-info/
-*.spec.bak
+*.exe
 
-# IDE/editor files
-.vscode/
-.idea/
-*.swp
-*.swo
+# Große Modelle & GPU-Binaries (49 GB – liegen nur lokal)
+Models/
 
-# OS clutter
-.DS_Store
-Thumbs.db
-Desktop.ini
+# Persönliche Daten: Chat-Verlauf, Gedächtnis, gemalte Bilder, Übungen
+chats/
+learned/
+Bilder/
+NemiSandbox/
+Befehle/
+Persoenlichkeiten/
+memory.md
 
-# Temporary files
-*.tmp
-*.temp
-*.bak
-*.old
-~$*
+# Logs & Verlauf
+logs/
+*.log
+.cli_history
+
+# Claude-Code-Sitzungseinstellungen (rechnerspezifisch)
+.claude/settings.local.json
+
+# Lokale Konfig (aktives Modell etc.)
+nemicli.config.json
+# Lebenszeichen/Briefkasten des laufenden Fensters (Rechtsklick-Menue)
+.nemicli.alive
+.nemicli.inbox
+
+# Gesicherte Gespraeche (F12) - privat, gehoeren nicht ins Repo
+Gespraeche/
+!Gespraeche/LIES-MICH.txt
+
+# Projekt-Ablage eines Workspace (/workspace) - gehoert zum jeweiligen Projekt
+.workspace/
+
+# Zeitplan-Auftraege, Hintergrund-Berichte, Vorschlaege der Persoenlichkeit, eigene Sperrliste (18.09.2026)
+Zeitplan/
+Berichte/
+Vorschläge/
+schreibsperre.json
