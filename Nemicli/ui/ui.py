@@ -226,7 +226,7 @@ def _banner_panel(logo: Text, width: int | None = None) -> Panel:
     tagline.append(APP_SUBTITLE, style="muted")
     tagline.append(" ✦", style="accent")
     credit = Text(justify="center")
-    credit.append("gebaut mit Claude Opus 5", style="brand.dim")
+    credit.append("von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5", style="brand.dim")
     inner = Group(Align.center(logo), Text(""), tagline, credit)
     return Panel(inner, box=HEAVY, border_style="brand.dim",
                  padding=(1, _banner_pad(width)))
