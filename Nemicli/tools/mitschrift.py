@@ -107,6 +107,15 @@ def leer() -> bool:
     return not _eintraege
 
 
+def letzte_antwort() -> str:
+    """Die letzte Antwort der Persönlichkeit (ohne Denktext) – der Hintergrund-
+    Auftrag macht daraus den Bericht."""
+    for e in reversed(_eintraege):
+        if e.get("art") == "assistent" and (e.get("text") or "").strip():
+            return e["text"]
+    return ""
+
+
 # ---------------------------------------------------------------------------
 # Markdown bauen
 # ---------------------------------------------------------------------------

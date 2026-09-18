@@ -28,7 +28,7 @@ _NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 def _git(*args: str, timeout: int = 120) -> tuple[int, str]:
     """(Exit-Code, Ausgabe) eines Git-Befehls im Projektordner."""
     try:
-        r = subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True,
+        r = subprocess.run(["git", *args], cwd=INSTALL, capture_output=True, text=True,
                            timeout=timeout, creationflags=_NOWIN)
         out = (r.stdout + r.stderr).strip()
         return r.returncode, out
@@ -96,7 +96,7 @@ def install_requirements(on_status) -> tuple[bool, str]:
     on_status("installiere Abhängigkeiten (pip) …")
     try:
         r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req)],
-                           cwd=ROOT, capture_output=True, text=True, timeout=900,
+                           cwd=INSTALL, capture_output=True, text=True, timeout=900,
                            creationflags=_NOWIN)
         tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-8:])
         return r.returncode == 0, tail

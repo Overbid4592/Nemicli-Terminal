@@ -728,6 +728,24 @@
       "note": "CERT/CC"
     },
     {
+      "domain": "ipinfo.io",
+      "tier": 2,
+      "category": "security",
+      "note": "Wem gehoert eine IP? https://ipinfo.io/<ip>/json -> Betreiber (org), Land, Hostname. Ohne Schluessel, begrenzt"
+    },
+    {
+      "domain": "bgp.he.net",
+      "tier": 2,
+      "category": "security",
+      "note": "Hurricane Electric: IP/Netz/AS-Auskunft, https://bgp.he.net/ip/<ip>"
+    },
+    {
+      "domain": "file.net",
+      "tier": 3,
+      "category": "security",
+      "note": "Prozess-/Datei-Beschreibungen (https://www.file.net/process/<name>.exe.html), werbefinanziert - nur als Hinweis, Signatur zaehlt"
+    },
+    {
       "domain": "nvd.nist.gov",
       "tier": 1,
       "category": "security",

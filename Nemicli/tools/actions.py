@@ -365,27 +365,32 @@ def _in_system_dir(path: str) -> bool:
 
 
 def _read_guard(*paths: str) -> str | None:
-    """Lese-Sperre: Systemordner und absolut gesperrte Orte sind unsichtbar."""
+    """Lese-Sperre: nur die absolut gesperrten Orte des Nutzers sind unsichtbar.
+
+    Bis 18.09.2026 waren auch Windows-/Systemordner fürs Lesen tabu. Für die
+    Systemwache (svchost am richtigen Ort? Signatur von C:\\Windows\\System32\\…?)
+    muss die KI aber hinschauen dürfen. Der Nutzer hat entschieden: nachschauen
+    ja, ändern nie – fürs Ändern bleibt _guard() so streng wie vorher."""
     for path in paths:
         if path and (base := _absolut_gesperrt(path)) is not None:
             return ("Fehler: 🔒 Komplett gesperrt – der Nutzer hat diesen Bereich für "
                     f"dich zugesperrt: {base}. Weder ansehen noch ändern. "
                     f"Verweigert: {path}. Sag dem Nutzer, dass du dort grundsätzlich "
                     "nicht hineinschaust; er sieht selbst nach.")
-    for path in paths:
-        if path and _in_system_dir(path):
-            return ("Fehler: 🛡️ Tabu – Windows-/Systemordner sind für NemiCLI komplett "
-                    f"gesperrt, auch zum Lesen: {path}. Sag dem Nutzer, dass du dort "
-                    "grundsätzlich nicht hineinschaust; er kann es selbst nachsehen.")
     return None
 
 
-def _skip_system(p: Path) -> bool:
-    """Für Suchläufe: Treffer in Systemordnern und gesperrten Orten still
-    überspringen. Ohne den zweiten Teil würde dateien_suchen den Inhalt des
-    NemiCLI-Ordners auflisten, den _read_guard gerade zugesperrt hat."""
+def _skip_system(p: Path, base: "Path | str | None" = None) -> bool:
+    """Für Suchläufe: gesperrte Orte immer überspringen (sonst würde
+    dateien_suchen den NemiCLI-Ordner auflisten, den _read_guard zusperrt).
+    Systemordner nur dann, wenn die Suche NICHT ausdrücklich dort begann –
+    `*.log` ab C:\\ soll nicht Windows durchwühlen, `*.log` ab C:\\Windows schon."""
     try:
-        return _in_system_dir(str(p)) or _absolut_gesperrt(str(p)) is not None
+        if _absolut_gesperrt(str(p)) is not None:
+            return True
+        if base is not None and _in_system_dir(str(base)):
+            return False
+        return _in_system_dir(str(p))
     except Exception:
         return True
 
@@ -445,7 +450,7 @@ _REG_SYSTEM = re.compile(
 )
 
 
-def _guard_command(cmd: str) -> str | None:
+def _guard_command(cmd: str, lesend: bool = False) -> str | None:
     """Sicherheitsnetz für freie PowerShell-Befehle.
 
     Zwei Stufen:
@@ -483,7 +488,9 @@ def _guard_command(cmd: str) -> str | None:
         or bool(re.search(r"(?i)\$env:(windir|systemroot|programfiles|programdata)", roh))
         or bool(_REG_SYSTEM.search(roh))
     )
-    if nennt_system:
+    # `abfragen` (lesend=True) darf Systemorte nennen – es kann nichts ändern,
+    # _nur_lesend() hat das vorher sichergestellt. `befehl` bleibt hier streng.
+    if nennt_system and not lesend:
         return ("Fehler: 🛡️ Tabu – dieser Befehl nennt einen Windows-Systemordner oder die "
                 "System-Registry. NemiCLI geht dort grundsätzlich nicht hin, auch nicht zum "
                 "Anschauen. Sag dem Nutzer, dass er das selbst nachsehen muss.")
@@ -537,9 +544,30 @@ def _datei_lesen(a: dict) -> str | ActionResult:
         return ActionResult(f"Fehler beim Lesen: {e}", ok=False)
     with open(p, "r", encoding="utf-8", errors="replace") as f:
         lines = f.readlines()
+    if not lines:
+        return "(leere Datei)"
+    # `ab`: ab dieser Zeile lesen. Lange Dateien kommen so in Stücken, statt dass
+    # das Modell nach der Kürzung zu Get-Content greift (das las UTF-8 falsch).
+    try:
+        ab = max(1, int(a.get("ab") or 1))
+    except (TypeError, ValueError):
+        ab = 1
+    if ab > len(lines):
+        return f"(Die Datei hat nur {len(lines)} Zeilen – ab Zeile {ab} steht nichts mehr.)"
     # mit Zeilennummern, damit das Modell gezielt bearbeiten kann
-    numbered = "".join(f"{i:>5}  {ln}" for i, ln in enumerate(lines, 1))
-    return _cut(numbered) if numbered else "(leere Datei)"
+    out, laenge, ende = [], 0, len(lines)
+    for i in range(ab - 1, len(lines)):
+        zeile = f"{i + 1:>5}  {lines[i]}"
+        if laenge + len(zeile) > MAX_OUT and out:
+            ende = i
+            break
+        out.append(zeile)
+        laenge += len(zeile)
+    text = "".join(out)
+    if ende < len(lines):
+        text += (f"\n… gekürzt: Zeilen {ende + 1}–{len(lines)} fehlen noch. Weiter mit "
+                 f"datei_lesen, pfad wie eben, ab: {ende + 1}")
+    return text
 
 
 def _bild_ansehen(a: dict) -> ActionResult:
@@ -592,7 +620,7 @@ def _ordner_auflisten(a: dict) -> str | ActionResult:
     out = []
     for name in sorted(os.listdir(p)):
         voll = os.path.join(p, name)
-        if _skip_system(voll):           # C:\ auflisten: Windows, Program Files … bleiben unsichtbar
+        if _absolut_gesperrt(voll) is not None:   # nur die Sperren des Nutzers bleiben unsichtbar
             continue
         marker = "[Ordner] " if os.path.isdir(voll) else "          "
         out.append(marker + name)
@@ -622,7 +650,7 @@ def _dateien_suchen(a: dict) -> str | ActionResult:
         return ActionResult(blocked, ok=False)
     muster = a.get("muster", "*")
     treffer = [str(p) for p in base.rglob(muster)
-               if p.is_file() and not _skip_system(p)][:200]
+               if p.is_file() and not _skip_system(p, base)][:200]
     return _cut("\n".join(treffer)) if treffer else "Keine Dateien gefunden."
 
 
@@ -647,7 +675,7 @@ def _inhalt_suchen(a: dict) -> str | ActionResult:
     rx = re.compile(muster, re.IGNORECASE)
     out = []
     for p in base.rglob(glob):
-        if not p.is_file() or _skip_system(p):
+        if not p.is_file() or _skip_system(p, base):
             continue
         try:
             for i, line in enumerate(p.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
@@ -741,7 +769,7 @@ def _befehl_text(a: dict) -> str:
     return ""
 
 
-def _befehl(a: dict) -> ActionResult:
+def _befehl(a: dict, lesend: bool = False) -> ActionResult:
     cmd = _befehl_text(a)
     if not cmd.strip():
         return ActionResult("Fehler: kein Befehl angegeben. Schreib den auszuführenden Befehl ins "
@@ -753,18 +781,40 @@ def _befehl(a: dict) -> ActionResult:
     # $ProgressPreference='SilentlyContinue' unterdrückt PowerShells Fortschritts-
     # balken (Write-Progress), den z.B. Test-NetConnection/Invoke-WebRequest zeigen –
     # der malt sonst direkt auf die Konsole und zerschießt unser Vollbild-TUI.
-    if (blocked := _guard_command(cmd)):     # System-Pfad + verändernd = Stopp
+    if (blocked := _guard_command(cmd, lesend)):     # System-Pfad + verändernd = Stopp
         return ActionResult(blocked, ok=False)
     # Cmdlet-Fehler sind standardmäßig nicht terminierend. Stop + catch macht
     # daraus einen Prozessfehler; $Error erfasst auch explizites -ErrorAction
     # Continue/SilentlyContinue. Native Programme liefern ihren eigenen Exitcode.
     # Zeilenumbrüche halten auch Befehle mit abschließendem Kommentar korrekt.
+    # Ausgabe: PowerShells Tabellen-Formatierer sammelt Objekte erst (er misst
+    # Spaltenbreiten) und schreibt verzögert – das `exit` direkt danach kam ihm
+    # zuvor, und `Get-CimInstance … | Select-Object a, b` kam als "(kein Output)"
+    # zurück. Out-String in der Pipeline zwingt die Formatierung. Und weil der
+    # Formatierer die Spalten vom ERSTEN Objekt nimmt, wurden bei mehreren
+    # Abfragen in einem Block (Select a,b; dann Select c,d) alle späteren Zeilen
+    # leer – deshalb werden Objekte gruppenweise formatiert: sobald sich die
+    # Eigenschaften ändern, beginnt eine neue Tabelle.
+    # Ausnahme: Objekte aus Format-Table/-List (ein Strom aus Start…End) bleiben
+    # als EIN Block zusammen – ein halber Format-Strom in Out-String ist eine
+    # NullReferenceException („Der Objektverweis wurde nicht …“, Chat 137).
+    # Get-Content liest in PowerShell 5.1 ohne BOM als Windows-1252 – UTF-8-
+    # Dateien kamen als „stÃ¤rkste“ zurück. Deshalb UTF-8 als Vorgabe fürs Lesen
+    # (nur Lesen: beim Schreiben würde 5.1 eine BOM voranstellen).
     wrapped = (
         "$ProgressPreference='SilentlyContinue'; "
         "$OutputEncoding = [Console]::OutputEncoding = "
         "[System.Text.Encoding]::UTF8;\n"
         "$ErrorActionPreference='Stop'; $Error.Clear(); $global:LASTEXITCODE=0;\n"
-        "try {\n& {\n" + cmd + "\n}\n"
+        "$PSDefaultParameterValues['Get-Content:Encoding']='UTF8'; "
+        "$PSDefaultParameterValues['Select-String:Encoding']='UTF8'; "
+        "$PSDefaultParameterValues['Import-Csv:Encoding']='UTF8';\n"
+        "try {\n& {\n" + cmd + "\n} | ForEach-Object -Begin { $nemiG=@(); $nemiK=$null } "
+        "-Process { $k = if ($_.PSObject.TypeNames[0] -like "
+        "'Microsoft.PowerShell.Commands.Internal.Format.*') { '__format__' } "
+        "else { $_.PSObject.Properties.Name -join ',' }; "
+        "if ($null -ne $nemiK -and $k -ne $nemiK) { $nemiG | Out-String -Width 200; $nemiG=@() }; "
+        "$nemiK=$k; $nemiG+=$_ } -End { if ($nemiG.Count) { $nemiG | Out-String -Width 200 } }\n"
         "$nemiCommandOk=$?; $nemiNativeExitCode=$LASTEXITCODE;\n"
         "if ($nemiNativeExitCode -ne 0) { exit $nemiNativeExitCode };\n"
         "if ((-not $nemiCommandOk) -or $Error.Count -gt 0) { exit 1 };\n"
@@ -783,6 +833,190 @@ def _befehl(a: dict) -> ActionResult:
             text += "\n" + _cut(out)
         return ActionResult(text, ok=False, returncode=r.returncode)
     return ActionResult(_cut(out) if out else "(kein Output)", ok=True, returncode=0)
+
+
+# ---------------------------------------------------------------------------
+# abfragen – PowerShell, das nur liest (ohne Nachfrage)
+# ---------------------------------------------------------------------------
+# `befehl` fragt IMMER. Für eine Systemwache (Prozesse, Verbindungen, Dienste,
+# Virenschutz, Netz-Tempo …) sind das zwanzig Rückfragen für zwanzig Blicke –
+# und im Hintergrund-Lauf (Zeitplan) sitzt niemand da, der F8 drückt.
+# `abfragen` lässt deshalb nur Befehle durch, die nichts verändern. Was genau
+# abgefragt wird, steht NICHT hier – das entscheidet die Persönlichkeit.
+#
+# Wie entschieden wird (fail-safe: im Zweifel nein):
+#   1. Alle Sperren von `befehl` (Systemordner, gesperrte Orte, Verschleierung).
+#   2. Jedes Cmdlet (Verb-Nomen) muss ein Lese-Verb tragen – Get, Test, Measure,
+#      Select, Sort … Trägt es ein anderes offizielles PowerShell-Verb (Set,
+#      Remove, Start, Stop, Invoke, New …), ist Schluss. Wörter mit Bindestrich,
+#      deren erster Teil KEIN PowerShell-Verb ist ("svc-host"), sind Argumente.
+#   3. Jeder Befehlsanfang (nach ; | Zeilenumbruch { ( =) muss ein Cmdlet, ein
+#      erlaubter Alias, ein erlaubtes natives Programm, ein Schlüsselwort oder
+#      eine Variable sein. Ein fremdes Programm (cmd, powershell, x.exe) nicht.
+#   4. Keine Umleitung in Dateien (>), kein & "pfad", kein Dot-Sourcing, keine
+#      .NET-Aufrufe, die schreiben/starten/löschen, kein Add-Type/New-Object,
+#      kein eigener Netz-Zugriff (Invoke-WebRequest & Co.) – fürs Web gibt es
+#      web_lesen mit Allowlist.
+
+# Offizielle PowerShell-Verben. Nur für DIESE gilt "Verb-Nomen ist ein Cmdlet".
+_PS_VERBEN = frozenset("""
+add clear close copy enter exit find format get hide join lock move new open optimize pop
+push redo remove rename reset resize restore search select set show skip split step switch
+undo unlock watch backup checkpoint compare compress convert convertfrom convertto dismount
+edit expand export group import initialize limit merge mount out publish save sync unpublish
+update debug measure ping repair resolve test trace connect disconnect read receive send
+write block grant protect revoke unblock unprotect use invoke register request restart resume
+start stop submit suspend uninstall unregister wait confirm deny approve assert complete
+build deploy install
+""".split())
+
+# Verben, die nur lesen.
+_LESE_VERBEN = frozenset("""
+get find search select show measure test compare resolve convert convertfrom convertto
+format group ping trace read
+""".split())
+
+# Cmdlets mit Lese-Verb, die trotzdem NICHT dürfen (schreiben, warten auf Eingabe, laden Code).
+_LESE_AUSNAHMEN = frozenset("""
+read-host get-credential test-scriptfile trace-command show-command
+""".split())
+
+# Cmdlets ohne Lese-Verb, die trotzdem harmlos sind.
+_LESE_EXTRA = frozenset("""
+sort-object where-object foreach-object out-string out-null out-default out-host
+write-output write-host write-verbose write-warning write-information write-debug
+join-path split-path join-string import-csv import-clixml select-xml
+set-location push-location pop-location start-sleep
+""".split())
+
+# Aliase und Schlüsselwörter, die am Befehlsanfang stehen dürfen.
+_LESE_ALIASE = frozenset("""
+gci ls dir gc cat type gp gps ps gsv gm select sort where ? % foreach ft fl fw measure
+group compare diff echo write oss sls gwmi gcim gdr gi gl pwd gv gcm gal gjb gu gtz gin
+gsnp ghy h history cd sl pushd popd
+if else elseif for while do switch try catch finally return param begin process end
+throw break continue exit in
+""".split())
+
+# Native Programme, die nur lesen. Bei manchen entscheidet das Argument – siehe
+# _NATIV_VERBOTEN: `ipconfig` liest, `ipconfig /flushdns` ändert.
+_LESE_NATIV = frozenset("""
+netstat ipconfig tasklist whoami systeminfo ping tracert pathping nslookup arp getmac
+driverquery nvidia-smi hostname ver query route netsh powercfg tzutil where.exe reg
+""".split())
+_NATIV_VERBOTEN = re.compile(
+    r"(?i)\b(ipconfig\s+/(release|renew|flushdns|registerdns|setclassid)|"
+    r"arp\s+-[ds]\b|route\s+(add|delete|change)\b|"
+    r"netsh\b(?![^;|\n]*\bshow\b)|powercfg\s+/(?!q|l|a\b|energy|batteryreport|devicequery)|"
+    r"tzutil\s+/s|reg\s+(?!query\b)\w+)"
+)
+
+# Konstrukte, die ein reiner Lese-Befehl nicht braucht.
+_NICHT_LESEND = re.compile(
+    r"(?i)("
+    r"(?<![\d*])>|"                                   # > und >> in Dateien (2>&1 bleibt erlaubt)
+    r"(?<![\w$])&\s*[\"'$]|"                            # & "programm" / & $x
+    r"(?:^|[;|\n{(])\s*\.\s+[\"'$.\\/]|"               # Dot-Sourcing
+    r"\badd-type\b|\bnew-object\b|\bimport-module\b|\btee-object\b|\bout-file\b|\bexport-\w+|"
+    r"\bfunction\s+\w|\bfilter\s+\w|"
+    r"\[[\w.]*(reflection|diagnostics\.process|io\.file|io\.directory|activator|marshal|"
+    r"runtime\.interop|net\.webclient|net\.http|net\.sockets|management\.automation)\b|"
+    r"(?:\.|::)\s*(kill|delete|remove\w*|move\w*|copy\w*|create\w*|write\w*|append\w*|"
+    r"start|stop|invoke\w*|load\w*|set\w+|terminate|dispose|exit)\s*\(|"
+    r"\b(invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget|certutil|bitsadmin)\b"
+    r")"
+)
+_VERB_NOMEN = re.compile(r"(?<![\w$@.:\-])([A-Za-z]+)-([A-Za-z][\w]*)")
+_SEGMENT_START = re.compile(r"(?:^|[;|\n{(]|(?<![=!<>])=(?!=))\s*([^\s;|{}()]+)")
+_STRINGS = re.compile(r"'[^']*'|\"[^\"]*\"")
+
+
+def _nur_lesend(cmd: str) -> str | None:
+    """None, wenn der Befehl nur liest. Sonst der Grund, warum nicht."""
+    roh = cmd or ""
+    if (m := _NICHT_LESEND.search(roh)):
+        return (f"'{m.group(0).strip()}' gehört nicht in eine reine Abfrage – das schreibt, "
+                "startet, lädt Code oder geht selbst ins Netz.")
+    for m in _VERB_NOMEN.finditer(roh):
+        verb, ganz = m.group(1).lower(), m.group(0).lower()
+        if ganz in _LESE_EXTRA:
+            continue
+        if ganz in _LESE_AUSNAHMEN:
+            return f"'{m.group(0)}' wartet auf Eingabe oder lädt Code – das ist keine Abfrage."
+        if verb in _LESE_VERBEN:
+            continue
+        if verb in _PS_VERBEN:
+            return f"'{m.group(0)}' verändert etwas (Verb '{m.group(1)}')."
+        # kein PowerShell-Verb -> ein Argument wie 'svc-host', kein Cmdlet
+    # Befehlsanfänge: Strings vorher ausblenden – ein '(' oder ';' IN einem
+    # Text ('\Processor(_Total)') ist kein neuer Befehl.
+    for m in _SEGMENT_START.finditer(_STRINGS.sub("'…'", roh)):
+        wort = m.group(1)
+        w = wort.lower()
+        if not w or w[0] in "$@\"'-[(" or w[0].isdigit() or w.startswith(("#", "..")):
+            continue
+        if "=" in w:                            # Zuweisung (n=$_.Name): rechts wird eigens geprüft
+            continue
+        if w.endswith(".exe") and w not in _LESE_NATIV:
+            w = w[:-4]
+        if w in _LESE_ALIASE or w in _LESE_NATIV or w in _LESE_EXTRA:
+            continue
+        if "-" in w and w.split("-", 1)[0] in _LESE_VERBEN:
+            continue
+        if re.fullmatch(r"[a-z]+-\w+", w) and w.split("-", 1)[0] not in _PS_VERBEN:
+            continue                            # 'svc-host' als Wert nach einem =
+        return (f"'{wort}' ist kein Lese-Befehl, den ich kenne. Erlaubt sind Cmdlets mit "
+                "Get/Test/Measure/Select/Sort/Where/Format/Compare/Resolve/Convert… und "
+                "diese Programme: " + ", ".join(sorted(_LESE_NATIV)) + ".")
+    if (m := _NATIV_VERBOTEN.search(roh)):
+        return f"'{m.group(0).strip()}' verändert etwas – das ist keine Abfrage."
+    return None
+
+
+def _abfragen(a: dict) -> ActionResult:
+    cmd = _befehl_text(a)
+    if not cmd.strip():
+        return ActionResult("Fehler: kein Befehl angegeben. Schreib die Abfrage ins Feld "
+                            "'befehl', z.B. {\"tool\": \"abfragen\", \"befehl\": \"Get-Process\"}.",
+                            ok=False)
+    if (grund := _nur_lesend(cmd)):
+        return ActionResult("Fehler: 🔍 'abfragen' darf nur lesen. " + grund +
+                            " Wenn es wirklich etwas ändern soll, nimm 'befehl' – "
+                            "das fragt den Nutzer.", ok=False)
+    if (blocked := _guard_command(cmd, lesend=True)):
+        return ActionResult(blocked, ok=False)
+    return _befehl({"befehl": cmd}, lesend=True)
+
+
+# ---------------------------------------------------------------------------
+# zeitplan – Aufgaben in der Windows-Aufgabenplanung
+# ---------------------------------------------------------------------------
+
+def _zeitplan(a: dict) -> ActionResult:
+    import zeitplan
+    was = str(a.get("aktion") or "").strip().lower()
+    try:
+        if was in ("anlegen", "neu", "erstellen", "planen"):
+            return ActionResult(zeitplan.anlegen(a.get("name", ""), a.get("wann", ""),
+                                                 a.get("auftrag", "")))
+        if was in ("loeschen", "löschen", "entfernen"):
+            return ActionResult(zeitplan.loeschen(a.get("name", "")))
+        if was in ("anzeigen", "liste", "zeigen"):
+            return ActionResult(zeitplan.liste())
+        return ActionResult("Fehler: 'aktion' muss 'anlegen' oder 'loeschen' sein "
+                            "(zum Ansehen: zeitplan_anzeigen).", ok=False)
+    except ValueError as e:
+        return ActionResult(f"Fehler: {e}", ok=False)
+    except Exception as e:
+        return ActionResult(f"Fehler in der Aufgabenplanung: {e}", ok=False)
+
+
+def _zeitplan_anzeigen(a: dict) -> ActionResult:
+    import zeitplan
+    try:
+        return ActionResult(zeitplan.liste())
+    except Exception as e:
+        return ActionResult(f"Fehler in der Aufgabenplanung: {e}", ok=False)
 
 
 def _skill_merken(a: dict) -> str:
@@ -973,6 +1207,9 @@ ACTIONS: dict[str, dict] = {
     "dateien_suchen":   {"func": _dateien_suchen,   "confirm": False, "felder": ["muster"]},
     "inhalt_suchen":    {"func": _inhalt_suchen,    "confirm": False, "felder": ["muster"]},
     "ordner_erkennen":  {"func": _ordner_erkennen,  "confirm": False, "felder": []},
+    # PowerShell, das nur liest (Prozesse, Verbindungen, Dienste …) – _nur_lesend wacht
+    "abfragen":         {"func": _abfragen,         "confirm": False, "felder": []},
+    "zeitplan_anzeigen": {"func": _zeitplan_anzeigen, "confirm": False, "felder": []},
     # Internet (nur Whitelist / Wikipedia – lesend, sicher)
     "web_lesen":        {"func": _web_lesen,        "confirm": False, "felder": ["url"]},
     "web_wiki":         {"func": _web_wiki,         "confirm": False, "felder": ["suche"]},
@@ -985,6 +1222,8 @@ ACTIONS: dict[str, dict] = {
     "verschieben":      {"func": _verschieben,      "confirm": True,  "felder": ["von", "nach"]},
     "loeschen":         {"func": _loeschen,         "confirm": True,  "felder": ["pfad"]},
     "befehl":           {"func": _befehl,           "confirm": True,  "felder": []},
+    # Windows-Aufgabenplanung: NemiCLI zu einer Zeit mit einem Auftrag starten
+    "zeitplan":         {"func": _zeitplan,         "confirm": True,  "felder": ["aktion", "name"]},
     # Bildschirm fotografieren – fragt, weil Privates zu sehen sein kann
     "bildschirm_ansehen": {"func": _bildschirm_ansehen, "confirm": True, "felder": []},
     # lernen (eigener Wissensspeicher – harmlos, ohne Nachfrage)
@@ -1160,6 +1399,14 @@ def describe(action: dict) -> str:
     if t == "verschieben":      return f"Verschieben:  {g('von', '?')} → {g('nach', '?')}"
     if t == "loeschen":         return f"LÖSCHEN:  {g('pfad', '?')}"
     if t == "befehl":           return f"PowerShell ausführen:\n    {_befehl_text(action) or '?'}"
+    if t == "abfragen":         return f"Abfragen (nur lesen):\n    {_befehl_text(action) or '?'}"
+    if t == "zeitplan_anzeigen": return "Zeitplan anzeigen (NemiCLI-Aufgaben in Windows)"
+    if t == "zeitplan":
+        was = str(g("aktion", "?")).lower()
+        if was.startswith("anl") or was in ("neu", "erstellen", "planen"):
+            return (f"Zeitplan anlegen:  '{g('name', '?')}'  –  {g('wann', '?')}\n"
+                    f"    Auftrag: {str(g('auftrag', ''))[:200]}")
+        return f"Zeitplan {was}:  '{g('name', '?')}'"
     if t == "skill_merken":
         inhalt = str(g("inhalt", "")).strip().replace("\n", " ")
         kurz = inhalt if len(inhalt) <= 160 else inhalt[:159] + "…"

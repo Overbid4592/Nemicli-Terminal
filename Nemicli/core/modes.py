@@ -58,6 +58,8 @@ READ_TOOLS = {
     "datei_lesen", "bild_ansehen", "ordner_auflisten", "ordner_erkennen",
     "dateien_suchen", "inhalt_suchen",
     "web_lesen", "web_wiki", "web_suche", "ml_status",
+    # PowerShell, das nur liest (actions._nur_lesend wacht) + Zeitplan ansehen
+    "abfragen", "zeitplan_anzeigen",
 }
 # Pfad-Felder verändernder Werkzeuge, für die Ordner-Grenze im Auto-Modus.
 _PATH_FIELDS = ("pfad", "von", "nach", "ziel", "quelle", "path")

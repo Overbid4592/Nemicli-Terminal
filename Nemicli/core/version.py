@@ -1,8 +1,8 @@
 """
 version.py - Welche NemiCLI läuft hier eigentlich?  (/version, --version)
 
-VERSION ist die Hauptnummer (Kalender-Schema: Jahr.Monat.Tag des Stands, bei
-mehreren Änderungen am selben Tag kommt ein .N dran). Dazu kommt, wenn das
+VERSION ist die Hauptnummer, die der Entwickler vergibt (3.5 Alpha, 3.6 …); STAND ist
+das Datum des Codes (Jahr.Monat.Tag). Dazu kommt, wenn das
 Projekt als Git-Repo läuft, der kurze Commit-Hash und dessen Datum – so lässt
 sich bei Support-Fragen genau sagen, welcher Stand gemeint ist. In der
 gepackten exe gibt es kein Git; dann steht nur die VERSION.
@@ -15,7 +15,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "2026.09.12"
+VERSION = "3.5 Alpha"
+STAND = "2026.09.18"
 AUTHOR = "D. Hoffmann (Vibecoder)"
 BUILT_WITH = "Claude Opus 5 · Anthropic"
 
@@ -31,7 +32,7 @@ _GIT_CACHE: dict | None = None
 def _git(*args: str) -> str:
     """Ein Git-Befehl im Projektordner, leerer String bei jedem Problem."""
     try:
-        r = subprocess.run(["git", *args], cwd=_ROOT, capture_output=True, text=True,
+        r = subprocess.run(["git", *args], cwd=_INSTALL, capture_output=True, text=True,
                            timeout=5, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         return r.stdout.strip() if r.returncode == 0 else ""
     except Exception:
@@ -53,17 +54,17 @@ def git_info() -> dict:
 
 
 def build_label() -> str:
-    """Kurzform für Banner/Statuszeile: '2026.09.12 (a4f25d1)' bzw. '2026.09.12 (exe)'."""
+    """Kurzform für Banner/Statuszeile: '3.5 Alpha · 2026.09.18 (a4f25d1)' bzw. '… (exe)'."""
     g = git_info()
     if g["hash"]:
-        return f"{VERSION} ({g['hash']}{'*' if g['dirty'] else ''})"
-    return f"{VERSION} ({'exe' if _FROZEN else 'Skript'})"
+        return f"{VERSION} · {STAND} ({g['hash']}{'*' if g['dirty'] else ''})"
+    return f"{VERSION} · {STAND} ({'exe' if _FROZEN else 'Skript'})"
 
 
 def report(model: str | None = None, persona: str | None = None) -> list[tuple[str, str]]:
     """Zeilen für /version: (Bezeichnung, Wert)."""
     g = git_info()
-    rows = [("Version", VERSION),
+    rows = [("Version", VERSION), ("Stand", STAND),
             ("Entwickelt von", AUTHOR),
             ("Gebaut mit", BUILT_WITH)]
     if g["hash"]:

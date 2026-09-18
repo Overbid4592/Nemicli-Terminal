@@ -43,6 +43,7 @@ Bootstrap, Chat-Schleife, Aktions-Steuerung, alle Slash-Befehle.
 | `do_reflect(ctx)` | Zieht aus dem Gespräch eine Lektion/Vorliebe und speichert sie ins Gedächtnis. |
 | `Ctx` | Sitzungs-Status (Backend, Modell, Stärke, aktueller Chat), geteilt zwischen TUI und Loop. |
 | `handle_line(ctx, text)` | Verarbeitet eine Eingabezeile. `TURN_LOCK` erlaubt nur EINEN Zug gleichzeitig (Terminal oder Browser). |
+| `auftrag_lauf(name)` | **Hintergrund-Auftrag** (`main.py --auftrag <name>`, gestartet von der Windows-Aufgabenplanung): kein Fenster, Ausgabe in `Berichte/<name>.log`, Modus fest auf „lesen“, jede Rückfrage ist ein Nein. Der Auftrag aus `Zeitplan/<name>.json` geht als Nachricht an die Persönlichkeit; ihre letzte Antwort wird `Berichte/<name>_<datum>.md`. Beim nächsten normalen Start zeigt `main()` die erste Zeile jedes neuen Berichts. |
 
 **Slash-Befehle:** `/help` `/theme` `/model` `/bild` `/staerke` `/resume`
 `/reset` `/clear` `/wissen` `/gedaechtnis` `/reflektieren` `/aufraeumen`
@@ -61,7 +62,7 @@ Bootstrap, Chat-Schleife, Aktions-Steuerung, alle Slash-Befehle.
 | **keyvault.py** | API-Key-Schutz über **Windows-DPAPI** (an Konto + PC gebunden). `encrypt/decrypt`, `mask` (`sk-12345•••`). Nicht-Windows: Klartext. |
 | **persona.py** | **Der System-Prompt** für alle Modelle: Persönlichkeit (aus `persoenlichkeiten.py`, austauschbar) + feste Grundregeln + Windows-Umgebung + komplettes **Aktions-Protokoll**, Werkzeugliste, Web-Sicherheitshinweis. Baut den Prompt bei jeder Nachricht neu aus Basis + Ordner-Sinn + Wissen + passenden Erinnerungen. |
 | **modes.py** | Arbeitsmodus (Sitzung, Start = normal): `decide(action, needs_confirm)` → run/ask/block je Modus; Auto mit Ordner-Grenze (`_inside_cwd`) und Zünder (`AUTO_FUSE_S`, `check_fuse()` im TUI-Ticker); `prompt_hint()` für den System-Prompt, `status_fragment()` für die Leiste. Netz-Taint (needs_confirm=True) schlägt jeden Modus. |
-| **version.py** | `VERSION` (Kalender-Schema) + Git-Info (Hash, Branch, Datum, dirty) für `/version` und `--version`; in der exe nur die Nummer. |
+| **version.py** | `VERSION` (Nummer des Entwicklers, z.B. 3.5 Alpha) + `STAND` (Datum des Codes) + Git-Info (Hash, Branch, Datum, dirty) für `/version` und `--version`; in der exe nur die Nummer. |
 | **persoenlichkeiten.py** | `/persönlichkeiten`: eingebaute „Nemi“ + eigene als Markdown-Dateien in `Persoenlichkeiten/` (erste `# Überschrift` = Name, erste `> Zeile` = Kurzbeschreibung, Rest = Prompt-Text). Aktive steht in `nemicli.config.json` (`persoenlichkeit`), fehlt sie → Nemi. `create()` baut aus Name/Kurz/Geschlecht/Tonfall eine editierbare Vorlage, überschreibt nie. |
 
 ---
@@ -92,7 +93,8 @@ Mistral, Cohere, Perplexity, DeepSeek, xAI/Grok, Groq, OpenRouter.
 
 | Modul | Zweck |
 |---|---|
-| **actions.py** | **Das Aktions-System.** `ACTIONS`-Registry, parst ` ```aktion `-Blöcke, korrigiert Tippfehler, führt aus. **Sicherheit:** sperrt verändernde Aktionen in System-/Windows-Ordnern (Pfad-Schutz gegen `..`, destruktive Befehle). Systemordner sind komplett tabu (auch Lesen): `_read_guard()` für Lesewerkzeuge, `_guard()` fürs Ändern, `_guard_command()` sperrt jeden Befehl, der einen Systemordner/HKLM nennt; `_skip_system()` blendet sie in Suchläufen und der `C:\`-Auflistung aus. |
+| **actions.py** | **Das Aktions-System.** `ACTIONS`-Registry, parst ` ```aktion `-Blöcke, korrigiert Tippfehler, führt aus. **Sicherheit:** sperrt verändernde Aktionen in System-/Windows-Ordnern (Pfad-Schutz gegen `..`, destruktive Befehle). Systemordner: nachschauen ja, ändern nie (seit 18.09.2026): `_read_guard()` sperrt für Lesewerkzeuge nur noch die absolut gesperrten Orte des Nutzers, `_guard()` fürs Ändern bleibt streng, `_guard_command()` sperrt jeden `befehl`, der einen Systemordner/HKLM nennt – mit `lesend=True` (für `abfragen`) darf er sie nennen; `_skip_system(p, base)` hält Suchläufe aus Windows heraus, außer die Suche beginnt dort. **`abfragen`** = PowerShell ohne Rückfrage, aber nur lesend: `_nur_lesend()` lässt Cmdlets nur mit Lese-Verb durch (Get/Test/Measure/Select/Sort/Where/Format/Compare/Resolve/Convert …), kennt eine Allowlist nativer Lese-Programme (netstat, ipconfig, tasklist, nslookup …) und sperrt Umleitungen, `&`-Aufrufe, Dot-Sourcing, .NET-Schreib-/Start-Methoden, Add-Type/New-Object und eigenen Netz-Zugriff. Fail-safe: unbekannter Befehlsanfang = nein. |
+| **zeitplan.py** | **Windows-Aufgabenplanung** für die Aktion `zeitplan`: `parse_wann()` versteht deutsche Zeitangaben (täglich HH:MM · alle N Stunden/Minuten · wöchentlich Tag HH:MM · Anmeldung · einmal Datum), `anlegen/loeschen/liste` reden per `Register-/Unregister-/Get-ScheduledTask` mit Windows – nur im Ordner `\NemiCLI\`, fremde Aufgaben nie. Aufträge liegen als `Zeitplan/<name>.json`, die Aufgabe startet `pythonw.exe main.py --auftrag <name>` (kein Fenster). Berichte + Log in `Berichte/`; `neue_berichte()` merkt sich per Marker, was der Nutzer schon gesehen hat. |
 | **foldersense.py** | Eigener **Naive-Bayes-Klassifikator** (reines Python): erkennt Ordner-Typ (Python, Node, Web, Rust, Dokumente, Bilder …). Lernt echte Ordner dazu. Modell in `learned/folder_model.json`. |
 | **learn.py** | Wissensspeicher: sichert Python-Code (`learned/snippets/`, dedupliziert) und selbstgeschriebene Anleitungen (`learned/skills/`). Kompakter Index in den Prompt. |
 | **memory.py** | **Langzeitgedächtnis** in natürlicher Sprache. `remember/recall` — semantisch über Qwen3-Embedding-0.6B auf der CPU (`embedder.py`), Fallback Stichwort. Arten: Fakt/Vorliebe/Projekt/Person/PC/Lektion. `consolidate` (für `/aufraeumen`). |
@@ -141,6 +143,7 @@ Optional nur für `/bild` (lazy): torch, diffusers, transformers, Pillow …
 - **Multi-Provider:** 10 Cloud-Anbieter (live abgefragt) + Ollama, offline möglich.
 - **Vision:** Ollama (👁-Modelle) und Cloud — Bildpfade werden automatisch angehängt. Ein blindes Modell bekommt den Hinweis, ein sehendes zu wählen.
 - **Aktionen:** Dateien, Ordner, PowerShell, Web, PDF, Bild — verändernde mit Bestätigung, Systemordner-Schutz.
+- **Systemwache & Zeitplan:** `abfragen` liest Prozesse, Verbindungen, Dienste, Virenschutz … ohne Rückfrage (nur Lese-Befehle kommen durch); `zeitplan` trägt NemiCLI in die Windows-Aufgabenplanung ein, der Hintergrund-Lauf schreibt Berichte. Was geprüft wird, steht in einer Anleitung in `Agenten/`, nicht im Code.
 - **Eigenes ML:** Naive-Bayes-Ordnererkennung, Wissensspeicher, Langzeitgedächtnis mit Embedding-Recall, Reflexion, Übungsmodus.
 - **UI:** Vollbild-TUI, klassischer Fallback, barrierefreie WebUI.
 - **Sicherheit:** verschlüsselte Keys (DPAPI), Systemordner-Schutz, Web-Allowlist + SSRF-Schutz + Injection-Warnung, GGUF-Parser + CVE-Warnung, kugelsichere Kindprozesse, WebUI nur lokal + Token.

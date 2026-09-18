@@ -162,19 +162,28 @@ async def _bilder_fuer_chat(model: str | None, text: str,
     return text, None, ("Das aktive Modell sieht keine Bilder. Nimm mit /model ein "
                         "Vision-Modell (Cloud oder ein Ollama-Modell mit 👁).")
 MAX_STEPS = 12                  # Bremse für Aktions-Ketten pro Nutzer-Nachricht (keine Endlosschleife)
+# Solange in einer Runde NUR gelesen wurde (READ_TOOLS: datei_lesen, abfragen, web …),
+# gilt eine weitere Grenze: Die Systemwache liest ihre Anleitung in drei Stücken und
+# fragt dann acht Dinge ab – mit 12 war sie bei Schritt 2 am Ende (Chat 137). Sobald
+# eine ändernde Aktion dabei war, gilt wieder die kurze Bremse.
+MAX_LESE_STEPS = 30
 # Lesende Werkzeuge, die mit identischen Feldern nichts Neues bringen: eine
 # Wiederholung in derselben Runde wird nicht ausgeführt, sondern nur angemerkt.
 # befehl/bild_malen/Helfer bewusst nicht – ein zweites `git status` kann Sinn haben.
 _DEDUPE_TOOLS = {"datei_lesen", "ordner_auflisten", "dateien_suchen", "inhalt_suchen",
                  "ordner_erkennen", "web_lesen", "web_wiki", "web_suche", "ml_status"}
 _STEP_LIMIT_NOTE = (
-    f"\n\n[System] ⏸ Du hast in dieser Runde {MAX_STEPS} Aktionen ausgeführt – das ist die "
-    "Obergrenze pro Nachricht. Führe jetzt KEINE weitere Aktion aus. Fasse zusammen, was du "
+    "\n\n[System] ⏸ Du hast in dieser Runde die Obergrenze an Aktionen erreicht "
+    f"({MAX_STEPS} mit Änderungen, {MAX_LESE_STEPS} nur lesend). Führe jetzt KEINE weitere Aktion aus. Fasse zusammen, was du "
     "bisher herausgefunden hast, und sag klar, was noch offen ist. Der Nutzer kann mit "
     "„weiter“ die nächste Runde starten."
 )
-_STEP_LIMIT_WARN = (f"⏸ {MAX_STEPS} Aktionen am Stück – ich halte kurz an, damit nichts endlos "
+_STEP_LIMIT_WARN = ("⏸ Viele Aktionen am Stück – ich halte kurz an, damit nichts endlos "
                     "läuft. Sag „weiter“, dann mache ich da weiter.")
+
+
+def _schritt_grenze(nur_gelesen: bool) -> int:
+    return MAX_LESE_STEPS if nur_gelesen else MAX_STEPS
 _DUPLICATE_NOTE = ("Diese Aktion hattest du in dieser Runde schon mit genau denselben Angaben "
                    "ausgeführt – das Ergebnis steht oben. Nutze es, statt es erneut abzurufen.")
 
@@ -423,8 +432,9 @@ async def _converse(backend, user_text, images, records) -> None:
     next_input = user_text
     first = True
     seen: set[str] = set()                   # identische Lese-Aktionen nur einmal
-    for schritt in range(MAX_STEPS + 1):
-        letzter = schritt == MAX_STEPS       # Extra-Runde: nur noch zusammenfassen
+    nur_gelesen = True                       # bisher nur Lese-Werkzeuge? -> längere Leine
+    for schritt in range(MAX_LESE_STEPS + 1):
+        letzter = schritt >= _schritt_grenze(nur_gelesen)   # Extra-Runde: nur noch zusammenfassen
         if letzter:
             next_input = next_input + _STEP_LIMIT_NOTE
         # 1) Antwort streamen (Denken + Text getrennt)
@@ -681,6 +691,8 @@ async def _converse(backend, user_text, images, records) -> None:
                     ui.info(f"Aktionen vom Typ '{tool}' frage ich diese Sitzung nicht mehr ab.")
             record = {"tool": tool, "status": "running"}
             records.append(record)
+            if tool not in modes.READ_TOOLS:
+                nur_gelesen = False
             if tool == "bild_malen":
                 # Bildmalen zeigt einen echten Ladebalken (Schritt i/n), genau wie
                 # der /bild-Befehl. Die Aktion läuft im Thread und meldet ihren
@@ -752,8 +764,9 @@ async def _web_converse(backend, user_text, images, emit, confirm, records) -> N
     next_input = user_text
     first = True
     seen: set[str] = set()
-    for schritt in range(MAX_STEPS + 1):
-        letzter = schritt == MAX_STEPS
+    nur_gelesen = True
+    for schritt in range(MAX_LESE_STEPS + 1):
+        letzter = schritt >= _schritt_grenze(nur_gelesen)
         if letzter:
             next_input = next_input + _STEP_LIMIT_NOTE
         answer = ""
@@ -894,6 +907,8 @@ async def _web_converse(backend, user_text, images, emit, confirm, records) -> N
 
             record = {"tool": tool, "status": "running"}
             records.append(record)
+            if tool not in modes.READ_TOOLS:
+                nur_gelesen = False
             if tool == "bild_malen":
                 # Gleicher Ladebalken wie im Terminal: Aktion im Thread,
                 # Fortschritt über actions.bild_status() an den Browser.
@@ -2652,6 +2667,84 @@ def _start_nachricht() -> str | None:
     return text or None
 
 
+# ---------------------------------------------------------------------------
+# Hintergrund-Auftrag (Zeitplan): `main.py --auftrag <name>`
+# ---------------------------------------------------------------------------
+# Die Windows-Aufgabenplanung startet NemiCLI so – ohne Fenster, ohne Nutzer.
+# Die Persönlichkeit bekommt den Auftrag aus Zeitplan/<name>.json als Nachricht,
+# arbeitet ihn im Modus „lesen" ab (abfragen, datei_lesen, web_suche … laufen;
+# alles Ändernde ist gesperrt, da drückt niemand F8) und ihre letzte Antwort
+# wird als Bericht nach Berichte/ geschrieben. Beim nächsten normalen Start
+# zeigt main() die erste Zeile jedes neuen Berichts.
+
+async def _nie_freigeben(*_a, **_k):
+    """Im Hintergrund gibt es keine Freigabe – jede Rückfrage ist ein Nein."""
+    return "no"
+
+
+async def _nie_pruefen(*_a, **_k):
+    return False
+
+
+async def auftrag_lauf(name: str) -> int:
+    global ask_confirm, review_action_confirm
+    import zeitplan
+    auftrag = zeitplan.lade_auftrag(name)
+    if not auftrag:
+        print(f"Kein Auftrag namens {name!r} in {zeitplan.ORDNER}.")
+        return 1
+    name = auftrag["name"]
+    ask_confirm = _nie_freigeben
+    review_action_confirm = _nie_pruefen
+    modes.set_mode("lesen")
+
+    cfg = config.load()
+    ref = _migrate_ref(cfg.get("model"))
+    backend = None
+    fehler = ""
+    if ref:
+        try:
+            backend = await make_backend(ref, None, cfg.get("strength", M.DEFAULT_STRENGTH))
+        except Exception as e:
+            fehler = f"Modell '{ref}' ließ sich nicht laden: {e}"
+    else:
+        fehler = "Kein Modell eingestellt (/model)."
+
+    mitschrift.leeren()
+    mitschrift.setze_quelle(lambda: {"chat": f"Auftrag {name}", "model": ref or "-",
+                                     "persona": PS.active().name, "modus": modes.label(),
+                                     "ordner": str(Path.cwd())})
+    stats.start_session(ref)
+    antwort = ""
+    if backend is not None:
+        text = (f"[Hintergrund-Auftrag „{name}“ aus deinem Zeitplan, "
+                f"{time.strftime('%d.%m.%Y %H:%M')}. Es ist niemand da, der antwortet oder "
+                "etwas freigibt: Du kannst nur lesen und abfragen. Deine LETZTE Antwort wird "
+                "als Bericht gespeichert – fang sie mit einer klaren Zeile an (✅ Alles OK / "
+                "⚠️ n Auffälligkeiten) und schreib dann, was du gesehen hast.]\n\n"
+                + auftrag["auftrag"])
+        try:
+            await asyncio.wait_for(converse(backend, text), timeout=25 * 60)
+        except asyncio.TimeoutError:
+            fehler = "Abgebrochen: der Auftrag lief länger als 25 Minuten."
+        except Exception as e:
+            fehler = f"Abgebrochen mit Fehler: {e}"
+        antwort = mitschrift.letzte_antwort()
+    stats.end_session()
+
+    if not antwort:
+        antwort = "❌ Kein Bericht – " + (fehler or "die Persönlichkeit hat nichts geantwortet.")
+    elif fehler:
+        antwort = f"⚠️ {fehler}\n\n{antwort}"
+    pfad = zeitplan.bericht_pfad(name)
+    pfad.write_text(
+        f"<!-- NemiCLI-Bericht: {name} · {time.strftime('%d.%m.%Y %H:%M')} · {ref or '-'} -->\n\n"
+        + antwort.strip() + "\n\n---\n\n## Ablauf\n\n" + mitschrift.als_markdown(),
+        encoding="utf-8")
+    print(f"Bericht: {pfad}")
+    return 0 if backend is not None and not fehler else 1
+
+
 async def run_classic(ctx: Ctx) -> None:
     """Klassischer scrollender Loop (Eingabe inline, prompt_toolkit-Session)."""
     session = PromptSession(
@@ -2758,6 +2851,13 @@ async def main():
     ui.welcome(model=ctx.model or "—", mode="Chat",
                strength=ctx.strength if ctx.strength_active() else None)
     ui.info(f"📒 Chat #{ctx.current_chat}  ·  /resume <#> setzt einen alten fort")
+    # Berichte aus dem Zeitplan, die seit dem letzten Start dazukamen: erste Zeile zeigen
+    try:
+        import zeitplan as _ZP
+        for _p in _ZP.neue_berichte()[-3:]:
+            ui.info(f"📋 Bericht „{_p.stem}“: {_ZP.bericht_kopfzeile(_p) or '(leer)'}  →  {_p}")
+    except Exception:
+        pass
     if ctx.backend is None:
         ui.warn("Noch kein Modell aktiv – tippe /model zum Wählen.")
         provs = {pid: p for pid, p in P.detected().items() if not p.keyless}
@@ -2937,6 +3037,24 @@ if __name__ == "__main__":
         _res = imagegen.generate(_text, on_status=lambda m: print("  ", m), **_opts)
         print("fertig:", _res)
         raise SystemExit(0)
+    if "--auftrag" in sys.argv:          # Zeitplan: ohne Fenster, Antwort wird Bericht
+        _i = sys.argv.index("--auftrag")
+        _name = " ".join(sys.argv[_i + 1:]).strip()
+        if not _name:
+            print("--auftrag braucht den Namen des Auftrags (Zeitplan/<name>.json).")
+            raise SystemExit(2)
+        # Unter pythonw.exe gibt es keine Konsole – alles, was NemiCLI sonst ins
+        # Terminal malt, landet in einer Log-Datei neben den Berichten.
+        try:
+            import zeitplan as _ZP
+            _ZP.BERICHTE.mkdir(parents=True, exist_ok=True)
+            _log = open(_ZP.BERICHTE / f"{_ZP.sauberer_name(_name) or 'auftrag'}.log",
+                        "a", encoding="utf-8", errors="replace")
+            sys.stdout = sys.stderr = _log
+            print(f"\n===== {time.strftime('%d.%m.%Y %H:%M:%S')} Auftrag {_name!r} =====")
+        except Exception:
+            pass
+        raise SystemExit(asyncio.run(auftrag_lauf(_name)))
     if "--systemcheck" in sys.argv:      # Bericht ohne Oberfläche (auch zum Testen)
         import syscheck
         _rep = syscheck.report(True)

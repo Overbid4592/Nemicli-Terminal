@@ -177,7 +177,7 @@ _DIRS = ("Models", "Models/checkpoints", "Bilder", "chats",
 # requirements.txt, nemicli.cmd, chrome-erweiterung, venv.
 DATEN_INHALT = ("chats", "Gespraeche", "learned", "Bilder", "Models",
                 "NemiSandbox", "Persoenlichkeiten", "Agenten", "Befehle",
-                "Vorschläge", ".cli_history")
+                "Vorschläge", "Zeitplan", "Berichte", ".cli_history")
 
 _BEFEHLE_README = """\
 === Hier landen Hilfs-Skripte (.ps1) ===
