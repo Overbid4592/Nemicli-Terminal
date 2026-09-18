@@ -16,6 +16,12 @@ import indexdb
 import persoenlichkeiten
 import modes
 
+try:
+    import version as _VER
+    _VERSION_ZEILE = f"NemiCLI {_VER.VERSION} (Stand {_VER.STAND})"
+except Exception:
+    _VERSION_ZEILE = "NemiCLI"
+
 _HOME = os.path.expanduser("~")
 _DESKTOP = os.path.join(_HOME, "Desktop")
 _CWD = os.getcwd()
@@ -64,6 +70,7 @@ Das ist dein innerer Ablauf – arbeite danach, aber zähl ihn dem Nutzer nicht 
 - Home-Ordner:    {_HOME}
 - Desktop:        {_DESKTOP}
 - NemiCLI-Projekt: {_CWD}
+- Du läufst in: {_VERSION_ZEILE} – das ist deine Programm-Version, wenn jemand fragt.
 
 # Deine Fähigkeiten – das Aktions-Protokoll
 Du kannst echte Dinge tun. Dafür schreibst du genau EINEN Block in diesem Format (und sonst nichts in dem Moment, außer einer kurzen Erklärung davor):
