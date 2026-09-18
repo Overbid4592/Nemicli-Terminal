@@ -1,8 +1,0 @@
-{
-  "_hinweis": "Zusaetzliche Sperren fuer die KI. Der NemiCLI-Ordner (absolut) und KreaWork.json (nur-lesen) stehen bereits fest in tools/actions.py und muessen hier NICHT eingetragen werden.",
-  "_pfade": "nur-lesen: die KI darf ansehen, aber nicht aendern",
-  "_pfade_absolut": "komplett tabu: weder ansehen noch aendern",
-  "_beispiel": "\"pfade_absolut\": [\"C:\\Users\\DeinName\\Desktop\\GeheimesProjekt\"]",
-  "pfade": [],
-  "pfade_absolut": []
-}
