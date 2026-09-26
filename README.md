@@ -12,7 +12,7 @@
 
 **Dein eigener KI-Agent im Terminal – Cloud & lokal, mit Werkzeugen, Gedächtnis und Herz.** ✦
 
-**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5 (Anthropic)**
+**Entwickelt von VibeCoder · gebaut mit Claude Opus 5 (Anthropic)**
 
 ![NemiCLI Screenshot](nemicli.png)
 
@@ -28,7 +28,7 @@ und er kann **handeln**: Dateien lesen und schreiben, Befehle ausführen, im Web
 Bilder ansehen und malen, den Bildschirm lesen, Helfer losschicken. Immer mit deiner Bestätigung.
 
 Dazu eine lebendige Oberfläche mit Persönlichkeit (Nemi, Lara oder deine eigene), Themes,
-Maskottchen, Live-Anzeige – und Lesehilfen für LRS.
+Maskottchen, Live-Anzeige – und Lesehilfen und anpassbare Darstellung.
 
 > Entstanden aus Neugier: „Wie funktioniert eigentlich so ein Coding-Agent?" 💜
 
@@ -58,7 +58,7 @@ jederzeit wieder; beim Wechsel wird **kopiert, nie gelöscht**.
 
 **Von überall starten (`nemicli`):** Programmordner einmalig in den Benutzer-PATH:
 ```powershell
-[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';C:\Users\<du>\AppData\Local\NemiCli', 'User')
+[Environment]::SetEnvironmentVariable('Path', [Environment]::GetEnvironmentVariable('Path','User') + ';C:\Users\<Benutzer>\AppData\Local\NemiCli', 'User')
 ```
 Neues Terminal öffnen → `nemicli`. Mit `nemicli --sag "…"` geht die erste Nachricht sofort ab.
 
@@ -137,7 +137,7 @@ Ollama Cloud.
   arbeitet sie eine abgesegnete Aufgabe selbst ab (planen → umsetzen → testen → prüfen → weiter) und
   hält von sich aus an, wenn sie fertig ist, nicht weiterkommt, oder eine Entscheidung ansteht, die
   dir gehört. **Dein Wunsch hat Vorrang:** kein Zerreden, keine Moralpredigten – ein Einwand, dann
-  wird gebaut, wie du es willst. **Rücksicht auf LRS und Sprachstörungen** ist Teil der Anweisung:
+  wird gebaut, wie du es willst. **Lesefreundliche Kommunikation** ist Teil der Anweisung:
   kurze Sätze, eine Frage auf einmal, Listen statt Absätze, Rechtschreibung nie kommentiert,
   Rückfragen mit Auswahl statt offen. Nach `/workspaceend` ist sie wieder ganz sie selbst – der Modus
   hängt am Workspace, nicht an ihr.
