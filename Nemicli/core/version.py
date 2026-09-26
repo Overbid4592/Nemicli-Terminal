@@ -17,7 +17,7 @@ from pathlib import Path
 
 VERSION = "3.5 Alpha"
 STAND = "2026.09.18"
-AUTHOR = "D. Hoffmann (Vibecoder)"
+AUTHOR = "VibeCoder"
 BUILT_WITH = "Claude Opus 5 · Anthropic"
 
 try:                                     # exe-Modus: Daten liegen neben der exe
