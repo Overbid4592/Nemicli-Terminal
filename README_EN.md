@@ -38,6 +38,11 @@ recurring tasks – every instruction only after your approval.
 
 > Born from curiosity: “How does a coding agent actually work?” 💜
 
+## 🖥 Platform support
+
+- ✅ **Windows 10/11:** fully tested and fully functional.
+- ⚠️ **Ubuntu:** limited support and not yet fully tested. Windows-specific features may be unavailable or limited. **Use on Ubuntu at your own risk.**
+
 ---
 
 ## 🚀 Start in 30 seconds
@@ -579,7 +584,7 @@ instead of silently starting with an empty memory.
 
 ## 🛠 Requirements
 
-- **Windows 10/11**, **Python 3.10+** (or `start.bat` tells you what is missing)
+- **Windows 10/11** (fully tested) · **Ubuntu** (limited, not yet fully tested, use at your own risk) · **Python 3.10+**
 - Packages: `anthropic`, `openai`, `httpx`, `rich`, `textual`, `prompt_toolkit`, `python-dotenv`
 - Local models in the own engine: only **torch** (CUDA) – same as for images; no numpy, no
   compiler, no server
