@@ -610,7 +610,6 @@ instead of silently starting with an empty memory.
 - [x] Desktop window `/gui` (PySide6, without HTML/CSS/JS), terminal stays in tray (28.09.2026)
 - [x] Skills with review-window approval, web reading with validated redirects and chunking (28.09.2026)
 - [ ] Move `Agenten/workspace.md` into the data folder (`/workspace` looks for it there)
-- [ ] Decide on license (love project – never for sale)
 - [ ] Signature with a recognized certificate if NemiCLI is distributed to others
 - [ ] Submit build to Bitdefender false-positive form
 

@@ -605,7 +605,6 @@ das** – statt stillschweigend mit leerem Gedächtnis hochzufahren.
 - [x] Desktop-Fenster `/gui` (PySide6, ohne HTML/CSS/JS), Terminal solange im Infobereich (28.09.2026)
 - [x] Skills mit Prüffenster-Freigabe, Web-Lesen mit geprüften Weiterleitungen und Teilen (28.09.2026)
 - [ ] `Agenten/workspace.md` in den Daten-Ordner bringen (`/workspace` sucht sie dort)
-- [ ] Lizenz festlegen (Liebesprojekt – nie zum Verkauf)
 - [ ] Signatur mit einem anerkannten Zertifikat, wenn NemiCLI an andere geht
 - [ ] Build beim Bitdefender-Falsch-Positiv-Formular einreichen
 
