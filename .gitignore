@@ -51,3 +51,7 @@ Zeitplan/
 Berichte/
 Vorschläge/
 schreibsperre.json
+ModelGGUF/
+
+# Sicherungskopien von Editoren
+*.bak
