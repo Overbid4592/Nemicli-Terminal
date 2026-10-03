@@ -1,0 +1,38 @@
+anthropic
+openai
+httpx
+rich
+# Vollbild-Oberflaeche (ui/screen_tx.py); prompt_toolkit bleibt fuer den alten Screen + Menues.
+textual>=8.2,<9
+prompt_toolkit
+python-dotenv
+# Gesichts-Erkennung fürs automatische Nachbessern nach /bild.
+# Muss die 4er-Reihe sein: OpenCV 5 hat die Haar-Cascades entfernt.
+opencv-python<5
+# Bild-Pipeline braucht transformers 4.x (diffusers).
+transformers<5
+# Krea 2 und Gedächtnis-Encoder: Gewichte, Wortliste, Rechnen, Bilder
+safetensors
+tokenizers
+numpy
+pillow
+# CPU-Gedächtnis (Qwen3-Embedding-0.6B) – bleibt auf der CPU, GPU für Bilder.
+# Läuft über tools/embedder.py direkt auf transformers. sentence-transformers
+# stand hier bis zum 15.09.2026 – es zieht scikit-learn zwingend mit, und dessen
+# unsignierte DLL blockiert Windows Smart App Control. Gebraucht wurde es nur
+# für zwei Handgriffe (letztes Token, normieren), die jetzt selbst dastehen.
+# PDF per Drag & Drop in den Chat ziehen: Text wird herausgezogen (reines Python, klein).
+pypdf
+# /kugel malen: Hintergrund freistellen (Modell isnet-general-use, 176 MB, lädt beim ersten Mal nach ~/.rembg)
+rembg[cpu]
+# Gedächtnis-Encoder (Qwen3-Embedding) rechnet auf der GPU, wenn torch sie sieht: dafür den
+# CUDA-Build installieren, z. B.  pip install torch==2.14.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+# (Config embedding_geraet: auto | cuda | cpu). Der reine CPU-Build tut's auch, nur ~50× langsamer.
+# Systemwache (tools/wache): Sensoren für Prozesse, Netz und Dateien + Schild, Kugel, Chatfenster.
+# Kein scikit-learn – der Isolation Forest steht selbst in tools/wache/wald.py (numpy).
+# PySide6-Essentials (nicht das volle PySide6): QtCore/QtGui/QtWidgets reichen – Kugel, Tray, Chat.
+psutil
+watchdog
+PySide6-Essentials
+# Eigenes Terminal-Fenster (ui/terminal_fenster.py): Terminal-Nachbau in reinem Python.
+pyte
