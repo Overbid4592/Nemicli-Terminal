@@ -36,6 +36,11 @@ Aufgaben bei – jede Anleitung erst nach deiner Freigabe.
 
 > Entstanden aus Neugier: „Wie funktioniert eigentlich so ein Coding-Agent?" 💜
 
+## 🖥 Plattform-Unterstützung
+
+- ✅ **Windows 10/11:** vollständig getestet und voll funktionsfähig.
+- ⚠️ **Ubuntu:** eingeschränkt nutzbar und noch nicht vollständig getestet. Windows-spezifische Funktionen können fehlen oder eingeschränkt sein. **Nutzung unter Ubuntu auf eigene Gefahr.**
+
 ---
 
 ## 🚀 In 30 Sekunden starten
@@ -574,7 +579,7 @@ das** – statt stillschweigend mit leerem Gedächtnis hochzufahren.
 
 ## 🛠 Voraussetzungen
 
-- **Windows 10/11**, **Python 3.10+** (oder `start.bat` sagt dir, was fehlt)
+- **Windows 10/11** (vollständig getestet) · **Ubuntu** (eingeschränkt, noch nicht vollständig getestet, Nutzung auf eigene Gefahr) · **Python 3.10+**
 - Pakete: `anthropic`, `openai`, `httpx`, `rich`, `textual`, `prompt_toolkit`, `python-dotenv`
 - Lokale Modelle im eigenen Motor: nur **torch** (CUDA) – wie für die Bilder; kein numpy, kein
   Compiler, kein Server
