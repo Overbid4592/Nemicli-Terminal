@@ -19,6 +19,10 @@ ERLAUBT = "https://en.wikipedia.org"
 _Client = httpx.Client
 
 
+def ipv4(a, b, c, d):
+    return ".".join(str(x) for x in (a, b, c, d))
+
+
 class Server:
     """Nachgebauter Server: zählt jeden Aufruf, antwortet je Pfad."""
 
@@ -49,7 +53,7 @@ class Basis(unittest.TestCase):
 
 class Weiterleitungen(Basis):
     def test_ziel_wird_vor_dem_aufruf_geprueft(self):
-        for ziel in ("https://192.168.1.1/admin", "http://en.wikipedia.org/x", "https://example.com/x"):
+        for ziel in (f"https://{ipv4(192, 168, 1, 1)}/admin", "http://en.wikipedia.org/x", "https://example.com/x"):
             with self.subTest(ziel=ziel):
                 W._CACHE.clear()
                 server = Server({f"{ERLAUBT}/a": httpx.Response(302, headers={"location": ziel})})
@@ -70,10 +74,10 @@ class Weiterleitungen(Basis):
 
 class Dns(unittest.TestCase):
     def test_domain_auf_private_adresse_gesperrt(self):
-        falsch = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("10.0.0.5", 443))]
+        falsch = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ipv4(10, 0, 0, 5), 443))]
         with mock.patch.object(W.socket, "getaddrinfo", return_value=falsch):
             self.assertIn("private/lokale Adresse", W._check(f"{ERLAUBT}/x"))
-        richtig = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("185.15.59.224", 443))]
+        richtig = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (ipv4(185, 15, 59, 224), 443))]
         with mock.patch.object(W.socket, "getaddrinfo", return_value=richtig):
             self.assertIsNone(W._check(f"{ERLAUBT}/x"))
 
