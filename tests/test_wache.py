@@ -130,7 +130,7 @@ class Merkmale(unittest.TestCase):
         v = m.vektor(prozess("a.exe", exe=r"C:\Temp\a.exe", eltern="winword.exe"))
         self.assertEqual(1.0, v[idx("pfad_neu")])
         self.assertEqual(1.0, v[idx("eltern_neu")])
-        v = m.vektor(netz("a.exe", "1.2.3.4", 4444))
+        v = m.vektor(netz("a.exe", ipv4(1, 2, 3, 4), 4444))
         self.assertEqual(1.0, v[idx("port_neu_fuer_prozess")])
 
     def test_stunde_untypisch_braucht_mindestmenge(self):
@@ -897,7 +897,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         self.assertTrue(alarme and all(a.regel == "R004" and a.subjekt == "chrome.exe" for a in alarme))
         alarme = []
         for i in range(65):
-            alarme += r.pruefen(netz("chrome.exe", f"10.0.0.{i}", 443, ts=ANKER + i))
+            alarme += r.pruefen(netz("chrome.exe", ipv4(10, 0, 0, i), 443, ts=ANKER + i))
         self.assertTrue(alarme and all(a.regel == "R008" and a.subjekt == "chrome.exe" for a in alarme))
         (a,) = r.pruefen(netz("evil.exe", ipv4(1, 2, 3, 4), 4444))
         self.assertEqual(("R006", "evil.exe → " + ipv4(1, 2, 3, 4)), (a.regel, a.subjekt))
@@ -1015,8 +1015,8 @@ class R014Tests(unittest.TestCase):
     def test_ohne_pfad_kein_alarm(self):
         # Ereignis ohne exe-Feld: Kein Pfad heißt „nichts gewusst“,
         # nicht „verdächtig“ – sonst alarmiert jeder unlesbare Prozess.
-        e = E.Ereignis(E.NETZ, "conn_open", "TextInputHost.exe → 104.18.20.226:80",
-                       prozess="TextInputHost.exe", ziel="104.18.20.226", zielport=80,
+        e = E.Ereignis(E.NETZ, "conn_open", f"TextInputHost.exe → {ipv4(104, 18, 20, 226)}:80",
+                       prozess="TextInputHost.exe", ziel=ipv4(104, 18, 20, 226), zielport=80,
                        extra={"extern": True})
         self.assertNotIn("R014", self.ids(e))
 
@@ -1090,7 +1090,7 @@ class NetzSensorPfadTests(unittest.TestCase):
 
     def test_pfad_wird_je_pid_nur_einmal_geholt(self):
         # Eine PID hat oft Dutzende Sockets – psutil.Process() pro Socket wäre teuer.
-        conns = [self._Conn(7, 1000 + i, f"10.0.0.{i}", 443) for i in range(5)]
+        conns = [self._Conn(7, 1000 + i, ipv4(10, 0, 0, i), 443) for i in range(5)]
         sensor, ereignisse = self._sensor(conns, {7: ("chrome.exe", r"C:\Chrome\chrome.exe")})
         self.assertEqual(5, len([x for x in ereignisse if x.aktion == "conn_open"]))
         self.assertEqual({7: ("chrome.exe", r"C:\Chrome\chrome.exe")}, sensor._namen)
