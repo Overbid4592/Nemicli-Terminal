@@ -514,7 +514,7 @@ Minuten, Zahl), wird danach gefragt.
   auch Domains, die per DNS ins eigene Netz zeigen) und Prompt-Injection – Web-Inhalte,
   Seitentexte aus Chrome und Erinnerungen gelten im Prompt als Daten, nie als Anweisungen.
 - **Alles, was auf einen Port hört, hört nur auf `127.0.0.1`** – WebUI, Chrome-Empfang, Ollama,
-  ComfyUI. Nie `0.0.0.0`, keine Option dafür; ein Test wacht darüber. Zugriff nur mit Token/Schlüssel.
+  ComfyUI. Keine Wildcard-Bind-Adresse, keine Option dafür; ein Test wacht darüber. Zugriff nur mit Token/Schlüssel.
 - **API-Keys** liegen verschlüsselt in `.env` (Windows-DPAPI, an dein Konto gebunden), Anzeige maskiert.
 - **Helfer-Agenten** unterliegen denselben Regeln wie der Haupt-Agent; nur einer fragt gleichzeitig.
 - **Persönlichkeiten** sind nur Prompt-Text – der Schutz sitzt im Code und gilt für jede.
