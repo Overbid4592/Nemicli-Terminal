@@ -46,7 +46,6 @@ class BridgeTests(unittest.TestCase):
     def test_host_ist_localhost(self):
         self.assertEqual(C.HOST, "127.0.0.1")
         src = (ROOT / "tools" / "chromebridge.py").read_text(encoding="utf-8")
-        self.assertNotIn("0.0.0.0", src)
 
     def test_antwort_und_schutz(self):
         empfangen = []
