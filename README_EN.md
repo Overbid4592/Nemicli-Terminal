@@ -519,7 +519,7 @@ minutes, number), it asks afterward.
   requesting it, including domains that resolve through DNS into the local network) and prompt injection –
   web content, page text from Chrome, and memories count as data in the prompt, never instructions.
 - **Everything listening on a port listens only on `127.0.0.1`** – WebUI, Chrome receiver, Ollama,
-  ComfyUI. Never `0.0.0.0`, no option for it; a test watches this. Access only with token/key.
+  ComfyUI. Never a wildcard bind address; there is no option for it, and a test watches this. Access only with token/key.
 - **API keys** are stored encrypted in `.env` (Windows DPAPI, tied to your account), display is masked.
 - **Helper agents** are subject to the same rules as the main agent; only one asks at a time.
 - **Personalities** are only prompt text – protection lives in code and applies to every personality.
