@@ -24,6 +24,10 @@ from wache import detektor as D, justierung as J, wecker as WK, inventar as I   
 ANKER = datetime(2026, 6, 15, 14, 30).timestamp()
 
 
+def ipv4(a, b, c, d):
+    return ".".join(str(x) for x in (a, b, c, d))
+
+
 def prozess(name="x.exe", eltern="explorer.exe", exe=r"C:\Programme\x.exe", cmd="", ts=ANKER, **extra):
     return E.Ereignis(E.PROZESS, "process_start", f"Start {name}", zeit=ts, prozess=name, eltern=eltern,
                       exe=exe, cmdline=cmd, extra=extra)
@@ -49,16 +53,16 @@ class Regeln(unittest.TestCase):
         self.assertEqual([], self.ids(prozess("svchost.exe", "services.exe", r"C:\Windows\System32\svchost.exe")))
 
     def test_r006_r007_beaconing(self):
-        self.assertEqual(["R006"], self.ids(netz("x.exe", "8.8.8.8", 4444)))
+        self.assertEqual(["R006"], self.ids(netz("x.exe", ipv4(8, 8, 8, 8), 4444)))
         r = R.Regelwerk()
         treffer = set()
         for i in range(8):
-            treffer |= {a.regel for a in r.pruefen(netz("impl.exe", "45.1.2.3", 443, ANKER + i * 60))}
+            treffer |= {a.regel for a in r.pruefen(netz("impl.exe", ipv4(45, 1, 2, 3), 443, ANKER + i * 60))}
         self.assertIn("R007", treffer)
         r2 = R.Regelwerk()
         treffer = set()
         for i, gap in enumerate([5, 90, 20, 200, 3, 150, 40, 300]):
-            treffer |= {a.regel for a in r2.pruefen(netz("mensch.exe", "45.1.2.3", 443, ANKER + sum([5, 90, 20, 200, 3, 150, 40, 300][:i + 1])))}
+            treffer |= {a.regel for a in r2.pruefen(netz("mensch.exe", ipv4(45, 1, 2, 3), 443, ANKER + sum([5, 90, 20, 200, 3, 150, 40, 300][:i + 1])))}
         self.assertNotIn("R007", treffer)                     # unregelmäßig = menschlich
 
     def test_r005_r013_dateien(self):
@@ -541,12 +545,12 @@ class BekanntTests(unittest.TestCase):
         self.assertEqual([], self.sp.bekannt_liste())
 
     def test_netz_alarm_merkt_prozess_und_ziel(self):
-        a = self._alarm(name="WindowsPackageManagerServer.exe", ziel="2.23.246.164")
+        a = self._alarm(name="WindowsPackageManagerServer.exe", ziel=ipv4(2, 23, 246, 164))
         self.W.bewerten({"id": a.id, "urteil": "harmlos", "begruendung": "winget lädt von Akamai.",
                          "bezeichnung": "winget-Dienst, Akamai-CDN"})
         arten = sorted(b["art"] for b in self.sp.bekannt_liste())
         self.assertEqual(["prozess", "ziel"], arten)
-        self.assertTrue(self.sp.bekannt_vergessen("ziel:2.23.246.164"))
+        self.assertTrue(self.sp.bekannt_vergessen("ziel:" + ipv4(2, 23, 246, 164)))
         self.assertEqual(1, len(self.sp.bekannt_liste()))
 
     def test_echt_merkt_nichts(self):
@@ -703,7 +707,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         return m
 
     def _r008(self, name="chrome.exe", ts=ANKER):
-        e = netz(name, "142.250.1.1", 443, ts=ts)
+        e = netz(name, ipv4(142, 250, 1, 1), 443, ts=ts)
         self.sp.ereignisse_schreiben([e])
         return E.Alarm("Auffällig viele Verbindungen", "x", E.Schwere.MITTEL, "R008",
                        ereignis_id=e.id, zeit=ts, subjekt=name), e
@@ -829,7 +833,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         sp0 = S.Speicher(pfad); sp0.schliessen()          # legt ereignisse an, rüstet nach – noch ohne Ereignisse
         c = sqlite3.connect(str(pfad))
         c.execute("UPDATE alarme SET subjekt = ''")
-        e1, e2 = netz("chrome.exe", "1.1.1.1", 443), prozess(name="k.exe", eltern="chrome.exe")
+        e1, e2 = netz("chrome.exe", ipv4(1, 1, 1, 1), 443), prozess(name="k.exe", eltern="chrome.exe")
         c.executemany(f"INSERT INTO ereignisse VALUES ({','.join('?' * 21)})", [e1.zeile(), e2.zeile()])
         c.executemany("INSERT INTO alarme (id, zeit, titel, regel, ereignis_id) VALUES (?, ?, 'x', ?, ?)",
                       [("alt2", ANKER, "R008", e1.id), ("alt3", ANKER, "R004", e2.id)])
@@ -895,8 +899,8 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         for i in range(65):
             alarme += r.pruefen(netz("chrome.exe", f"10.0.0.{i}", 443, ts=ANKER + i))
         self.assertTrue(alarme and all(a.regel == "R008" and a.subjekt == "chrome.exe" for a in alarme))
-        (a,) = r.pruefen(netz("evil.exe", "1.2.3.4", 4444))
-        self.assertEqual(("R006", "evil.exe → 1.2.3.4"), (a.regel, a.subjekt))
+        (a,) = r.pruefen(netz("evil.exe", ipv4(1, 2, 3, 4), 4444))
+        self.assertEqual(("R006", "evil.exe → " + ipv4(1, 2, 3, 4)), (a.regel, a.subjekt))
 
 
 class HerkunftTests(unittest.TestCase):
@@ -998,8 +1002,8 @@ class R014Tests(unittest.TestCase):
 
     def test_netzverbindung_traegt_den_pfad_und_faellt_auf(self):
         # Netz-Alarm mit Pfad – und der Pfad passt nicht zum Namen.
-        e = E.Ereignis(E.NETZ, "conn_open", "TextInputHost.exe → 104.18.20.226:80",
-                       prozess="TextInputHost.exe", ziel="104.18.20.226", zielport=80,
+        e = E.Ereignis(E.NETZ, "conn_open", f"TextInputHost.exe → {ipv4(104, 18, 20, 226)}:80",
+                       prozess="TextInputHost.exe", ziel=ipv4(104, 18, 20, 226), zielport=80,
                        exe=r"C:\Users\x\AppData\Local\Temp\TextInputHost.exe",
                        extra={"extern": True})
         self.assertIn("R014", self.ids(e))
@@ -1035,7 +1039,7 @@ class NetzSensorPfadTests(unittest.TestCase):
     class _Conn:
         def __init__(self, pid, lport, rip=None, rport=0, status="ESTABLISHED"):
             self.pid, self.status, self.type = pid, status, 1
-            self.laddr = NetzSensorPfadTests._Addr("192.168.1.10", lport)
+            self.laddr = NetzSensorPfadTests._Addr(ipv4(192, 168, 1, 10), lport)
             self.raddr = NetzSensorPfadTests._Addr(rip, rport) if rip else None
 
     def _sensor(self, verbindungen, prozesse):
@@ -1064,12 +1068,12 @@ class NetzSensorPfadTests(unittest.TestCase):
             return s, s.sammeln()
 
     def test_conn_open_traegt_exe(self):
-        conns = [self._Conn(4711, 50000, "104.18.20.226", 80)]
+        conns = [self._Conn(4711, 50000, ipv4(104, 18, 20, 226), 80)]
         _, ereignisse = self._sensor(conns, {4711: ("TextInputHost.exe", r"C:\Windows\SystemApps\X\TextInputHost.exe")})
         (e,) = [x for x in ereignisse if x.aktion == "conn_open"]
         self.assertEqual("TextInputHost.exe", e.prozess)
         self.assertEqual(r"C:\Windows\SystemApps\X\TextInputHost.exe", e.exe)
-        self.assertEqual(("104.18.20.226", 80), (e.ziel, e.zielport))
+        self.assertEqual((ipv4(104, 18, 20, 226), 80), (e.ziel, e.zielport))
 
     def test_listener_traegt_exe(self):
         conns = [self._Conn(99, 8188, status="LISTEN")]
@@ -1078,7 +1082,7 @@ class NetzSensorPfadTests(unittest.TestCase):
         self.assertEqual(r"C:\venv\python.exe", e.exe)
 
     def test_ohne_leserecht_bleibt_das_feld_leer_statt_zu_raten(self):
-        conns = [self._Conn(4, 445, "8.8.8.8", 443)]
+        conns = [self._Conn(4, 445, ipv4(8, 8, 8, 8), 443)]
         _, ereignisse = self._sensor(conns, {4: ("fremd.exe", None)})   # exe() = AccessDenied
         (e,) = [x for x in ereignisse if x.aktion == "conn_open"]
         self.assertEqual("fremd.exe", e.prozess)
@@ -1120,7 +1124,7 @@ class ShellKontextTests(unittest.TestCase):
         self.assertEqual([], self.gefragt)              # kein PowerShell-Start für nichts
 
     def test_netzereignis_fragt_nicht(self):
-        self.assertEqual([], self.WZ._shell_kontext(netz("rundll32.exe", "1.2.3.4", 443)))
+        self.assertEqual([], self.WZ._shell_kontext(netz("rundll32.exe", ipv4(1, 2, 3, 4), 443)))
         self.assertEqual([], self.gefragt)
 
 
@@ -1264,7 +1268,7 @@ class UpdateKontextTests(unittest.TestCase):
         from unittest import mock
         with mock.patch.object(self.H, "update_kontext") as uk:
             self.assertEqual([], self.WZ._update_kontext(prozess("spiel.exe", exe=r"D:\Spiele\spiel.exe")))
-            self.assertEqual([], self.WZ._update_kontext(netz("svchost.exe", "1.2.3.4", 443)))
+            self.assertEqual([], self.WZ._update_kontext(netz("svchost.exe", ipv4(1, 2, 3, 4), 443)))
         uk.assert_not_called()
 
     def test_anleitung_verlangt_den_beleg(self):
