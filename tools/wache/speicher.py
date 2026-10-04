@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS justierungen (
 
 -- Bekannte harmlose Dinge: was ist das (bezeichnung) und warum harmlos. Gefüllt
 -- aus den Urteilen der Persönlichkeit (wache_bewerten mit bezeichnung). Schlüssel
--- = "prozess:winstore.app.exe", "ziel:2.23.246.164", "datei:c:\…", "eintrag:…".
+-- = "prozess:winstore.app.exe", "ziel:<adresse>", "datei:c:\…", "eintrag:…".
 CREATE TABLE IF NOT EXISTS bekannt (
     schluessel TEXT PRIMARY KEY, art TEXT NOT NULL, name TEXT NOT NULL,
     bezeichnung TEXT NOT NULL, begruendung TEXT DEFAULT '', wer TEXT DEFAULT '',
