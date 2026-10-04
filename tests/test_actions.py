@@ -578,10 +578,10 @@ class WindowsPfadeImJson(unittest.TestCase):
     """Modelle schreiben Windows-Pfade mit EINEM Backslash - der Block darf nicht stumm wegfallen."""
 
     def test_einfacher_backslash_wird_repariert(self):
-        text = '```aktion\n{"tool": "datei_lesen", "pfad": "C:\\Users\\Max\\Desktop\\brief.md"}\n```'
+        text = '```aktion\n{"tool": "datei_lesen", "pfad": "C:\\Users\\TestUser\\Desktop\\brief.md"}\n```'
         text = text.replace("\\\\", "\\")            # so, wie das Modell es schreibt: EIN Backslash
         acts, rest = A.parse_actions(text)
-        self.assertEqual([{"tool": "datei_lesen", "pfad": r"C:\Users\Max\Desktop\brief.md"}], acts)
+        self.assertEqual([{"tool": "datei_lesen", "pfad": r"C:\Users\TestUser\Desktop\brief.md"}], acts)
         self.assertEqual("", rest)
 
     def test_gueltige_escapes_im_pfad_werden_zurueckgedreht(self):
