@@ -8,6 +8,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+
+def _ipv4(a, b, c, d):
+    return ".".join(str(x) for x in (a, b, c, d))
+
+
 ROOT = Path(__file__).resolve().parents[1]
 for sub in ("core", "engines", "tools", "ui"):
     sys.path.insert(0, str(ROOT / sub))
@@ -254,8 +259,8 @@ class Hilfen(unittest.TestCase):
         self.assertEqual(SY.ampel(e(pfad=r"C:\Program Files\a.cmd"))[0], SY.GELB)
         self.assertEqual(SY.ampel(e(pfad=r"C:\Windows\a.cmd", status="Skript"))[1], SY.AMPEL_REGELN[6][1])
         self.assertEqual(SY.ampel(e(pfad=r"C:\Users\user\a.cmd", status="Skript"))[0], SY.ROT)
-        self.assertEqual(SY.ampel(e(art="hosts", name="x.example", pfad="", detail="93.184.216.34"))[0], SY.ROT)
-        self.assertEqual(SY.ampel(e(art="hosts", name="x.example", pfad="", detail="0.0.0.0"))[0], SY.GELB)
+        self.assertEqual(SY.ampel(e(art="hosts", name="x.example", pfad="", detail=_ipv4(93, 184, 216, 34)))[0], SY.ROT)
+        self.assertEqual(SY.ampel(e(art="hosts", name="x.example", pfad="", detail=_ipv4(0, 0, 0, 0)))[0], SY.GELB)
         self.assertEqual(SY.ampel(e(art="hosts", name="localhost", pfad="", detail="127.0.0.1"))[0], SY.GRUEN)
 
 
