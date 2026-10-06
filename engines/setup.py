@@ -9,20 +9,21 @@ NemiCLI soll auch ohne Vorwissen laufen. Dieses Modul:
   • erkennt, ob Ollama installiert/erreichbar ist, gibt sonst einen
     Hinweis, und lädt Ollama-Modelle direkt herunter (/api/pull).
 
-llama.cpp-Binaries lädt es nicht: lokale Modelle laufen ausschließlich über Ollama, das sein eigenes Laufzeit-Paket mitbringt.
+Bis zum 15.09.2026 lud dieses Modul zusätzlich die llama.cpp-Binaries von
+GitHub (passend zur GPU, mit Zip-Slip-Schutz und Host-Allowlist). Das ist auf
+Wunsch des Nutzers komplett entfallen - lokale Modelle laufen jetzt
+ausschließlich über Ollama, das sein eigenes Laufzeit-Paket mitbringt.
 """
 
 from __future__ import annotations
 
-import os
 import re
+import shutil
 import subprocess
-from pathlib import Path
 from typing import Callable, Iterator
 
 import httpx
 
-import models as M
 import providers as P
 
 # Wo man Ollama bzw. GGUF-Modelle bekommt (zum SELBER Aussuchen – NemiCLI gibt
@@ -159,17 +160,6 @@ def hardware_hint(gpu: dict) -> dict:
     else:
         fits = "sehr kleine Modelle (~1–2B)"
     return {"ram": gb, "fits": fits}
-
-
-# ===========================================================================
-#  Models-Ordner
-# ===========================================================================
-
-
-def ensure_models_dir() -> Path:
-    """Legt den Models-Ordner an, falls er fehlt. Gibt den Pfad zurück."""
-    M.MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    return M.MODELS_DIR
 
 
 def ollama_cli() -> str | None:

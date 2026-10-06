@@ -11,13 +11,13 @@ Geprüft/erledigt wird:
   2. Eigene Arbeits-Umgebung     (venv neben NemiCLI, damit nichts am
                                   System-Python herumgepfuscht wird)
   3. torch                       (passend zur Grafikkarte, siehe syscheck)
-  4. diffusers & Co.             (Bausteine fürs Bilder-Malen)
+  4. Pakete aus requirements.txt (Krea 2, Gedächtnis-Encoder …)
   5. Ollama                      (Motor für lokale Modelle – nur prüfen)
   6. Modelle                     -> NUR prüfen und erklären. Die lädt der
                                     Nutzer selbst, NemiCLI darf keine
                                     Gigabyte-Modelle für ihn auswählen.
 
-ISOLATION: Python + venv + Bild-Pakete kommen über `uv`
+ISOLATION (seit 12.09.2026): Python + venv + Bild-Pakete kommen über `uv`
 (core/uvsetup.py). Es wird ein EIGENSTÄNDIGES Python in <NemiCLI>/.runtime/
 gelegt - kein Admin, keine PATH-Änderung, nichts am System des Nutzers. Das
 löst den alten python.org-Weg (systemweite Installation) ab.
@@ -124,13 +124,8 @@ def check_all() -> list[dict]:
         "info": ("alle da" if not fehlend
                  else "fehlt: " + ", ".join(fehlend[:6]) + (" …" if len(fehlend) > 6 else "")),
     })
-    schritte.append({
-        "id": "diffusers", "titel": "Bild-Bausteine (diffusers, transformers …)",
-        "ok": _hat_paket("diffusers"), "machbar": True, "pflicht": False,
-        "info": "nötig für /bild",
-    })
 
-    # 5. Ollama (der lokale Motor)
+    # 5. Ollama (der lokale Motor; llama.cpp ist am 15.09.2026 entfallen)
     ollama = S.ollama_running()
     schritte.append({
         "id": "ollama", "titel": "Ollama (Motor für lokale Modelle)",
@@ -159,9 +154,9 @@ def check_all() -> list[dict]:
     })
     schritte.append({
         "id": "bildmodell", "titel": "Bild-Modell (zum Malen)",
-        "ok": stock["checkpoints"] > 0, "machbar": False, "pflicht": False,
-        "info": (f"{stock['checkpoints']} Checkpoint(s)" if stock["checkpoints"]
-                 else f"fehlt – .safetensors nach {stock['ckpt_ordner']}"),
+        "ok": stock["bildmodelle"] > 0, "machbar": False, "pflicht": False,
+        "info": (f"{stock['bildmodelle']} Krea-2-Modell(e)" if stock["bildmodelle"]
+                 else f"fehlt – Krea-2-Dateien nach {stock['bild_ordner']}"),
     })
     return schritte
 
@@ -199,7 +194,7 @@ def install_torch(on_status=None) -> str:
         uvsetup.pip_install(["torch-directml"], on_status)
     else:
         # --reinstall-package: ein schon vorhandenes torch (z. B. der CPU-Bau, den
-        # accelerate/diffusers als Abhängigkeit mitziehen) wird ersetzt, statt als
+        # andere Pakete als Abhängigkeit mitziehen) wird ersetzt, statt als
         # „schon erfüllt“ liegen zu bleiben.
         uvsetup.pip_install(["torch"], on_status,
                             extra=["--index-url", f"https://download.pytorch.org/whl/{kanal}",
@@ -301,29 +296,11 @@ def install_pakete(on_status=None) -> str:
     return f"{len(pakete)} Pakete aus requirements.txt installiert."
 
 
-def install_diffusers(on_status=None) -> str:
-    """Die restlichen Bausteine fürs Bilder-Malen."""
-    if not _venv_python():
-        install_venv(on_status)
-    _torch_zuerst(on_status)
-    if on_status:
-        on_status("installiere diffusers, transformers, safetensors, pillow …")
-    # transformers MODERN pinnen: uv (strenger als pip) fiel bei losem
-    # `transformers<5` sonst auf uralt-4.12.2 zurück, dessen `tokenizers 0.10.3`
-    # kein 3.12-Wheel hat und aus Rust-Quellcode gebaut werden müsste → Fehler.
-    # >=4.44 erzwingt eine Fassung mit fertigen cp312-Wheels (kein Rust nötig).
-    uvsetup.pip_install(["diffusers>=0.38", "transformers>=4.44,<5", "tokenizers>=0.20",
-                         "accelerate", "safetensors", "pillow", "numpy",
-                         "opencv-python<5"], on_status)
-    return "Bild-Bausteine installiert."
-
-
 ERLEDIGER = {
     "python": install_python,
     "venv": install_venv,
     "torch": install_torch,
     "pakete": install_pakete,
-    "diffusers": install_diffusers,
 }
 
 
@@ -345,13 +322,18 @@ MODELL_HINWEISE = [
     ("Cloud (am einfachsten, kein Download)",
      "/model → 'Cloud-Anbieter hinzufügen' → Schlüssel eintragen"),
     ("Ollama (lokal, bequem)", S.OLLAMA_INSTALL_URL),
-    ("Bild-Modelle (.safetensors)", "https://civitai.com"),
+    ("Lokale Sprach-Modelle", "/model → 'Modell von Hugging Face holen'"),
+    ("Krea 2 (Bilder)", "/bildmodel → 'Krea-2-Ordner öffnen'"),
 ]
 
 
 def modell_ordner() -> dict:
     """Wohin die selbst geladenen Dateien gehören."""
-    return {"checkpoints": str(ROOT / "Models" / "checkpoints")}
+    try:
+        import krea
+        return {"bilder": str(krea.krea_dir())}
+    except Exception:
+        return {"bilder": str(ROOT / "Models" / "Krea2")}
 
 
 def erster_start() -> bool:

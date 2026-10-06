@@ -9,15 +9,17 @@ from typing import Iterator, List, Optional
 import torch
 
 from . import debuglog as dbg
+from . import hostmem
 from .chat import ChatFormatter, Message, detect_format
 from .gguf import GGUFFile
 from .models import build_model
-from .models.common import GPU_SPERRE, PREFILL_CHUNK
+from .models.common import GPU_SPERRE, PREFILL_CHUNK, release_pinned_memory
 from .qlinear import UNPACK_FROM
 from .sampling import Sampler, SamplerConfig
 from .tokenizer import StreamDecoder, Tokenizer
 
 RELEASE_FROM = UNPACK_FROM   # reads this long allocate scratch worth releasing afterwards
+HOSTMEM_AB = 1 << 20          # offload: tensors from this size go to exact-size pinned blocks
 
 _BILD_NR = itertools.count(1)
 
@@ -122,8 +124,12 @@ class Engine:
         self.verbose = verbose
         self.max_tok_s = max_tok_s if max_tok_s and max_tok_s > 0 else None
         t0 = time.time()
+        self.load_phases: dict = {}   # seconds per phase: file, tokenizer, weights, warmup (+ vision)
         self.gg = GGUFFile(path)
+        self.load_phases["file"] = time.time() - t0
+        t = time.time()
         self.tokenizer = Tokenizer(self.gg)
+        self.load_phases["tokenizer"] = time.time() - t
         total = sum(t.n_bytes for t in self.gg.tensor_list)
         self._log_model_header(path, weights, n_ctx)
 
@@ -139,9 +145,22 @@ class Engine:
 
         if weights not in ("quant", "bf16"):
             raise ValueError("weights must be 'quant' or 'bf16'")
-        self.model = build_model(self.gg, self.device, self.dtype, n_ctx, progress, quant=(weights == "quant"),
-                                 kv_bits=kv_bits, experten_vram=experts_vram)
-        self._warmup()
+        t = time.time()
+        # pinned allocations, frees and synchronize would break a graph capture of another
+        # engine in this process
+        with GPU_SPERRE:
+            self.model = build_model(self.gg, self.device, self.dtype, n_ctx, progress, quant=(weights == "quant"),
+                                     kv_bits=kv_bits, experten_vram=experts_vram)
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)      # queued conversions count as weights
+                release_pinned_memory()
+        self.load_phases["weights"] = time.time() - t
+        t = time.time()
+        with GPU_SPERRE:
+            self._warmup()
+            if self.device.type == "cuda":
+                torch.cuda.synchronize(self.device)
+        self.load_phases["warmup"] = time.time() - t
         self.load_seconds = time.time() - t0
         self._log_loaded()
         if verbose:
@@ -299,7 +318,9 @@ class Engine:
         if not getattr(self.model, "supports_images", False):
             raise ValueError(f"{self.gg.architecture} does not take image inputs")
         from .vision import load_projector
+        t = time.time()
         vision = load_projector(mmproj_path, self.device)
+        self.load_phases["vision"] = time.time() - t
         width = self.gg.get(f"{self.gg.architecture}.embedding_length")
         if width is not None and int(width) != vision.n_out:
             raise ValueError(f"mmproj width {vision.n_out} does not match the model ({width})")
@@ -317,7 +338,10 @@ class Engine:
         if self.vision is None:
             raise RuntimeError("no vision projector attached (enable_vision)")
         t0 = time.time()
-        self.vision.load()
+        with GPU_SPERRE:
+            self.vision.load()
+            if self.device.type == "cuda":
+                release_pinned_memory()
         try:
             out = self.vision.encode(image, tokens or self.vision.default_tokens)
         finally:
@@ -654,7 +678,11 @@ class Engine:
             graph.pool = None
 
         def to_ram(t):
-            host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
+            n = t.numel() * t.element_size()
+            if n >= HOSTMEM_AB:              # exact size (torch rounds pinned blocks up to 2^k)
+                host = hostmem.empty(n, self.device).view(t.dtype).view(t.shape)
+            else:
+                host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
             host.copy_(t, non_blocking=True)
             return host
         self._moved = _move_tensors(self.model, lambda t: t.device.type == "cuda", to_ram)
@@ -674,6 +702,7 @@ class Engine:
         _move_tensors(self.model, lambda t: id(t) in moved,
                       lambda t: t.to(self.device, non_blocking=True))
         torch.cuda.synchronize()
+        release_pinned_memory()                      # the RAM copies are no longer needed
         dbg.event(f"zurück auf der GPU in {time.time() - t0:.2f}s")
         return time.time() - t0
 

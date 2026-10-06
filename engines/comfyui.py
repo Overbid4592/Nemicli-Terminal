@@ -26,7 +26,8 @@ die man in ComfyUI auch von Hand zusammenklickt:
                            → VAEDecode → SaveImage
 
 NemiCLI startet ComfyUI NICHT und ändert dort nichts. Es redet nur mit einer
-laufenden Instanz auf 127.0.0.1. ComfyUI startet mit Windows, NemiCLI generiert nur.
+laufenden Instanz auf 127.0.0.1. (Am 19.09.2026 kurz überlegt, die Desktop-App
+selbst zu starten – verworfen: ComfyUI startet mit Windows, NemiCLI generiert nur.)
 """
 
 from __future__ import annotations

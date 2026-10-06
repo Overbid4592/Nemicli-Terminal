@@ -7,7 +7,7 @@ Für /systemcheck. Beantwortet drei Fragen:
      capability, z.B. sm_120 bei den RTX-50er/Blackwell)? Das entscheidet,
      WELCHES torch man installieren muss: eine zu alte torch-Version kennt
      sm_120 nicht und rechnet dann gar nicht oder nur auf der CPU.
-  2. Was ist schon installiert (torch, diffusers, transformers …)?
+  2. Was ist schon installiert (torch, transformers …)?
   3. Was liegt an Modellen da (GGUF / Checkpoints) und was fehlt?
 
 Es wird NICHTS automatisch installiert und kein bestimmtes Modell vorgegeben –
@@ -78,16 +78,14 @@ def torch_plan(gpu: dict | None = None, cap: str = "") -> dict:
 
     Rückgabe: {ok, kanal, grund, cmd, extra, warnung}
       cmd     = pip-Befehl für torch (zum Kopieren)
-      extra   = pip-Befehl für den Rest (diffusers …)
+      extra   = pip-Befehl für den Rest (Krea 2)
       warnung = Hinweis, wenn etwas nicht zusammenpasst
     """
     gpu = gpu or S.gpu_info()
     vendor = gpu.get("vendor", "cpu")
     py = "python -m pip install"
 
-    # transformers MUSS < 5 bleiben: 5.x bricht das Laden von Einzeldatei-
-    # Checkpoints in diffusers ('CLIPTextModel' has no attribute 'text_model').
-    extra = f'{py} "diffusers>=0.38" "transformers<5" accelerate safetensors'
+    extra = f'{py} safetensors tokenizers pillow numpy'
 
     if vendor == "nvidia":
         kanal, grund = _wheel_for(cap or compute_cap())
@@ -177,16 +175,14 @@ def packages() -> list[dict]:
         ("openai", "Cloud-Anbieter (OpenAI-Protokoll)", True),
         ("anthropic", "Cloud-Anbieter Anthropic", True),
         ("dotenv", "Schlüssel aus .env lesen", True),
-        ("cv2", "Gesichter finden beim Bild-Nachbessern", False),
-        ("torch", "Rechen-Motor fürs Bilder-Malen", False),
-        ("diffusers", "Stable-Diffusion-Bausteine", False),
-        ("transformers", "Text-Verstehen fürs Bild-Modell (muss < 5 sein!)", False),
+        ("torch", "Rechen-Motor für Krea 2, lokale Modelle und Gedächtnis", False),
+        ("transformers", "nur für safetensors-Gedächtnismodelle (GGUF braucht es nicht)", False),
         ("safetensors", "Modell-Dateien laden", False),
         ("tokenizers", "Wortliste für Krea 2 und den Gedächtnis-Encoder", False),
         ("numpy", "Rechnen für Wache, Kugel und Bilder", False),
         ("PIL", "Bilder speichern und lesen (Pillow)", False),
     ]
-    dist = {"cv2": "opencv-python", "dotenv": "python-dotenv", "PIL": "pillow"}
+    dist = {"dotenv": "python-dotenv", "PIL": "pillow"}
     out = []
     for mod, zweck, pflicht in rows:
         v = _version(dist.get(mod, mod))
@@ -197,13 +193,13 @@ def packages() -> list[dict]:
 
 
 def transformers_ok() -> bool | None:
-    """transformers muss < 5 sein (sonst bricht das Laden der Bild-Modelle).
-    None = nicht installiert."""
+    """transformers ab 5.10 (ältere haben bekannte Sicherheitslücken). None = nicht installiert."""
     v = _version("transformers")
     if not v:
         return None
     try:
-        return int(v.split(".")[0]) < 5
+        from packaging.version import Version
+        return Version(v) >= Version("5.10")
     except Exception:
         return True
 
@@ -213,27 +209,12 @@ def transformers_ok() -> bool | None:
 # ===========================================================================
 
 def model_stock() -> dict:
-    """Zählt vorhandene Modelle und sagt, wo sie hingehören."""
-    ckpt_dirs = [ROOT / "Models" / "checkpoints", ROOT / "Models"]
-
-    def _count(d: Path, suffix: str, skip_mmproj: bool = False) -> int:
-        if not d.exists():
-            return 0
-        n = 0
-        for f in d.glob(f"*{suffix}"):
-            if skip_mmproj and f.name.lower().startswith("mmproj"):
-                continue
-            n += 1
-        return n
-
-    ckpts = 0
-    seen: set[str] = set()
-    for d in ckpt_dirs:
-        if d.exists():
-            for f in d.glob("*.safetensors"):
-                if f.name not in seen:
-                    seen.add(f.name)
-                    ckpts += 1
+    """Zählt vorhandene Bild-Modelle (Krea 2) und sagt, wo sie hingehören."""
+    try:
+        import krea
+        bilder, ordner = len(krea.discover()), str(krea.krea_dir())
+    except Exception:
+        bilder, ordner = 0, str(ROOT / "Models" / "Krea2")
 
     frei = 0
     try:
@@ -242,8 +223,8 @@ def model_stock() -> dict:
         pass
 
     return {
-        "checkpoints": ckpts,
-        "ckpt_ordner": str(ckpt_dirs[0]),
+        "bildmodelle": bilder,
+        "bild_ordner": ordner,
         "ollama": S.ollama_running(),
         "frei_gb": frei,
     }
@@ -299,9 +280,9 @@ def todo(rep: dict) -> list[str]:
     if not st["ollama"]:
         out.append("Kein lokales Modell: Ollama installieren "
                    "(ollama.com/download) und /model → 'Ollama einrichten'.")
-    if st["checkpoints"] == 0:
-        out.append(f"Zum Bilder-Malen fehlt ein .safetensors-Modell in "
-                   f"{st['ckpt_ordner']} (siehe LIES-MICH dort).")
+    if st["bildmodelle"] == 0:
+        out.append(f"Zum Bilder-Malen fehlt ein Krea-2-Modell in {st['bild_ordner']} "
+                   "(siehe LIES-MICH dort).")
     t = rep["torch"]
     if not t.get("da"):
         out.append("torch ist nicht installiert – ohne das kann NemiCLI keine "
@@ -314,11 +295,8 @@ def todo(rep: dict) -> list[str]:
             out.append(f"Dein torch kennt {rep['sm']} nicht (deine Karte ist zu neu "
                        "für diese torch-Version). Befehl oben nutzen.")
     if rep["transformers_ok"] is False:
-        out.append('transformers ist Version 5 oder neuer – das bricht die '
-                   'Bild-Modelle. Bitte: python -m pip install "transformers<5"')
-    if not any(p["da"] for p in rep["pakete"] if p["modul"] == "diffusers"):
-        if t.get("da"):
-            out.append("diffusers fehlt noch (zweiter Befehl oben).")
+        out.append("transformers ist älter als 5.10 (bekannte Sicherheitslücken) – "
+                   "/update räumt es auf.")
     if st["frei_gb"] and st["frei_gb"] < 20:
         out.append(f"Nur noch {st['frei_gb']} GB frei – Modelle brauchen viel Platz.")
     return out

@@ -1,10 +1,10 @@
 """
 sdwebui.py - Bilder über eine externe Forge/A1111-WebUI (Standard: 127.0.0.1:7860).
 
-Das ist ein GANZ EIGENER Bild-Weg, getrennt von NemiCLIs eigener SD1.5/SDXL-
-Pipeline (engines/imagegen.py). Grund: die WebUI ist anders gebaut. Sie fährt
-z.B. Krea-/Qwen-Modelle, die die eigene Pipeline nicht kann, und will andere
-Werte – standardmäßig **kein Negativ-Prompt, CFG 1, 1024×1024, 14 Schritte**.
+Ein eigener Bild-Weg neben Krea 2 (engines/krea.py), gewählt über
+engines/imagegen.py. Die WebUI fährt Modelle, die NemiCLI selbst nicht malt
+(z.B. Qwen, Flux), und will eigene Werte – standardmäßig **CFG 1, 832×1216, 14 Schritte,
+fester Positiv-Vorsatz und Negativ-Prompt**.
 
 Nur die REST-Schnittstelle wird genutzt (`/sdapi/v1/...`). NemiCLI startet die
 WebUI nicht und steuert sie nicht fern – sie muss schon laufen. Erreichbar ist
@@ -23,7 +23,6 @@ from __future__ import annotations
 import base64
 import struct
 import threading
-import time
 import zlib
 from pathlib import Path
 
@@ -36,7 +35,7 @@ OUT_DIR = _ROOT / "Bilder"
 DEFAULT_HOST = "http://127.0.0.1:7860"
 
 # Bewusst ANDERE Vorgaben als die eigene Pipeline – passend zu Krea/Qwen & Co.
-# Vorgaben = ein erprobtes Forge-Neo-Setup:
+# Vorgaben = erprobtes Forge-Neo-Setup:
 # hochkant 832x1216, Euler a, fester Positiv-Vorsatz, fester Negativ-Prompt,
 # Sperrwörter. Jeder Wert ist per nemicli.config.json überschreibbar (bild_webui_*).
 DEFAULTS = {
@@ -44,7 +43,7 @@ DEFAULTS = {
     "cfg": 1.0,
     "size": (832, 1216),
     "sampler": "Euler a",
-    "scheduler": "Automatic",   # Forge entscheidet
+    "scheduler": "Automatic",   # Forge entscheidet (wie im MCP-Skript, das keinen setzt)
     "neg": (
         "multiple heads, double head, duplicate head, extra face, cloned face, hydra, "
         "extra arms, extra legs, extra limbs, duplicate limbs, detached limbs, "
@@ -65,7 +64,7 @@ DEFAULTS = {
 }
 
 # Diese Tags fliegen aus jedem Prompt – im Code, egal was das Modell schreibt
-# (feste Bild-Regeln: eine erwachsene Frau, keine Männer, keine Gruppen).
+# (feste Vorgabe: eine erwachsene Frau, keine Männer, keine Gruppen).
 # Zusätzlich alles, was "pov" enthält.
 STRIP_TAGS = {
     "male pov", "1boy", "2boys", "2girls", "3girls", "man", "men", "male", "boy", "boys",
@@ -341,7 +340,6 @@ def _save(b64: str, payload: dict, model_name: str, info, on_status=None) -> str
     # WebUI-Weg auch in der schlanken exe, in der PIL bewusst nicht mitkommt.
     raw = base64.b64decode(b64.split(",", 1)[-1])
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    stamp = time.strftime("%Y%m%d_%H%M%S")
     seed = payload.get("seed")
     if seed in (None, -1):                       # echten Seed aus der Antwort holen
         try:

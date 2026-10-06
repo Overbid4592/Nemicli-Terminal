@@ -6,6 +6,7 @@ metadata template is only *inspected* (substring checks) to pick a format.
 """
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional
 
@@ -28,8 +29,10 @@ class Message:
 IMAGE_MARKS = {                                   # begin, placeholder, end
     "gemma4": ("<|image>", "<|image|>", "<image|>"),
     "qwen": ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"),
+    "pixtral": ("[IMG_BREAK]", "[IMG]", "[IMG_END]"),   # Zeilenende, Platzhalter, Bildende
 }
 IMAGE_BEGIN, IMAGE_TOKEN, IMAGE_END = IMAGE_MARKS["gemma4"]
+ZEILEN_MARKEN = IMAGE_MARKS["pixtral"]            # Bild zeilenweise, braucht `grid` (Zeilen, Spalten)
 
 
 def detect_image_marks(tok: Tokenizer) -> Optional[tuple]:
@@ -55,6 +58,8 @@ def detect_format(template: Optional[str], arch: str) -> str:
         return "ernie4_5"
     if "<｜User｜>" in t:                        # DeepSeek-R1 (and its distills)
         return "deepseek"
+    if "Reasoning Mode: " in t or arch == "smollm3":
+        return "smollm3"
     if "<|im_start|>" in t:
         if "<|im_sep|>" in t:
             return "phi4"
@@ -62,8 +67,8 @@ def detect_format(template: Optional[str], arch: str) -> str:
     if "<role>HUMAN</role>" in t or arch == "bailingmoe3":
         return "bailing"
     if "[INST]" in t:
-        if "[SYSTEM_PROMPT]" in t:
-            return "mistral-v7"
+        if "[SYSTEM_PROMPT]" in t:                 # Tekken-Vorlagen: [INST] ohne Leerzeichen
+            return "mistral-v7-tekken" if ("'[INST]' +" in t or '"[INST]" +' in t) else "mistral-v7"
         if "' [INST] ' + system_message" in t or "[AVAILABLE_TOOLS]" in t:
             if " [INST]" in t:
                 return "mistral-v1"
@@ -120,6 +125,9 @@ _ROLLEN_FORMATE = {
 # final answer as the detokenised stream shows them
 HARMONY_IDENTITAET = "You are ChatGPT, a large language model trained by OpenAI."
 HARMONY_FINAL = "<|end|><|start|>assistant<|channel|>final<|message|>"
+# SmolLM3: "Today Date" as strftime("%d %B %Y") in the C locale
+_MONATE_EN = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
+              "October", "November", "December")
 
 
 class ChatFormatter:
@@ -135,7 +143,14 @@ class ChatFormatter:
         b, p, e = (self.tok.special_id(m) for m in self.image_marks)
         ids: List[int] = []
         for img in images:
-            ids += [b] + [p] * int(img.shape[0]) + [e]
+            if tuple(self.image_marks) == ZEILEN_MARKEN:      # Pixtral: [IMG]×Spalten + [IMG_BREAK] je Zeile
+                rows, cols = img.grid
+                if rows * cols != int(img.shape[0]):
+                    raise ValueError("image grid does not match its embeddings")
+                for r in range(rows):
+                    ids += [p] * cols + [b if r < rows - 1 else e]
+            else:
+                ids += [b] + [p] * int(img.shape[0]) + [e]
         return ids
 
     @property
@@ -163,6 +178,8 @@ class ChatFormatter:
             return self._stuecke(("<|channel>",)), self._stuecke(("<channel|>",))
         if self.fmt == "k2":
             return self._stuecke(("<ifm|think>",)), self._stuecke(("</ifm|think>", "\n"))
+        if self.fmt.startswith("mistral") and "[THINK]" in self.tok.special and "[/THINK]" in self.tok.special:
+            return self._stuecke(("[THINK]",)), self._stuecke(("[/THINK]",))      # Magistral / Ministral 3 Reasoning
         if "<think>" in self.tok.special and "</think>" in self.tok.special:
             return self._stuecke(("<think>",)), self._stuecke(("</think>", "\n\n"))
         return None
@@ -228,7 +245,10 @@ class ChatFormatter:
         ids = self._bos()
 
         def inhalt(m):
-            return list(m.ids) if (m.role == "assistant" and m.ids is not None) else tok.encode(m.content.strip())
+            if m.role == "assistant" and m.ids is not None:
+                return list(m.ids)
+            bilder = self._image_ids(m.images) if (m.role == "user" and m.images) else []
+            return bilder + tok.encode(m.content.strip())                 # Bilder vor dem Text
         if fmt.startswith("mistral-v7"):
             sp = " " if fmt == "mistral-v7" else ""
             for m in messages:
@@ -432,6 +452,46 @@ class ChatFormatter:
         # read to the model like an unclosed think block
         nl2 = tok.encode("\n\n")
         return [tok.special_id("<think>")] + nl2 + [tok.special_id("</think>")] + nl2
+
+    def _smollm3(self, messages, gen):
+        # System part with a metadata header; "/think" or "/no_think" in the system text picks the
+        # mode.  Without a tool list the model's template ends the system part WITHOUT <|im_end|>.
+        # Answers stay as generated (thinking included); in /no_think mode an empty block leads them.
+        tok = self.tok
+        s, e = tok.special_id("<|im_start|>"), tok.special_id("<|im_end|>")
+        nl = tok.encode("\n")
+        denken = self.thinking
+        system = ""
+        if messages and messages[0].role == "system":
+            system = messages[0].content
+            if "/no_think" in system:
+                denken = False
+            elif "/think" in system:
+                denken = True
+            system = system.replace("/no_think", "").replace("/think", "").rstrip()
+            messages = messages[1:]
+        leer = self._stuecke(("<think>", "\n\n", "</think>", "\n")) if not denken else []
+        t = time.localtime()
+        heute = f"{t.tm_mday:02d} {_MONATE_EN[t.tm_mon - 1]} {t.tm_year}"
+        kopf = ("## Metadata\n\nKnowledge Cutoff Date: June 2025\n"
+                f"Today Date: {heute}\nReasoning Mode: {'/think' if denken else '/no_think'}\n\n"
+                "## Custom Instructions\n\n"
+                + (system or "You are a helpful AI assistant named SmolLM, trained by Hugging Face.") + "\n\n")
+        ids: List[int] = [s] + tok.encode("system\n" + kopf)
+        for m in messages:
+            if m.role in ("user", "tool"):
+                ids += [s] + tok.encode("user\n")
+                if m.images:
+                    ids += self._image_ids(m.images)
+                ids += tok.encode(m.content) + [e] + nl
+            elif m.role == "assistant":
+                ids += [s] + tok.encode("assistant\n") + leer
+                ids += (list(m.ids) if m.ids is not None else tok.encode(m.content.lstrip("\n"))) + [e] + nl
+            else:
+                raise ValueError(f"unsupported role {m.role!r}")
+        if gen:
+            ids += [s] + tok.encode("assistant\n") + leer
+        return ids
 
     def _k2(self, messages, gen):
         # <bos><|ifm|im_start|>system\n{..}<|ifm|im_end|><|ifm|im_start|>user\n{..}<|ifm|im_end|>

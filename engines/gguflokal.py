@@ -3,7 +3,7 @@ gguflokal.py - Lokale Sprachmodelle über den eigenen GGUF-Motor (ggufengine).
 
 Kein Server, kein Kindprozess: das Modell läuft im NemiCLI-Prozess auf torch.
 Referenz: `gguf:<Ordner>` – jeder Unterordner von `ModelGGUF/` im Programm-Ordner
-ist ein Modell (die .gguf darin; eine mmproj-*.gguf ist der Bild-/Audio-Teil).
+ist ein Modell (die .gguf darin; eine .gguf mit „mmproj“ im Namen ist der Bild-/Audio-Teil).
 
 Der Motor bleibt nach dem ersten Laden im Speicher, damit der Präfix-Cache wirkt:
 Systemprompt und bisheriges Gespräch werden nur einmal gelesen. Der Systemprompt
@@ -12,7 +12,7 @@ bleibt dafür ohne Gedächtnis-Treffer; die stehen vor der Nutzernachricht.
 Bildermalen: `gpu_fuer_bild()` lagert das Sprachmodell für die Dauer in den RAM
 aus, das Bildmodell hat die GPU allein; danach kommt es zurück.
 
-Sehen: liegt eine mmproj-*.gguf im Modell-Ordner, kann das Modell Bilder ansehen.
+Sehen: liegt eine mmproj-Datei im Modell-Ordner, kann das Modell Bilder ansehen.
 Der Bild-Encoder bleibt im RAM und kommt nur zum Kodieren eines Bildes auf die GPU.
 """
 
@@ -22,6 +22,8 @@ import asyncio
 import contextlib
 import re
 import threading
+import time
+import weakref
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -236,9 +238,14 @@ def denk_budget() -> int | None:
     return wert if wert > 0 else None
 
 
+def _ist_mmproj(p: Path) -> bool:
+    """Bild-/Audio-Teil: „mmproj“ irgendwo im Namen (mmproj-….gguf, …-BF16-mmproj.gguf)."""
+    return "mmproj" in p.name.lower()
+
+
 def _gguf_in(ordner: Path) -> Path | None:
     """Die Sprachmodell-Datei eines Modell-Ordners (mmproj-Dateien ausgenommen)."""
-    dateien = sorted(p for p in ordner.glob("*.gguf") if not p.name.lower().startswith("mmproj"))
+    dateien = sorted(p for p in ordner.glob("*.gguf") if not _ist_mmproj(p))
     return dateien[0] if dateien else None
 
 
@@ -257,7 +264,7 @@ def _mmproj(name: str) -> Path | None:
     datei = modelle().get(name)
     if datei is None:
         return None
-    treffer = sorted(datei.parent.glob("mmproj*.gguf"))
+    treffer = sorted(p for p in datei.parent.glob("*.gguf") if _ist_mmproj(p))
     return treffer[0] if treffer else None
 
 
@@ -429,6 +436,8 @@ def entladen() -> None:
         import torch
         gc.collect()
         torch.cuda.empty_cache()
+        from ggufengine.models.common import release_pinned_memory
+        release_pinned_memory()                  # Experten im RAM, ausgelagerte Gewichte
     except Exception:
         pass
 
@@ -472,7 +481,7 @@ def gpu_fuer_bild():
 class _Denktrenner:
     """Trennt Denktext von der Antwort: Gemma `<|channel>thought…<channel|>`,
     K2 `<ifm|think>…</ifm|think>`, gpt-oss Kanal `analysis` bis zum Beginn von `final`,
-    sonst `<think>…</think>`. `offen`: der Prompt hat den Denkblock schon geöffnet, die
+    Mistral `[THINK]…[/THINK]`, sonst `<think>…</think>`. `offen`: der Prompt hat den Denkblock schon geöffnet, die
     Antwort beginnt darin."""
     AUF, ZU = "<|channel>", "<channel|>"
 
@@ -484,6 +493,8 @@ class _Denktrenner:
         elif format == "harmony":
             from ggufengine.chat import HARMONY_FINAL
             self.AUF, self.ZU, self.KANAL = "<|channel|>analysis<|message|>", HARMONY_FINAL, ""
+        elif format.startswith("mistral"):                  # Magistral / Ministral 3 Reasoning
+            self.AUF, self.ZU, self.KANAL = "[THINK]", "[/THINK]", ""
         elif format != "gemma4":
             self.AUF, self.ZU, self.KANAL = "<think>", "</think>", ""
         self.denkt = offen
@@ -735,9 +746,14 @@ class GgufChat:
         if hinweis := pricing.aufraeum_hinweis(self):
             yield {"type": "note", "text": hinweis}
         try:
+            # schwacher Verweis: entladen() muss das alte Modell freigeben können
+            vorher = weakref.ref(_motor[2]) if _motor is not None else None
             if _motor is None or _motor[0] != modelle().get(self.name):
                 yield {"type": "note", "text": f"🧠 lade {self.name} in die Grafikkarte …"}
+            zeiten, t = {}, time.time()
             engine = await self._laden()
+            zeiten["laden"] = time.time() - t
+            frisch = vorher is None or vorher() is not engine   # auch nach geänderten Einstellungen
             if engine.n_ctx < kontext(self.name):
                 yield {"type": "note", "text": f"⚠ Kontext auf {engine.n_ctx // 1024}k begrenzt – mehr passt "
                                                "neben dem Modell nicht in den Grafikspeicher (/kontext)."}
@@ -750,8 +766,10 @@ class GgufChat:
                     self._zusatz.von(frage)["bilder"] = await asyncio.to_thread(_kodieren, engine, images)
             # Systemprompt ohne Gedächtnis-Treffer (bleibt gleich -> Präfix-Cache);
             # die Treffer und nachgereichte Anleitungen gehören zu dieser Nachricht.
+            t = time.time()
             system = await persona.build_system_prompt_async("", kompakt_fuer_lokal=True)
             treffer = await asyncio.to_thread(_gedaechtnis, user_text)
+            zeiten["vorbereitung"] = time.time() - t
             vorsatz = [t.strip() for t in (treffer, self._anleitungen_fuer(user_text)) if t and t.strip()]
             if vorsatz:
                 self._zusatz.von(frage)["gesendet"] = "\n\n".join(vorsatz + [NACHRICHT_MARKE + user_text])
@@ -759,14 +777,18 @@ class GgufChat:
             self.messages.pop()
             raise
 
+        t = time.time()
         if await asyncio.to_thread(prefix_laden, self.name, engine, system):
             yield {"type": "note", "text": "⚡ Anleitung aus dem Zwischenspeicher – kein erneutes Einlesen."}
+        zeiten["zwischenspeicher"] = time.time() - t
         trenner, voll, abbruch = _trenner(engine), "", threading.Event()
         gedacht = False
         try:
+            t = time.time()
             async for stueck in self._erzeugen(engine, self._nachrichten(system, self.messages,
                                                                          engine.chat_format.drops_old_thinking),
                                                MAX_ANTWORT, abbruch):
+                zeiten.setdefault("erstes_token", time.time() - t)
                 for art, text in trenner(stueck):
                     if art == "text":
                         voll += text
@@ -783,7 +805,11 @@ class GgufChat:
                 self.messages.pop()
             raise
         erzeugt = len(engine.last_ids)
-        yield {"type": "usage", "input": max(0, engine._pos - erzeugt), "output": erzeugt}
+        eingabe = max(0, engine._pos - erzeugt)
+        yield {"type": "usage", "input": eingabe, "output": erzeugt}
+        if frisch:
+            zeiten["gelesen"] = max(0, eingabe - engine.last_cached)
+            yield {"type": "note", "text": ladezeiten_text(engine, zeiten)}
         antwort = voll.strip() or "(keine Antwort)"
         erwiderung = {"role": "assistant", "content": antwort}
         # die erzeugten Token samt Denktext; ob er beim nächsten Mal mitgeht, entscheidet _nachrichten
@@ -792,6 +818,31 @@ class GgufChat:
         self.messages.append(erwiderung)
         if engine.checkpoint_new:
             await asyncio.to_thread(prefix_speichern, self.name, engine)
+
+
+LADE_PHASEN = {"file": "Datei", "tokenizer": "Tokenizer", "weights": "Gewichte", "warmup": "Aufwärmen",
+               "vision": "Bildteil"}
+
+
+def _sek(x: float) -> str:
+    return f"{x:.1f}".replace(".", ",")
+
+
+def ladezeiten_text(engine, zeiten: dict) -> str:
+    """Eine Zeile mit der Dauer jedes Schritts vom Laden bis zum ersten Token.
+    `zeiten`: laden, vorbereitung, zwischenspeicher, erstes_token (Sekunden), gelesen (Token)."""
+    phasen = getattr(engine, "load_phases", {}) or {}
+    teile = [f"{LADE_PHASEN.get(k, k)} {_sek(v)}" for k, v in phasen.items()]
+    rest = zeiten.get("laden", 0.0) - sum(phasen.values())
+    if rest >= 0.05:
+        teile.append(f"Sonstiges {_sek(rest)}")
+    zeile = f"⏱ Laden {_sek(zeiten.get('laden', 0.0))} s: " + " · ".join(teile)
+    danach = [f"Gedächtnis+Anleitung {_sek(zeiten.get('vorbereitung', 0.0))} s",
+              f"Zwischenspeicher {_sek(zeiten.get('zwischenspeicher', 0.0))} s"]
+    if "erstes_token" in zeiten:
+        gelesen = f"{zeiten.get('gelesen', 0):,}".replace(",", ".")
+        danach.append(f"{gelesen} Token gelesen bis zum ersten Wort {_sek(zeiten['erstes_token'])} s")
+    return zeile + " │ " + " · ".join(danach)
 
 
 def _prefix_datei(name: str) -> Path | None:

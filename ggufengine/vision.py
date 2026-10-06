@@ -5,6 +5,7 @@ the file and picks the matching encoder:
 * "gemma4v"         -> Gemma4Vision  (Gemma 4)
 * "gemma4uv"        -> Gemma4UnifiedVision (Gemma 4 12B, no encoder layers)
 * "qwen3vl_merger"  -> Qwen3VLVision (Qwen3-VL / Qwen3.5)
+* "pixtral"         -> PixtralVision (Mistral Small 3.x, Ministral 3)
 
 Every encoder exposes `marks` (begin, placeholder, end token of an image in the
 prompt), `n_out` (width of the embeddings), `default_tokens`, `load()`, `unload()`
@@ -443,6 +444,176 @@ class Qwen3VLVision:
         return lin(F.gelu(lin(y, self.mm0)), self.mm2), (gy // m, gx // m)
 
 
+class PixtralVision:
+    """Pixtral vision encoder with the Mistral 3 projector ("pixtral" mmproj: Mistral Small 3.x,
+    Ministral 3), following transformers PixtralVisionModel + Mistral3MultiModalProjector:
+
+    * 14x14 patches (conv without bias), mean/std from the file, RMSNorm (ln_pre)
+    * blocks: RMSNorm -> attention (no bias, 2-D RoPE, bidirectional) -> residual ->
+      RMSNorm -> SiLU-gated MLP -> residual
+    * 2-D RoPE in the layout llama.cpp stores (the converter interleaves the q/k rows): the
+      first half of each head turns adjacent pairs by the patch row with the even
+      frequencies, the second half by the column with the odd frequencies
+    * projector: RMSNorm -> 2x2 neighbouring patches concatenated (channel, row, column)
+      -> linear -> linear -> GELU -> linear
+    The embeddings come out row-major over the merged grid; in the prompt every row ends
+    with [IMG_BREAK], the last one with [IMG_END] (chat.ZEILEN_MARKEN)."""
+
+    default_tokens = 1024       # merged tokens, at most (image_size / 28)^2
+    min_tokens = 4
+    uses_grid = False
+
+    def __init__(self, path: str, device, dtype=torch.bfloat16):
+        from .chat import ZEILEN_MARKEN
+        self.marks = ZEILEN_MARKEN
+        self.gg = GGUFFile(path)
+        g = self.gg
+        if projector_type(g) != "pixtral" or not g.get("clip.has_vision_encoder"):
+            raise GGUFError("not a Pixtral vision projector")
+        self.n_embd = int(g.require("clip.vision.embedding_length"))
+        self.n_head = int(g.require("clip.vision.attention.head_count"))
+        self.n_layer = int(g.require("clip.vision.block_count"))
+        self.patch = int(g.require("clip.vision.patch_size"))
+        self.image_size = int(g.get("clip.vision.image_size", 1540))
+        self.merge = int(g.get("clip.vision.spatial_merge_size", 2))
+        self.eps = float(g.get("clip.vision.attention.layer_norm_epsilon", 1e-5))
+        self.rope_base = float(g.get("clip.rope.freq_base", 10000.0))
+        self.silu = bool(g.get("clip.use_silu", True))
+        self.mean = [float(x) for x in (g.get("clip.vision.image_mean") or [0.5] * 3)]
+        self.std = [float(x) for x in (g.get("clip.vision.image_std") or [0.5] * 3)]
+        mm2 = g.tensors.get("mm.2.weight")
+        if mm2 is None:
+            raise GGUFError("mm.2.weight missing")
+        self.n_out = int(mm2.shape[0])
+        if not (0 < self.n_layer <= 128 and 0 < self.patch <= 64 and self.n_embd % self.n_head == 0
+                and 0 < self.merge <= 8 and 0 < self.image_size <= 8192 and 0 < self.n_out <= 65536
+                and 0 < self.rope_base < 1e9 and len(self.mean) == 3 and len(self.std) == 3
+                and all(s > 0 for s in self.std)):
+            raise GGUFError("implausible vision hyper-parameters")
+        self.head_dim = self.n_embd // self.n_head
+        if self.head_dim % 4:
+            raise GGUFError("vision head size must be a multiple of 4")
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.loaded = False
+
+    def load(self):
+        if self.loaded:
+            return
+        ld = WeightLoader(self.gg, self.device, self.dtype, quant=False)
+        E, P, f32 = self.n_embd, self.patch, torch.float32
+        opt = lambda n: ld.get(n) if ld.has(n) else None
+        self.patch_embd = ld.get("v.patch_embd.weight", f32)
+        if tuple(self.patch_embd.shape) != (E, 3, P, P):
+            raise GGUFError("v.patch_embd.weight has an unexpected shape")
+        self.ln_pre = ld.get("v.pre_ln.weight", f32)
+        self.blocks = []
+        for i in range(self.n_layer):
+            p = f"v.blk.{i}."
+            self.blocks.append({n: ld.get(p + n + ".weight") for n in
+                                ("attn_q", "attn_k", "attn_v", "attn_out", "ffn_gate", "ffn_up", "ffn_down")})
+            self.blocks[-1]["ln1"] = ld.get(p + "ln1.weight", f32)
+            self.blocks[-1]["ln2"] = ld.get(p + "ln2.weight", f32)
+        if tuple(self.blocks[0]["attn_q"].shape) != (E, E):
+            raise GGUFError("attn_q has an unexpected shape")
+        self.mm_norm = ld.get("mm.input_norm.weight", f32)
+        self.merger = ld.get("mm.patch_merger.weight")                    # (E, E * merge^2)
+        self.mm1 = (ld.get("mm.1.weight"), opt("mm.1.bias"))
+        self.mm2 = (ld.get("mm.2.weight"), opt("mm.2.bias"))
+        if (tuple(self.merger.shape) != (E, E * self.merge ** 2) or self.mm1[0].shape[1] != E
+                or tuple(self.mm2[0].shape) != (self.n_out, self.mm1[0].shape[0])):
+            raise GGUFError("projector has an unexpected shape")
+        freqs = 1.0 / (self.rope_base ** (torch.arange(0, self.head_dim, 2, device=self.device,
+                                                       dtype=torch.float32) / self.head_dim))
+        self.f_row, self.f_col = freqs[0::2], freqs[1::2]
+        self.loaded = True
+
+    def unload(self):
+        for name in ("patch_embd", "ln_pre", "blocks", "mm_norm", "merger", "mm1", "mm2", "f_row", "f_col"):
+            self.__dict__.pop(name, None)
+        self.loaded = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # -- preprocessing -----------------------------------------------------------
+    def grid_for(self, width: int, height: int, tokens: int) -> Tuple[int, int]:
+        """(merged tokens across, down): aspect ratio kept, at most `tokens`, no wider than the
+        model's image size and no larger than the picture itself."""
+        unit = self.patch * self.merge
+        tokens = max(self.min_tokens, int(tokens))
+        nx, ny = _fit_grid(width, height, tokens)
+        seite = max(1, self.image_size // unit)
+        s = min(1.0, seite / max(nx, ny))
+        nx, ny = max(1, int(nx * s)), max(1, int(ny * s))
+        return min(nx, max(1, math.ceil(width / unit))), min(ny, max(1, math.ceil(height / unit)))
+
+    def pixels(self, image, tokens: int) -> torch.Tensor:
+        """PIL image -> (3, H, W) normalised, H and W multiples of patch * merge."""
+        from PIL import Image
+        img = image.convert("RGB")
+        nx, ny = self.grid_for(img.width, img.height, tokens)
+        unit = self.patch * self.merge
+        img = img.resize((nx * unit, ny * unit), Image.BICUBIC)
+        raw = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
+        x = raw.view(img.height, img.width, 3).permute(2, 0, 1).float() / 255.0
+        return (x - torch.tensor(self.mean).view(3, 1, 1)) / torch.tensor(self.std).view(3, 1, 1)
+
+    # -- encoder -----------------------------------------------------------------
+    @staticmethod
+    def _paare(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        a, b = t[..., 0::2], t[..., 1::2]
+        return torch.stack([a * cos - b * sin, a * sin + b * cos], dim=-1).flatten(-2)
+
+    @torch.inference_mode()
+    def encode(self, image, tokens: Optional[int] = None):
+        """PIL image -> ((n_tokens, n_out) float32 embeddings, (rows, cols))."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        return self.encode_pixels(self.pixels(image, tokens or self.default_tokens))
+
+    @torch.inference_mode()
+    def encode_pixels(self, pix: torch.Tensor):
+        """(3, H, W) normalised pixels, H and W multiples of patch * merge."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        P, m = self.patch, self.merge
+        if pix.shape[1] % (P * m) or pix.shape[2] % (P * m):
+            raise ValueError("image size must be a multiple of patch_size * spatial_merge_size")
+        x = F.conv2d(pix.to(self.device, torch.float32).unsqueeze(0), self.patch_embd, stride=P)[0]
+        E, gy, gx = x.shape
+        h = rms_norm(x.flatten(1).t(), self.ln_pre, self.eps)                     # (N, E), row-major
+        row = torch.arange(gy, device=self.device, dtype=torch.float32).repeat_interleave(gx)
+        col = torch.arange(gx, device=self.device, dtype=torch.float32).repeat(gy)
+        ar, ac = torch.outer(row, self.f_row), torch.outer(col, self.f_col)
+        cr, sr, cc, sc = ar.cos().unsqueeze(1), ar.sin().unsqueeze(1), ac.cos().unsqueeze(1), ac.sin().unsqueeze(1)
+        N, H, D = h.shape[0], self.n_head, self.head_dim
+        half = D // 2
+        lin = lambda t, w: F.linear(t.to(w.dtype), w).float()
+
+        def rope(t):
+            return torch.cat([self._paare(t[..., :half], cr, sr), self._paare(t[..., half:], cc, sc)], dim=-1)
+        act = F.silu if self.silu else (lambda t: F.gelu(t, approximate="tanh"))
+        for b in self.blocks:
+            y = rms_norm(h, b["ln1"], self.eps)
+            q = rope(lin(y, b["attn_q"]).view(N, H, D))
+            k = rope(lin(y, b["attn_k"]).view(N, H, D))
+            v = lin(y, b["attn_v"]).view(N, H, D)
+            a = F.scaled_dot_product_attention(q.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               k.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               v.transpose(0, 1).unsqueeze(0).to(self.dtype)
+                                               )[0].transpose(0, 1).reshape(N, E)
+            h = h + lin(a, b["attn_out"])
+            y = rms_norm(h, b["ln2"], self.eps)
+            h = h + lin(act(lin(y, b["ffn_gate"])) * lin(y, b["ffn_up"]), b["ffn_down"])
+        y = rms_norm(h, self.mm_norm, self.eps)
+        y = F.unfold(y.t().reshape(1, E, gy, gx), kernel_size=m, stride=m)[0].t()   # (N/m², E·m²)
+        y = lin(y, self.merger)
+        w1, b1 = self.mm1
+        w2, b2 = self.mm2
+        y = F.gelu(F.linear(y.to(w1.dtype), w1, b1).float())
+        return F.linear(y.to(w2.dtype), w2, b2).float(), (gy // m, gx // m)
+
+
 def _fit_grid(width: int, height: int, tokens: int) -> Tuple[int, int]:
     """(across, down) keeping the aspect ratio, at most `tokens` cells."""
     if width <= 0 or height <= 0:
@@ -458,7 +629,8 @@ def _fit_grid(width: int, height: int, tokens: int) -> Tuple[int, int]:
 
 
 # -- automatic selection -------------------------------------------------------
-ENCODERS = {"gemma4v": Gemma4Vision, "gemma4uv": Gemma4UnifiedVision, "qwen3vl_merger": Qwen3VLVision}
+ENCODERS = {"gemma4v": Gemma4Vision, "gemma4uv": Gemma4UnifiedVision, "qwen3vl_merger": Qwen3VLVision,
+            "pixtral": PixtralVision}
 
 
 def projector_type(gg: GGUFFile) -> Optional[str]:

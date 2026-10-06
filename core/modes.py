@@ -61,6 +61,8 @@ MEMORY_TOOLS = {"merken", "skill_merken"}
 # skill_merken → learned/, ordner_lernen → learned/); die gehören NICHT hierher.
 READ_TOOLS = {
     "datei_lesen", "bild_ansehen", "bild_fragen", "anleitung_lesen", "ordner_auflisten", "ordner_erkennen",
+    "charakter_zeigen",
+    "api_nachschlagen", "code_pruefen", "paket_info", "seite_ansehen", "doku_suchen",
     "dateien_suchen", "inhalt_suchen",
     "web_lesen", "web_wiki", "web_suche", "ml_status",
     "gedaechtnis_suchen", "gedaechtnis_lesen", "skill_laden",
@@ -207,6 +209,10 @@ def decide(action: dict, needs_confirm: bool) -> str:
     jedem Modus."""
     mode = current()
     tool = action.get("tool", "")
+    if tool == "plan":                 # die Todo-Liste liegt nur im Speicher – in jedem Modus frei
+        return "run"
+    if tool == "menue_oeffnen":        # das Menü IST die Rückfrage: der Nutzer wählt selbst
+        return "run"
     # Der Workspace-Riegel steht VOR den Modi: hat der Nutzer einen Ordner
     # festgenagelt, kommt da nichts raus - auch nicht im Auto-Modus.
     if _ausserhalb_workspace(action) is not None:
@@ -224,6 +230,8 @@ def decide(action: dict, needs_confirm: bool) -> str:
         # Skills werden später befolgt: Prüffenster in jedem Modus, auch Auto –
         # frei nur mit /skills selbst an (steckt in needs_confirm, samt Netz-Taint).
         return "ask" if needs_confirm else "run"
+    if tool == "einstellung_aendern":
+        return "ask"                    # Prüffenster in jedem Modus, auch Auto
     if tool == "todo":
         # Mit Prüfbefehl gelten die Regeln von `befehl`. Sonst entscheidet der
         # Nutzer in jedem Modus: Liste abnicken, Kriterium ändern, streichen,

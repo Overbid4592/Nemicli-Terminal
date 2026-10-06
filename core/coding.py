@@ -474,6 +474,17 @@ _WEG = """\
 - Lies eine Datei, bevor du sie änderst.
 - `befehl` läuft im Projektordner. Fürs Projekt immer das Python aus `venv\\Scripts`.
 - Charme ja, Schönfärben nein. Ergebnisse mit Fakten beschreiben: was lief, was nicht, Zahlen.
+
+## Aktuell bleiben (dein Wissen hat ein Datum, die Bibliotheken nicht)
+- Schreib für die Versionen unter „Umgebung“, nicht für die aus deinem Gedächtnis.
+- Bist du bei einer Funktion, Klasse oder einem Parameter unsicher: api_nachschlagen (z. B. "requests.get")
+  – das liest Signatur und Doku aus der INSTALLIERTEN Version. Grundlagen zu Python, HTML, CSS, JS:
+  doku_suchen. Neuere Version oder Lücken eines Pakets: paket_info.
+- Nach dem Schreiben meldet NemiCLI Syntax- und Strukturfehler sofort. Vor todo "pruefen" eines
+  Python-Punktes: code_pruefen (ruff: undefinierte Namen, veralteter Stil, typische Fehler).
+- Web-Punkte (HTML/CSS/JS): seite_ansehen zeigt dir die Seite als Bild – prüf, ob sie aussieht wie verlangt.
+- Meldet etwas „⚠️ Veraltet“ oder stellst du fest, dass sich eine API geändert hat: modernisieren und mit
+  skill_merken festhalten, Name „<Paket> <Version>: <Thema>“, Inhalt: was alt war, was jetzt gilt.
 """
 
 
@@ -492,12 +503,54 @@ def prompt_hinweis() -> str:
     else:
         stand = text_fuer_modell(daten)
         if fertig(daten):
-            stand += "\n\nAlle Punkte sind geprüft → Abschluss-Bericht in der festen Form."
+            stand += ("\n\nAlle Punkte sind geprüft → Abschluss-Bericht in der festen Form. Frag danach, "
+                      "ob der Coding-Assistent aus soll (/codeend) – ausschalten kann nur der Nutzer.")
     return ("\n\n# 🟦 Coding-Assistent ist AN\n"
             f"Projekt: {p}  (Ablage: {p / ABLAGE})\n"
             "Du arbeitest jetzt auf einem festen Weg. Das Programm führt die Todo-Liste und "
             "prüft; du denkst und baust. Der Modus bleibt an, bis der Nutzer ihn beendet.\n\n"
-            + _WEG + "\n## Aktueller Stand\n" + stand + "\n")
+            + _WEG + _umgebung_block(p) + "\n## Aktueller Stand\n" + stand + "\n")
+
+
+def _umgebung_block(p: Path) -> str:
+    """Umgebung aus der Installation + passende Lehren. Leer, solange der Ordner fehlt."""
+    if not p.is_dir():
+        return ""
+    try:
+        import pyumgebung
+        text = "\n## Umgebung (aus der Installation gelesen, nicht aus deinem Gedächtnis)\n" \
+            + pyumgebung.umgebung_text(p) + "\n"
+        pakete = list(pyumgebung.umgebung(p).get("relevant") or {})
+    except Exception:
+        return ""
+    lehren = lehren_zu(pakete)
+    if lehren:
+        text += "\n## Deine Lehren zu diesen Paketen\n" + "\n".join(lehren) + "\n"
+    return text
+
+
+def lehren_zu(pakete: list[str], hoechstens: int = 5) -> list[str]:
+    """Gemerkte Lehren (learn-Skills), deren Titel ein Paket nennt: '- Titel: Anfang des Inhalts'."""
+    if not pakete:
+        return []
+    try:
+        import learn
+        liste = learn.list_skills()
+    except Exception:
+        return []
+    muster = re.compile(r"\b(" + "|".join(re.escape(n) for n in pakete) + r")\b", re.I)
+    raus = []
+    for pfad, titel in liste:
+        if not muster.search(titel or ""):
+            continue
+        try:
+            inhalt = Path(pfad).read_text(encoding="utf-8").split("\n", 3)[-1]
+        except OSError:
+            inhalt = ""
+        raus.append(f"- {titel.lstrip('# ').strip()}: {' '.join(inhalt.split())[:300]}")
+        if len(raus) >= hoechstens:
+            break
+    return raus
 
 
 def status_text() -> str:

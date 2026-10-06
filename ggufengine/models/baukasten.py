@@ -20,7 +20,10 @@ Erkannt je Schicht:
 * gpt-oss: Attention-Sinks (`attn_sinks`), Fenster jede zweite Schicht, Top-k vor der Softmax,
   begrenzte SwiGLU-Variante, YaRN ohne gerundete Grenzen
 * Command-R/Cohere 2: Attention und FFN parallel, globale Schichten ohne RoPE (auch EXAONE 4)
+* SmolLM3: Llama-Aufbau, jede vierte Schicht ohne RoPE
 * GLM-4.5: Zusatzschichten für Mehr-Token-Vorhersage werden übersprungen
+* Ministral 3 (`mistral3`): Q-Temperatur je Position ab dem Original-Kontext (wie Llama 4),
+  YaRN-Lautstärke aus `yarn_log_multiplier` (= mscale_all_dim)
 
 Jede Zahl aus der Datei wird vor Gebrauch auf Plausibilität geprüft.
 """
@@ -37,17 +40,23 @@ from .common import (GraphDecoder, KVCache, RoPE, WeightLoader, attention, atten
                      group_rms_norm, layer_norm, rms_norm)
 from .moe import Experten
 
-ARCHS = ("llama", "mistral", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "k2-horizon",
+ARCHS = ("llama", "mistral", "mistral3", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "k2-horizon",
          "gemma", "gemma2", "gemma3", "phi3", "granite", "granitemoe", "olmo2", "olmo3", "gpt-oss",
-         "ernie4_5", "ernie4_5-moe", "seed_oss", "exaone4", "cohere2", "command-r", "glm4", "glm4moe")
+         "ernie4_5", "ernie4_5-moe", "seed_oss", "exaone4", "cohere2", "command-r", "glm4", "glm4moe",
+         "smollm3")
 
 # llama.cpp-RoPE-Art „normal“ (benachbarte Paare; der Konverter hat Q/K dafür umsortiert)
-_PAARE = {"llama", "mistral", "granite", "granitemoe", "ernie4_5", "ernie4_5-moe", "cohere2", "command-r", "glm4"}
+_PAARE = {"llama", "mistral", "mistral3", "granite", "granitemoe", "ernie4_5", "ernie4_5-moe", "cohere2",
+          "command-r", "glm4", "smollm3"}
+# YaRN-Lautstärke = get_mscale(f, 1) / get_mscale(f, yarn_log_multiplier) wie transformers mit
+# mscale=1, mscale_all_dim=yarn_log_multiplier (DeepSeek V2 rechnet anders, eigenes Modul)
+_YARN_LOG_MUL_ALL_DIM = {"mistral3"}
 _GELU = {"gemma", "gemma2", "gemma3"}                    # GELU (tanh) statt SiLU
 _EINBETTUNG_WURZEL = {"gemma", "gemma2", "gemma3"}      # Einbettung * sqrt(n_embd)
 _FENSTER_MUSTER = {"gemma2": 2, "gemma3": 6, "gpt-oss": 2,   # jede n-te Schicht global, Rest Fenster
                    "olmo3": 4, "exaone4": 4, "cohere2": 4}
 _GLOBAL_OHNE_ROPE = {"exaone4", "cohere2"}             # mit Fenster: globale Schichten ohne RoPE
+_OHNE_ROPE_JEDE = {"smollm3": 4}                       # ohne Fenster: jede n-te Schicht ohne RoPE (NoPE)
 _FENSTER_ROPE_SCHLICHT = {"olmo3"}                     # Fenster-Schichten: RoPE ohne Skalierung (YaRN nur global)
 _PARALLEL = {"cohere2", "command-r"}                   # Attention und FFN auf derselben Norm, beide aufs Residuum
 _LOGITS_MAL_SKALA = {"cohere2", "command-r"}           # logit_scale multipliziert (Granite: teilt)
@@ -225,6 +234,9 @@ class _Schicht:
             k = rms_norm(k, self.k_norm, hp["eps"])
         if self.rope is not None:
             q, k = self.rope(q, pos_idx), self.rope(k, pos_idx)
+        if hp["q_temp"] is not None:                                 # Ministral 3: 1 + β·ln(1 + ⌊pos/n⌋)
+            beta, n = hp["q_temp"]
+            q = q * (1 + beta * torch.log1p(torch.div(pos_idx, n, rounding_mode="floor").float())).view(L, 1, 1)
         self.cache.write(k, v, pos_idx)
         if hp["attn_softcap"]:
             o = attention_softcap(q, *self.cache.kv(kv_len), pos_idx, kv_len, hp["attn_scale"],
@@ -296,7 +308,15 @@ class BaukastenModel:
             weights_scale=_zahl(gg, k("expert_weights_scale"), 1.0, lo=0, hi=1e4),
             parallel=a in _PARALLEL,
             logits_mal=a in _LOGITS_MAL_SKALA,
+            q_temp=None,
         )
+        temp = _zahl(gg, k("attention.temperature_scale"), 0.0, lo=0, hi=10) if a == "mistral3" else 0.0
+        if temp:
+            n = (_zahl(gg, k("rope.scaling.original_context_length"), 0, ganz=True, lo=0, hi=1 << 26)
+                 or _zahl(gg, k("context_length"), 0, ganz=True, lo=0, hi=1 << 26))
+            if not n:
+                raise GGUFError("attention.temperature_scale needs an original context length")
+            hp["q_temp"] = (temp, n)
         if n_embd % hp["norm_groups"]:
             raise GGUFError("group_norm_groups must divide embedding_length")
         self.hp = hp
@@ -338,6 +358,8 @@ class BaukastenModel:
         def rope_von(i):
             if ist_fenster(i):
                 return fenster_rope
+            if a in _OHNE_ROPE_JEDE and (i + 1) % _OHNE_ROPE_JEDE[a] == 0:
+                return None
             return None if fenster and a in _GLOBAL_OHNE_ROPE else global_rope
         self.layers: List[_Schicht] = [
             _Schicht(ld, i, hp, rope_von(i), n_ctx, fenster if ist_fenster(i) else 0) for i in range(n_layer)]
@@ -373,6 +395,9 @@ class BaukastenModel:
             yarn = (faktor, orig,
                     _zahl(gg, k("rope.scaling.yarn_beta_fast"), 32.0, lo=0, hi=1e4),
                     _zahl(gg, k("rope.scaling.yarn_beta_slow"), 1.0, lo=0, hi=1e4), a not in _YARN_UNGERUNDET)
+            log_mul = _zahl(gg, k("rope.scaling.yarn_log_multiplier"), None, lo=0, hi=100)
+            if mscale is None and a in _YARN_LOG_MUL_ALL_DIM and log_mul is not None:
+                mscale = (0.1 * math.log(faktor) + 1.0) / (0.1 * log_mul * math.log(faktor) + 1.0)
             if mscale is None:
                 mscale = 0.1 * math.log(faktor) + 1.0
         elif art not in ("none", "linear", "yarn", "longrope", None):
@@ -400,12 +425,17 @@ class BaukastenModel:
         pass
 
     # -- Rechnen ---------------------------------------------------------------------
-    def _verborgen(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, alle: bool = False) -> torch.Tensor:
-        """Zustand nach der Schluss-Norm: letzte Zeile oder (alle=True) jede Zeile."""
+    def _verborgen(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, alle: bool = False,
+                   inject=None) -> torch.Tensor:
+        """Zustand nach der Schluss-Norm: letzte Zeile oder (alle=True) jede Zeile.
+        inject: (Zeilen, Einbettungen) – Bild-Einbettungen ersetzen dort die Token-Einbettung."""
         hp = self.hp
         h = self.embed(tok)
         if hp["embedding_scale"] != 1.0:
             h = h * hp["embedding_scale"]
+        if inject is not None:
+            rows, emb = inject
+            h = h.index_copy(0, rows, emb.to(h.device, h.dtype))
         for layer in self.layers:
             h = layer(h, pos_idx, kv_len)
         x = h if alle else h[-1:]
@@ -413,9 +443,9 @@ class BaukastenModel:
             return layer_norm(x, self.out_norm, self.out_norm_b, hp["eps"])
         return group_rms_norm(x, self.out_norm, hp["eps"], hp["norm_groups"])
 
-    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, inject=None) -> torch.Tensor:
         hp = self.hp
-        x = self._verborgen(tok, pos_idx, kv_len)
+        x = self._verborgen(tok, pos_idx, kv_len, inject=inject)
         logits = self.lm_head(x)[0].float()
         if hp["logit_scale"] != 1.0:                   # Granite teilt die Logits, Cohere multipliziert
             logits = logits * hp["logit_scale"] if hp["logits_mal"] else logits / hp["logit_scale"]
@@ -448,14 +478,16 @@ class BaukastenModel:
             return summe / len(tokens)
         return erstes if pooling == "cls" else x[-1]
 
+    supports_images = True          # Bild-Einbettungen über `inject` (Pixtral bei Mistral/Ministral 3)
+
     @torch.inference_mode()
-    def forward(self, tokens: List[int], pos: int) -> torch.Tensor:
+    def forward(self, tokens: List[int], pos: int, inject=None) -> torch.Tensor:
         if pos < 0 or pos + len(tokens) > self.n_ctx:
             raise RuntimeError(f"context window of {self.n_ctx} tokens exceeded")
         if any(not 0 <= t < self.n_vocab for t in tokens):
             raise ValueError("token id out of range")
-        if len(tokens) == 1 and self.graph is not None:
+        if len(tokens) == 1 and self.graph is not None and inject is None:
             return self.graph(tokens[0], pos)
         tok = torch.tensor(tokens, device=self.device, dtype=torch.long)
         pos_idx = torch.arange(pos, pos + len(tokens), device=self.device, dtype=torch.long)
-        return self._run(tok, pos_idx, pos + len(tokens))
+        return self._run(tok, pos_idx, pos + len(tokens), inject)

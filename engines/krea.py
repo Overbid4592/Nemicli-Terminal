@@ -47,7 +47,15 @@ DEFAULTS = {
     "sampler": "euler_ancestral",       # oder "euler"
     "shift": 1.15,
     "entladen_nach": 120,               # Sekunden ohne Bild, dann auch RAM frei
+    "gesicht": True,                    # Gesichter nach dem Malen vergrößert nachmalen
+    "gesicht_staerke": 0.45,            # Rauschstärke beim Nachmalen (0 = nichts, 1 = neu)
+    "gesicht_schritte": 10,
+    "gesicht_kante": 1024,              # Arbeitsgröße des Ausschnitts (längere Kante)
 }
+
+# Vorsatz beim Nachmalen; danach folgt der ursprüngliche Prompt (Figur, Licht, Stil).
+GESICHT_SATZ = ("A close-up of the face with clear, detailed eyes, sharp irises, "
+                "natural skin texture and fine detail, in sharp focus.")
 
 # Qwen3-VL-Eingabe: dieselbe Systemvorlage wie Qwen-Image. Vor dem Weiterreichen
 # wird alles bis einschließlich "<|im_start|>user\n" abgeschnitten.
@@ -129,6 +137,27 @@ def chosen_model() -> str | None:
     if gemerkt and gemerkt in modelle:
         return gemerkt
     return next(iter(modelle), None)
+
+
+SCHRITTE_MIN, SCHRITTE_MAX = 8, 16
+
+
+def schritte() -> int:
+    """Gespeicherte Schrittzahl (Config `bild_krea_schritte`, 8–16); sonst der Standard."""
+    try:
+        import config
+        n = int(config.load().get("bild_krea_schritte") or DEFAULTS["steps"])
+    except Exception:
+        n = DEFAULTS["steps"]
+    return min(max(n, SCHRITTE_MIN), SCHRITTE_MAX)
+
+
+def set_schritte(n: int) -> int:
+    """Schrittzahl dauerhaft speichern (auf 8–16 begrenzt). Gibt den gespeicherten Wert zurück."""
+    import config
+    n = min(max(int(n), SCHRITTE_MIN), SCHRITTE_MAX)
+    config.update(bild_krea_schritte=n)
+    return n
 
 
 def set_chosen_model(ref: str) -> None:
@@ -643,24 +672,25 @@ class _DiT:
 
 
 # ===========================================================================
-#  VAE-Decoder (Qwen-Image / Wan 2.1, als reiner 2D-Decoder für Einzelbilder)
+#  VAE (Qwen-Image / Wan 2.1, als reiner 2D-Encoder/-Decoder für Einzelbilder)
 # ===========================================================================
 #
 # Die kausalen 3D-Faltungen sehen bei einem einzelnen Bild vor sich nur Nullen.
 # Übrig bleibt die letzte Zeitscheibe des Kerns als gewöhnliche 2D-Faltung.
+# Die zeitliche Verkleinerung (time_conv) greift erst ab dem zweiten Bild.
 
-class _VAEDecoder:
-    def __init__(self, path: Path, device, dtype):
-        sd = _lade(path, device, skip=("encoder.", "conv1."))
+class _VAEBasis:
+    def __init__(self, path: Path, device, dtype, skip: tuple):
+        sd = _lade(path, device, skip=skip)
         self.sd = {k: v.to(dtype) for k, v in sd.items()}
         self.dtype = dtype
 
-    def _conv(self, x, p, pad):
+    def _conv(self, x, p, pad, stride=1):
         import torch.nn.functional as F
         w = self.sd[p + ".weight"]
         if w.ndim == 5:
             w = w[:, :, -1]
-        return F.conv2d(x, w, self.sd.get(p + ".bias"), padding=pad)
+        return F.conv2d(x, w, self.sd.get(p + ".bias"), stride=stride, padding=pad)
 
     def _norm(self, x, p):
         import torch.nn.functional as F
@@ -682,6 +712,37 @@ class _VAEDecoder:
         a = _sdpa(q, k, v)
         a = a.transpose(-1, -2).reshape(b, c, hh, ww)
         return x + self._conv(a, p + ".proj", 0)
+
+
+class _VAEEncoder(_VAEBasis):
+    """Bild [-1, 1] (B, 3, H, W) -> Mittelwert des Latents (B, 16, H/8, W/8), unnormiert."""
+
+    def __init__(self, path: Path, device, dtype):
+        super().__init__(path, device, dtype, skip=("decoder.", "conv2."))
+
+    def __call__(self, x):
+        import torch.nn.functional as F
+        x = self._conv(x.to(self.dtype), "encoder.conv1", 1)
+        i = 0
+        while f"encoder.downsamples.{i}.residual.0.gamma" in self.sd or \
+                f"encoder.downsamples.{i}.resample.1.weight" in self.sd:
+            p = f"encoder.downsamples.{i}"
+            if (p + ".resample.1.weight") in self.sd:
+                x = self._conv(F.pad(x, (0, 1, 0, 1)), p + ".resample.1", 0, stride=2)
+            else:
+                x = self._res(x, p)
+            i += 1
+        x = self._res(x, "encoder.middle.0")
+        x = self._attn(x, "encoder.middle.1")
+        x = self._res(x, "encoder.middle.2")
+        x = self._conv(F.silu(self._norm(x, "encoder.head.0")), "encoder.head.2", 1)
+        x = self._conv(x, "conv1", 0)
+        return x[:, :16].float()                     # Mittelwert; die zweite Hälfte ist log var
+
+
+class _VAEDecoder(_VAEBasis):
+    def __init__(self, path: Path, device, dtype):
+        super().__init__(path, device, dtype, skip=("encoder.", "conv1."))
 
     def __call__(self, z):
         import torch.nn.functional as F
@@ -718,6 +779,17 @@ def _sigmas(steps: int, shift: float):
 
     ss = n / steps
     s = [sig((n - int(i * ss)) / n) for i in range(steps)]
+    return torch.tensor(s + [0.0], dtype=torch.float32)
+
+
+def _sigmas_ab(steps: int, shift: float, start: float):
+    """Wie _sigmas, aber beginnend bei Rauschstärke `start` (Nachmalen eines Bildes).
+    Der Zeitabschnitt bis `start` wird gleichmäßig in `steps` Schritte geteilt."""
+    import torch
+    k = math.exp(shift)
+    start = min(max(float(start), 0.01), 1.0)
+    t0 = 1.0 / (1.0 + k * (1.0 / start - 1.0))          # Umkehrung der Zeitverschiebung
+    s = [k / (k + (1.0 / t - 1.0)) for t in (t0 * (1 - i / steps) for i in range(steps))]
     return torch.tensor(s + [0.0], dtype=torch.float32)
 
 
@@ -858,8 +930,10 @@ def _uhr_neu() -> None:
     _TIMER.start()
 
 
-def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype, on_status):
-    """Die eigentliche Rechnung. Gibt das Bild als uint8-Array zurück."""
+def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype, on_status,
+          bild=None, staerke: float = 1.0):
+    """Die eigentliche Rechnung. Gibt das Bild als uint8-Array zurück.
+    Mit `bild` (uint8, H×W×3) wird es ab Rauschstärke `staerke` nachgemalt statt neu."""
     import numpy as np
     import torch
 
@@ -870,22 +944,39 @@ def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype
     del te
     _frei()
 
+    mean = torch.tensor(_LAT_MEAN, device=device).view(1, 16, 1, 1)
+    std = torch.tensor(_LAT_STD, device=device).view(1, 16, 1, 1)
+    start = None
+    if bild is not None:
+        if on_status:
+            on_status("Krea 2: VAE liest das Bild …")
+        enc = _auf_gpu("vae_enc", t["vae"], lambda: _VAEEncoder(t["vae"], device, dtype), device)
+        x = torch.from_numpy(np.ascontiguousarray(bild)).to(device).permute(2, 0, 1)[None]
+        with torch.no_grad():
+            start = (enc(x.float() / 127.5 - 1.0) - mean) / std
+        del enc, x
+        _frei()
+
     if on_status:
         on_status("Krea 2: Modell in den VRAM …")
     dit = _auf_gpu("dit", pfad, lambda: _DiT(pfad, device, dtype, on_status), device)
     with torch.no_grad():
         txt = dit.text(ctx)
     del ctx
-    sig = _sigmas(steps, shift).to(device)
-    noise = torch.randn((1, 16, H // 8, W // 8), generator=torch.Generator().manual_seed(seed))
-    lat = _sample(dit, noise.to(device) * sig[0], txt, sig, sampler, seed, on_status)
-    del dit, txt, noise, sig
+    noise = torch.randn((1, 16, H // 8, W // 8),
+                        generator=torch.Generator().manual_seed(seed)).to(device)
+    if start is None:
+        sig = _sigmas(steps, shift).to(device)
+        x0 = noise * sig[0]
+    else:
+        sig = _sigmas_ab(steps, shift, staerke).to(device)
+        x0 = (1.0 - sig[0]) * start + sig[0] * noise       # Flow-Matching: Bild + Rauschen
+    lat = _sample(dit, x0, txt, sig, sampler, seed, on_status)
+    del dit, txt, noise, sig, x0, start
     _frei()
 
     if on_status:
         on_status("Krea 2: VAE …")
-    mean = torch.tensor(_LAT_MEAN, device=device).view(1, 16, 1, 1)
-    std = torch.tensor(_LAT_STD, device=device).view(1, 16, 1, 1)
     vae = _auf_gpu("vae", t["vae"], lambda: _VAEDecoder(t["vae"], device, dtype), device)
     with torch.no_grad():
         img = vae(lat * std + mean)
@@ -893,6 +984,21 @@ def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype
     _frei()
     return ((img[0].permute(1, 2, 0).float().cpu().numpy() + 1.0) * 127.5
             ).round().clip(0, 255).astype(np.uint8)
+
+
+def _modell(model: str | None, modelle: dict) -> str | None:
+    """Ein erfundener oder ungenauer Name soll das Bild nicht verhindern."""
+    if model and model not in modelle:
+        name = Path(str(model).replace("\\", "/")).stem.lower()
+        treffer = [k for k in modelle if name and name in k.lower()]
+        model = treffer[0] if treffer else None
+    return model or chosen_model()
+
+
+def _geraet():
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return device, (torch.bfloat16 if device.type == "cuda" else torch.float32)
 
 
 def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
@@ -904,19 +1010,13 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
     if grund:
         raise RuntimeError(grund)
 
-    import torch
     from PIL import Image, PngImagePlugin
 
     modelle = discover()
-    if model and model not in modelle:
-        # Ein erfundener oder ungenauer Name soll das Bild nicht verhindern.
-        name = Path(str(model).replace("\\", "/")).stem.lower()
-        treffer = [k for k in modelle if name and name in k.lower()]
-        model = treffer[0] if treffer else None
-    ref = model or chosen_model()
+    ref = _modell(model, modelle)
     t = teile()
 
-    steps = int(steps or DEFAULTS["steps"])
+    steps = int(steps or schritte())
     sampler = (sampler or DEFAULTS["sampler"]).lower()
     shift = DEFAULTS["shift"] if shift is None else float(shift)
     W, H = size or DEFAULTS["size"]
@@ -925,8 +1025,7 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
     if seed is None:
         seed = int(time.time() * 1000) & 0x7FFFFFFF
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+    device, dtype = _geraet()
 
     fehler = None
     with _LOCK:
@@ -952,3 +1051,103 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
                             f"sampler={sampler}, shift={shift}, backend=krea2")
     Image.fromarray(arr).save(out, pnginfo=meta)
     return str(out)
+
+
+# ===========================================================================
+#  Gesichter nachmalen
+# ===========================================================================
+
+def _cfg(key: str, standard):
+    try:
+        import config
+        wert = config.load().get(key)
+        return standard if wert is None else type(standard)(wert)
+    except Exception:
+        return standard
+
+
+def gesicht_an() -> bool:
+    """Gesichts-Nachbesserung eingeschaltet (Config `bild_krea_gesicht`)?"""
+    return bool(_cfg("bild_krea_gesicht", DEFAULTS["gesicht"]))
+
+
+def _arbeitsgroesse(cw: int, ch: int, kante: int) -> tuple[int, int, float]:
+    """(W, H, Lupe) für den Ausschnitt: längere Kante = `kante`, Vielfache von 16."""
+    lupe = kante / max(cw, ch)
+    W = max(256, (round(cw * lupe) // 16) * 16)
+    H = max(256, (round(ch * lupe) // 16) * 16)
+    return W, H, lupe
+
+
+def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None = None,
+                        on_status=None) -> str | None:
+    """Gesichter eines Krea-Bildes vergrößert nachmalen und weich einsetzen.
+
+    Das Original bleibt; das Ergebnis liegt daneben als `<name>_gesicht.png`.
+    None, wenn kein Gesicht gefunden wurde, alle schon groß genug sind oder
+    OpenCV fehlt. Blockiert."""
+    import gesichter
+    if not gesichter.verfuegbar() or missing_reason():
+        return None
+
+    import re
+    import numpy as np
+    from PIL import Image, PngImagePlugin
+
+    with Image.open(path) as im:
+        meta = dict(getattr(im, "text", {}) or {})
+        arr = np.asarray(im.convert("RGB"))
+    boxen = gesichter.finden(arr)
+    if not boxen:
+        return None
+
+    staerke = _cfg("bild_krea_gesicht_staerke", DEFAULTS["gesicht_staerke"]) if staerke is None else staerke
+    steps = int(steps or _cfg("bild_krea_gesicht_schritte", DEFAULTS["gesicht_schritte"]))
+    kante = int(_cfg("bild_krea_gesicht_kante", DEFAULTS["gesicht_kante"]))
+    params = meta.get("params", "")
+    m = re.search(r"sampler=(\w+)", params)
+    sampler = m.group(1) if m and m.group(1) in ("euler", "euler_ancestral") else DEFAULTS["sampler"]
+    m = re.search(r"seed=(\d+)", params)
+    seed = (int(m.group(1)) if m else int(time.time() * 1000)) + 1
+    prompt = f"{GESICHT_SATZ} {meta.get('prompt', '')}".strip()
+
+    modelle = discover()
+    ref = _modell(meta.get("model"), modelle)
+    t = teile()
+    device, dtype = _geraet()
+
+    fertig, fehler = 0, None
+    with _LOCK:
+        if _TIMER is not None:
+            _TIMER.cancel()
+        try:
+            for i, box in enumerate(boxen):
+                x0, y0, x1, y1 = box
+                W, H, lupe = _arbeitsgroesse(x1 - x0, y1 - y0, kante)
+                if lupe < 1.3:
+                    continue                  # Gesicht hat schon genug Pixel
+                ausschnitt = np.asarray(Image.fromarray(arr[y0:y1, x0:x1]).resize((W, H), Image.LANCZOS))
+                melde = None
+                if on_status:
+                    melde = (lambda s, i=i: on_status(f"Gesicht {i + 1}/{len(boxen)} · {s}"))
+                neu = _male(prompt, ref, modelle[ref], t, steps, sampler, DEFAULTS["shift"],
+                            W, H, seed + i, device, dtype, melde, bild=ausschnitt, staerke=staerke)
+                arr = gesichter.einsetzen(arr, box, neu)
+                fertig += 1
+        except Exception as e:
+            fehler = f"{type(e).__name__}: {e}"
+        _frei()
+        _uhr_neu()
+        if fehler:
+            raise RuntimeError(f"Krea 2 (Gesicht): {fehler}")
+    if not fertig:
+        return None
+
+    p = Path(path)
+    ziel = p.with_name(f"{p.stem}_gesicht.png")
+    info = PngImagePlugin.PngInfo()
+    for k, v in meta.items():
+        info.add_text(k, str(v))
+    info.add_text("nachgebessert", f"gesicht x{fertig}, staerke={staerke}, steps={steps}")
+    Image.fromarray(arr).save(ziel, pnginfo=info)
+    return str(ziel)

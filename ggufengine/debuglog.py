@@ -15,11 +15,10 @@ import threading
 import time
 import traceback
 from datetime import datetime
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 _lock = threading.Lock()
 _path: Optional[str] = None
-_listeners: List[Callable[[str], None]] = []
 _t0 = time.time()
 
 
@@ -53,22 +52,12 @@ def path() -> Optional[str]:
     return _path
 
 
-def add_listener(fn: Callable[[str], None]) -> None:
-    """fn(text) is called with every chunk written (used by the GUI's live panel)."""
-    _listeners.append(fn)
-
-
 def _write(text: str) -> None:
     if _path is None:
         return
     with _lock:
         with open(_path, "a", encoding="utf-8") as f:
             f.write(text)
-    for fn in list(_listeners):
-        try:
-            fn(text)
-        except Exception:
-            pass
 
 
 def _stamp() -> str:

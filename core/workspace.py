@@ -222,10 +222,7 @@ def schreibe_auftrag(text: str, ws: Path | None = None) -> Path | None:
     Warum: die Anweisung geht sonst nur als Text in den Chat. Wird der Verlauf
     lang und abgeschnitten, ist sie weg – und die Persönlichkeit arbeitet aus
     dem Gedächtnis weiter. Genau da fangen Agenten an zu raten. Als Datei klebt
-    sie am Projekt und lässt sich jederzeit nachlesen.
-
-    (Der Hinweis kam von Lara selbst, nachdem sie den ersten Workspace
-    durchgegangen war.)"""
+    sie am Projekt und lässt sich jederzeit nachlesen."""
     ziel_ws = Path(ws) if ws else pfad()
     if ziel_ws is None or not text.strip():
         return None

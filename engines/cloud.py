@@ -88,9 +88,6 @@ class CloudChat:
         # es ändert sich nur der Modellname, der Verlauf bleibt derselbe.
         self.auto_stark = False
         self.auto_ziel: str | None = None
-        # Vision macht der kleine Qwen-4B-Helfer (laden/gucken/entladen),
-        # nicht mehr Gemma-4-12B. Auto-Stark bleibt das große Gemma.
-        self.vision_ziel: str | None = None
         if provider_id == "ollama":
             try:
                 import config
@@ -196,13 +193,7 @@ class CloudChat:
             yield {"type": "note", "text": hinweis}
 
         use_model = self.model_id
-        if images and self.vision_ziel:
-            # Bild da + kleines Gemma aktiv → großer Bruder (12b) übernimmt das Sehen.
-            use_model = self.vision_ziel
-            kurz = self.vision_ziel.split(":")[-1].split("-")[0]      # z.B. "12b"
-            yield {"type": "note",
-                   "text": f"🔎 Bild erkannt – ich schau mit {kurz} genauer hin"}
-        elif self.auto_stark and self.auto_ziel and not images:
+        if self.auto_stark and self.auto_ziel and not images:
             # Auto-Stark: bei schweren Fragen für DIESE Antwort das große Modell nehmen.
             if await self._ist_schwer(user_text):
                 use_model = self.auto_ziel

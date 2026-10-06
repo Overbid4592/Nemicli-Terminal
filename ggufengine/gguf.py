@@ -24,6 +24,7 @@ from __future__ import annotations
 import mmap
 import os
 import struct
+import threading
 from dataclasses import dataclass
 from typing import Any, Dict, List, Tuple
 
@@ -170,6 +171,7 @@ class GGUFFile:
     def __init__(self, path: str | os.PathLike):
         self.path = os.fspath(path)
         self._fh = open(self.path, "rb")
+        self._lesen = threading.Lock()   # read_into: seek + read on the shared handle
         self.file_size = os.fstat(self._fh.fileno()).st_size
         if self.file_size < 24:
             self._fh.close()
@@ -300,6 +302,27 @@ class GGUFFile:
         if end > self.file_size:  # cannot happen after validation; belt and braces
             raise GGUFError("tensor out of bounds")
         return memoryview(self._mm)[start:end]
+
+    def read_into(self, ti: TensorInfo, out, start: int = 0) -> int:
+        """Copies tensor bytes [start, start + len(out)) into the writable buffer `out` with
+        plain file reads (large sequential requests instead of page faults on the mapping);
+        stops at the tensor end and returns the number of bytes read."""
+        view = memoryview(out).cast("B")
+        if not 0 <= start <= ti.n_bytes:
+            raise GGUFError("read outside the tensor")
+        n = min(view.nbytes, ti.n_bytes - start)
+        pos = self.data_offset + ti.offset + start
+        if pos + n > self.file_size:  # cannot happen after validation; belt and braces
+            raise GGUFError("tensor out of bounds")
+        with self._lesen:
+            self._fh.seek(pos)
+            got = 0
+            while got < n:
+                k = self._fh.readinto(view[got:n])
+                if not k:
+                    raise GGUFError("unexpected end of file")
+                got += k
+        return n
 
     def close(self) -> None:
         mm = getattr(self, "_mm", None)

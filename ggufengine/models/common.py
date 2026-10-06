@@ -10,9 +10,18 @@ import torch.nn.functional as F
 
 from .. import cudakern
 from .. import debuglog as dbg
+from .. import hostmem
 from ..gguf import GGML_TYPES, GGUFError, GGUFFile
 from ..qlinear import QuantLinear, build_quant_linear, kernel_available, quantizable
 from ..quant import dequantize, raw_to_tensor
+
+
+def release_pinned_memory() -> None:
+    """Hands pinned RAM nothing uses any more back to the system: dead `hostmem` blocks and
+    torch's cache of freed pinned blocks (read buffers of finished loaders)."""
+    hostmem.flush()
+    if hasattr(torch._C, "_host_emptyCache"):
+        torch._C._host_emptyCache()
 
 
 class WeightLoader:
@@ -32,6 +41,47 @@ class WeightLoader:
         self.quant = quant and kernel_available(device)
         self.experten_rest = experten_vram if device.type == "cuda" else None
         self.n_quant = 0            # matrices kept in quantised form
+        self._ring = None           # pinned read buffers [tensor, event of the last copy]
+        self._ring_pos = 0
+        self._strom = None          # copy stream: file reads overlap the conversions on the GPU
+
+    LESE_STUECK = 32 * 2**20
+    LESE_PUFFER = 4
+
+    def _roh(self, ti, device) -> torch.Tensor:
+        """Raw tensor bytes on `device`.  To the GPU they go as large file reads through a
+        ring of pinned buffers on a copy stream, so reading the next tensor overlaps the
+        conversion of this one (page faults on the mapping are about half as fast); on the
+        CPU they stay a zero-copy view of the mapping."""
+        device = torch.device(device)
+        if device.type != "cuda":
+            return raw_to_tensor(self.gg.tensor_bytes(ti), device)
+        if self._ring is None:
+            try:
+                self._ring = [[torch.empty(self.LESE_STUECK, dtype=torch.uint8, pin_memory=True), None]
+                              for _ in range(self.LESE_PUFFER)]
+                self._strom = torch.cuda.Stream(device)
+            except RuntimeError as exc:
+                dbg.event(f"Lesepuffer nicht festsetzbar ({exc}), Gewichte über die Dateiabbildung")
+                self._ring = []
+        if not self._ring:
+            return raw_to_tensor(self.gg.tensor_bytes(ti), device)
+        ziel = torch.empty(ti.n_bytes, dtype=torch.uint8, device=device)
+        # `ziel` may reuse memory that queued kernels on the compute stream still read
+        self._strom.wait_stream(torch.cuda.current_stream(device))
+        for start in range(0, ti.n_bytes, self.LESE_STUECK):
+            platz = self._ring[self._ring_pos]
+            self._ring_pos = (self._ring_pos + 1) % len(self._ring)
+            if platz[1] is not None:
+                platz[1].synchronize()                # buffer still being copied
+            n = self.gg.read_into(ti, platz[0].numpy(), start)
+            with torch.cuda.stream(self._strom):
+                ziel[start:start + n].copy_(platz[0][:n], non_blocking=True)
+                platz[1] = torch.cuda.Event()
+                platz[1].record(self._strom)
+        ziel.record_stream(self._strom)
+        torch.cuda.current_stream(device).wait_stream(self._strom)
+        return ziel
 
     def has(self, name: str) -> bool:
         return name in self.gg.tensors
@@ -40,7 +90,7 @@ class WeightLoader:
         ti = self.gg.tensors.get(name)
         if ti is None:
             raise GGUFError(f"missing tensor {name!r}")
-        raw = raw_to_tensor(self.gg.tensor_bytes(ti), self.device)
+        raw = self._roh(ti, self.device)
         out = dequantize(raw, ti.ggml_type, ti.n_elements, dtype or self.dtype)
         del raw
         self.loaded_bytes += ti.n_bytes
@@ -71,13 +121,13 @@ class WeightLoader:
         bias = self.norm(bias_name) if bias_name and self.has(bias_name) else None
         n_out, n_in = ti.shape
         if self.quant and quantizable(ti.ggml_type, n_out, n_in):
-            raw = raw_to_tensor(self.gg.tensor_bytes(ti), self.device)
+            raw = self._roh(ti, self.device)
             ql = build_quant_linear(raw, ti.ggml_type, n_out, n_in, bias)
             del raw
             self._count(ti)
             return ql
         if packed_type(ti.ggml_type):
-            pl = PackedLinear(raw_to_tensor(self.gg.tensor_bytes(ti), self.device), ti.ggml_type,
+            pl = PackedLinear(self._roh(ti, self.device), ti.ggml_type,
                               n_out, n_in, bias, self.dtype)
             self._count(ti)
             return pl
@@ -97,20 +147,21 @@ class WeightLoader:
         per = ti.n_bytes // n_exp
         if self.experten_rest is not None and GGML_TYPES[ti.ggml_type][0] in cudakern.FORMATE \
                 and not self._passt_in_vram(ti, n_out, n_in):
-            roh = raw_to_tensor(self.gg.tensor_bytes(ti), "cpu")           # view of the file mapping
-            try:
-                roh = roh.pin_memory()                                       # readable by the GPU kernels
+            try:                                                             # pinned: readable by the GPU kernels
+                roh = hostmem.empty(ti.n_bytes, self.device)               # exact size, no rounding
+                self.gg.read_into(ti, roh.numpy())
             except RuntimeError as exc:                                      # too much to pin: unpack per step
+                roh = raw_to_tensor(self.gg.tensor_bytes(ti), "cpu")       # view of the file mapping
                 dbg.event(f"{name}: RAM nicht festsetzbar ({exc}), Experten werden je Schritt kopiert")
             ex = PackedExperts(roh, ti.ggml_type, n_exp, n_out, n_in, self.dtype, geraet=self.device)
             self._count(ti)
             return ex
         if packed_type(ti.ggml_type):
-            ex = PackedExperts(raw_to_tensor(self.gg.tensor_bytes(ti), self.device), ti.ggml_type,
+            ex = PackedExperts(self._roh(ti, self.device), ti.ggml_type,
                                n_exp, n_out, n_in, self.dtype)
             self._count(ti)
             return ex
-        raw = raw_to_tensor(self.gg.tensor_bytes(ti), self.device)
+        raw = self._roh(ti, self.device)
         out = []
         for e in range(n_exp):
             part = raw[e * per:(e + 1) * per]
@@ -148,13 +199,13 @@ class WeightLoader:
             self._count(ti)
             return Embedding(raw, ti.ggml_type, n_vocab, n_embd), None
         if self.quant and quantizable(ti.ggml_type, n_vocab, n_embd):
-            raw = raw_to_tensor(self.gg.tensor_bytes(ti), self.device)
+            raw = self._roh(ti, self.device)
             emb = Embedding(raw, ti.ggml_type, n_vocab, n_embd)
             head = build_quant_linear(raw, ti.ggml_type, n_vocab, n_embd) if tied_head else None
             self._count(ti)
             return emb, head
         if packed_type(ti.ggml_type):
-            raw = raw_to_tensor(self.gg.tensor_bytes(ti), self.device)
+            raw = self._roh(ti, self.device)
             head = PackedLinear(raw, ti.ggml_type, n_vocab, n_embd, None, self.dtype) if tied_head else None
             self._count(ti)
             return Embedding(raw, ti.ggml_type, n_vocab, n_embd), head

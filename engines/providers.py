@@ -167,10 +167,6 @@ def detected() -> dict[str, Provider]:
     return {pid: p for pid, p in PROVIDERS.items() if p.available()}
 
 
-def any_cloud() -> bool:
-    return bool(detected())
-
-
 # --- Ollama (lokal, OpenAI-kompatibel, ohne Key) ----------------------------
 # Ollama spricht das OpenAI-Protokoll auf /v1 -> cloud.py kann es fahren.
 # Die Modell-Liste holen wir aber aus /api/tags, weil die (anders als /v1/models)
@@ -324,37 +320,9 @@ def cloud_name_vision(model_id: str) -> bool:
 def ist_vision_schwach(model_id: str) -> bool:
     """True für kleine Gemmas (e2b/e4b): Die MELDEN zwar 'vision', sind aber zu
     klein, um Bilder wirklich brauchbar zu lesen (Text/Zahlen/Details gehen unter).
-    Für die wird bei Bildern auf das große Gegenstück (12b) umgeschaltet."""
+    Sie gelten deshalb als nicht sehend."""
     low = (model_id or "").lower()
     return "gemma" in low and any(_hat_groesse(low, k) for k in ("e2b", "e4b"))
-
-
-def ollama_embedding_model() -> str | None:
-    """Name eines Embedding-fähigen Ollama-Modells (z.B. embeddinggemma), sonst None.
-    Wird vom Langzeitgedächtnis als „Bibliothekar" zum Finden passender Notizen genutzt."""
-    for m in _ollama_tags() or []:
-        if "embedding" in (m.get("capabilities") or []) and m.get("name"):
-            return m["name"]
-    return None
-
-
-def ollama_embed(texts: list[str], model: str | None = None) -> list[list[float]] | None:
-    """Wandelt Texte in Vektoren (Embeddings) über Ollama. None, wenn nicht möglich
-    (kein Embedding-Modell / Ollama aus / Fehler)."""
-    model = model or ollama_embedding_model()
-    if not model or not texts:
-        return None
-    try:
-        with httpx.Client(timeout=30.0) as c:
-            r = c.post(f"{OLLAMA_HOST}/api/embed",
-                       json={"model": model, "input": texts})
-            r.raise_for_status()
-            embs = r.json().get("embeddings")
-        if embs and len(embs) == len(texts):
-            return embs
-    except Exception:
-        return None
-    return None
 
 
 # --- Modell-Liste live abfragen --------------------------------------------
@@ -397,15 +365,6 @@ def _parse_models(p: Provider, data: dict) -> list[str]:
 
 _models_cache: dict[str, tuple[float, list[str]]] = {}
 _MODELS_TTL = 600.0        # 10 Minuten – Anbieter bringen selten stündlich neue Modelle
-
-
-def clear_model_cache(provider_id: str | None = None) -> None:
-    """Cache leeren – für einen Anbieter oder komplett."""
-    if provider_id is None:
-        _models_cache.clear()
-        return
-    for k in [k for k in _models_cache if k.startswith(f"{provider_id}:")]:
-        del _models_cache[k]
 
 
 async def list_models(provider_id: str, limit: int = 40,

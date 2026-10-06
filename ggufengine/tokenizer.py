@@ -181,7 +181,7 @@ _REGELN = {
 }
 _PRE_TYP = {
     **dict.fromkeys(("llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2",
-                     "glm4", "chatglm-bpe"), "llama3"),
+                     "glm4", "chatglm-bpe", "smaug-bpe", "dbrx"), "llama3"),
     **dict.fromkeys(("gpt-2", "phi-2", "mpt", "olmo", "jais", "trillion", "exaone4", "roberta-bpe"), "gpt2"),
     **dict.fromkeys(("starcoder", "refact", "command-r", "smollm", "codeshell", "exaone", "minerva-7b"), "starcoder"),
     "falcon": "falcon", "deepseek-coder": "deepseek-coder", "deepseek-v3": "deepseek-v3", "tekken": "tekken",
@@ -413,7 +413,7 @@ class StreamDecoder:
         self.tok = tok
         self.buf = bytearray()
 
-    VISIBLE_CONTROL = ("<think>", "</think>", "<|channel>", "<channel|>")
+    VISIBLE_CONTROL = ("<think>", "</think>", "<|channel>", "<channel|>", "[THINK]", "[/THINK]")
 
     def push(self, tid: int) -> str:
         if self.tok.is_control(tid):

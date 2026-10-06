@@ -41,8 +41,9 @@ class Cmd:
 
 COMMAND_LIST: list[Cmd] = [
     Cmd("/help", "Alle Befehle anzeigen"),
-    Cmd("/model", "KI-Modell wechseln (Cloud oder Lokal)", "[name]",
-        "KI-Modell wechseln (Cloud oder Lokal) – ohne Name: Auswahl-Menü"),
+    Cmd("/model", "KI-Modell wechseln (Cloud oder Lokal) · Modell von Hugging Face holen", "[name · huggingface]",
+        "KI-Modell wechseln (Cloud oder Lokal) – ohne Name: Auswahl-Menü. '/model huggingface' holt ein "
+        "lokales Modell: Größe und MoE wählen, Q4_K_M vorgeschlagen, Prüfung per SHA-256, fortsetzbar."),
     Cmd("/staerke", "Denk-Stärke oder Denkbudget wählen", "[stufe]",
         "Zeigt die passenden Stufen für dein Modell. Bei Kimi steuern sie das "
         "gemeinsame Tokenbudget für Denken und Antwort."),
@@ -56,14 +57,13 @@ COMMAND_LIST: list[Cmd] = [
         "🎭 Wer spricht? Ohne Name: Menü (eingebaute Nemi + deine eigenen). "
         "'/persönlichkeiten neu' legt per Fragen eine neue an – als Markdown-Datei "
         "in Persoenlichkeiten/, die du frei umschreiben kannst. Gilt sofort, bleibt gespeichert."),
-    Cmd("/bild", "Bild erzeugen 🎨 (eigene Stable-Diffusion-Pipeline)", "<beschreibung>"),
-    Cmd("/bildmodel", "Bild-Modell wählen 🎨 (eigene Pipeline oder externe WebUI)", "[name]",
-        "🖥 eigene Checkpoints (SD 1.5 / SDXL) ODER 🌐 Modelle einer laufenden "
-        "Forge/A1111-WebUI (Krea/Qwen/Flux …). Ohne Name: Menü. Die Wahl bleibt "
-        "gespeichert; '/bildmodel webui-adresse' ändert den WebUI-Host."),
-    Cmd("/bearbeiten", "Bild nachbessern 🖼 – Bereich markieren & neu malen", "[pfad]",
-        "Öffnet ein Fenster: Rahmen um Gesicht/Augen ziehen, neu malen lassen, "
-        "speichern. Ohne Pfad wird das zuletzt gemalte Bild genommen."),
+    Cmd("/bild", "Bild erzeugen 🎨 (Krea 2 · WebUI · ComfyUI)", "<beschreibung> | schritte",
+        "Malt ein Bild mit dem aktiven Motor. '/bild schritte' stellt die Krea-2-Schritte "
+        "dauerhaft ein (8 bis 16, Auswahl mit Enter)."),
+    Cmd("/bildmodel", "Bild-Modell wählen 🎨 (Krea 2 oder externe WebUI/ComfyUI)", "[name]",
+        "🟣 Krea 2 (eigene Pipeline) ODER 🌐 Modelle einer laufenden Forge/A1111-WebUI bzw. "
+        "🧩 ComfyUI. Ohne Name: Menü. Die Wahl bleibt gespeichert; '/bildmodel webui-adresse' "
+        "ändert den WebUI-Host."),
     Cmd("/resume", "Früheren Chat fortsetzen", "[#]",
         "Früheren Chat fortsetzen – ohne #: Liste"),
     Cmd("/wissen", "Zeigt, was NemiCLI gelernt hat"),
@@ -98,16 +98,27 @@ COMMAND_LIST: list[Cmd] = [
         "📜 Jede Aktion steht dauerhaft in learned/aktionen.log – Zeit, ändert/liest, "
         "Werkzeug, ausgeführt/abgelehnt/gesperrt, wer (auch Helfer), Beschreibung. "
         "Auch lesende Aktionen, denn die fragen nicht nach. Ohne Zahl: die letzten 30."),
+    Cmd("/doku", "Offline-Doku 📚: Python und MDN für den Coding-Assistenten", "[laden python|mdn · loeschen <quelle>]",
+        "📚 Lädt die offizielle Python-Doku (~4 MB, passend zur Python-Version) oder MDN (HTML, CSS, "
+        "JavaScript, Web-APIs; großer Download) und legt einen Volltext-Index an. Die KI sucht darin mit "
+        "doku_suchen, statt aus dem Gedächtnis zu raten. Ohne Zusatz: was geladen ist."),
+    Cmd("/charakter", "Charakter-Datei 🧬: feste Figur der Persönlichkeit für Bilder", "[oeffnen]",
+        "🧬 Zeigt die Charakter-Datei der aktiven Persönlichkeit (Profile/<Name>/<name>.json): Kern-Look, "
+        "fester Seed, Stil, Outfits, Posen, Regeln. `/charakter oeffnen` öffnet sie im Editor. Anlegen und "
+        "ändern kann auch die KI (charakter_aendern, mit Bestätigung)."),
     Cmd("/kugel", "Schwebekugel 🔮: Gesicht der Persönlichkeit malen, ansehen, entfernen",
-        "[malen <beschreibung> · weg · ordner]",
+        "[malen [beschreibung|bereich|alle] · motive · impuls an|aus · weg · ordner]",
         "🔮 Ohne Bild ist die Kugel eine Kugel. `/kugel malen` lässt die aktive Persönlichkeit sich "
         "selbst beschreiben und malt vier Stimmungsbilder (neutral, froh, ernst, denkt) mit festem "
-        "Seed über den Bild-Motor, stellt sie frei und legt sie in Persoenlichkeiten/ ab. "
-        "`/kugel malen <beschreibung>` nimmt deine Beschreibung. `/kugel weg` = zurück zur Kugel."),
+        "Seed über den Bild-Motor, stellt sie frei und legt sie in Persoenlichkeiten/<Name>/ ab. "
+        "`/kugel malen <beschreibung>` nimmt deine Beschreibung. `/kugel motive` zeigt 20 Bereiche "
+        "mit 400 Motiven; `/kugel malen <nummer|bereich>` oder `alle` malt die fehlenden mit derselben "
+        "Figur (10 Schritte je Bild). `/kugel impuls an`: ab und an ein freier Moment – sie entscheidet "
+        "selbst, ob sie etwas sagt, malt oder still bleibt. `/kugel weg` = zurück zur Kugel."),
     Cmd("/wache", "Systemwache 🛡: Sensoren, Regeln, lernendes Modell – im Hintergrund",
         "[status · alarme · start · stop · …]",
         "🛡 Die Wache läuft als Hintergrund-Prozess mit Symbol in der Taskleiste: Prozesse, "
-        "Netz und Dateien werden beobachtet, 13 Regeln und ein eigener Isolation Forest "
+        "Netz und Dateien werden beobachtet, 14 Regeln und ein eigener Isolation Forest "
         "bewerten, ab 200 Ereignissen wird trainiert, dann alle 200 von selbst. Bei Alarm "
         "wird die aktive Persönlichkeit geweckt, prüft nach, urteilt und darf in deinen "
         "Grenzen justieren – alles im Protokoll. Ohne Zusatz: Lage. Weitere: alarme [id], "
@@ -137,9 +148,14 @@ COMMAND_LIST: list[Cmd] = [
         "✅ `befehl` fragt einmal, wenn das Kommando nur liest oder auf der Whitelist steht "
         "(git status, pip list …) – sonst zweimal, rot markiert. '/whitelist git push' prüft "
         "einen Befehl. Die Liste liegt in befehl_whitelist.json im Programm-Ordner."),
-    Cmd("/update", "NemiCLI per Git aktualisieren ⬇", "",
-        "⬇ git pull (nur Fast-Forward) und bei Bedarf Abhängigkeiten nachziehen – "
-        "fragt vorher. Geht nur im Skript-Modus mit Git-Repo + Remote."),
+    Cmd("/update", "Aktualisieren ⬇: venv prüfen – Lücken, fehlende Pakete, Updates", "",
+        "⬇ Prüft das venv neben NemiCLI gegen requirements.txt und die Bild-Bausteine: fehlt etwas, "
+        "passt eine Version nicht, stimmt der torch-Bau nicht zur Grafikkarte, gibt es erlaubte Updates? "
+        "Dazu bekannte Sicherheitslücken und Schadpakete aller Pakete (OSV.dev) – behoben wird mit der "
+        "ersten reparierten Version. Zeigt eine Liste und fragt; nach dem Installieren prüft ein Import-Test, "
+        "ob alles lädt, sonst kommt die alte Version zurück. Mit Cloud-Modell kann die KI die Lücken erklären. "
+        "Pakete, die gerade benutzt werden, kommen beim nächsten Start. torch wird nur repariert. "
+        "Im Quelltext-Modus mit Git-Remote vorher git pull."),
     Cmd("/workspace", "Projektordner festnageln 📌 – nur noch dort arbeiten", "[pfad · status]",
         "📌 Nagelt einen Ordner fest: ab dann arbeitet die Persönlichkeit NUR dort "
         "(lesen, schreiben, suchen, Befehle) – gegen das Abdriften in zwanzig Ordner. "
@@ -158,9 +174,10 @@ COMMAND_LIST: list[Cmd] = [
         "Bleibt an, bis du /codeend tippst oder „Coding aus“ sagst. '/code status' zeigt die Liste."),
     Cmd("/codeend", "Coding-Assistent beenden", "",
         "🟦 Schaltet den Coding-Assistenten ab. Die Ablage .nemicli/ bleibt beim Projekt liegen."),
-    Cmd("/systemcheck", "PC prüfen 🩺: Grafikkarte, Pakete, was noch fehlt",
+    Cmd("/systemcheck", "PC prüfen 🩺: CPU, Grafikkarten, RAM, Pakete, was noch fehlt",
         "",
-        "🩺 Prüft die Grafikkarte (auch die Rechen-Stufe wie sm_120), sagt den "
+        "🩺 Steckbrief des PCs (CPU mit AVX, alle Grafikkarten, RAM, Windows, womit lokale Modelle "
+        "rechnen), prüft die Grafikkarte (auch die Rechen-Stufe wie sm_120), sagt den "
         "passenden torch-Installationsbefehl für genau diesen PC und listet, "
         "welche Modelle und Pakete noch fehlen"),
     Cmd("/ml", "ML-Bericht: was mein Ordner-Sinn erkennt & gelernt hat"),
@@ -292,9 +309,27 @@ UNTERMENUES: dict[str, list[tuple[str, str, str | None]]] = {
         ("an", "Auto-Stark an", None),
         ("aus", "Auto-Stark aus", None),
     ],
+    "/bild": [
+        ("", "🎨 Status: Bild-Motor und Nutzung", None),
+        ("{}", "🖌 Bild malen", "Was soll gemalt werden?"),
+        ("schritte", "🔢 Krea-2-Schritte einstellen (8 bis max. 16, bleibt gespeichert)", None),
+    ],
+    "/doku": [
+        ("", "📚 Was ist geladen?", None),
+        ("laden python", "🐍 Python-Doku laden (~4 MB)", None),
+        ("laden mdn", "🌐 MDN laden: HTML, CSS, JavaScript, Web-APIs (großer Download)", None),
+    ],
+    "/charakter": [
+        ("", "🧬 Charakter-Datei ansehen", None),
+        ("oeffnen", "📝 Im Editor öffnen", None),
+    ],
     "/kugel": [
         ("", "🔮 Status", None),
         ("malen {}", "🎨 Gesicht malen lassen", "Wie soll sie aussehen? (leer = sie beschreibt sich selbst)"),
+        ("motive", "🖼 Motive: 20 Bereiche, was schon gemalt ist", None),
+        ("motive {}", "🎨 Motive malen", "Bereich (Nummer oder Name) oder alle"),
+        ("impuls an", "🌈 Freier Moment an", None),
+        ("impuls aus", "Freier Moment aus", None),
         ("weg", "⚪ Zurück zur Kugel", None),
         ("ordner", "📁 Ordner öffnen", None),
     ],
@@ -340,6 +375,145 @@ def help_rows() -> list[tuple[str, str]]:
     return [(c.usage, c.help_text) for c in COMMAND_LIST]
 
 
+def _fold(s: str) -> str:
+    """Vergleichsform: klein, Umlaute ausgeschrieben."""
+    s = s.lower()
+    for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
+        s = s.replace(a, b)
+    return s
+
+
+def find_commands(text: str, ausfuehrlich: bool = False) -> list[tuple[str, str]]:
+    """Befehle zu einer Eingabe wie "/mod": erst Treffer am Namensanfang, dann
+    im Namen, dann im Kurztext (ab 3 Zeichen; `ausfuehrlich`: auch im langen Text).
+    Liefert (Name, Kurztext)."""
+    q = _fold(text.lstrip("/"))
+    if not q:
+        return [(c.name, c.short) for c in COMMAND_LIST]
+    anfang, im_namen, in_text = [], [], []
+    for c in COMMAND_LIST:
+        name = _fold(c.name[1:])
+        if name.startswith(q):
+            anfang.append(c)
+        elif q in name:
+            im_namen.append(c)
+        elif len(q) >= 3 and q in _fold(f"{c.short} {c.long}" if ausfuehrlich else c.short):
+            in_text.append(c)
+    return [(c.name, c.short) for c in anfang + im_namen + in_text]
+
+
+TASTEN = ("Enter senden · Strg+J neue Zeile · Esc abbrechen · F2 Denktext · F8 Änderung freigeben · "
+          "F12 Gespräch sichern · Shift+Tab Modus · Tab/↑↓ im /-Menü · Strg+C markierten Text kopieren")
+
+EINSTELLUNGEN = """\
+## Einstellungen und Dateien
+Selbst ändern (nur auf direkten Wunsch, der Nutzer bestätigt): einstellung_aendern mit
+was "internet_erlauben" oder "internet_sperren" und wert = Domain. Eigene Einträge liegen in
+allowlist_eigen.json im Programm-Ordner, die mitgelieferte Liste in allowlist.json; /web zeigt alle.
+Gefällt kein Farbschema: mit theme_erstellen ein eigenes entwerfen (themes_eigen.json im Programm-Ordner),
+danach /theme mit menue_oeffnen öffnen.
+Nur der Nutzer selbst – nenne ihm den Weg:
+- Modell, Cloud-Key: /model → „Cloud-Anbieter hinzufügen“ (Key wird verschlüsselt gespeichert)
+- Lösch-Limit /limit · Befehls-Whitelist /whitelist (befehl_whitelist.json) · Projekt für die
+  Sandbox freigeben /sandbox · Programm-Ordner auf Zeit öffnen /schluessel · Sperrliste
+  schreibsperre.json im Programm-Ordner (nur von Hand)
+- Daten-Ordner wählen /start: chats, Bilder, Persoenlichkeiten, Skills, Papierkorb (/undo),
+  Protokoll learned/aktionen.log
+- Lokales Modell holen: /model → „Modell von Hugging Face holen“ (oder /model huggingface) –
+  Größe und MoE wählen, landet in ModelGGUF/<Name>/; danach /model → Lokal.
+  Gedächtnis-Modelle: Models/embeddings (/embeddings)"""
+
+
+# Auswahl nach laufendem Stand (Theme, Modus, Stärke …); main.py setzt das beim Start.
+AUSWAHL_JETZT: Callable[[str], list] | None = None
+
+
+def auswahl(name: str) -> list[tuple[str, str, str | None]]:
+    """Einträge des Auswahlmenüs eines Befehls: laufender Stand, sonst die festen."""
+    if AUSWAHL_JETZT is not None:
+        try:
+            return list(AUSWAHL_JETZT(name) or [])
+        except Exception:
+            pass
+    return list(UNTERMENUES.get(name, []))
+
+
+# Werkzeug menue_oeffnen: Die KI öffnet ein Auswahlmenü, der Nutzer wählt selbst.
+# Sicherheit, Modus und Arbeitsordner bleiben beim Nutzer.
+MENUE_GESPERRT = {"/schluessel", "/schlüssel", "/limit", "/whitelist", "/sandbox", "/modus", "/auto",
+                  "/wache", "/code", "/workspace"}
+MENUE_EIGENE = {"/theme", "/staerke", "/kontext", "/embeddings", "/model", "/bildmodel"}
+MENUE_UNTERPUNKTE = {"/bild": {"schritte"}, "/model": {"huggingface"}}   # Zusatz öffnet ein weiteres Menü
+
+
+def menue_befehle() -> list[str]:
+    """Befehle, deren Menü die KI öffnen darf."""
+    namen = (set(UNTERMENUES) | MENUE_EIGENE) - MENUE_GESPERRT
+    return sorted(namen & {c.name for c in COMMAND_LIST})
+
+
+def menue_pruefen(befehl) -> tuple[str | None, str]:
+    """("/befehl [zusatz]", "") wenn die KI dieses Menü öffnen darf, sonst (None, Grund)."""
+    teile = str(befehl or "").strip().split()
+    if not teile:
+        return None, "Feld 'befehl' fehlt (z. B. \"/theme\")."
+    cmd = teile[0].lower()
+    cmd = cmd if cmd.startswith("/") else "/" + cmd
+    erlaubt = menue_befehle()
+    if cmd not in erlaubt:
+        return None, (f"{cmd} kann ich nicht öffnen – nenne dem Nutzer den Befehl. "
+                      "Öffnen kann ich: " + " ".join(erlaubt))
+    zusatz = " ".join(teile[1:]).lower()
+    if zusatz and zusatz not in MENUE_UNTERPUNKTE.get(cmd, set()):
+        return None, (f"'{cmd} {zusatz}' würde direkt etwas ändern – öffne nur '{cmd}', der Nutzer wählt selbst."
+                      + "".join(f" Erlaubt: {cmd} {u}." for u in sorted(MENUE_UNTERPUNKTE.get(cmd, ()))))
+    return f"{cmd} {zusatz}".strip(), ""
+
+
+def _werte_kurz(name: str) -> str:
+    """Gültige Werte eines Befehls in einer Zeile ("cyan (aktiv) · matrix"), nur bei kurzen,
+    reinen Wertelisten; sonst leer."""
+    eintraege = auswahl(name)
+    if not eintraege or len(eintraege) > 8 or any(not z or "{}" in z or " " in z for z, _, _ in eintraege):
+        return ""
+    return " · ".join(z + (" (aktiv)" if t.lstrip().startswith("✓") else "") for z, t, _ in eintraege)
+
+
+def hilfe_fuer_ki(thema: str = "") -> str:
+    """Bedienhilfe zu NemiCLI für das Modell. Leer: alle Befehle kurz, mit den gültigen Werten.
+    "/befehl" oder Suchwort: die passenden Befehle ausführlich, mit Untermenü."""
+    thema = (thema or "").strip()
+    if not thema:
+        zeilen = []
+        for c in COMMAND_LIST:
+            werte = _werte_kurz(c.name)
+            zeilen.append(f"- {c.usage} — {c.short}" + (f"  [Werte: {werte}]" if werte else ""))
+        return ("# NemiCLI-Bedienung\nSlash-Befehle tippt der Nutzer selbst. Diese Menüs kannst du ihm "
+                "mit menue_oeffnen öffnen (er wählt selbst): " + " ".join(menue_befehle())
+                + ", dazu /bild schritte und /model huggingface. Sonst nenne den passenden Befehl und was "
+                "dort zu wählen ist. Bei [Werte: …] gibt es genau diese Werte – keine anderen nennen; die "
+                "Werte anderer Befehle stehen unter anleitung_lesen \"/name\".\n\n"
+                + "\n".join(zeilen)
+                + f"\n\nTasten: {TASTEN}\n\n" + EINSTELLUNGEN
+                + "\n\nDetails zu einem Befehl: anleitung_lesen mit thema \"/name\".")
+    namen = [n for n, _ in find_commands(thema if thema.startswith("/") else "/" + thema,
+                                         ausfuehrlich=True)][:5]
+    if not namen:
+        return ""
+    nach_name = {c.name: c for c in COMMAND_LIST}
+    teile = []
+    for n in namen:
+        c = nach_name[n]
+        teil = f"## {c.usage}\n{c.help_text}"
+        eintraege = auswahl(c.name)
+        if eintraege:
+            teil += "\nAuswahl ohne Zusatz (✓ = jetzt aktiv): " + " · ".join(
+                f"{c.name} {z}".replace("{}", "<…>").strip() + f" ({t.strip()})"
+                for z, t, _ in eintraege)
+        teile.append(teil)
+    return "\n\n".join(teile)
+
+
 # ---------------------------------------------------------------------------
 # Der Vorschlags-Motor für prompt_toolkit
 # ---------------------------------------------------------------------------
@@ -373,14 +547,13 @@ class SlashCompleter(Completer):
 
         # Noch beim ersten Wort -> Befehle vorschlagen
         if " " not in text:
-            for cmd, desc in COMMANDS.items():
-                if cmd.startswith(text):
-                    yield Completion(
-                        cmd,
-                        start_position=-len(text),
-                        display=cmd,
-                        display_meta=desc,
-                    )
+            for cmd, desc in find_commands(text):
+                yield Completion(
+                    cmd,
+                    start_position=-len(text),
+                    display=cmd,
+                    display_meta=desc,
+                )
             return
 
         # Zweites Wort -> Argumente zum jeweiligen Befehl
@@ -399,7 +572,7 @@ class SlashCompleter(Completer):
         if cmd == "/theme":
             return [(k, v["label"]) for k, v in self._get_themes().items()]
         if cmd == "/model":
-            return list(self._get_models().items())
+            return [("huggingface", "🤗 Modell von Hugging Face holen")] + list(self._get_models().items())
         if cmd == "/staerke":
             return list(self._get_strengths().items())
         if cmd == "/resume":
@@ -421,12 +594,13 @@ class SlashCompleter(Completer):
             return ([("neu", "Neue Persönlichkeit anlegen (Fragen beantworten)")]
                     + list(self._get_personas().items()))
         if cmd == "/bild":
-            flags = [("--neg", "Negativ-Prompt (was NICHT)"),
-                     ("--steps", "Schritte (z.B. 28)"),
-                     ("--cfg", "Prompt-Treue (z.B. 7)"),
-                     ("--size", "Größe, z.B. 768x768"),
+            flags = [("schritte", "Krea-2-Schritte dauerhaft einstellen (8–16)"),
+                     ("--steps", "Schritte nur für dieses Bild"),
+                     ("--size", "Größe, z.B. 1024x1024"),
                      ("--seed", "Zufalls-Startwert"),
-                     ("--model", "welcher Checkpoint")]
+                     ("--model", "welches Bild-Modell"),
+                     ("--neg", "Negativ-Prompt (nur WebUI/ComfyUI)"),
+                     ("--cfg", "Prompt-Treue (nur WebUI/ComfyUI)")]
             return list(self._get_checkpoints().items()) + flags
         return []
 

@@ -10,8 +10,10 @@ ZWEI WURZELN, und das ist der ganze Punkt dieser Datei:
   DATEN   - der NemiCLI-Ordner des Nutzers. Chats, Bilder, Modelle, das
             Gelernte, die Persönlichkeiten. Alles, was wächst.
 
-Getrennt, weil ein Umzug des Programm-Ordners sonst das ganze Gedächtnis
-mitreißen kann: das Programm darf umziehen, neu gebaut oder als exe gepackt
+Bis zum 15.09.2026 war das derselbe Ordner. Das ging so lange gut, bis der
+Programm-Ordner umzog (Desktop -> AppData) - dabei blieb das venv auf der
+Strecke, und genauso hätte es das ganze Gedächtnis erwischen können. Deshalb
+jetzt getrennt: das Programm darf umziehen, neu gebaut oder als exe gepackt
 werden, ohne dass die Daten das mitmachen müssen.
 
 Wo DATEN liegt, entscheidet der NUTZER - über das Fenster beim ersten Start
@@ -31,8 +33,9 @@ NemiCLI.exe liegt.
 
 Zusätzlich legt `ensure_layout()` beim Start die Ordner an, die NemiCLI
 braucht, und schreibt in die Modell-Ordner eine "LIES-MICH"-Datei: die
-großen Modelle (GGUF / Stable-Diffusion-Checkpoints) darf NemiCLI nicht
-mitliefern - die holt sich jeder selbst.
+großen Modelle (GGUF, Bildbeschreiber, Krea 2) liefert NemiCLI nicht mit.
+Sprachmodelle (ModelGGUF/), Bildbeschreiber (Vision/) und Embeddings
+(Models/embeddings/) liegen im Programm-Ordner, Krea 2 bei den Daten.
 """
 
 from __future__ import annotations
@@ -190,7 +193,7 @@ def asset(name: str) -> Path:
 # ===========================================================================
 
 # Ordner, die immer da sein sollen.
-_DIRS = ("Models", "Models/checkpoints", "Bilder", "chats",
+_DIRS = ("Models", "Models/Krea2", "Bilder", "chats",
          "learned", "learned/snippets", "learned/skills", "NemiSandbox", "Befehle",
          "Gespraeche", "Wissen")
 
@@ -215,55 +218,75 @@ Für einen einmaligen Befehl braucht NemiCLI KEINE Datei: das Werkzeug führt
 mehrzeilige PowerShell direkt aus. Skripte hier darfst du jederzeit löschen.
 """
 
-_GGUF_README = """=== Sprach-Modelle laufen ueber Ollama ===
+_MODELS_README = """=== Was in diesen Ordner gehoert ===
 
-NemiCLI bringt KEINE Modelle mit - die sind mehrere Gigabyte gross und jeder
-soll sich selbst aussuchen, welches er mag.
+Krea2/   Dateien fuer den Bild-Motor Krea 2 (/bild). Erklaerung im Ordner.
 
-Frueher konnte NemiCLI eigene .gguf-Dateien aus diesem Ordner selbst starten
-(ueber llama.cpp). Das ist entfallen. Eine .gguf hier abzulegen bringt nichts -
-sie wird nicht gefunden.
+Sprachmodelle, Bildbeschreiber und Embeddings liegen NICHT hier, sondern
+im Programm-Ordner von NemiCLI:
 
-So geht es heute:
+  ModelGGUF/<Name>/          lokale Sprachmodelle (eigener GGUF-Motor)
+  Vision/<Name>/             Bildbeschreiber fuer Modelle ohne Sehen
+  Models/embeddings/<Name>/  Embedding-Modell fuers Gedaechtnis
 
-  1. Ollama installieren:  https://ollama.com/download
-  2. NemiCLI starten -> /model -> "Ollama-Modell herunterladen"
-     (oder im Terminal:  ollama pull gemma3)
-  3. /model -> "Ollama" -> Modell auswaehlen.
-
-Ollama bringt seine eigene Rechen-Maschine mit und laeuft auf der GPU.
-Welche Groesse auf deinen PC passt, sagt dir:  /systemcheck
-
-Alternative ohne lokale Modelle: einen Cloud-Schluessel in die .env legen
-(z.B. OPENAI_API_KEY) - dann laeuft alles ueber die Cloud.
-
-In diesem Ordner liegen weiterhin die BILD-Modelle (Models/checkpoints) und
-die Embeddings fuers Gedaechtnis.
+In jedem dieser Ordner steht ein eigener LIES-MICH.
 """
 
-_SD_README = """\
-=== Hier kommen deine Bild-Modelle rein (.safetensors) ===
+# Erster Satz des frueheren Models-LIES-MICH (Stand llama.cpp/Ollama). Eine solche
+# unveraenderte Datei ersetzt ensure_layout() durch _MODELS_README.
+_ALTER_MODELS_NAME = "LIES-MICH – hier GGUF-Modelle ablegen.txt"
+_ALTER_MODELS_KOPF = "=== Sprach-Modelle laufen ueber Ollama ==="
 
-Für /bild (Bilder malen) braucht NemiCLI ein Stable-Diffusion-Modell.
-Auch das bringt sie NICHT mit - zu groß, und der Geschmack ist verschieden.
+_MODELGGUF_README = """=== Lokale Sprachmodelle fuer den eigenen GGUF-Motor ===
 
-So geht's:
+Ein Unterordner je Modell. Darin:
+  - genau eine .gguf mit dem Sprachmodell
+  - optional eine mmproj-*.gguf: dann sieht das Modell Bilder
 
-  1. Einen Checkpoint herunterladen (Format .safetensors), z.B. von
-     https://civitai.com  oder  https://huggingface.co
-     Unterstützt: SD 1.5 und SDXL. (SDXL braucht ca. 6-7 GB Platz.)
+Beispiel:
+  ModelGGUF/Gemma4/gemma-4-E4B-it-Q4_K_M.gguf
+  ModelGGUF/Gemma4/mmproj-gemma-4-E4B-it-BF16.gguf
 
-  2. Die .safetensors-Datei IN DIESEN ORDNER LEGEN.
+Am einfachsten: /model huggingface. NemiCLI zeigt nur Modelle, die der Motor
+laden kann (ab 4B Parameter), prueft jede Datei mit SHA-256 und legt sie
+hier ab. Danach: /model -> "Lokal (eigener Motor)".
 
-  3. NemiCLI starten -> /bildmodel -> Modell auswählen.
-     Danach: /bild ein fuchs im wald   (oder einfach "mal mir einen Fuchs")
+Kein Server, kein llama.cpp, kein Ollama noetig - der Motor rechnet mit torch
+im NemiCLI-Prozess.
+"""
 
-Dafür wird zusätzlich torch + diffusers gebraucht (einmalige Installation).
-Welcher Befehl bei DEINER Grafikkarte der richtige ist, sagt dir:
-  /systemcheck
+_VISION_README = """=== Bildbeschreiber: Augen fuer lokale Modelle ohne Sehen ===
 
-Sicherheits-Hinweis: Nimm .safetensors, keine .ckpt-Dateien - .ckpt kann
-beim Laden Code ausführen.
+Sieht ein Modell im eigenen GGUF-Motor selbst keine Bilder, beschreibt ein
+kleines sehendes Modell aus diesem Ordner das Bild als Text. Das Sprachmodell
+bekommt die Beschreibung und kann mit dem Werkzeug bild_fragen nachfragen.
+
+Ein Unterordner je Beschreiber. Darin:
+  - eine .gguf mit dem Modell (z. B. Gemma-4-E2B)
+  - eine mmproj-*.gguf mit dem Bild-Teil
+
+Beispiel:
+  Vision/GemmaE2B/gemma-4-E2B-it-Q4_K_M.gguf
+  Vision/GemmaE2B/mmproj-gemma-4-E2B-it-BF16.gguf
+
+Genommen wird der erste Ordner mit bekanntem Bild-Encoder.
+Gilt nur fuer lokale Modelle im eigenen Motor, nie fuer Cloud-Modelle.
+Modelle, die selbst sehen (mmproj im ModelGGUF-Ordner), brauchen ihn nicht.
+"""
+
+_KREA_README = """\
+=== Hier kommen die Dateien fuer Krea 2 rein (Bilder malen) ===
+
+/bild malt mit Krea 2, NemiCLIs eigener Bild-Pipeline. Die Modelldateien bringt
+NemiCLI nicht mit - zu gross.
+
+Hierher gehoeren:
+  - das Krea-2-Modell (.safetensors)
+  - text_encoders/  (Text-Encoder)
+  - vae/            (VAE)
+  - der Tokenizer   (vocab.json + merges.txt)
+
+Danach: /bildmodel -> Modell auswaehlen. Fehlt etwas, sagt /bild genau was.
 """
 
 _BILDER_README = """\
@@ -314,14 +337,30 @@ def ensure_layout() -> None:
             (DATEN / rel).mkdir(parents=True, exist_ok=True)
         except Exception:
             pass
-    _write_once(DATEN / "Models" / "LIES-MICH – hier GGUF-Modelle ablegen.txt",
-                _GGUF_README)
-    _write_once(DATEN / "Models" / "checkpoints" /
-                "LIES-MICH – hier Bild-Modelle ablegen.txt", _SD_README)
+    _alten_models_zettel_ersetzen()
+    _write_once(DATEN / "Models" / "LIES-MICH.txt", _MODELS_README)
+    _write_once(DATEN / "Models" / "Krea2" /
+                "LIES-MICH – hier Krea-2-Dateien ablegen.txt", _KREA_README)
     _write_once(DATEN / "Bilder" / "LIES-MICH.txt", _BILDER_README)
     _write_once(DATEN / "Befehle" / "LIES-MICH.txt", _BEFEHLE_README)
     _write_once(DATEN / "Gespraeche" / "LIES-MICH.txt", _GESPRAECHE_README)
     _write_once(DATEN / "Wissen" / "LIES-MICH.txt", _WISSEN_README)
+    for rel, text in (("ModelGGUF", _MODELGGUF_README), ("Vision", _VISION_README)):
+        try:
+            (INSTALL / rel).mkdir(parents=True, exist_ok=True)
+        except Exception:
+            continue
+        _write_once(INSTALL / rel / "LIES-MICH.txt", text)
+
+
+def _alten_models_zettel_ersetzen() -> None:
+    """Den früheren Models-LIES-MICH entfernen, solange er unverändert ist."""
+    alt = DATEN / "Models" / _ALTER_MODELS_NAME
+    try:
+        if alt.is_file() and alt.read_text(encoding="utf-8").startswith(_ALTER_MODELS_KOPF):
+            alt.unlink()
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":       # Selbsttest:  python core/paths.py

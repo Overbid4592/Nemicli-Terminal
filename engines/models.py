@@ -8,8 +8,7 @@ Modell-Referenzen ("refs") sind einheitlich `<anbieter>:<modell>`:
     gguf:Gemma4                     -> eigener GGUF-Motor (engines/gguflokal.py,
                                        Modelle in ModelGGUF/<Name>/ im Programm-Ordner)
 
-`Models/` bleibt: dort liegen weiterhin die Bild-Modelle (Models/checkpoints)
-und die Embeddings fürs Gedächtnis.
+`Models/` bleibt: dort liegen die Krea-2-Dateien (Models/Krea2) und die Embeddings fürs Gedächtnis.
 """
 
 from __future__ import annotations

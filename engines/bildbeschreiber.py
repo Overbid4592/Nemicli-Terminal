@@ -60,7 +60,7 @@ def finden() -> tuple[Path, Path] | None:
         return None
     for d in sorted(p for p in ORDNER.iterdir() if p.is_dir()):
         modell = gguflokal._gguf_in(d)
-        mm = sorted(d.glob("mmproj*.gguf"))
+        mm = sorted(p for p in d.glob("*.gguf") if gguflokal._ist_mmproj(p))
         if modell is not None and mm and gguflokal.projektor_bekannt(mm[0]):
             return modell, mm[0]
     return None
@@ -136,5 +136,7 @@ def entladen() -> None:
     try:
         import gc
         gc.collect()
+        from ggufengine.models.common import release_pinned_memory
+        release_pinned_memory()                  # ausgelagerte Gewichte im festgesetzten RAM
     except Exception:
         pass

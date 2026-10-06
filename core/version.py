@@ -20,8 +20,8 @@ import sys
 from pathlib import Path
 
 VERSION = "5.1 Alpha"
-STAND = "2026.09.25"
-AUTHOR = "VibeCoder"
+STAND = "2026.10.06"
+AUTHOR = "D. Hoffmann (Vibecoder)"
 BUILT_WITH = "Claude Opus 5 · Anthropic"
 
 try:                                     # exe-Modus: Daten liegen neben der exe

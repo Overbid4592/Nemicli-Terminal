@@ -5,7 +5,7 @@ Idee (wie beim Hermes-Agent): Statt Python ins System zu installieren und den
 PATH zu verbiegen, holt sich NemiCLI ein winziges Werkzeug namens `uv` und lässt
 es ein **eigenständiges Python 3.12** in einen App-eigenen Ordner legen. Dann
 baut es damit ein `venv` neben NemiCLI und installiert die schweren Bild-Pakete
-(torch/diffusers) dort hinein. Nichts davon berührt das System des Nutzers:
+(torch & Co.) dort hinein. Nichts davon berührt das System des Nutzers:
 
   · kein Admin
   · keine PATH-Änderung
