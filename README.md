@@ -241,7 +241,6 @@ NemiCli/
 ├─ Agenten/               Anleitungen, die die Persönlichkeit abarbeitet
 ├─ chrome-erweiterung/    Chrome-Erweiterung (LIESMICH.md)
 ├─ installer/             MSI-Bau
-├─ tests/                 Offline-Tests
 ├─ docs/                  Funktionen, Technik, Modelltests, Pläne, Ideen
 ├─ build_exe.py · NemiCLI.spec · zertifikat.py
 ├─ nemicli.config.json · .env            Einstellungen · Schlüssel (verschlüsselt)
