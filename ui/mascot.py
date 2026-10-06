@@ -1,8 +1,9 @@
 """
 mascot.py - das kleine Maskottchen, das ab und zu was bubbelt. 💜
 
-Beim Start ein Gruß, zwischendurch ein Tipp oder ein Spruch. Hier spricht
-die AKTIVE PERSÖNLICHKEIT, kein fester Spruchzettel. Jede
+Beim Start ein Gruß, zwischendurch ein Tipp oder ein Spruch. Seit 19.09.2026
+spricht hier die AKTIVE PERSÖNLICHKEIT, nicht mehr ein fester Spruchzettel
+(„Dein Terminal-Kumpel ist wach“ passte zu keiner von ihnen). Jede
 Persönlichkeit hat ihre eigene Datei `Persoenlichkeiten/<key>.sprueche.md`
 mit zwei Abschnitten (## Begrüßung / ## Sprüche, eine Zeile je Satz,
 {nutzer} und {name} werden ersetzt). Fehlt die Datei, schreibt sie die

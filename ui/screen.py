@@ -109,7 +109,7 @@ _MAX_LINES = 6000          # Verlauf im Speicher kappen
 
 
 # --- Zeichenbreite: Terminal und prompt_toolkit müssen sich einig sein --------
-# Gemessen (Windows Terminal): alle nackten Symbole der UI stimmen
+# Gemessen (Windows Terminal, 12.09.2026): alle nackten Symbole der UI stimmen
 # überein. Auseinander laufen sie nur bei
 #   · Symbol + U+FE0F (Variation Selector-16, „zeig mich als buntes Emoji"):
 #     ❤️ ⚠️ 🛡️ …   Terminal 2 Zellen, prompt_toolkit 1

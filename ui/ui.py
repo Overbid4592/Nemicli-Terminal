@@ -73,6 +73,20 @@ THEMES: dict[str, dict] = {
     },
 }
 
+EINGEBAUT = frozenset(THEMES)
+
+
+def eigene_themes_laden() -> None:
+    """Eigene Themes (themes_eigen.json, Werkzeug theme_erstellen) zu den eingebauten holen."""
+    try:
+        import themes_eigen
+        THEMES.update({k: v for k, v in themes_eigen.laden().items() if k not in EINGEBAUT})
+    except Exception:
+        pass
+
+
+eigene_themes_laden()
+
 _active = "cyan"          # aktuelles Theme
 _gradient: list[str] = THEMES[_active]["gradient"]
 
@@ -226,7 +240,7 @@ def _banner_panel(logo: Text, width: int | None = None) -> Panel:
     tagline.append(APP_SUBTITLE, style="muted")
     tagline.append(" ✦", style="accent")
     credit = Text(justify="center")
-    credit.append("von VibeCoder · gebaut mit Claude Opus 5", style="brand.dim")
+    credit.append("von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5", style="brand.dim")
     inner = Group(Align.center(logo), Text(""), tagline, credit)
     return Panel(inner, box=HEAVY, border_style="brand.dim",
                  padding=(1, _banner_pad(width)))
@@ -337,8 +351,6 @@ def stats_panel(rep: dict) -> None:
         except Exception:
             return "–"
 
-    p = THEMES[_active]
-    body = Text()
     ov = Table.grid(padding=(0, 3))
     ov.add_column(style="muted", no_wrap=True); ov.add_column(style="accent", no_wrap=True)
     ov.add_column(style="muted", no_wrap=True); ov.add_column(style="accent", no_wrap=True)
@@ -426,36 +438,6 @@ def text_panel(title: str, text: str) -> None:
     console.print(Panel(escape(text.rstrip()) or "(leer)", title=f"[brand]{escape(title)}[/brand]",
                         title_align="left", box=ROUNDED, border_style="brand.dim",
                         padding=(0, 1)))
-
-
-def model_menu(models: dict, current: str | None = None) -> None:
-    """Zeigt die verfügbaren Modelle (Cloud + Lokal) für den /model-Befehl."""
-    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
-    table.add_column("Modell", style="accent", no_wrap=True)
-    table.add_column("Beschreibung", style="muted")
-    for key, desc in models.items():
-        marker = "  ← aktiv" if key == current else ""
-        table.add_row(key, desc + marker)
-    console.print(
-        Panel(table, title="[brand]Modelle[/brand]  ·  /model <name>", title_align="left",
-              box=ROUNDED, border_style="brand.dim", padding=(1, 1))
-    )
-
-
-def cloud_setup_menu(rows: list) -> None:
-    """Zeigt alle Cloud-Anbieter + welchen Key man wo (.env) einträgt.
-    rows: Liste von (label, env_var, note, has_key)."""
-    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
-    table.add_column("Anbieter", style="accent", no_wrap=True)
-    table.add_column("Key in .env", no_wrap=True)
-    table.add_column("Notiz", style="muted")
-    for label, env, note, has in rows:
-        status = Text("✓ gesetzt", style="ok") if has else Text(env, style="muted")
-        table.add_row(label, status, note)
-    console.print(
-        Panel(table, title="[brand]☁ Cloud-Anbieter[/brand]  ·  Key in .env, dann /model",
-              title_align="left", box=ROUNDED, border_style="brand.dim", padding=(1, 1))
-    )
 
 
 def web_menu(entries: list) -> None:
@@ -579,7 +561,7 @@ def theme_menu() -> None:
 # ---------------------------------------------------------------------------
 
 def persona_name() -> str:
-    """Name der aktiven Persönlichkeit (Lara, Nemi, …) – für Titel und Kopfzeile.
+    """Name der aktiven Persönlichkeit – für Titel und Kopfzeile.
     Fällt auf „Nemi" zurück, wenn das Profil-Modul (noch) nicht erreichbar ist."""
     try:
         import persoenlichkeiten
@@ -748,14 +730,27 @@ def todo_panel(daten: dict):
                  border_style=TODO_GELB, padding=(0, 2))
 
 
-def working_spinner(label: str = "denkt nach"):
-    """Animiertes 'arbeitet gerade'-Panel, solange noch keine Antwort kommt."""
-    spinner = Spinner(
-        "dots",
-        text=Text(f"  ✦ {APP_NAME} {label} …", style="muted"),
-        style="accent",
-    )
-    return Panel(spinner, box=ROUNDED, border_style="brand.dim", padding=(0, 2))
+def plan_panel(daten: dict):
+    """Gelber Kasten der Todo-Liste einer Runde: 🔴 offen · 🟠 in Arbeit · 🟢 erledigt · ⚪ gestrichen."""
+    import plan
+    erl, gesamt = plan.zaehlen(daten)
+    aktuell = plan.aktuell(daten)
+    farben = {plan.OFFEN: _TODO_FARBEN["offen"], plan.ERLEDIGT: _TODO_FARBEN["fertig"],
+              plan.GESTRICHEN: _TODO_FARBEN["gestrichen"]}
+    body = Text()
+    for i, p in enumerate(daten.get("punkte", [])):
+        dran = aktuell is not None and p["nr"] == aktuell["nr"]
+        farbe = _TODO_FARBEN["frage"] if dran else farben.get(p["status"], "#7d8590")
+        if i:
+            body.append("\n")
+        body.append("▶ " if dran else "  ", style=f"bold {TODO_GELB}")
+        body.append(f"{plan.zeichen(p, daten)} {p['nr']}. ", style=f"bold {farbe}")
+        body.append(p["text"], style="strike #7d8590" if p["status"] == plan.GESTRICHEN else "assistant")
+        if p["status"] == plan.GESTRICHEN and p.get("notiz"):
+            body.append(f"\n      gestrichen: {p['notiz']}", style="muted")
+    titel = Text(f"🟨 Todo · {erl}/{gesamt} erledigt", style=f"bold {TODO_GELB}")
+    return Panel(body, title=titel, title_align="left", box=ROUNDED,
+                 border_style=TODO_GELB, padding=(0, 2))
 
 
 # ---------------------------------------------------------------------------
@@ -892,17 +887,6 @@ def thinking_panel(text: str, collapsed: bool = False,
         title=title, title_align="left", subtitle=subtitle, subtitle_align="right",
         box=ROUNDED, border_style="brand.dim", padding=(0, 2),
     )
-
-
-def tool_running(name: str, tool_input: dict):
-    arg = ""
-    if tool_input:
-        key = next(iter(tool_input))
-        val = str(tool_input[key])
-        val = (val[:70] + "…") if len(val) > 70 else val
-        arg = f"  [muted]{key}=[/muted][assistant]{val}[/assistant]"
-    head = Text.from_markup(f"[tool]⚙ {name}[/tool]{arg}")
-    return Panel(head, box=ROUNDED, border_style="warn", padding=(0, 2))
 
 
 def action_request(desc: str, confirm: bool, kopf: str | None = None, risiko: bool = False):
@@ -1068,10 +1052,6 @@ def error(msg: str) -> None:
     console.print(f"[err]✗ {msg}[/err]")
 
 
-def skill_activated(name: str) -> None:
-    console.print(f"[brand]🧠 Skill aktiviert:[/brand] [accent]{name}[/accent]")
-
-
 # ---------------------------------------------------------------------------
 # TUI-Brücke  (Vollbild-Modus, ui/screen.py)
 # ---------------------------------------------------------------------------
@@ -1171,6 +1151,137 @@ def progress_panel(title: str, msg: str):
         inhalt = spinner
     return Panel(inhalt, title=f"[brand]{title}[/brand]", title_align="left",
                  box=ROUNDED, border_style="brand.dim", padding=(0, 2))
+
+
+def _profil_text(profil, body: Text) -> None:
+    """Steckbrief des Rechners (engines/systemprofil.py) als Zeilen mit Zeichen."""
+    body.append("🧠 ", style="brand")
+    body.append(profil.cpu, style="accent")
+    body.append(f"  ·  {profil.kerne} Kerne / {profil.threads} Threads"
+                + ("  ·  AVX-512" if profil.avx512 else "  ·  AVX2" if profil.avx2 else ""), style="muted")
+    body.append(f"\n🧮 {profil.ram_mb / 1024:.0f} GB Arbeitsspeicher  ·  frei {profil.ram_frei_mb / 1024:.0f} GB\n",
+                style="muted")
+    for g in profil.gpus:
+        body.append("🎮 ", style="brand")
+        body.append(g.name, style="accent")
+        teile = ([f"{g.vram_mb / 1024:.0f} GB"] if g.vram_mb else []) + (["integriert"] if g.integriert else [])
+        if g.cuda_cap:
+            teile.append(f"sm_{g.cuda_cap.replace('.', '')}" + (f" · {g.generation}" if g.generation else ""))
+        body.append(("  ·  " + "  ·  ".join(teile) if teile else "") + "\n", style="muted")
+    if not profil.gpus:
+        body.append("🎮 keine Grafikkarte erkannt\n", style="muted")
+    body.append("⚡ ", style="brand")
+    if profil.nvidia:
+        body.append(f"Lokale Modelle rechnen mit CUDA auf der {profil.nvidia.name}", style="muted")
+        if profil.cuda_max:
+            body.append(f" (Treiber kann CUDA {profil.cuda_max:g})", style="muted")
+    else:
+        body.append("Lokale Modelle rechnen auf der CPU – CUDA gibt es nur mit einer NVIDIA-Karte", style="muted")
+    body.append(f"\n🪟 {profil.windows} (Build {profil.build})", style="muted")
+
+
+def steckbrief_panel(profil) -> None:
+    """/systemcheck: was in diesem PC steckt."""
+    body = Text()
+    _profil_text(profil, body)
+    console.print(Panel(body, title="[brand]🖥 Dein PC[/brand]", title_align="left", box=ROUNDED,
+                        border_style="accent", padding=(1, 2)))
+
+
+def hf_willkommen(profil, frei_platte: str, motor_bereit: bool) -> None:
+    """Kopf des Hugging-Face-Downloaders: Rechner, Regeln, was danach passiert."""
+    body = Text()
+    _profil_text(profil, body)
+    body.append(f"\n💽 Frei auf der Platte: {frei_platte}\n\n", style="muted")
+    for zeichen, satz in (("🔎", "Nur Modelle, die NemiCLI selbst laden kann – ab 4B, von bekannten Anbietern"),
+                          ("⭐", "Q4_K_M wird vorgeschlagen: klein, schnell, kaum schlechter als das Original"),
+                          ("🔐", "Nach dem Laden wird jede Datei mit SHA-256 gegen Hugging Face geprüft"),
+                          ("⏸", "Esc hält an – beim nächsten Mal geht es an derselben Stelle weiter")):
+        body.append(f"{zeichen}  ", style="brand")
+        body.append(f"{satz}\n", style="muted")
+    if not motor_bereit:
+        body.append("\n⚠  Für lokale Modelle fehlt noch torch – laden geht, verwenden erst nach /einrichten.",
+                    style="warn")
+    body.rstrip()
+    console.print(Panel(body, title="[brand]🤗 Modell von Hugging Face holen[/brand]", title_align="left",
+                        box=ROUNDED, border_style="accent", padding=(1, 2)))
+
+
+def hf_modell(modell, datei, mmproj, passt: tuple[str, str], frei_platte: str, ziel: str) -> None:
+    """Steckbrief vor dem Download."""
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="muted", no_wrap=True)
+    t.add_column()
+    t.add_row("Modell", Text(modell.name, style="accent"))
+    t.add_row("Anbieter", f"{modell.anbieter}  ·  ⬇ {modell.downloads:,}".replace(",", "."))
+    t.add_row("Größe", f"{modell.groesse_text}  ·  Bauart {modell.bauart}")
+    if modell.kontext:
+        t.add_row("Kontext", f"{modell.kontext:,} Token".replace(",", "."))
+    t.add_row("Datei", f"{datei.name}  ·  {_gb(datei.groesse)}")
+    t.add_row("Sehen", f"👁 {mmproj.name}  ·  {_gb(mmproj.groesse)}" if mmproj else "–")
+    t.add_row("Grafikkarte", f"{passt[0]} {passt[1]}")
+    t.add_row("Platte", f"frei {frei_platte}")
+    t.add_row("Ziel", Text(ziel, style="muted"))
+    console.print(Panel(t, title="[brand]📦 Steckbrief[/brand]", title_align="left", box=ROUNDED,
+                        border_style="brand.dim", padding=(1, 2)))
+
+
+def _gb(n: int) -> str:
+    return f"{n / 2**30:.1f} GB".replace(".", ",")
+
+
+def _dauer(sek: float) -> str:
+    sek = int(max(0, sek))
+    return f"{sek // 3600}:{sek % 3600 // 60:02d}:{sek % 60:02d}" if sek >= 3600 else f"{sek // 60}:{sek % 60:02d}"
+
+
+def hf_fortschritt(datei: str, phase: str, erledigt: int, gesamt: int, tempo: float, nr: int, von: int):
+    """Live-Panel beim Laden: Balken, GB, Tempo, Restzeit."""
+    kopf = Text()
+    kopf.append(f"  {datei}", style="accent")
+    if von > 1:
+        kopf.append(f"   ({nr}/{von})", style="muted")
+    zeile = Text("  ")
+    if phase == "pruefe":
+        zeile.append(f"🔐 prüfe angefangene Datei  {_gb(erledigt)} / {_gb(gesamt)}", style="muted")
+    else:
+        zeile.append(f"{_gb(erledigt)} / {_gb(gesamt)}", style="muted")
+        if tempo > 0:
+            zeile.append(f"  ·  {tempo / 2**20:.0f} MB/s  ·  noch {_dauer((gesamt - erledigt) / tempo)}",
+                         style="muted")
+    zeile.append("   ·   Esc hält an", style="brand.dim")
+    return Panel(Group(kopf, _fortschritt_balken(erledigt, gesamt, cells=40), zeile),
+                 title="[brand]⬇ Herunterladen[/brand]", title_align="left", box=ROUNDED,
+                 border_style="accent", padding=(0, 1))
+
+
+def update_tabelle(eintraege) -> None:
+    """/update: was im venv zu tun ist."""
+    import luecken
+    marke = {"fehlt": ("🔴", "fehlt"), "passt nicht": ("🟠", "Version passt nicht"),
+             "torch-bau": ("🟠", "falscher Bau für die Grafikkarte"), "update": ("🟢", "neuere Version"),
+             "luecke": ("🛡", "Sicherheitslücke"), "luecke-offen": ("⚠", "Sicherheitslücke, offen"),
+             "schadcode": ("🚫", "als Schadpaket gemeldet"), "ueberfluessig": ("🧹", "nicht mehr gebraucht")}
+    t = Table(box=None, padding=(0, 2), show_edge=False, header_style="muted")
+    t.add_column("")
+    t.add_column("Paket", style="accent")
+    t.add_column("jetzt", style="muted")
+    t.add_column("danach")
+    t.add_column("warum", style="muted", overflow="fold")
+    for e in eintraege:
+        z, warum = marke.get(e.grund, ("•", e.grund))
+        if e.luecken:
+            kenn = ", ".join(l.kennung for l in e.luecken[:2]) + (f" +{len(e.luecken) - 2}" if len(e.luecken) > 2 else "")
+            warum = (warum if e.grund in ("luecke", "luecke-offen", "schadcode", "ueberfluessig")
+                     else warum + " · Lücke") + \
+                f" · {luecken.schwerste(e.luecken)}: {kenn}"
+        if e.hinweis and e.hinweis != "wird nicht mehr gebraucht":
+            warum += f"\n{e.hinweis}"
+        danach = (e.neu or ("CUDA-Bau" if e.grund == "torch-bau" else "entfernen" if e.entfernen
+                            else "–" if e.grund == "luecke-offen" else e.spez[len(e.name):] or "aktuell"))
+        t.add_row(z, e.name, e.installiert or "–", danach, warum)
+    console.print(Panel(t, title="[brand]📦 venv prüfen[/brand]", title_align="left", box=ROUNDED,
+                        border_style="brand.dim", padding=(1, 2)))
 
 
 def befehl_panel(befehl: str, sekunden: float, zeilen: list[str]):
@@ -1565,13 +1676,13 @@ def system_panel(rep: dict, todos: list[str]) -> None:
         body.append(f"{p['version']:<15}", style="muted")
         body.append(f"{p['zweck']}\n", style="muted")
     if rep.get("transformers_ok") is False:
-        body.append('   ⚠ transformers muss KLEINER als 5 sein, sonst gehen '
-                    'Bild-Modelle nicht.\n', style="warn")
+        body.append("   ⚠ transformers ist älter als 5.10 (bekannte Sicherheitslücken) – "
+                    "/update räumt es auf.\n", style="warn")
 
     # --- Modelle ----------------------------------------------------------
     body.append("\n🧠 Modelle auf diesem PC\n", style="brand")
-    body.append(f"   Bild-Modelle (.safetensors):   {st['checkpoints']}\n", style="accent")
-    body.append(f"      {st['ckpt_ordner']}\n", style="muted")
+    body.append(f"   Bild-Modelle (Krea 2):   {st['bildmodelle']}\n", style="accent")
+    body.append(f"      {st['bild_ordner']}\n", style="muted")
     body.append(f"   Ollama: {'✅ läuft' if st['ollama'] else '– nicht erreichbar'}"
                 f"   ·   {st['frei_gb']} GB frei\n", style="muted")
     body.append("   Modelle bringt NemiCLI nicht mit – die suchst du dir selbst aus\n",
@@ -1620,7 +1731,7 @@ def wizard_models_panel(hinweise: list[tuple[str, str]], ordner: dict) -> None:
         body.append(f"  • {label}\n", style="brand")
         body.append(f"    {wo}\n", style="accent")
     body.append("\n  Dateien gehören hierhin:\n", style="brand")
-    body.append(f"    .safetensors  →  {ordner['checkpoints']}\n", style="muted")
+    body.append(f"    Krea 2 (Bilder)  →  {ordner['bilder']}\n", style="muted")
     console.print(Panel(body, title="[brand]📦 Modelle besorgen[/brand]",
                         title_align="left", box=ROUNDED, border_style="accent",
                         padding=(1, 2)))

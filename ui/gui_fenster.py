@@ -994,9 +994,6 @@ class ChatSeite(QWidget):
         if self._folgen:
             self.rollen.sanft_zu(oben, 140)
 
-    def _unten_bleiben(self) -> bool:
-        return self._folgen
-
     def _hinzu(self, w: QWidget) -> None:
         self.leer(False)
         self.liste.insertWidget(self.liste.count() - 1, w)

@@ -72,7 +72,7 @@ _TOOLBAR_BG = "#15151f"
 _MIN_INPUT_ROWS = 3
 _MAX_INPUT_ROWS = 8
 _MAX_BLOCKS = 600            # Verlauf im Speicher kappen (Widgets)
-_MAX_COMPLETIONS = 8
+_MAX_COMPLETIONS = 10         # sichtbare Zeilen im /-Menü, der Rest wird geblättert
 
 
 # ---------------------------------------------------------------------------
@@ -714,6 +714,11 @@ class _Composer(TextArea):
             event.prevent_default()
             nemi._complete_next()
             return
+        if event.key in ("up", "down") and nemi._complete is not None and nemi._complete.display:
+            event.stop()
+            event.prevent_default()
+            nemi._complete_next(1 if event.key == "down" else -1)
+            return
         if event.key == "shift+tab":
             event.stop()
             event.prevent_default()
@@ -1349,7 +1354,7 @@ class Screen:
             return []
         try:
             doc = Document(text, len(text))
-            return list(self._completer.get_completions(doc, CompleteEvent()))[:_MAX_COMPLETIONS]
+            return list(self._completer.get_completions(doc, CompleteEvent()))
         except Exception:
             return []
 
@@ -1364,34 +1369,44 @@ class Screen:
         if not items:
             self._complete.display = False
             return
+        if self._comp_base is not None:             # Liste der Basis, durch die geblättert wird
+            items = self._candidates(self._comp_base[0]) or items
         p = ui.THEMES[ui.current_theme()]
         sel = self._comp_base[1] if self._comp_base is not None else -1
+        # Fenster von _MAX_COMPLETIONS Zeilen, das der Auswahl folgt
+        start = min(max(0, sel - _MAX_COMPLETIONS + 1), max(0, len(items) - _MAX_COMPLETIONS))
+        ende = min(len(items), start + _MAX_COMPLETIONS)
         t = Text(no_wrap=True, overflow="ellipsis")
-        for i, c in enumerate(items):
+        if start:
+            t.append(f"  ▲ {start} weitere\n", style="#7d8590")
+        for i in range(start, ende):
+            c = items[i]
             st = f"bold {p['accent']}" if i == sel else "#c8c4ff"
             t.append(f"{c.text:<22}", style=st)
             meta = getattr(c, "display_meta_text", "") or ""
             t.append(f" {meta}", style="#7d8590")
-            if i < len(items) - 1:
+            if i < ende - 1:
                 t.append("\n")
+        if ende < len(items):
+            t.append(f"\n  ▼ {len(items) - ende} weitere · ↑↓ blättern", style="#7d8590")
         self._complete.update(t)
         self._complete.display = True
 
-    def _complete_next(self) -> None:
-        """Tab: erste Vervollständigung einsetzen, weitere Tabs blättern."""
+    def _complete_next(self, schritt: int = 1) -> None:
+        """Tab/↓: nächste Vervollständigung einsetzen, ↑: vorige."""
         text = self._input.text
         if self._comp_base is None:
             items = self._candidates(text)
             if not items:
                 return
-            self._comp_base = [text, 0, None]
+            self._comp_base = [text, 0 if schritt > 0 else len(items) - 1, None]
         else:
             base, idx, _ = self._comp_base
             items = self._candidates(base)
             if not items:
                 self._comp_base = None
                 return
-            self._comp_base[1] = (idx + 1) % len(items)
+            self._comp_base[1] = (idx + schritt) % len(items)
         base, idx, _ = self._comp_base
         c = items[idx]
         neu = base[: len(base) + c.start_position] + c.text
@@ -1455,7 +1470,7 @@ class Screen:
         if now - self._inbox_stamp >= 1.0:
             self._inbox_stamp = now
             if self.busy or self._modal is not None:
-                return                              # erst, wenn Lara frei ist
+                return                              # erst, wenn die KI frei ist
             try:
                 if not K.INBOX_DATEI.exists():
                     return

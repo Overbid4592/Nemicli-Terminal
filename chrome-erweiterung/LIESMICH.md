@@ -1,6 +1,6 @@
 # 🐈 NemiCLI – Nemi antwortet (Chrome-Erweiterung)
 
-Rechtsklick auf einer Webseite → **„Nemi antwortet (ins Textfeld)“**: Lara liest die Seite
+Rechtsklick auf einer Webseite → **„Nemi antwortet (ins Textfeld)“**: Die aktive Persönlichkeit liest die Seite
 (E-Mail, Chat, Formular), schreibt in deinem Namen eine Antwort und setzt sie direkt in das
 Textfeld, in dem dein Cursor steht. Text markieren → **„Nemi, erklär mir das“** zeigt eine
 Erklärung als Kästchen auf der Seite.

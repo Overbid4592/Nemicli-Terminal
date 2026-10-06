@@ -1,38 +1,38 @@
-anthropic
-openai
-httpx
-rich
+# Mindestversion = getesteter Stand (pip freeze, 06.10.2026). Obergrenzen nur, wo eine
+# neue Hauptversion etwas Benötigtes entfernt. torch installiert /einrichten getrennt (CUDA-Bau).
+anthropic>=1.5.0
+openai>=3.14.0
+httpx>=0.28.1
+rich>=15.0.0
 # Vollbild-Oberflaeche (ui/screen_tx.py); prompt_toolkit bleibt fuer den alten Screen + Menues.
-textual>=8.2,<9
-prompt_toolkit
-python-dotenv
-# Gesichts-Erkennung fürs automatische Nachbessern nach /bild.
-# Muss die 4er-Reihe sein: OpenCV 5 hat die Haar-Cascades entfernt.
-opencv-python<5
-# Bild-Pipeline braucht transformers 4.x (diffusers).
-transformers<5
-# Krea 2 und Gedächtnis-Encoder: Gewichte, Wortliste, Rechnen, Bilder
-safetensors
-tokenizers
-numpy
-pillow
-# CPU-Gedächtnis (Qwen3-Embedding-0.6B) – bleibt auf der CPU, GPU für Bilder.
-# Läuft über tools/embedder.py direkt auf transformers. sentence-transformers
-# stand hier bis zum 15.09.2026 – es zieht scikit-learn zwingend mit, und dessen
-# unsignierte DLL blockiert Windows Smart App Control. Gebraucht wurde es nur
-# für zwei Handgriffe (letztes Token, normieren), die jetzt selbst dastehen.
+textual>=8.2.8,<9
+prompt_toolkit>=3.0.53
+python-dotenv>=1.2.3
+# Versionsvergleiche für /update und die Lücken-Prüfung (tools/venvpflege.py, tools/luecken.py).
+packaging>=26.3
+# GGUF-Motor: Vorverarbeitung des Tokenizers (Llama 3, DeepSeek, Ling …) wie im Original.
+regex>=2026.9.10
+# Krea 2: Gewichte, Wortliste, Rechnen, Bilder (der Gedächtnis-Encoder läuft als GGUF im eigenen Motor)
+safetensors>=0.8.0
+tokenizers>=0.23.2
+numpy>=2.5.3
+pillow>=12.3.0
+# Krea 2: Gesichter finden (Haar-Cascades) fürs Nachmalen. OpenCV 5 hat sie nicht mehr.
+opencv-python>=4.14.0.94,<5
+# Coding-Assistent: ruff prüft Python-Code (Syntax, Namen, veralteter Stil). Ein einzelnes Programm, kein Node.
+ruff>=0.16.10,<1
 # PDF per Drag & Drop in den Chat ziehen: Text wird herausgezogen (reines Python, klein).
-pypdf
+pypdf>=6.19.0
 # /kugel malen: Hintergrund freistellen (Modell isnet-general-use, 176 MB, lädt beim ersten Mal nach ~/.rembg)
-rembg[cpu]
-# Gedächtnis-Encoder (Qwen3-Embedding) rechnet auf der GPU, wenn torch sie sieht: dafür den
-# CUDA-Build installieren, z. B.  pip install torch==2.14.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+rembg[cpu]>=2.0.84
+# GGUF-Motor, Krea 2 und Gedächtnis rechnen mit torch auf der GPU, wenn es der CUDA-Bau ist, z. B.
+#   pip install torch==2.14.0+cu132 --index-url https://download.pytorch.org/whl/cu132
 # (Config embedding_geraet: auto | cuda | cpu). Der reine CPU-Build tut's auch, nur ~50× langsamer.
 # Systemwache (tools/wache): Sensoren für Prozesse, Netz und Dateien + Schild, Kugel, Chatfenster.
 # Kein scikit-learn – der Isolation Forest steht selbst in tools/wache/wald.py (numpy).
 # PySide6-Essentials (nicht das volle PySide6): QtCore/QtGui/QtWidgets reichen – Kugel, Tray, Chat.
-psutil
-watchdog
-PySide6-Essentials
+psutil>=7.2.2
+watchdog>=6.0.0
+PySide6-Essentials>=6.11.2
 # Eigenes Terminal-Fenster (ui/terminal_fenster.py): Terminal-Nachbau in reinem Python.
-pyte
+pyte>=0.8.2

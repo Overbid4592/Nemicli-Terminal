@@ -9,6 +9,7 @@ Lokal  = Ollama auf diesem PC (kein Key nötig)
 """
 
 import asyncio
+import itertools
 import os
 import re
 import sys
@@ -40,6 +41,14 @@ if not getattr(sys, "frozen", False):
 import paths                 # weiß, wo gespeichert wird (neben der exe)
 paths.ensure_layout()        # fehlende Ordner + LIES-MICH-Dateien anlegen
 
+# Von /update zurückgestellte Pakete (waren in Gebrauch) jetzt einspielen –
+# noch ist nichts aus dem venv geladen.
+try:
+    import venvpflege
+    venvpflege.ausstehende_einspielen()
+except Exception:
+    pass
+
 # Die exe bringt torch, numpy, Pillow und transformers nicht mit (NemiCLI.spec,
 # EXCLUDES) – sie kommen aus einem installierten Python. Einmal hier einbinden,
 # vor allen Modulen: Gedächtnis-Encoder, Wache, Kugel und beide Bild-Motoren
@@ -54,7 +63,6 @@ if getattr(sys, "frozen", False):
 from dotenv import load_dotenv
 from prompt_toolkit import PromptSession
 from prompt_toolkit.history import FileHistory
-from rich.live import Live
 from rich.console import Group
 
 import ui
@@ -85,6 +93,7 @@ import sicherheit
 import snapshot
 import workspace as WS
 import coding
+import plan
 import modes
 import stats
 from commands import SlashCompleter, parse, PERSONA_CMDS
@@ -194,12 +203,15 @@ async def _bilder_fuer_chat(model: str | None, text: str,
 MAX_STEPS = 12                  # Bremse für Aktions-Ketten pro Nutzer-Nachricht (keine Endlosschleife)
 # Solange in einer Runde NUR gelesen wurde (READ_TOOLS: datei_lesen, abfragen, web …),
 # gilt eine weitere Grenze: Die Systemwache liest ihre Anleitung in drei Stücken und
-# fragt dann acht Dinge ab – mit 12 war sie bei Schritt 2 am Ende. Sobald
+# fragt dann acht Dinge ab – mit 12 war sie bei Schritt 2 am Ende (Chat 137). Sobald
 # eine ändernde Aktion dabei war, gilt wieder die kurze Bremse.
 MAX_LESE_STEPS = 30
 # Im Coding-Assistenten zählt die Bremse pro Todo-Punkt: jeder Fortschritt (Punkt in
 # Arbeit, Punkt geprüft) setzt sie zurück. Darüber liegt eine feste Gesamtgrenze.
 CODING_MAX_STEPS = 80
+# Mit offener Todo-Liste (lange Serien, z. B. 20 Bilder) gilt diese Gesamtgrenze; die Bremse ohne
+# Fortschritt (MAX_STEPS ohne neuen Haken) bleibt, damit nichts endlos läuft.
+SERIE_MAX_STEPS = 120
 _FRAGE_HALT_NOTE = ("\n\n[System] 🟠 Eine Frage ist offen. Stell sie dem Nutzer jetzt, kurz und "
                     "klar – ohne Aktion. Dann wartest du auf seine Antwort.")
 # Lesende Werkzeuge, die mit identischen Feldern nichts Neues bringen: eine
@@ -215,6 +227,9 @@ _STEP_LIMIT_NOTE = (
     "bisher herausgefunden hast, und sag klar, was noch offen ist. Der Nutzer kann mit "
     "„weiter“ die nächste Runde starten."
 )
+_TODO_OFFEN_NOTE = ("\n\n[System] Deine Todo-Liste aus der letzten Runde ist noch offen:\n{liste}\n"
+                    "Arbeite sie weiter ab. Passt sie nicht mehr zur neuen Nachricht: neue Liste mit "
+                    "plan \"punkte\" oder Punkte mit \"streichen\" + \"grund\" weglassen.")
 _STEP_LIMIT_WARN = ("⏸ Viele Aktionen am Stück – ich halte kurz an, damit nichts endlos "
                     "läuft. Sag „weiter“, dann mache ich da weiter.")
 
@@ -236,7 +251,8 @@ AUTO_ALLOW: set[str] = set()    # Werkzeuge, die diese Sitzung nicht mehr abgefr
 WEB_BRIDGE = None               # aktive WebUI-Brücke (None = kein /webui gestartet)
 GUI_BRUECKE = None              # Verbindung zum GUI-Fenster (None = kein /gui gestartet)
 # Im GUI-Modus „Chat“ erlaubt: nichts am PC ändern – malen, Bilder ansehen, Gedächtnis, Skills (Prüffenster).
-CHAT_WERKZEUGE = frozenset({"bild_malen", "bild_ansehen", "bild_fragen",
+CHAT_WERKZEUGE = frozenset({"plan", "bild_malen", "bild_serie", "charakter_zeigen", "charakter_aendern",
+                            "bild_ansehen", "bild_fragen",
                             "gedaechtnis_suchen", "gedaechtnis_lesen", "merken",
                             "skill_laden", "skill_schreiben", "skill_ausbessern"})
 _CHAT_GESPERRT = ("Werkzeug „{tool}“ ist im Chat-Modus gesperrt (dort gibt es nur Bilder malen/ansehen, "
@@ -306,8 +322,8 @@ def _render(thinking_txt: str, answer: str, think_secs: float | None = None,
 
 async def _bilder_aus_ergebnis(res, model: str | None):
     """Werkzeug hat Bilder geliefert (bild_ansehen/bildschirm_ansehen): als Data-URIs
-    fürs Modell – oder, wenn das Modell nicht sieht, vom Qwen-Helfer beschreiben
-    lassen (die Beschreibung kommt dann in den Ergebnistext).
+    fürs Modell – oder, wenn das Modell nicht sieht, vom Bildbeschreiber (`Vision/`)
+    beschreiben lassen (die Beschreibung kommt dann in den Ergebnistext).
     Gibt (uris_oder_None, ergebnis) zurück – ActionResult ist unveränderlich."""
     import dataclasses
     pfade = [Path(x) for x in (getattr(res, "bilder", None) or []) if Path(x).is_file()]
@@ -335,6 +351,31 @@ def _result_feedback(tool, result) -> str:
         "fehlgeschlagen" if result.ok is False else "Status ungeprüft")
     code = f", Exitcode {result.returncode}" if result.returncode is not None else ""
     return f"Ergebnis von '{tool}' ({status}{code}):\n{result.text}"
+
+
+async def _menue_fuer_ki(act: dict) -> "actions.ActionResult":
+    """menue_oeffnen: Auswahlmenü eines Befehls öffnen; der Nutzer wählt selbst.
+    Gibt zurück, was gewählt wurde – die KI sieht so, ob und was sich geändert hat."""
+    import commands as C
+    befehl, fehler = C.menue_pruefen(act.get("befehl"))
+    ctx = AKTIVER_CTX
+    if fehler:
+        return actions.ActionResult(fehler, ok=False)
+    if ctx is None:
+        return actions.ActionResult(f"Kein Menü verfügbar – nenne dem Nutzer den Befehl {befehl}.", ok=False)
+    cmd, _, zusatz = befehl.partition(" ")
+    ui.info(f"🧭 Öffne {befehl} …")
+    if not zusatz:
+        gewaehlt = await _untermenue(ctx, cmd)
+        if gewaehlt is None:
+            return actions.ActionResult(f"Menü {cmd}: der Nutzer hat ohne Auswahl geschlossen.", ok=True)
+        zusatz = gewaehlt
+    vorher = C.auswahl(cmd)
+    await handle_line(ctx, f"{cmd} {zusatz}".strip())
+    aktiv = [z for z, t, _ in C.auswahl(cmd) if t.lstrip().startswith("✓")]
+    stand = f" Jetzt aktiv: {', '.join(aktiv)}." if aktiv and C.auswahl(cmd) != vorher else ""
+    return actions.ActionResult(
+        f"Menü {cmd} geöffnet, der Nutzer hat gewählt: {(cmd + ' ' + zusatz).strip()}.{stand}", ok=True)
 
 
 def _finish_record(record, result) -> None:
@@ -387,7 +428,7 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
     confirm = urteil == "ask" and tool not in AUTO_ALLOW and not (frei and id(act) in frei)
     if confirm and sicherheit.arbeitsbereich(act):
         # Der Stift der Persönlichkeit: im eigenen Daten-Ordner schreibt sie
-        # ohne Rückfrage. Protokoll + Papierkorb bleiben.
+        # ohne Rückfrage (Wunschbrief 19.09.2026). Protokoll + Papierkorb bleiben.
         confirm = False
         act["_frei"] = "Arbeitsbereich"
         desc = actions.describe(act)
@@ -400,7 +441,9 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
         res = actions.ActionResult(f"Vorschau nicht möglich: {exc}", ok=False)
         return "no_run", res
     if preview is not None:
-        titel = "Skill prüfen" if tool in actions.SKILL_AENDERN else "Dateiänderung prüfen"
+        titel = ("Skill prüfen" if tool in actions.SKILL_AENDERN
+                 else "Einstellung prüfen" if tool == "einstellung_aendern"
+                 else "Theme prüfen" if tool == "theme_erstellen" else "Dateiänderung prüfen")
         choice = "yes" if await pruefe(titel, preview) else "no"
     else:
         choice = await frage(sicherheit.frage(act), sicherheit.optionen(act))
@@ -545,13 +588,19 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
     """Eine Nutzer-Runde; gibt die Werkzeugbilanz zurück (tool, status)."""
     records = []
     actions.reset_taint()            # neue Nutzer-Runde: noch nichts aus dem Netz
+    offen = plan.runde_neu()         # offene Todo-Liste läuft weiter, sonst beginnt eine neue
     mitschrift.nutzer(user_text)     # F12 soll das ganze Gespräch sichern können
+    if offen:
+        _plan_zeigen()
+        user_text += _TODO_OFFEN_NOTE.format(liste=plan.text_fuer_modell())
     if coding.aktiv() and coding.ist_ende_ansage(user_text):
         _coding_beenden()
     try:
         await _converse(backend, user_text, images, records)
     finally:
         _close_records(records)
+        if plan.neu_seit_anzeige():          # Endstand der Todo-Liste
+            _plan_zeigen()
         ui.console.print(ui.execution_receipt(records))
     return records
 
@@ -564,10 +613,14 @@ async def _converse(backend, user_text, images, records) -> None:
     seen: set[str] = set()                   # identische Lese-Aktionen nur einmal
     nur_gelesen = True                       # bisher nur Lese-Werkzeuge? -> längere Leine
     basis = 0                                # ab diesem Schritt zählt die Bremse
-    marke = coding.marke()                   # Todo-Fortschritt (nur im Coding-Assistenten)
+    marke = (coding.marke(), plan.marke())   # Todo-Fortschritt (Coding-Assistent bzw. Todo-Liste)
     frage_halt = False
     gesamt = CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
-    for schritt in range(gesamt + 1):
+    for schritt in itertools.count():
+        if plan.aktuell() is not None:
+            gesamt = max(gesamt, SERIE_MAX_STEPS)
+        if schritt > gesamt:
+            break
         letzter = (schritt - basis >= _schritt_grenze(nur_gelesen) or schritt >= gesamt
                    or frage_halt)            # Extra-Runde: nur noch zusammenfassen / fragen
         if frage_halt:
@@ -746,6 +799,13 @@ async def _converse(backend, user_text, images, records) -> None:
             if fixed and fixed != raw_tool:
                 act["tool"] = fixed
                 ui.info(f"(kleiner Tippfehler korrigiert: '{raw_tool}' → '{fixed}')")
+        acts, gesperrt = plan.zurueckweisen(acts, coding.aktiv())
+        if gesperrt:
+            ui.warn("🟨 Erst die Todo-Liste – nicht ausgeführt: "
+                    + ", ".join(actions.describe(a).splitlines()[0] for a in gesperrt))
+            for act in gesperrt:
+                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
+            ergebnisse.append(plan.sperr_text(gesperrt))
         frei, abgelehnt = await _buendel_freigabe(acts, ask_confirm)
         for act in acts:
             tool = act.get("tool")
@@ -759,6 +819,18 @@ async def _converse(backend, user_text, images, records) -> None:
                         tool, actions.ActionResult(_DUPLICATE_NOTE, ok=None)))
                     continue
                 seen.add(key)
+
+            # --- Menü für den Nutzer öffnen: das Menü ist selbst die Rückfrage ---
+            if tool == "menue_oeffnen":
+                record = {"tool": tool, "status": "running"}
+                records.append(record)
+                res = await _menue_fuer_ki(act)
+                _finish_record(record, res)
+                if res.ok is False:
+                    ui.console.print(ui.action_result(res.text, ok=False))
+                mitschrift.aktion(tool, actions.describe(act), res.text, res.ok)
+                ergebnisse.append(_result_feedback(tool, res))
+                continue
 
             # --- Helfer-Agenten (max 5, parallel, nur auf Abruf) ---
             if tool == "subagenten":
@@ -805,12 +877,14 @@ async def _converse(backend, user_text, images, records) -> None:
             records.append(record)
             if tool not in modes.READ_TOOLS:
                 nur_gelesen = False
-            if tool == "bild_malen":
+            if tool in ("bild_malen", "bild_serie"):
                 # Bildmalen zeigt einen echten Ladebalken (Schritt i/n), genau wie
                 # der /bild-Befehl. Die Aktion läuft im Thread und meldet ihren
                 # Fortschritt über actions.bild_status() zurück.
                 run_task = asyncio.create_task(actions.run(act))
-                titel = "🎨 male dein Bild"
+                titel = "🎨 male deine Serie" if tool == "bild_serie" else "🎨 male dein Bild"
+                if (punkt := plan.aktuell()) is not None:
+                    titel = f"🎨 Todo {punkt['nr']}: {punkt['text'][:60]}"
                 with ui.live_view(ui.progress_panel(titel, "starte …")) as live:
                     while not run_task.done():
                         live.update(ui.progress_panel(
@@ -824,7 +898,12 @@ async def _converse(backend, user_text, images, records) -> None:
                     res = await actions.run(act)
             _finish_record(record, res)
             uris, res = await _bilder_aus_ergebnis(res, SESSION.get("model"))
-            ui.console.print(ui.action_result(res.text, ok=res.ok))
+            if tool == "plan" and res.ok:
+                _plan_zeigen()
+            else:
+                ui.console.print(ui.action_result(res.text, ok=res.ok))
+                if plan.abhaken_nach(act, res.ok):          # Feld „abhaken“: sofort grün
+                    _plan_zeigen()
             if tool in ("todo", "coding_start") and res.ok:
                 _todo_zeigen()
                 if str(act.get("aktion", "")).lower() == "frage":
@@ -833,7 +912,7 @@ async def _converse(backend, user_text, images, records) -> None:
             protokoll.schreibe(tool, actions.describe(act), record["status"],
                                veraendernd=actions.needs_confirm(act), wer=PS.active().name,
                                ergebnis=res.text, stufe=sicherheit.stufe(act))
-            if tool == "bild_malen" and res.ok:
+            if tool in ("bild_malen", "bild_serie") and res.ok:
                 _bild_vorschau(res.text)
             if uris:
                 naechste_bilder.extend(uris)
@@ -842,8 +921,10 @@ async def _converse(backend, user_text, images, records) -> None:
             ergebnisse.append(_result_feedback(tool, res))
 
         # 4) Ergebnisse zurück ans Modell, nächster Schritt
+        if any(a.get("tool") != "plan" for a in acts) and (stand := plan.kurzstand()):
+            ergebnisse.append(stand)
         next_input = "\n\n".join(ergebnisse)
-        if (neu := coding.marke()) != marke:  # Todo-Fortschritt: Bremse beginnt neu
+        if (neu := (coding.marke(), plan.marke())) != marke:  # Todo-Fortschritt: Bremse beginnt neu
             marke, basis, nur_gelesen = neu, schritt + 1, True
 
     ui.warn(_STEP_LIMIT_WARN)                # Rückfall – normalerweise endet die Extra-Runde oben
@@ -887,6 +968,8 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None) 
     """erlaubt: Menge von Werkzeugnamen (None = alle); andere werden nicht ausgeführt."""
     records = []
     actions.reset_taint()
+    if plan.runde_neu():
+        user_text += _TODO_OFFEN_NOTE.format(liste=plan.text_fuer_modell())
     try:
         await _web_converse(backend, user_text, images, emit, confirm, records, erlaubt)
     finally:
@@ -977,6 +1060,13 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
                 records.append({"tool": act.get("tool", "?"), "status": "not_run"})
                 ergebnisse.append(_CHAT_GESPERRT.format(tool=act.get("tool", "?")))
             acts = [a for a in acts if a.get("tool") in erlaubt]
+        acts, gesperrt = plan.zurueckweisen(acts, coding.aktiv())
+        if gesperrt:
+            emit({"t": "note", "text": "🟨 Erst die Todo-Liste – nicht ausgeführt: "
+                  + ", ".join(actions.describe(a).splitlines()[0] for a in gesperrt)})
+            for act in gesperrt:
+                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
+            ergebnisse.append(plan.sperr_text(gesperrt))
         frei, abgelehnt = await _buendel_freigabe(acts, confirm)
         for act in acts:
             tool = act.get("tool")
@@ -1042,7 +1132,7 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
             records.append(record)
             if tool not in modes.READ_TOOLS:
                 nur_gelesen = False
-            if tool == "bild_malen":
+            if tool in ("bild_malen", "bild_serie"):
                 # Gleicher Ladebalken wie im Terminal: Aktion im Thread,
                 # Fortschritt über actions.bild_status() an den Browser.
                 run_task = asyncio.create_task(actions.run(act))
@@ -1058,6 +1148,7 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
             else:
                 res = await actions.run(act)
             _finish_record(record, res)
+            plan.abhaken_nach(act, res.ok)
             uris, res = await _bilder_aus_ergebnis(res, SESSION.get("model"))
             if uris:
                 naechste_bilder.extend(uris)
@@ -1068,6 +1159,8 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
                                ergebnis=res.text, stufe=sicherheit.stufe(act))
             ergebnisse.append(_result_feedback(tool, res))
 
+        if any(a.get("tool") != "plan" for a in acts) and (stand := plan.kurzstand()):
+            ergebnisse.append(stand)
         next_input = "\n\n".join(ergebnisse)
 
     emit({"t": "warn", "text": _STEP_LIMIT_WARN})
@@ -1352,7 +1445,7 @@ async def start_webui(ctx: "Ctx") -> "webui.WebBridge":
         "resume":  lambda cid: schedule(do_resume(int(cid))) if cid not in (None, "") else None,
         "newchat": lambda: schedule(do_newchat()),
     }
-    url = webui.start(bridge, handlers)
+    webui.start(bridge, handlers)
     return bridge
 
 
@@ -1681,6 +1774,7 @@ def _neuer_chat_nach_wechsel(ctx: "Ctx | None" = None) -> None:
         ctx.backend.reset()
     ctx.current_prompts = []
     ctx.current_chat = chatstore.next_id()
+    plan.verwerfen()
     ctx.sync_session()
     ui.info(f"📒 Neuer Chat #{ctx.current_chat} für {PS.active().name} – der alte bleibt bei der vorigen.")
 
@@ -1808,7 +1902,7 @@ async def _run_with_status(title: str, work) -> str:
 
 
 # Der Bibliothekar (indexdb.after_turn) läuft nach jeder Runde und zeigt seinen Fortschritt
-# als Balken. Er darf den Chat nicht blockieren (ein dicker Wache-Bericht = 60 Brocken
+# als Balken. Er darf den Chat nicht blockieren (ein großer Wache-Bericht = 60 Brocken
 # ≈ 90 s auf der CPU). Deshalb zwei Wege:
 #   TUI:      Hintergrund-Task, Fortschritt als Badge mit Mini-Balken in der Statuszeile
 #             (screen_tx.set_bibliothekar); der Nutzer tippt derweil weiter. Läuft schon
@@ -1933,16 +2027,48 @@ async def bibliothekar(chat_id: int | None = None, alles: bool = False) -> int:
 
 
 async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
-    """/kugel · /kugel malen [beschreibung] · /kugel weg · /kugel ordner – siehe tools/kugelbilder.py."""
+    """/kugel · malen [beschreibung | <bereich> | alle] · motive · impuls [an|aus] · weg · ordner
+    – siehe tools/kugelbilder.py und tools/kugelmotive.py."""
     import kugelbilder as KB
+    import kugelmotive as KM
     name = PS.active().name
     teile = arg.split(maxsplit=1)
     sub = teile[0].lower() if teile else ""
     rest = teile[1].strip() if len(teile) > 1 else ""
+    if sub == "impuls":
+        if rest.lower() in ("an", "aus"):
+            _c = config.load()
+            _c["kugel_impuls"] = rest.lower() == "an"
+            config.save(_c)
+        an = bool(config.load().get("kugel_impuls", False))
+        ui.info(f"🌈 Freier Moment: {'an' if an else 'aus'} – "
+                + ("alle 1–3 Stunden entscheidet sie selbst: etwas sagen, malen, Bild wechseln oder nichts. "
+                   "Nicht nachts, nicht bei Vollbild. Feste Grüße sind dann aus."
+                   if an else "die Kugel grüßt mit den Zeilen aus Wache/gruesse.md. Einschalten: /kugel impuls an"))
+        return
+    if sub == "motive" and rest:
+        if rest.lower() == "alle" or KM.bereich_finden(rest):
+            await _kugel_motive_malen(name, rest)
+        else:
+            ui.warn(f"Bereich „{rest}“ kenne ich nicht – /kugel motive zeigt die 20 Bereiche.")
+        return
+    if sub == "motive":
+        ordner = KB.motiv_ordner(name)
+        ui.info(f"🎨 Motive für {name} (malen: /kugel motive <nummer|name> · alle):")
+        for i, (key, (titel, liste)) in enumerate(KM.BEREICHE.items(), 1):
+            da = sum(1 for k in liste if (ordner / f"{k}.png").exists())
+            ui.info(f"  {i:>2}. {titel:<32} {da:>3}/{len(liste)}   ({key})")
+        if not KB.figur(name):
+            ui.info("Noch keine Figur: zuerst /kugel malen (Grundbilder) – die Motive zeigen dieselbe Figur.")
+        return
+    if sub == "malen" and rest and (rest.lower() == "alle" or KM.bereich_finden(rest)):
+        await _kugel_motive_malen(name, rest)
+        return
     if sub in ("ordner", "oeffnen"):
         try:
-            KB.ORDNER.mkdir(parents=True, exist_ok=True)
-            os.startfile(str(KB.ORDNER))
+            ziel = KB.motiv_ordner(name) if KB.motiv_ordner(name).is_dir() else KB.ORDNER
+            ziel.mkdir(parents=True, exist_ok=True)
+            os.startfile(str(ziel))
         except Exception as e:
             ui.warn(f"Konnte den Ordner nicht öffnen: {e}")
         return
@@ -1964,8 +2090,8 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
                         + (f" · zuletzt gesteuert von {z.get('wer')}" if z.get('wer') else ""))
         except Exception:
             pass
-        ui.info("Nutzung:  /kugel malen [beschreibung]  ·  /kugel weg  ·  /kugel ordner  ·  "
-                f"Dateien: {KB.ORDNER}\\{name}.png, {name}_froh.png, _ernst.png, _denkt.png")
+        ui.info("Nutzung:  /kugel malen [beschreibung]  ·  /kugel malen <bereich|alle>  ·  /kugel motive  ·  "
+                "/kugel impuls an|aus  ·  /kugel weg  ·  /kugel ordner")
         return
     import imagegen
     grund = imagegen.missing_reason_aktiv()
@@ -1982,8 +2108,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
             try:
                 beschreibung = (await ctx.backend.ask_once(
                     KB.SELBSTBESCHREIBUNG_PROMPT,
-                    KB.selbstbeschreibung_system(name, PS.render_text(PS.active()),
-                                                 sd=KB.sd_pipeline()))).strip()
+                    KB.selbstbeschreibung_system(name, PS.render_text(PS.active())))).strip()
             except Exception as e:
                 ui.error(f"Selbstbeschreibung fehlgeschlagen: {e}")
                 return
@@ -2009,6 +2134,59 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         _bild_vorschau(str(p))
     ui.info("Die Kugel zeigt es beim nächsten Takt. Stimmung wechselt die Persönlichkeit selbst "
             "(Aktion kugel) – oder du sagst ihr „sei mal ernst“. Nicht gut? /kugel malen nochmal (neuer Seed).")
+
+
+async def _kugel_motive_malen(name: str, auswahl: str) -> None:
+    """/kugel malen <bereich|alle>: fehlende Motive mit der Figur der Grundbilder malen."""
+    import imagegen
+    import kugelbilder as KB
+    import kugelmotive as KM
+    if not KB.figur(name):
+        ui.warn(f"{name} hat noch keine Figur – zuerst /kugel malen (Grundbilder), "
+                "dann zeigen alle Motive dieselbe Figur.")
+        return
+    grund = imagegen.missing_reason_aktiv()
+    if grund:
+        ui.warn("Der Bild-Motor kann gerade nicht malen.")
+        ui.info(grund)
+        return
+    if auswahl.lower() == "alle":
+        schluessel, was = [k for _, liste in KM.BEREICHE.values() for k in liste], "alle Bereiche"
+    else:
+        key = KM.bereich_finden(auswahl)
+        schluessel, was = KM.BEREICHE[key][1], KM.BEREICHE[key][0]
+    offen = KB.motive_fehlend(name, schluessel)
+    if not offen:
+        ui.success(f"🎨 {was}: schon alle {len(schluessel)} Motive gemalt.")
+        return
+    ui.info(f"🎨 {was}: {len(offen)} von {len(schluessel)} Motiven fehlen – {imagegen.active_label()}, "
+            f"{KB.SCHRITTE} Schritte je Bild.")
+    halt = {"an": False}
+
+    def _halt() -> bool:
+        """Esc: nach dem laufenden Bild aufhören – fertige Bilder bleiben, der Rest kommt beim nächsten Mal."""
+        try:
+            if ui.TUI.consume_abort() if ui.TUI is not None else _esc_pressed():
+                halt["an"] = True
+        except Exception:
+            pass
+        return halt["an"]
+
+    try:
+        bilder = await _run_with_status(
+            f"🎨 {name} malt Motive ({was}) · Esc stoppt nach dem laufenden Bild",
+            lambda on_status: KB.motive_malen(name, offen, on_status=on_status, abbruch=_halt))
+    except asyncio.CancelledError:
+        halt["an"] = True                    # das laufende Bild wird fertig, dann ist Schluss
+        raise
+    except Exception as e:
+        ui.error(f"Malen fehlgeschlagen: {e}")
+        return
+    ui.success(f"🎨 {len(bilder)} Motive gemalt → {KB.motiv_ordner(name)}")
+    if halt["an"] and len(bilder) < len(offen):
+        ui.info(f"Gestoppt – {len(offen) - len(bilder)} fehlen noch. Weiter mit: /kugel motive {auswahl}")
+    for b in bilder[:2]:
+        _bild_vorschau(str(b))
 
 
 async def run_reich(erststart: bool = False) -> None:
@@ -2128,33 +2306,12 @@ async def run_wizard(nur_offene: bool = False) -> None:
     if fehlt_modell or nur_offene is False:
         ui.wizard_models_panel(W.MODELL_HINWEISE, W.modell_ordner())
     if todo:
-        if getattr(sys, "frozen", False) and any(s["id"] in ("venv", "torch", "pakete", "diffusers") for s in todo):
+        if getattr(sys, "frozen", False) and any(s["id"] in ("venv", "torch", "pakete") for s in todo):
             # torch & Co. aus dem neuen venv greifen erst nach einem Neustart: das bisher
             # eingebundene Python ist in diesem Prozess schon geladen.
             ui.warn("🔄 Bitte NemiCLI einmal neu starten – erst dann nutzen Gedächtnis, "
                     "Krea und Wache das neue venv neben der exe.")
         ui.info("Zum Nachsehen, was jetzt läuft:  /systemcheck")
-
-
-_SCHWERE_ZEICHEN = {"critical": "🛑 kritisch", "high": "⚠ hoch",
-                    "moderate": "• mittel", "medium": "• mittel", "low": "· niedrig"}
-
-
-def _cve_text(cves: list) -> str:
-    """Die offenen Sicherheitshinweise als Text für die Vorschau (F8)."""
-    zeilen = []
-    for c in cves:
-        grad = _SCHWERE_ZEICHEN.get(c["schwere"], c["schwere"])
-        punkte = f"  ·  CVSS {c['punkte']}" if c.get("punkte") else ""
-        zustand = ("betrifft den neuen Build" if c["offen"] else
-                   "Grenze ist ein Commit, keine Build-Nummer – nicht vergleichbar")
-        zeilen.append(f"{grad}{punkte}   {c['cve']}   ({zustand})")
-        zeilen.append(f"    {c['titel']}")
-        zeilen.append(f"    gemeldet {c.get('datum') or '?'} · betrifft "
-                      f"{c['bereich'] or '?'} · behoben ab {c['fix'] or '?'}")
-        zeilen.append(f"    {c['url']}")
-        zeilen.append("")
-    return "\n".join(zeilen).rstrip()
 
 
 async def workspace_befehl(ctx: "Ctx | None" = None, arg: str = "") -> None:
@@ -2219,6 +2376,13 @@ async def workspace_befehl(ctx: "Ctx | None" = None, arg: str = "") -> None:
     await converse(ctx.backend, auftrag)
 
 
+def _plan_zeigen() -> None:
+    daten = plan.daten()
+    if daten is not None:
+        ui.console.print(ui.plan_panel(daten))
+        plan.angezeigt()
+
+
 def _todo_zeigen() -> None:
     daten = coding.laden() if coding.aktiv() else None
     if daten is not None:
@@ -2264,7 +2428,7 @@ def _auftrag_lesen(name: str) -> str | None:
     """Lädt eine Agenten-Anleitung und setzt {{char}}/{{user}} ein.
 
     Keine feste Persönlichkeit: wer gerade spricht, steht in der Anleitung als
-    Platzhalter – so gilt dieselbe Datei für Nemi, Lara oder jedes eigene Profil."""
+    Platzhalter – so gilt dieselbe Datei für jede Persönlichkeit."""
     p = AGENTEN_DIR / f"{name}.md"
     if not p.exists():
         return None
@@ -2294,6 +2458,260 @@ async def _ollama_pull_and_done(name: str) -> None:
         return
     P._ollama_tags(force=True)                   # Cache auffrischen -> Modell taucht auf
     ui.success(f"🦙 {name} ist da. Wähle es jetzt über /model → Ollama.")
+
+
+async def _hf_datei_laden(H, repo: str, datei, ordner: Path, nr: int, von: int) -> Path:
+    """Eine Datei mit Live-Balken laden; Esc hält an (H.Abbruch, die .part-Datei bleibt)."""
+    import threading
+    stopp = threading.Event()
+    st = {"phase": "lade", "erledigt": 0, "tempo": 0.0, "letzt": None}
+
+    def fortschritt(phase: str, erledigt: int, gesamt: int) -> None:
+        jetzt = time.monotonic()
+        letzt = st["letzt"]
+        if phase != st["phase"] or letzt is None:
+            st["letzt"] = (jetzt, erledigt)
+        elif jetzt - letzt[0] >= 0.5:
+            momentan = (erledigt - letzt[1]) / (jetzt - letzt[0])
+            st["tempo"] = momentan if not st["tempo"] else 0.7 * st["tempo"] + 0.3 * momentan
+            st["letzt"] = (jetzt, erledigt)
+        st["phase"], st["erledigt"] = phase, erledigt
+
+    def panel():
+        return ui.hf_fortschritt(datei.name, st["phase"], st["erledigt"], datei.groesse, st["tempo"], nr, von)
+
+    task = asyncio.create_task(asyncio.to_thread(H.laden, repo, datei, ordner, fortschritt, stopp))
+    try:
+        with ui.live_view(panel()) as live:
+            while not task.done():
+                if ui.TUI.consume_abort() if ui.TUI is not None else _esc_pressed():
+                    stopp.set()
+                live.update(panel())
+                await asyncio.wait({task}, timeout=0.25)
+    except asyncio.CancelledError:
+        stopp.set()
+        task.add_done_callback(lambda t: t.exception())
+        raise
+    return task.result()
+
+
+async def hf_downloader() -> str | None:
+    """Modell von Hugging Face holen: Größe → MoE → Modell → Quantisierung → Sehen →
+    Steckbrief → Download mit SHA-256-Prüfung. Gibt die gguf-Referenz zurück, wenn das
+    Modell gleich verwendet werden soll."""
+    import extlibs
+    import gguflokal
+    import hfladen as H
+    abbruch = ("__cancel__", "↩  Abbrechen")
+    import systemprofil as SP
+    with ui.thinking("schaue mir deinen PC an"):
+        profil = await asyncio.to_thread(SP.erkennen)
+        motor = await asyncio.to_thread(lambda: bool(extlibs.enable().get("aktiv")))
+    vram = profil.nvidia.vram_mb if profil.nvidia else 0      # AMD/Intel: der Motor rechnet auf der CPU
+    ram = profil.ram_mb
+    ui.hf_willkommen(profil, H.gb(H.frei_auf_platte(gguflokal.ORDNER)), motor)
+
+    hinweise = {"4-8": "klein & flott", "8-15": "ausgewogen", "15-35": "stark", "35+": "sehr groß"}
+    opts = []
+    for key, (von, _, text) in H.GROESSEN.items():
+        ab = int(von * 1e9 * 4.9 / 8)
+        opts.append((key, f"{H.passt(ab, vram, ram)[0]}  {text}  ·  {hinweise[key]}  ·  ab ≈ {H.gb(ab)}"))
+    legende = ("✅ passt in die Grafikkarte · ⚠ knapp · 🐢 teils im RAM · ❌ zu groß" if vram
+               else "🐢 läuft auf der CPU · ❌ zu groß für den Arbeitsspeicher")
+    groesse = await ask_confirm(f"Wie groß soll das Modell sein?  ({legende})", opts + [abbruch])
+    if groesse == "__cancel__":
+        return None
+    moe = await ask_confirm("Mixture of Experts (MoE)?", [
+        ("egal", "🔀  Egal – alle zeigen"),
+        ("ja", "🧩  Nur MoE – viele Experten, je Wort rechnet nur ein Teil: schnell trotz Größe"),
+        ("nein", "🧱  Nur klassisch – alles rechnet immer mit"),
+        abbruch])
+    if moe == "__cancel__":
+        return None
+    with ui.thinking("frage Hugging Face nach passenden Modellen"):
+        try:
+            liste = await asyncio.to_thread(H.suchen, groesse, {"ja": True, "nein": False}.get(moe))
+        except Exception as e:
+            ui.error(f"{e} – ist das Internet da?")
+            return None
+    if not liste:
+        ui.warn("Dazu gibt es gerade nichts Passendes. Probier eine andere Größe oder „Egal“ bei MoE.")
+        return None
+    vorhanden = set(gguflokal.modelle())
+    opts = []
+    for m in liste:
+        da = "  ·  ✔ schon da" if m.name in vorhanden else ""
+        sieht = "  ·  👁" if m.sieht else ""
+        opts.append((m.repo, f"{H.passt(m.q4_schaetzung, vram, ram)[0]}  {m.name}  ·  {m.groesse_text}  ·  "
+                             f"≈ {H.gb(m.q4_schaetzung)}{sieht}{da}"))
+    repo = await ask_confirm(f"{len(liste)} Modelle, meistgeladene zuerst – welches?", opts + [abbruch])
+    if repo == "__cancel__":
+        return None
+    modell = next(m for m in liste if m.repo == repo)
+
+    with ui.thinking(f"schaue in {modell.name}"):
+        try:
+            sprach, bild = await asyncio.to_thread(H.dateien, repo)
+        except Exception as e:
+            ui.error(f"Dateiliste nicht abrufbar: {e}")
+            return None
+    tipp = H.empfohlen(sprach)
+    if tipp is None:
+        ui.warn(f"{modell.name} hat keine einzelne GGUF-Datei mit Prüfsumme – das lässt sich nicht sicher laden.")
+        return None
+    opts = [(tipp.pfad, f"⭐ {tipp.quant}  ·  {H.gb(tipp.groesse)}  ·  {H.passt(tipp.groesse, vram, ram)[0]}  ·  empfohlen")]
+    opts += [(d.pfad, f"   {d.quant}  ·  {H.gb(d.groesse)}  ·  {H.passt(d.groesse, vram, ram)[0]}")
+             for d in sprach if d is not tipp]
+    wahl = await ask_confirm("Welche Quantisierung?  (weniger Bit: kleiner und schneller · mehr Bit: genauer)",
+                             opts + [abbruch])
+    if wahl == "__cancel__":
+        return None
+    datei = next(d for d in sprach if d.pfad == wahl)
+    mm = H.mmproj_wahl(bild)
+    if mm is not None:
+        sehen = await ask_confirm("👁 Dieses Modell kann Bilder ansehen. Die Sehen-Datei dazu laden?", [
+            ("ja", f"👁  Ja, mit Sehen  ·  +{H.gb(mm.groesse)}"), ("nein", "Nein, nur Text")])
+        if sehen != "ja":
+            mm = None
+
+    ziel = gguflokal.ORDNER / modell.name
+    andere = [p for p in ziel.glob("*.gguf") if "mmproj" not in p.name.lower() and p.name != datei.name]
+    if andere:                                 # andere Quantisierung schon da: eigener Ordner
+        ziel = gguflokal.ORDNER / f"{modell.name}-{datei.quant}"
+    noetig = datei.groesse + (mm.groesse if mm else 0)
+    frei = H.frei_auf_platte(ziel)
+    ui.hf_modell(modell, datei, mm, H.passt(datei.groesse, vram, ram), H.gb(frei), str(ziel))
+    if frei < noetig + 2**30:
+        ui.error(f"Nicht genug Platz: gebraucht {H.gb(noetig)}, frei {H.gb(frei)}.")
+        return None
+    los = await ask_confirm(f"{H.gb(noetig)} herunterladen?", [("ja", "⬇  Ja, herunterladen"), abbruch])
+    if los != "ja":
+        return None
+
+    teile = [datei] + ([mm] if mm else [])
+    for nr, d in enumerate(teile, 1):
+        try:
+            await _hf_datei_laden(H, repo, d, ziel, nr, len(teile))
+        except H.Abbruch:
+            ui.info("⏸ Angehalten. Starte den Download einfach nochmal – er macht an derselben Stelle weiter.")
+            return None
+        except H.PruefFehler as e:
+            ui.error(f"🔐 {e}")
+            return None
+        except Exception as e:
+            ui.error(f"Download fehlgeschlagen: {e} – nochmal starten setzt fort.")
+            return None
+    ui.success(f"✅ {ziel.name} ist da. SHA-256 geprüft: stimmt mit Hugging Face überein.")
+    if not motor:
+        ui.info("Zum Verwenden fehlt noch torch – /einrichten installiert es, danach /model → Lokal.")
+        return None
+    jetzt = await ask_confirm("Gleich verwenden?", [("ja", f"🧠  Ja, {ziel.name} laden"),
+                                                    ("nein", "Später  ·  /model → Lokal")])
+    return M.make_ref("gguf", ziel.name) if jetzt == "ja" else None
+
+
+def _cloud_modell(ctx) -> bool:
+    """Läuft gerade ein Cloud-Modell (mit Key) – kein lokales?"""
+    anbieter = M.split_ref(ctx.model or "")[0]
+    prov = P.get(anbieter) if anbieter else None
+    return ctx.backend is not None and prov is not None and not prov.keyless and anbieter not in ("gguf", "ollama")
+
+
+async def update_befehl(ctx) -> str | None:
+    """/update: Programm per Git (nur Quelltext mit Remote), dann das venv prüfen und auf Stand
+    bringen – Nötiges (Lücken, Schadpakete, fehlt, Version passt nicht, torch-Bau) und erlaubte
+    Updates. Gibt eine Nachricht an die KI zurück, wenn sie die Lücken erklären soll."""
+    import venvpflege as V
+    grund = updater.why_not()
+    if grund is None:
+        try:
+            res = await _run_with_status("⬇ Programm", updater.run)
+        except Exception as e:
+            res = {"ok": False, "output": str(e)}
+        if not res["ok"]:
+            ui.warn("⬇ Programm-Update nicht durchgeführt.")
+            ui.text_panel("Git sagt", res["output"] or "(keine Ausgabe)")
+        elif res["changed"]:
+            ui.success(f"⬇ Programm: {res['before']} → {res['after']}  ({len(res['files'])} Datei(en)) – "
+                       "Neustart nötig, damit der neue Code läuft.")
+        else:
+            ui.info(f"⬇ Programm ist aktuell ({res['before']}).")
+    else:
+        ui.info("⬇ Programm: " + ("exe – neue Versionen kommen als neuer Ordner." if getattr(sys, "frozen", False)
+                                 else "kein Git-Remote, übersprungen."))
+
+    if V.site_packages() is None:
+        ui.warn("📦 Noch kein venv neben NemiCLI – /einrichten legt es an.")
+        return None
+    with ui.thinking("prüfe das venv: Pakete, Versionen, torch, bekannte Sicherheitslücken"):
+        liste = await asyncio.to_thread(V.pruefen)
+    if V.STAND["luecken"]:
+        ui.warn(f"🛡 {V.STAND['luecken']} – Lücken diesmal nicht geprüft.")
+    if not liste:
+        ui.success("📦 venv ist aktuell, keine bekannten Lücken – nichts zu tun.")
+        return None
+    ui.update_tabelle(liste)
+    machbar = [e for e in liste if e.machbar]
+    noetig = [e for e in machbar if e.noetig]
+    updates = [e for e in machbar if not e.noetig]
+    mit_luecken = [e for e in liste if e.luecken]
+    opts = []
+    if noetig and updates:
+        opts += [("alles", f"🔧  Nötiges reparieren + {len(updates)} Update(s)"),
+                 ("noetig", f"🔧  Nur Nötiges ({len(noetig)})")]
+    elif noetig:
+        opts.append(("noetig", f"🔧  Reparieren ({len(noetig)})"))
+    elif updates:
+        opts.append(("alles", f"⬆  {len(updates)} Update(s) installieren"))
+    erklaeren = bool(mit_luecken) and _cloud_modell(ctx)
+    if erklaeren:
+        opts.append(("ki", "🤖  Erst erklären lassen: wie gefährlich sind die Lücken?"))
+    opts.append(("__cancel__", "↩  Nicht jetzt"))
+    wahl = await ask_confirm("Was soll ich tun?", opts)
+    if wahl == "ki":
+        return _luecken_frage(mit_luecken)
+    if wahl == "__cancel__":
+        return None
+    auswahl = noetig if wahl == "noetig" else machbar
+    try:
+        res = await _run_with_status("📦 venv aktualisieren", lambda on_status: V.einspielen(auswahl, on_status))
+    except Exception as e:
+        ui.error(f"📦 Update fehlgeschlagen: {e}")
+        return None
+    if res["jetzt"]:
+        ui.success(f"📦 Aktualisiert und geprüft (lädt): {', '.join(res['jetzt'])}. Ein Neustart nimmt die neuen Fassungen.")
+    if res["entfernt"]:
+        ui.success(f"🚫 Schadpaket entfernt: {', '.join(res['entfernt'])}.")
+    if res["aufgeraeumt"]:
+        ui.success(f"🧹 Nicht mehr gebraucht, entfernt: {', '.join(res['aufgeraeumt'])}.")
+    for name, fehler in res["zurueck"]:
+        ui.warn(f"↩ {name} lud nach dem Update nicht mehr – alte Version zurückgeholt: {fehler}")
+    if res["spaeter"]:
+        ui.info(f"⏳ Gerade in Benutzung, kommt beim nächsten Start: {', '.join(res['spaeter'])}.")
+    if res["neustart"]:
+        ui.warn(f"⚙ {', '.join(res['neustart'])} ist geladen – NemiCLI neu starten und gleich /update tippen.")
+    for name, grund in res["abgelehnt"]:
+        ui.warn(f"⏭ {name} übersprungen, nichts verändert: {grund}")
+    offen = [e for e in liste if not e.machbar]
+    if offen:
+        ui.info("🛡 Offen (nicht automatisch behebbar): " + ", ".join(f"{e.name} – {e.hinweis}" for e in offen))
+    return None
+
+
+def _luecken_frage(eintraege) -> str:
+    """Nachricht an die KI: Funde als Daten, Bitte um eine verständliche Einordnung."""
+    import fremddaten
+    zeilen = []
+    for e in eintraege:
+        for l in e.luecken:
+            zeilen.append(f"{e.name} {e.installiert}: {l.kennung} · Schwere {l.schwere} · "
+                          f"behoben in {l.behoben or '–'} · {l.text}")
+        if e.hinweis:
+            zeilen.append(f"{e.name}: {e.hinweis}")
+    return ("/update hat in meinem NemiCLI-venv diese bekannten Sicherheitslücken gefunden (Daten aus OSV.dev). "
+            "Erklär mir kurz und verständlich, wie gefährlich sie für meine Nutzung sind und ob ich sofort "
+            "handeln sollte. Nichts installieren oder ändern – nur einordnen.\n\n"
+            + fremddaten.rahmen("\n".join(zeilen), "ausgabe", "OSV.dev"))
 
 
 async def setup_ollama() -> None:
@@ -2432,13 +2850,24 @@ async def pick_model(current: str | None) -> str | None:
     stufe1.append(("ollama_get",
                    "🦙  Ollama-Modell herunterladen" if ollama_on
                    else "🦙  Ollama einrichten  ·  installieren & Modell laden"))
-    stufe1.append(("__cancel__", "Abbrechen"))
+    hf = ("hf", "🤗  Modell von Hugging Face holen  ·  lokal, Größe und MoE wählen")
+    if current:
+        stufe1.append(hf)
+        stufe1.append(("__cancel__", "Abbrechen"))
+        frage = "Cloud-Anbieter oder Lokal?"
+    else:                                   # noch kein Modell: die zwei Einstiege zuerst
+        oben = [o for o in stufe1 if o[0] == "cloudadd"] + [hf]
+        stufe1 = oben + [o for o in stufe1 if o[0] != "cloudadd"] + [("__cancel__", "Später")]
+        frage = ("👋 Willkommen! Womit soll NemiCLI denken?  Cloud: API-Key eintragen · "
+                 "Lokal: ein Modell auf diesen PC holen")
 
-    wahl = await ask_confirm("Cloud-Anbieter oder Lokal?", stufe1)
+    wahl = await ask_confirm(frage, stufe1)
     if wahl == "__cancel__":
         return None
 
     # --- Einrichtungs-Zweige (laden/installieren, dann zurück ins /model) ---
+    if wahl == "hf":
+        return await hf_downloader()
     if wahl == "ollama_get":
         await setup_ollama()
         return None
@@ -2763,7 +3192,8 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
     if cmd == "/modus":
         return [(k, f"{haken(k == modes.current())}{sym} {name}", None) for k, sym, name in modes.MODES]
     if cmd == "/theme":
-        return [(k, f"{haken(k == ui.current_theme())}{k}", None) for k in ui.THEMES]
+        return [(k, f"{haken(k == ui.current_theme())}{k}  · {p.get('label', k)}"
+                 + ("  ✨ eigenes" if k not in ui.EINGEBAUT else ""), None) for k, p in ui.THEMES.items()]
     if cmd == "/kontext":
         prov, name = M.split_ref(ctx.model or "")
         if prov != "gguf":
@@ -2947,7 +3377,9 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             await run_wizard()
         elif cmd == "/systemcheck":
             import syscheck
+            import systemprofil as SP
             ui.info("🩺 Schaue mir deinen PC an … (ein paar Sekunden)")
+            ui.steckbrief_panel(await asyncio.to_thread(SP.erkennen, True))
             rep = await asyncio.to_thread(syscheck.report, True)
             ui.system_panel(rep, syscheck.todo(rep))
         elif cmd == "/ml":
@@ -3169,7 +3601,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
         elif cmd == "/subagenten":
             sub = arg.strip().lower()
             texte = {"an": "🤝 Helfer an – vor jedem Losschicken wirst du gefragt.",
-                     "auto": "🤝 Helfer auto – Lara nimmt sich Helfer nach Bedarf, ohne Frage.",
+                     "auto": "🤝 Helfer auto – Helfer nach Bedarf, ohne Frage.",
                      "off": "🤝 Helfer aus – das Werkzeug ist gesperrt."}
             if sub:
                 neu = subagents.set_stufe(sub)
@@ -3252,6 +3684,39 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                 ui.info(f"Datei: {protokoll.PFAD}")
         elif cmd == "/wache":
             await _wache_befehl(ctx, arg.strip())
+        elif cmd == "/doku":
+            import doku
+            teile = arg.lower().split()
+            if teile[:1] == ["laden"] and len(teile) > 1 and teile[1] in doku.QUELLEN:
+                laden = doku.laden_python if teile[1] == "python" else doku.laden_mdn
+                try:
+                    ergebnis = await _run_with_status(
+                        f"📚 lade Doku: {teile[1]}", lambda on_status: laden(melde=on_status))
+                    ui.success(ergebnis)
+                except Exception as e:
+                    ui.error(f"Doku laden fehlgeschlagen: {e}")
+            elif teile[:1] == ["loeschen"] and len(teile) > 1:
+                ui.info(doku.loeschen(teile[1]))
+            elif teile:
+                ui.warn("Nutzung: /doku · /doku laden python|mdn · /doku loeschen python|mdn")
+            else:
+                ui.info(doku.status_text())
+        elif cmd == "/charakter":
+            import charakter
+            pfad = charakter.datei()
+            if arg.strip().lower() in ("oeffnen", "öffnen", "edit"):
+                if not pfad.is_file():
+                    ui.warn(f"Noch keine Charakter-Datei: {pfad}")
+                    ui.info("Bitte die Persönlichkeit, sie anzulegen – oder lege die JSON selbst an "
+                            "(kern, seed_referenz, stil, outfits, posen, regeln).")
+                else:
+                    try:
+                        os.startfile(str(pfad))
+                    except Exception as e:
+                        ui.warn(f"Öffnen fehlgeschlagen: {e}")
+            else:
+                ui.info(charakter.zeigen(charakter.laden()))
+                ui.info(f"📄 {pfad}")
         elif cmd == "/kugel":
             await _kugel_befehl(ctx, arg.strip())
         elif cmd in ("/undo", "/rueckgaengig", "/papierkorb"):
@@ -3321,37 +3786,9 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                 ui.error(f"Selbsttest abgebrochen: {e}")
             ui.text_panel("🔧 Selbsttest", "\n".join(zeilen))
         elif cmd == "/update":
-            grund = updater.why_not()
-            if grund:
-                ui.warn(f"⬇ /update geht hier nicht: {grund}")
-                return None
-            try:
-                res = await _run_with_status("⬇ Update", updater.run)
-            except Exception as e:
-                ui.error(f"Update fehlgeschlagen: {e}")
-                return None
-            if not res["ok"]:
-                ui.warn("⬇ Update nicht durchgeführt.")
-                ui.text_panel("Git sagt", res["output"] or "(keine Ausgabe)")
-                return None
-            if not res["changed"]:
-                ui.success(f"⬇ Schon aktuell ({res['before']}).")
-                return None
-            ui.success(f"⬇ Aktualisiert: {res['before']} → {res['after']}  "
-                       f"({len(res['files'])} Datei(en))")
-            if res["files"]:
-                ui.text_panel("Geändert", "\n".join(res["files"][:40]))
-            if res["requirements"]:
-                w = await ask_confirm("requirements.txt hat sich geändert – Abhängigkeiten jetzt "
-                                      "nachinstallieren (pip)?",
-                                      [("ja", "Ja, installieren"), ("nein", "Später selbst")])
-                if w == "ja":
-                    ok, tail = await _run_with_status("📦 pip install", updater.install_requirements)
-                    (ui.success if ok else ui.error)("📦 " + ("Abhängigkeiten aktuell." if ok
-                                                           else "pip meldet Fehler:"))
-                    if tail:
-                        ui.text_panel("pip", tail)
-            ui.info("Neustart nötig, damit der neue Code läuft: /exit, dann nemicli.")
+            frage = await update_befehl(ctx)
+            if frage:                          # KI soll die gefundenen Lücken einordnen
+                text, cmd = frage, None
         elif cmd in ("/workspace", "/workspaceend"):
             await workspace_befehl(ctx, "end" if cmd == "/workspaceend" else arg)
         elif cmd in ("/code", "/codeend"):
@@ -3448,6 +3885,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                 ctx.backend.reset()
             ctx.current_prompts = []
             ctx.current_chat = chatstore.next_id()
+            plan.verwerfen()
             mitschrift.leeren()
             ui.success(f"Neuer Chat #{ctx.current_chat} gestartet.")
         elif cmd == "/resume":
@@ -3465,6 +3903,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                     ctx.backend.messages = data.get("messages", [])
                     ctx.current_prompts = data.get("prompts", [])
                     ctx.current_chat = int(arg)
+                    plan.verwerfen()
                     mitschrift.leeren()
                     mitschrift.notiz(
                         f"Chat #{arg} fortgesetzt - {len(ctx.current_prompts)} fruehere "
@@ -3492,7 +3931,9 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             else:
                 tokens = arg.split()
                 head = tokens[0].lower()
-                if ":" in arg:                       # direkte Referenz: anbieter:modell
+                if head in ("huggingface", "hf"):
+                    ref = await hf_downloader()
+                elif ":" in arg:                     # direkte Referenz: anbieter:modell
                     ref = arg.strip()
                 elif len(tokens) > 1 and P.get(head):   # "openai gpt-4o"
                     ref = M.make_ref(head, tokens[1])
@@ -3517,10 +3958,27 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                     ui.warn(f"Unbekannt: '{arg}'. Tippe /model (ohne Text) für die Auswahl.")
             if ref:
                 ctx.backend, ctx.model = await switch_model(ref, ctx.backend, ctx.model, ctx.strength)
+        elif cmd == "/bild" and re.fullmatch(r"(?i)(schritte|steps)(\s+\d+)?", arg.strip()):
+            import krea
+            zahl = arg.split()[1] if len(arg.split()) > 1 else None
+            if zahl is None:
+                akt = krea.schritte()
+                opts = [(str(n), ("✓  " if n == akt else "   ") + f"{n} Schritte"
+                         + {krea.SCHRITTE_MIN: "  · schnell", krea.DEFAULTS["steps"]: "  · Standard",
+                            krea.SCHRITTE_MAX: "  · am genauesten"}.get(n, ""))
+                        for n in range(krea.SCHRITTE_MIN, krea.SCHRITTE_MAX + 1)]
+                opts.append(("__cancel__", "Abbrechen"))
+                zahl = await ask_confirm(
+                    f"Wie viele Schritte soll Krea 2 malen? ({krea.SCHRITTE_MIN} bis max. "
+                    f"{krea.SCHRITTE_MAX} – mehr Schritte = genauer, aber langsamer)", opts)
+                if zahl == "__cancel__":
+                    return None
+            neu = krea.set_schritte(int(zahl))
+            ui.success(f"🟣 Krea 2 malt jetzt mit {neu} Schritten – dauerhaft gespeichert.")
+            if int(zahl) != neu:
+                ui.info(f"Erlaubt sind {krea.SCHRITTE_MIN} bis {krea.SCHRITTE_MAX} Schritte.")
         elif cmd == "/bild":
             import imagegen
-            # Nur den AKTIVEN Motor pruefen: laeuft ComfyUI/WebUI, ist diffusers
-            # voellig gleichgueltig. Vorher hing beides an derselben Pruefung.
             reason = imagegen.missing_reason_aktiv()
             if reason:
                 ui.warn("Der Bild-Motor kann gerade nicht malen.")
@@ -3529,69 +3987,50 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             import sdwebui
             akt_backend = imagegen.backend()
             opts = imagegen.parse_opts(arg)
-            cks = imagegen.menu()
-            # Ohne Prompt: Status + Hilfe zeigen
-            if not opts["prompt"]:
+            if not opts["prompt"]:                   # ohne Prompt: Status + Hilfe
                 ui.info(f"🎨 Aktiver Bild-Motor: {imagegen.active_label()}")
-                if akt_backend == "krea":
+                if akt_backend == "webui":
+                    ui.info(f"🌐 WebUI ({sdwebui.host()}) – Vorgabe: fester Negativ-Prompt, CFG 1, "
+                            "832×1216, 14 Schritte. /bildmodel wechselt das Modell.")
+                elif akt_backend == "krea":
                     import krea
-                    ui.info(f"🟣 Krea 2 – eigene Pipeline, kein Negativ-Prompt, CFG 1, "
-                            f"{krea.DEFAULTS['steps']} Schritte. Modelle in {krea.krea_dir()}. "
+                    ui.info(f"🟣 Krea 2 – kein Negativ-Prompt, CFG 1, {krea.schritte()} Schritte "
+                            f"(/bild schritte ändert das). Modelle in {krea.krea_dir()}. "
                             "/bildmodel wechselt das Modell.")
-                elif akt_backend == "webui":
-                    ui.info(f"🌐 WebUI ({sdwebui.host()}) – kein Negativ-Prompt, CFG 1, "
-                            "1024×1024, 14 Schritte. /bildmodel wechselt das Modell.")
-                elif cks:
-                    ui.info("Checkpoints (in Models/checkpoints/):")
-                    for ref, label in cks.items():
-                        ui.console.print(f"  [dim]·[/dim] {label}")
-                else:
-                    ui.warn("Noch kein Modell da. Lege eine .safetensors (z.B. von Civitai) in:")
-                    ui.console.print(f"  [dim]{imagegen.CKPT_DIRS[0]}[/dim]")
-                ui.info('Nutzung:  /bild <beschreibung>  [--neg "..."] [--steps 28] '
-                        '[--cfg 7] [--size 768x768] [--seed 123] [--model name]')
+                ui.info('Nutzung:  /bild <beschreibung>  [--steps 8] [--size 1024x1024] [--seed 123] '
+                        '[--model name] [--ohne-gesicht]  ·  bei WebUI/ComfyUI auch [--neg "..."] [--cfg 7]')
                 return None
-            if akt_backend == "builtin" and not cks:
-                ui.warn("Kein Checkpoint gefunden. Lege eine .safetensors-Datei in:")
-                ui.console.print(f"  [dim]{imagegen.CKPT_DIRS[0]}[/dim]")
-                return None
+            modell, hinweis = imagegen.modell_aufloesen(opts.get("model"))
+            if hinweis:
+                ui.info(hinweis.strip(" ()") + ".")
             try:
-                # --no-face schaltet die Gesichts-Nachbesserung ganz ab; sonst an.
-                will_face = opts.get("adetailer")
-                will_face = True if will_face is None else will_face
-                path, nachbessern = await _run_with_status(
+                path = await _run_with_status(
                     "🎨 male dein Bild",
                     lambda on_status: imagegen.paint(
-                        opts["prompt"], model=opts.get("model"), neg=opts.get("neg"),
+                        opts["prompt"], model=modell, neg=opts.get("neg"),
                         steps=opts.get("steps"), cfg=opts.get("cfg"),
                         size=opts.get("size"), seed=opts.get("seed"),
-                        sampler=opts.get("sampler"), karras=opts.get("karras"),
-                        on_status=on_status))
+                        sampler=opts.get("sampler"), on_status=on_status))
                 ui.success(f"🖼 Fertig: {path}")
-                _bild_vorschau(str(path))
-                # Automatisch nachbessern (Gesicht/Augen) – nur bei der eigenen
-                # Pipeline sinnvoll (OpenCV-img2img passt nicht zu WebUI-Modellen).
-                anzeigen = path
-                if will_face and nachbessern:
+                if opts.get("gesicht", True):
                     try:
-                        gespeichert = await _run_with_status(
-                            "✨ bessere Gesicht & Augen nach",
-                            lambda on_status: imagegen.auto_nachbessern(path, on_status=on_status))
-                        if gespeichert:
-                            anzeigen = gespeichert
-                            ui.success(f"✨ Nachgebessert: {gespeichert}")
+                        besser = await _run_with_status(
+                            "✨ male das Gesicht nach",
+                            lambda on_status: imagegen.gesicht_nachbessern(path, on_status=on_status))
+                        if besser:
+                            path = besser
+                            ui.success(f"✨ Gesicht nachgebessert: {besser}")
                     except Exception as e:
-                        ui.warn(f"Nachbessern übersprungen ({e}).")
+                        ui.warn(f"Gesicht nachbessern übersprungen ({e}).")
+                _bild_vorschau(str(path))
                 try:
-                    os.startfile(anzeigen)        # fertiges Bild anzeigen (Windows)
+                    os.startfile(path)            # fertiges Bild anzeigen (Windows)
                 except Exception:
                     pass
             except Exception as e:
                 ui.error(f"Bild fehlgeschlagen: {e}")
         elif cmd == "/bildmodel":
             import imagegen, sdwebui, comfyui
-            cks = imagegen.menu()
-            aktuell = imagegen.default_model()
             akt_backend = imagegen.backend()
             webui_da = sdwebui.available()
             webui_models = sdwebui.models() if webui_da else {}
@@ -3622,12 +4061,6 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                     krea.set_chosen_model(treffer[0])
                     ui.success(f"🟣 Bild-Modell (Krea 2): {treffer[0]}")
                     return None
-                # dann eigene SD-Checkpoints, dann WebUI-Modelle
-                ck = imagegen.resolve(arg)
-                if ck is not None:
-                    imagegen.set_default_model(ck.ref)
-                    ui.success(f"🎨 Bild-Modell (eigene Pipeline): {ck.label}")
-                    return None
                 treffer = [n for n in webui_models if arg.strip().lower() in n.lower()]
                 if len(treffer) == 1:
                     sdwebui.set_chosen_model(treffer[0])
@@ -3640,13 +4073,9 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                     config.update(bild_backend="comfy")
                     ui.success(f"🧩 Bild-Modell (ComfyUI): {treffer[0]}")
                     return None
-                ui.warn(f"Kein Modell gefunden, das zu '{arg}' passt "
-                        "(weder eigene Pipeline noch WebUI noch ComfyUI).")
+                ui.warn(f"Kein Modell gefunden, das zu '{arg}' passt (weder Krea 2 noch WebUI noch ComfyUI).")
                 return None
-            opts = [(f"builtin::{ref}",
-                     ("✓  " if (akt_backend == "builtin" and ref == aktuell) else "   ")
-                     + f"🖥 {label}")
-                    for ref, label in cks.items()]
+            opts = []
             for name in krea_models:
                 mark = "✓  " if (akt_backend == "krea" and name == krea_aktiv) else "   "
                 opts.append((f"krea::{name}", f"{mark}🟣 {name}  (Krea 2)"))
@@ -3659,7 +4088,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                 # dazu gehören CLIP und VAE als eigene Dateien.
                 zusatz = "ComfyUI · geteilt" if art == "diffusion" else "ComfyUI"
                 opts.append((f"comfy::{name}", f"{mark}🧩 {name}  ({zusatz})"))
-            opts.append(("__ordner__", "📂  Ordner öffnen (eigene .safetensors ablegen)"))
+            opts.append(("__ordner__", "📂  Krea-2-Ordner öffnen (Modelldateien ablegen)"))
             opts.append(("__host__", f"🌐  WebUI-Adresse ändern  ({sdwebui.host()})"))
             opts.append(("__chost__", f"🧩  ComfyUI-Adresse ändern  ({comfyui.host()})"
                                       + ("" if comfy_da else "  – nicht erreichbar")))
@@ -3667,28 +4096,22 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             if comfy_da and not comfy_models:
                 i = comfyui.info()
                 ui.warn(f"🧩 ComfyUI {i['version']} läuft ({i['gpu']}, {i['vram_gb']} GB), "
-                        "kennt aber keinen Checkpoint.")
-                ui.info("Leg eins in ComfyUIs models/checkpoints – oder zeig ComfyUI "
-                        "per extra_model_paths.yaml auf deinen vorhandenen Ordner:")
-                ui.console.print(f"  [dim]{imagegen.CKPT_DIRS[0]}[/dim]")
-            if not cks and not krea_models and not webui_models and not comfy_models:
-                ui.warn("Noch kein Bild-Modell da. Entweder eine .safetensors hier ablegen:")
-                ui.console.print(f"  [dim]{imagegen.CKPT_DIRS[0]}[/dim]")
+                        "kennt aber keinen Checkpoint – leg eins in ComfyUIs models/checkpoints.")
+            if not krea_models and not webui_models and not comfy_models:
+                ui.warn(f"Noch kein Bild-Modell da. Krea-2-Dateien gehören nach:  {krea.krea_dir()}")
                 ui.info("… oder eine Forge/A1111-WebUI mit --api starten "
                         f"(erwartet unter {sdwebui.host()}).")
             wahl = await ask_confirm("Welches Modell zum Bildermalen?  "
-                                     "(🖥 SD-Pipeline · 🟣 Krea 2 · 🌐 Forge/A1111 · 🧩 ComfyUI)",
-                                     opts)
+                                     "(🟣 Krea 2 · 🌐 Forge/A1111 · 🧩 ComfyUI)", opts)
             if wahl == "__cancel__":
                 return None
             if wahl == "__ordner__":
-                imagegen.CKPT_DIRS[0].mkdir(parents=True, exist_ok=True)
+                krea.krea_dir().mkdir(parents=True, exist_ok=True)
                 try:
-                    os.startfile(imagegen.CKPT_DIRS[0])
+                    os.startfile(krea.krea_dir())
                 except Exception:
-                    ui.info(str(imagegen.CKPT_DIRS[0]))
-                ui.info("Datei reinlegen, dann nochmal /bildmodel – sie taucht "
-                        "automatisch auf.")
+                    ui.info(str(krea.krea_dir()))
+                ui.info("Dateien reinlegen, dann nochmal /bildmodel – sie tauchen automatisch auf.")
                 return None
             if wahl == "__host__":
                 neu = await ask_text(f"WebUI-Adresse (jetzt: {sdwebui.host()}):")
@@ -3708,7 +4131,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             if art == "krea":
                 krea.set_chosen_model(name)
                 ui.success(f"🟣 Bild-Modell (Krea 2): {name}  ·  kein Negativ-Prompt, CFG 1, "
-                           f"{krea.DEFAULTS['steps']} Schritte, "
+                           f"{krea.schritte()} Schritte, "
                            f"{krea.DEFAULTS['size'][0]}×{krea.DEFAULTS['size'][1]}")
             elif art == "comfy":
                 comfyui.set_chosen_model(name)
@@ -3723,43 +4146,8 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             elif art == "webui":
                 sdwebui.set_chosen_model(name)
                 config.update(bild_backend="webui")
-                ui.success(f"🌐 Bild-Modell (WebUI): {name}  ·  kein Negativ-Prompt, "
-                           "CFG 1, 1024×1024, 14 Schritte")
-            else:
-                imagegen.set_default_model(name)
-                ui.success(f"🎨 Bild-Modell (eigene Pipeline): {cks.get(name, name)}")
-        elif cmd == "/bearbeiten":
-            import imgwin
-            # Hier bleibt die harte Pruefung mit Absicht: /bearbeiten malt einen
-            # Bildbereich mit imagegen.repaint_region() neu - das IST die eigene
-            # img2img-Pipeline. ComfyUI hilft dabei nicht, also braucht es hier
-            # wirklich torch/diffusers.
-            reason = None
-            try:
-                import imagegen
-                reason = imagegen.missing_reason()
-            except Exception as e:
-                reason = str(e)
-            if reason:
-                ui.warn("Fürs Bearbeiten fehlen noch Bibliotheken.")
-                ui.info(reason)
-                return None
-            pfad = arg.strip('"') if arg else imgwin.neuestes_bild()
-            if not pfad or not Path(pfad).exists():
-                ui.warn("Kein Bild gefunden. Erst eins mit /bild malen – oder "
-                        "/bearbeiten <pfad> angeben.")
-                return None
-            ui.info(f"🖼 Fenster geöffnet: {Path(pfad).name}  ·  "
-                    "Rahmen ziehen → Neu malen → Speichern")
-            try:
-                gespeichert = await imgwin.open_editor(pfad)
-            except Exception as e:
-                ui.error(f"Bearbeiten-Fenster fehlgeschlagen: {e}")
-                return None
-            if gespeichert:
-                ui.success(f"🖼 Gespeichert: {gespeichert}")
-            else:
-                ui.info("Fenster geschlossen – nichts gespeichert.")
+                ui.success(f"🌐 Bild-Modell (WebUI): {name}  ·  fester Negativ-Prompt, "
+                           "CFG 1, 832×1216, 14 Schritte")
         elif cmd == "/staerke":
             options = M.strength_menu(ctx.model)
             if not ctx.strength_active() or not options:
@@ -3779,10 +4167,22 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             else:
                 ui.warn(f"Unbekannte Stärke. Optionen: {', '.join(options)}")
         else:
-            ui.warn(f"Unbekannter Befehl: {cmd}. Tippe /help.")
-        if GUI_BRUECKE is not None:
-            _gui_spiegeln(ctx)
-        return None
+            # Unbekannt: ähnliche Befehle zeigen; ohne Treffer fragt die KI in der Befehlsliste nach.
+            import commands as C
+            treffer = [n for n, _ in C.find_commands(cmd)[:5]]
+            if treffer:
+                ui.info(f"{cmd} gibt es nicht. Meintest du: " + " · ".join(treffer))
+            elif ctx.backend is None:
+                ui.warn(f"Unbekannter Befehl: {cmd}. Tippe /help.")
+            else:
+                suche = f"{cmd[1:]} {arg}".strip()
+                text = (f"Ich suche in NemiCLI: „{suche}“. Welcher Befehl oder welche Taste passt? "
+                        "Schlag in anleitung_lesen mit thema \"nemicli\" nach.")
+                cmd = None
+        if cmd is not None:
+            if GUI_BRUECKE is not None:
+                _gui_spiegeln(ctx)
+            return None
 
     # --- Normaler Chat ----------------------------------------------------
     if not text.strip():
@@ -3961,7 +4361,7 @@ async def auftrag_lauf(name: str) -> int:
 # Justieren. Die letzte Antwort wird der Bericht in Berichte/Wache_….md.
 
 async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
-    from wache import zugang as Z, justierung as J, werkzeuge as W, regeln as R
+    from wache import zugang as Z, justierung as J, werkzeuge as W
     teile = arg.split(None, 1)
     sub = (teile[0].lower() if teile else "")
     rest = teile[1].strip() if len(teile) > 1 else ""
@@ -4170,7 +4570,7 @@ KUGEL_MODELL_HALTEN_S = 300      # lokales Modell nach dem letzten Kugel-Gesprä
 
 def wache_lauf() -> int:
     global ask_confirm, review_action_confirm
-    from wache import dienst as _dienst, wecker as _wecker, zugang as _zugang
+    from wache import dienst as _dienst, wecker as _wecker, zugang as _zugang, ORDNER as _WACHE_ORDNER
     import zeitplan as _ZP
     if _zugang.laeuft():
         print("Die Wache läuft schon.")
@@ -4217,6 +4617,32 @@ def wache_lauf() -> int:
         gespraech["freigabe"] = zeit
         zeit.start()
 
+    gespraech_datei = _WACHE_ORDNER / "kugel_gespraech.json"
+
+    def _gespraech_laden() -> list:
+        import json
+        try:
+            d = json.loads(gespraech_datei.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return []
+        return [m for m in d if isinstance(m, dict)] if isinstance(d, list) else []
+
+    def _gespraech_speichern(messages: list) -> None:
+        """Kugel-Gespräch für den nächsten Start – nur Text, Screenshots bleiben draußen."""
+        import json
+        raus = []
+        for m in messages:
+            inhalt = m.get("content")
+            if isinstance(inhalt, list):
+                inhalt = " ".join(t.get("text", "") for t in inhalt
+                                  if isinstance(t, dict) and t.get("type") == "text").strip() or "[Bild]"
+            raus.append({"role": m.get("role"), "content": inhalt})
+        try:
+            gespraech_datei.parent.mkdir(parents=True, exist_ok=True)
+            gespraech_datei.write_text(json.dumps(raus, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            pass
+
     def _lock() -> asyncio.Lock:
         if gespraech["lock"] is None:
             gespraech["lock"] = asyncio.Lock()
@@ -4230,11 +4656,14 @@ def wache_lauf() -> int:
         return ref, await make_backend(ref, None, cfg.get("strength", M.DEFAULT_STRENGTH))
 
     async def wecken(alarme) -> str:
+        from wache import steuerung as _ST
         async with _lock():
             _freigabe_absagen()
+            _ST.hintergrund(True)
             try:
                 return await _wecken(alarme)
             finally:
+                _ST.hintergrund(False)
                 await asyncio.to_thread(_lokales_modell_freigeben)
 
     async def _wecken(alarme) -> str:
@@ -4270,10 +4699,10 @@ def wache_lauf() -> int:
         print(f"[{time.strftime('%H:%M:%S')}] Weckruf: {len(alarme)} Alarme → {pfad.name}")
         return antwort
 
-    async def chat(text: str, bilder: list) -> tuple[str, list[str]]:
-        """Gespräch über die Schwebekugel: EIN Verlauf, solange der Dienst läuft.
+    async def chat(text: str, bilder: list) -> tuple[str, list[str], str]:
+        """Gespräch über die Schwebekugel: EIN Verlauf, gespeichert bis „+ Neu“.
         Bilder (Screenshots) gehen als Data-URIs mit; neue Bilder aus Bilder/
-        kommen als Pfade zurück, damit die Kugel sie zeigt."""
+        kommen als Pfade zurück, damit die Kugel sie zeigt, dazu die Todo-Liste der Runde."""
         async with _lock():
             _freigabe_absagen()
             try:
@@ -4281,12 +4710,23 @@ def wache_lauf() -> int:
             finally:
                 _freigabe_planen(KUGEL_MODELL_HALTEN_S)       # auch nach Fehlern: nicht im VRAM hängen
 
-    async def _kugel_gespraech(text: str, bilder: list) -> tuple[str, list[str]]:
+    async def chat_neu() -> None:
+        """„+ Neu“ im Kugel-Fenster: das Gespräch beginnt von vorn."""
+        async with _lock():
+            if gespraech["kugel_backend"] is not None:
+                gespraech["kugel_backend"][1].reset()
+            try:
+                gespraech_datei.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    async def _kugel_gespraech(text: str, bilder: list) -> tuple[str, list[str], str]:
         if gespraech["kugel_backend"] is None:
             try:
                 ref, backend = await _backend_neu()
             except Exception as e:
-                return f"Ich kann gerade nicht antworten: {e}", []
+                return f"Ich kann gerade nicht antworten: {e}", [], ""
+            backend.messages = _gespraech_laden()
             gespraech["kugel_backend"] = (ref, backend)
         ref, backend = gespraech["kugel_backend"]
         name = PS.active().name
@@ -4303,7 +4743,8 @@ def wache_lauf() -> int:
         try:
             await asyncio.wait_for(converse(backend, text, images=uris or None), timeout=10 * 60)
         except Exception as e:
-            return f"(abgebrochen: {e})", []
+            return f"(abgebrochen: {e})", [], plan.text_fuer_modell()
+        _gespraech_speichern(backend.messages)
         antwort = mitschrift.letzte_antwort() or ""
         neue = []
         import profilordner
@@ -4314,9 +4755,9 @@ def wache_lauf() -> int:
                 pass
         protokoll.schreibe("kugel_chat", f"Kugel: {text[:120]}", "success", veraendernd=False,
                            wer=name, ergebnis=antwort)
-        return antwort, sorted(neue)
+        return antwort, sorted(neue), plan.text_fuer_modell()
 
-    d = _dienst.Dienst(wecken, paths.INSTALL, chat=chat, name=PS.active().name,
+    d = _dienst.Dienst(wecken, paths.INSTALL, chat=chat, chat_neu=chat_neu, name=PS.active().name,
                        nutzer=PS.nutzername() or "du", mit_tray="--ohne-tray" not in sys.argv,
                        mit_kugel="--ohne-kugel" not in sys.argv)
     print(f"[{time.strftime('%H:%M:%S')}] Wache läuft (PID {os.getpid()})")
@@ -4414,6 +4855,8 @@ async def main():
 
     ctx = Ctx(backend=backend, model=model, strength=strength,
               current_chat=chatstore.next_id(), current_prompts=[])
+    import commands as _befehle                  # die KI sieht dieselbe Auswahl wie das Menü
+    _befehle.AUSWAHL_JETZT = lambda cmd: _untermenue_eintraege(ctx, cmd)
     stats.start_session(model)
     sicherheit.sitzung_zuruecksetzen()
     try:                                     # Papierkorb: Sicherungen älter als 30 Tage weg
@@ -4475,8 +4918,7 @@ async def main():
         if P.get("ollama").available():
             ui.info(f"🦙 Ollama läuft: {len(P.ollama_models())} Modell(e) – lokal, kein Key")
         if not provs and not P.get("ollama").available():
-            ui.info("Cloud: einen API-Key in die .env (z.B. OPENAI_API_KEY). "
-                    "Lokal: Ollama installieren und starten.")
+            ui.info("Cloud: API-Key eintragen · Lokal: Modell von Hugging Face holen – beides unter /model.")
     # Key-Schutz nur als einmaliges Ereignis melden (wenn gerade verschlüsselt wurde).
     # Der dauerhafte „geschützt"-Hinweis steht jetzt unter /help (sauberer Start).
     if secured_keys:
@@ -4521,6 +4963,8 @@ async def main():
 
     # --sag "<text>": erste Nachricht gleich abschicken (z.B. aus dem Rechtsklick-Menü)
     start_text = _start_nachricht()
+    if not start_text and ctx.backend is None and tui is not None:
+        start_text = "/model"                  # ohne Modell: gleich die Begrüßung (Cloud-Key · Hugging Face)
     if start_text and tui is not None:
         tui.start_text = start_text
     elif start_text:
@@ -4565,15 +5009,16 @@ def selftest(out=print) -> int:
                 "pricing", "setup", "syscheck", "extlibs", "practice", "webui",
                 "keyvault", "commands", "confirm", "chat", "cloud", "wizard",
                 "persona", "memory", "foldersense", "webfetch", "imagegen", "sdwebui", "comfyui",
+                "gesichter",
                 "stats", "modes", "uvsetup",
-                "imgwin", "textproc", "pdfgen", "winjob", "paths"):
+                "textproc", "pdfgen", "paths"):
         try:
             __import__(mod)
             print(f"  ok   {mod}")
         except Exception as e:
             fehler += 1
             print(f"  FEHLT {mod}: {e}")
-    for rel in ("Models", "Models/checkpoints", "Bilder", "chats", "learned"):
+    for rel in ("Models", "Bilder", "chats", "learned"):
         d = paths.ROOT / rel
         print(f"  {'ok  ' if d.exists() else 'FEHLT'} Ordner {rel}")
         fehler += 0 if d.exists() else 1
@@ -4672,9 +5117,9 @@ if __name__ == "__main__":
         _opts = imagegen.parse_opts(_prompt)      # --steps/--size/--seed ... erlaubt
         _text = _opts.pop("prompt", _prompt)
         print(f"male: {_text}  ({imagegen.device_info()})")
-        _erlaubt = ("model", "neg", "steps", "cfg", "size", "seed", "sampler", "karras")
-        _res, _ = imagegen.paint(_text, on_status=lambda m: print("  ", m),
-                                 **{k: v for k, v in _opts.items() if k in _erlaubt})
+        _erlaubt = ("model", "neg", "steps", "cfg", "size", "seed", "sampler")
+        _res = imagegen.paint(_text, on_status=lambda m: print("  ", m),
+                              **{k: v for k, v in _opts.items() if k in _erlaubt})
         print("fertig:", _res)
         raise SystemExit(0)
     if "--vollscan" in sys.argv:         # Vollscan aller Laufwerke (eigener Prozess, ohne Fenster)

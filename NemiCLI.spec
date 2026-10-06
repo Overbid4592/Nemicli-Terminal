@@ -5,9 +5,9 @@ NemiCLI.spec - Bauplan für die NemiCLI.exe (PyInstaller).
 Bauen:   python build_exe.py        (empfohlen, prüft alles vorher)
 oder:    pyinstaller NemiCLI.spec --noconfirm
 
-Was NICHT mit reinkommt: torch, diffusers, transformers, numpy, opencv, Pillow.
-Die gehören zum Bilder-Malen und wären zusammen ~6 GB. NemiCLI holt sie sich
-zur Laufzeit aus einem normal installierten Python (siehe engines/extlibs.py);
+Was NICHT mit reinkommt: torch, numpy, safetensors, opencv, Pillow, ruff.
+Die brauchen der GGUF-Motor, Krea 2 und das Gedächtnis, zusammen mehrere GB.
+NemiCLI holt sie sich zur Laufzeit aus dem venv (siehe engines/extlibs.py);
 welcher pip-Befehl dafür der richtige ist, sagt /systemcheck.
 """
 
@@ -36,13 +36,13 @@ HIDDEN += [
     "dotenv", "rich", "prompt_toolkit",
     "textual",                     # Vollbild-Oberfläche (ui/screen_tx.py)
     "pyte",                        # eigenes Terminal-Fenster (ui/terminal_fenster.py)
-    "tkinter",                     # Fenster für /bearbeiten
+    "tkinter",                     # Ordner-Auswahl (core/reich.py, /start)
     "PySide6.QtCore", "PySide6.QtGui", "PySide6.QtWidgets",   # Wache: Kugel, Chat, Tray (oberflaeche.py)
     "encodings.oem", "encodings.cp850", "encodings.cp1252",   # Konsolen-Ausgabe
 ]
 
 # Die KOMPLETTE Standard-Bibliothek mitnehmen (kostet nur ein paar MB).
-# Grund: torch & diffusers werden später von außen dazugeladen (extlibs.py)
+# Grund: torch & Co. werden später von außen dazugeladen (extlibs.py)
 # und benutzen Standard-Module, die NemiCLI selbst nie anfasst - fehlt eines,
 # stirbt der Import mit "No module named 'timeit'" o.ä.
 import sys as _sys
@@ -59,7 +59,7 @@ HIDDEN += _STDLIB
 # Unter-Module (unittest.mock!) müssen einzeln benannt werden.
 from PyInstaller.utils.hooks import collect_submodules
 HIDDEN += collect_submodules("textual")          # Widgets werden dynamisch geladen
-# Pakete, die die exe mitbringt UND transformers/torch aus dem venv benutzen: Die exe-Fassung
+# Pakete, die die exe mitbringt UND torch & Co. aus dem venv benutzen: Die exe-Fassung
 # wird zuerst gefunden – fehlt ihr ein Untermodul (tqdm.contrib), bricht der Import im venv ab.
 # Deshalb vollständig mitnehmen.
 for _geteilt in ("tqdm", "packaging", "requests", "jinja2", "yaml"):
@@ -90,6 +90,7 @@ EXCLUDES = [
     "torch", "torchvision", "torchaudio", "diffusers", "transformers",
     "numpy", "scipy", "cv2", "PIL", "safetensors", "accelerate",
     "matplotlib", "pandas", "IPython", "pytest", "setuptools", "pip",
+    "ruff",                        # Programm im venv; extlibs bindet es zur Laufzeit ein
 ]
 
 a = Analysis(

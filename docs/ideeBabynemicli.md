@@ -1,6 +1,6 @@
 # Idee: Baby-NemiCLI – eine eigene KI von null
 
-Stand: 26.09.2026 · besprochen mit Claude · **noch nicht begonnen, Umsetzung „die Tage“**
+Stand: 26.09.2026 · Idee des Autors · besprochen mit Claude · **noch nicht begonnen, Umsetzung „die Tage“**
 
 ## Der Gedanke
 Keine fremde KI nachtrainieren („Fine-Tune-Lappen“), sondern eine **eigene KI von null** auf dem
@@ -38,8 +38,8 @@ Die KI wird **fest in NemiCLI verankert**.
 - Kleine KIs erfinden anfangs **mehr**, nicht weniger – das Baby weiß noch nichts.
 - Das System zerschießen kann auch die eigene KI nicht: Die Sicherheit steckt in NemiCLI
   (Sandbox, Bestätigungen, Admin-Sperre, Schreibsperre), nicht im Modell.
-- Regel „Sprachmodelle unter 4B tabu“: gilt für Arbeits-KIs; die Baby-KI ist ein
-  Lernprojekt (Ausnahme entscheidet der Entwickler).
+- Die Regel „Sprachmodelle unter 4B tabu“: gilt für Arbeits-KIs; die Baby-KI ist ein
+  Lernprojekt (Ausnahme entscheidet der Autor).
 - Training in der **Labor-VHD** bzw. getrennt vom Alltags-NemiCLI.
 
 ## Nächster Schritt (wenn es losgeht)

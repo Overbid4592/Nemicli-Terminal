@@ -1,6 +1,6 @@
 # Plan: Coding-Assistent
 
-Stand: 02.10.2026 · Status: **Stufe 1–3 + 7 gebaut** (siehe Bau-Reihenfolge)
+Stand: 06.10.2026 · Status: **Stufe 1–3 + 7 gebaut, 4–5 teilweise; Ergänzungen A–J gebaut** (siehe Bau-Reihenfolge und Ergänzungen)
 
 ---
 
@@ -215,5 +215,7 @@ Ziel: Die KI soll in Python, HTML, CSS und JS weniger Fehler machen, die sie sel
 
 Dazu die offenen Stufen oben: Folgen-Check, Kopier-Check, Prüf-Schritt, `/gui`, Lese-Pflicht, Code ohne JSON-Escaping.
 Vorschlag für den Start: **A + B**.
+
+**Stand 06.10.2026: A–E gebaut**, dazu F–J (Versions-Blick, Nachschlagen in der Installation, Veraltetes melden mit ruff, Neuigkeiten-Check über PyPI/OSV, Lehren zu installierten Paketen). B nimmt jeden Chromium-Browser (Edge, Chrome, Brave …), C ist ein Volltext-Index (SQLite FTS5) statt der Vektor-Datenbank – der Bibliothekar liest nur 3 Wissen-Dateien je Runde, die Doku hat Tausende.
 
 **Bewusst ausgeschlossen: MCP.** NemiCLI bindet keine MCP-Server an – Werkzeuge bleiben eigener Code.

@@ -1,7 +1,9 @@
 """
 build_exe.py - Macht aus NemiCLI eine NemiCLI.exe.
 
-Aufruf:   python build_exe.py
+Aufruf:   python build_exe.py            exe bauen
+          python build_exe.py --msi      exe bauen + dist/NemiCLI-<Build>.msi (Windows Installer)
+          python build_exe.py --nur-msi  nur die MSI aus dem vorhandenen dist/NemiCLI
 Ergebnis: dist/NemiCLI/NemiCLI.exe  +  dist/NemiCLI/NemiCLIT2/  (Python, Bibliotheken, Code)
           dist/NemiCLI/SHA256SUMS.txt    (Prüfsummen der exe-Dateien)
 
@@ -92,10 +94,10 @@ def _eigene_exe() -> list[Path]:
     return sorted(ZIEL.glob("*.exe"))
 
 
-def signieren() -> str:
+def signieren(liste: list[Path] | None = None) -> str:
     """Signiert die exe-Dateien mit dem Zertifikat aus dem Nutzer-Speicher.
     Mit Zeitstempel, damit die Signatur das Ablaufen des Zertifikats überdauert."""
-    dateien = ",".join("'" + str(f).replace("'", "''") + "'" for f in _eigene_exe())
+    dateien = ",".join("'" + str(f).replace("'", "''") + "'" for f in (liste or _eigene_exe()))
     skript = "\n".join([
         "$ErrorActionPreference='Stop'",
         r"$z = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | "
@@ -129,7 +131,37 @@ def pruefsummen() -> Path:
     return ziel
 
 
+def msi_bauen() -> Path | None:
+    """dist/NemiCLI-<Build>.msi aus dist/NemiCLI, signiert, mit .sha256 daneben.
+    Die Build-Nummer kommt aus build.txt im Bau, damit MSI und exe gleich heißen."""
+    _step("Windows Installer (MSI)")
+    if not EXE.exists():
+        print(f"  Kein Bau in {ZIEL} – erst ohne --nur-msi bauen.")
+        return None
+    daten = eigene_daten_im_ziel()
+    if daten:
+        print(f"  ABBRUCH: In {ZIEL} liegen eigene Daten ({', '.join(daten)}) – die kämen in die MSI.")
+        return None
+    try:
+        build = (ZIEL / "NemiCLIT2" / "build.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        build = "0.0.0"
+    sys.path.insert(0, str(ROOT / "installer"))
+    import msi
+    paket = msi.bauen(ZIEL, DIST, build, ROOT / "nemicli.ico")
+    ergebnis = signieren([paket])
+    print("  " + ("unsigniert (kein Zertifikat)" if "kein-zertifikat" in ergebnis
+                  else ergebnis.replace("\n", "\n  ")))
+    h = hashlib.sha256(paket.read_bytes()).hexdigest()
+    (DIST / f"{paket.name}.sha256").write_text(f"{h}  {paket.name}\n", encoding="utf-8")
+    print(f"  {paket}  ({paket.stat().st_size / (1024**2):.0f} MB)")
+    print(f"  SHA-256: {h}")
+    return paket
+
+
 def main() -> int:
+    if "--nur-msi" in sys.argv:
+        return 0 if msi_bauen() else 1
     t0 = time.time()
     _step("Vorprüfung")
     if not check():
@@ -163,6 +195,8 @@ def main() -> int:
     _step("Fertig")
     print(f"  {EXE}")
     print(f"  Größe: {groesse / (1024**2):.0f} MB   ·   Dauer: {time.time() - t0:.0f} s")
+    if "--msi" in sys.argv:
+        return 0 if msi_bauen() else 1
     print("\n  Weitergeben: den ganzen Ordner 'dist/NemiCLI' kopieren oder zippen.")
     return 0
 

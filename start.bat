@@ -2,9 +2,11 @@
 REM ==== NemiCLI Starter ====
 REM Doppelklick startet NemiCLI (Slash-Befehle).
 REM
-REM Der Starter prueft ZUERST, ob die Installation vollstaendig ist, und baut
-REM Fehlendes selbst nach. Ohne venv fiele NemiCLI sonst stumm auf das
-REM System-Python zurueck, wo die Pakete fehlen, und startete nicht.
+REM Seit 15.09.2026 prueft der Starter ZUERST, ob die Installation vollstaendig
+REM ist, und baut Fehlendes selbst nach. Anlass: beim Umzug des Programm-Ordners
+REM (Desktop -> AppData) blieb das venv auf der Strecke - NemiCLI fiel dann
+REM stumm auf das System-Python zurueck, wo die Pakete fehlen, und startete
+REM einfach nicht mehr. Lieber einmal zwei Minuten warten als ratlos dastehen.
 REM
 REM Geprueft wird in dieser Reihenfolge:
 REM   1. Ist ueberhaupt ein Python da?      (venv, sonst py -3, sonst python)

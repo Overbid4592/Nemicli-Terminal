@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "NemiCLI – Nemi antwortet",
   "version": "1.0",
-  "description": "Rechtsklick auf einer Webseite: Nemi/Lara schreibt die Antwort direkt ins Textfeld oder erklärt den markierten Text. Redet nur mit dem laufenden NemiCLI auf 127.0.0.1.",
+  "description": "Rechtsklick auf einer Webseite: die aktive Persönlichkeit schreibt die Antwort direkt ins Textfeld oder erklärt den markierten Text. Redet nur mit dem laufenden NemiCLI auf 127.0.0.1.",
   "permissions": ["contextMenus", "storage", "activeTab", "scripting", "notifications"],
   "host_permissions": ["http://127.0.0.1:9000/*", "http://127.0.0.1/*"],
   "background": { "service_worker": "background.js" },
