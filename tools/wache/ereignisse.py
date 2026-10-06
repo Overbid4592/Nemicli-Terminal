@@ -119,8 +119,8 @@ class Alarm:
     urteil_von: str = ""                 # wer den Status gesetzt hat (Persönlichkeit, Nutzer)
     begruendung: str = ""
     # Worum es geht – der Prozess, bei R004 der Elternprozess, bei Dateien der Pfad, bei
-    # Netz „prozess → ziel“. Regel + Subjekt ist der Schlüssel fürs Verdichten
-    # (derselbe Vorgang soll nicht viele Einzelalarme geben) und fürs Dämpfen.
+    # Netz „prozess → ziel“. Regel + Subjekt ist der Schlüssel fürs Verdichten (derselbe
+    # Vorgang soll nicht 100 Einzelalarme geben) und fürs Dämpfen.
     subjekt: str = ""
     anzahl: int = 1                      # wie oft dasselbe innerhalb des Cooldowns wiederkam
     zuletzt: float = 0.0                 # Zeit des letzten Wiederkommens (0 = nur einmal)

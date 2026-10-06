@@ -37,7 +37,7 @@ ARTEN = {
     "datei":        "Größe und Zeitstempel einer Datei (pfad)",
     "registry":     "Werte und Unterschlüssel eines Registry-Schlüssels (schluessel)",
     "laufwerke":    "Laufwerke mit Belegung",
-    "system":       "Betriebssystem, Laufzeit, CPU, Arbeitsspeicher",
+    "system":       "Betriebssystem, Laufzeit, CPU, Arbeitsspeicher, Grafikkarten, Rechenweg lokaler Modelle",
     "netz":         "Netzwerkadapter mit Adressen und Zählern",
     "ereignisse":   "Ereignisprotokoll (kanal, optional id, anzahl)",
     "nutzer":       "angemeldete Benutzer",
@@ -425,14 +425,22 @@ def system() -> str:
     ram = psutil.virtual_memory()
     boot = psutil.boot_time()
     stunden = (time.time() - boot) / 3600
+    cpu, extra = platform.processor(), []
+    try:
+        import systemprofil                      # echter CPU-Name, Grafikkarten, Rechenweg
+        p = systemprofil.erkennen(prozesse=False)
+        cpu = p.cpu if p.cpu != "?" else cpu
+        extra = [z.replace(":", ":   ", 1) for z in p.zeilen() if z.startswith(("GPU", "Motor"))]
+    except Exception:
+        pass
     return "\n".join([
         f"System:     {platform.platform()}",
         f"Rechner:    {platform.node()}",
         f"Gestartet:  {_zeit(boot)} (seit {stunden:.1f} h)",
-        f"CPU:        {platform.processor()} · {psutil.cpu_count(logical=False)} Kerne / "
+        f"CPU:        {cpu} · {psutil.cpu_count(logical=False)} Kerne / "
         f"{psutil.cpu_count()} Threads · Last {psutil.cpu_percent(interval=0.3):.0f} %",
         f"RAM:        {_gb(ram.used)} von {_gb(ram.total)} belegt ({ram.percent:.0f} %)",
-    ])
+    ] + extra)
 
 
 def laufwerke() -> str:

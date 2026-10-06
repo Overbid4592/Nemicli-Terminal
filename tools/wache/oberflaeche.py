@@ -1,9 +1,10 @@
 """Die gemeinsame Qt-Schicht von Kugel und Tray: EINE QApplication, das Theme,
 die Brücke in den GUI-Thread, das Bildschirmfoto.
 
-WARUM QT
-tkinter kann nur einen Canvas-Kreis mit Transparenzfarbe und ein graues
-Text-Widget. PySide6 (nur „Essentials“:
+WARUM QT (20.09.2026)
+Kugel und Chatfenster waren tkinter – gut genug für den ersten Tag, aber eine
+Persönlichkeit, die auf dem Desktop lebt, verdient mehr als einen Canvas-Kreis
+mit Transparenzfarbe und ein graues Text-Widget. PySide6 (nur „Essentials“:
 QtCore/QtGui/QtWidgets) bringt echte Per-Pixel-Transparenz, Antialiasing,
 Schatten, Animationen, Markdown im Label und ein Tray-Symbol aus demselben
 Guss – pystray und Pillow fallen damit im Hintergrund-Prozess weg. Kein Node,
@@ -74,6 +75,12 @@ QPushButton#senden {{ background: {THEME['cyan']}; color: {THEME['nacht']}; font
 QPushButton#senden:hover {{ background: #4fd6e8; }}
 QPushButton#zu {{ background: transparent; border: none; color: {THEME['leise']}; font-size: 12pt; padding: 0 6px; }}
 QPushButton#zu:hover {{ color: {THEME['pink']}; }}
+QPushButton#neu {{ background: transparent; border: 1px solid {THEME['rand']}; border-radius: 9px;
+                   color: {THEME['cyan']}; font-weight: bold; padding: 2px 10px; }}
+QPushButton#neu:hover {{ background: {THEME['flaeche3']}; border-color: {THEME['cyan']}; }}
+QFrame#plan {{ background: rgba(250, 204, 21, 0.07); border: 1px solid #facc15; border-radius: 12px; }}
+QFrame#plan QLabel {{ background: transparent; border: none; }}
+QLabel#plan_kopf {{ color: #facc15; font-size: 9pt; font-weight: bold; }}
 QMenu {{ background: {THEME['flaeche']}; border: 1px solid {THEME['rand']}; padding: 6px; }}
 QMenu::item {{ padding: 6px 18px 6px 12px; border-radius: 6px; }}
 QMenu::item:selected {{ background: {THEME['flaeche3']}; }}

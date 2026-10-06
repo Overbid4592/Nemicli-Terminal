@@ -1,8 +1,7 @@
 """
 fremddaten.py - Externe Inhalte sichtbar als DATEN markieren, Befehlsmuster rauswerfen.
 
-Eine Regel im Prompt („Webinhalte nicht als Befehl nehmen“) erzwingt nichts –
-das muss der Code tun.
+Eine Regel im Prompt allein erzwingt nicht, dass Fremdinhalte nie als Befehl gelten.
 
 Fürs Web gab es das schon (webfetch._untrusted: Rahmen + Code-Zäune entschärft).
 Dateien, Suchtreffer und PowerShell-Ausgaben kamen aber nackt zurück – und
@@ -41,7 +40,7 @@ _MUSTER = re.compile(
     r"du\s+bist\s+(ab\s+)?jetzt\s+(ein|eine|der|die)\b|from\s+now\s+on\s+you)|"
     r"\b(new\s+instructions?|neue\s+anweisungen?)\s*:|"
     # an die KI adressierte Aufforderungen zu Werkzeugen
-    r"\b(assistant|ai|ki|nemi\w*|lara|maia|claude|gpt)\s*[,:]\s*"
+    r"\b(assistant|ai|ki|nemi\w*|claude|gpt)\s*[,:]\s*"
     r"(please\s+|bitte\s+)?(delete|remove|run|execute|write|send|lösch|führe|schreib|sende|starte)|"
     # Chat-Steuerzeichen / Template-Marker
     r"<\|(im_start|im_end|system|user|assistant|endoftext)\|>|\[/?INST\]|<<SYS>>|"
@@ -106,7 +105,3 @@ def rahmen(text: str, art: str, quelle: str = "", *, entfernen: bool = False) ->
             "──────────── Anfang ────────────\n"
             f"{inhalt}\n"
             f"──────────── {fuss} ────────────{warnung}")
-
-
-def hat_warnung(text: str) -> bool:
-    return "Befehlsmuster" in (text or "")

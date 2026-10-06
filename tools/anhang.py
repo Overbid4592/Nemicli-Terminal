@@ -256,7 +256,7 @@ def anhaengen(text: str) -> dict:
 
     for p in pfade:
         if p.is_dir():
-            # Ordner reingezogen: Listing statt Inhalt (Laras Vorschlag 4).
+            # Ordner reingezogen: Listing statt Inhalt.
             rest = _pfad_entfernen(rest, p)
             listing, n_o, n_d = liste_ordner(p)
             zusatz = f"{n_o} Ordner, {n_d} Dateien"

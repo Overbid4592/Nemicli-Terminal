@@ -1,13 +1,13 @@
 """
 updater.py - /update: NemiCLI per Git aktualisieren, ohne selbst zu tippen.
 
-Ablauf: Stand merken → `git pull --ff-only` → neuen Stand merken → hat sich
-requirements.txt geändert, Abhängigkeiten (nach Rückfrage in main.py) nachziehen.
+Ablauf: Stand merken → `git pull --ff-only` → neuen Stand merken. Die Pakete im
+venv prüft danach venvpflege.py.
 Nur Fast-Forward: bei lokalen Änderungen, die kollidieren würden, bricht Git ab
 und wir zeigen die Meldung – es wird nie etwas überschrieben oder gemergt.
 
 Funktioniert nur im Skript-Modus mit Git-Repo und eingerichtetem Remote. In der
-exe (kein Git) und ohne Remote gibt es eine klare Ansage statt eines Fehlers.
+exe (kein Git) und ohne Remote wird dieser Teil übersprungen.
 """
 
 from __future__ import annotations
@@ -86,19 +86,3 @@ def run(on_status) -> dict:
         res["files"] = [f for f in files.splitlines() if f.strip()]
         res["requirements"] = "requirements.txt" in res["files"]
     return res
-
-
-def install_requirements(on_status) -> tuple[bool, str]:
-    """pip install -r requirements.txt mit dem laufenden Python (also dem venv)."""
-    req = INSTALL / "requirements.txt"
-    if not req.exists():
-        return False, "requirements.txt fehlt."
-    on_status("installiere Abhängigkeiten (pip) …")
-    try:
-        r = subprocess.run([sys.executable, "-m", "pip", "install", "-r", str(req)],
-                           cwd=INSTALL, capture_output=True, text=True, timeout=900,
-                           creationflags=_NOWIN)
-        tail = "\n".join((r.stdout + r.stderr).strip().splitlines()[-8:])
-        return r.returncode == 0, tail
-    except Exception as e:
-        return False, str(e)

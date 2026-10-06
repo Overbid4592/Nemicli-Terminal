@@ -211,16 +211,6 @@ def _container_sid():
     return sid
 
 
-def container_sid_text() -> str:
-    text = w.LPWSTR()
-    if not _adv.ConvertSidToStringSidW(_container_sid(), ctypes.byref(text)):
-        return ""
-    try:
-        return text.value or ""
-    finally:
-        _k32.LocalFree(text)
-
-
 def _freigabe_vorhanden(zeile: str, marke: Path) -> bool:
     try:
         return zeile.lower() in marke.read_text(encoding="utf-8").lower().splitlines()

@@ -29,12 +29,6 @@ from .regeln import Regelwerk
 from .speicher import Speicher
 
 ANKER = datetime(2026, 6, 15, 14, 30).timestamp()
-
-
-def _ipv4(a, b, c, d):
-    return ".".join(str(x) for x in (a, b, c, d))
-
-
 _NORMAL = [("chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.exe", "explorer.exe"),
            ("code.exe", r"C:\Users\test\AppData\Local\Programs\Microsoft VS Code\Code.exe", "explorer.exe"),
            ("python.exe", r"C:\Python312\python.exe", "code.exe"),
@@ -43,7 +37,7 @@ _NORMAL = [("chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.ex
            ("OneDrive.exe", r"C:\Users\test\AppData\Local\Microsoft\OneDrive\OneDrive.exe", "explorer.exe"),
            ("Teams.exe", r"C:\Users\test\AppData\Local\Microsoft\Teams\current\Teams.exe", "explorer.exe"),
            ("git.exe", r"C:\Program Files\Git\cmd\git.exe", "code.exe")]
-_ZIELE = [_ipv4(142, 250, 185, 78), _ipv4(20, 190, 160, 2), _ipv4(13, 107, 42, 14), _ipv4(151, 101, 1, 69)]
+_ZIELE = ["11.22.33.1", "11.22.33.2", "11.22.33.3", "11.22.33.5"]
 _PORTS = [443] * 16 + [80, 80, 8080, 53]
 _SELTEN = [(f"tool{i}.exe", rf"C:\Program Files\Tools\tool{i}.exe", "explorer.exe") for i in range(30)]
 _DOWNLOADS = r"C:\Users\test\Downloads"
@@ -126,8 +120,8 @@ def angriffe() -> list[tuple[str, Ereignis]]:
         ("Makro startet PowerShell", _prozess("powershell.exe", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
                                               "winword.exe", ts, cmd="powershell -w hidden -enc SQBFAFgA")),
         ("Dropper aus Temp", _prozess("a8f3k2p9.exe", rf"{_TEMP}\a8f3k2p9.exe", "explorer.exe", ts + 60)),
-        ("C2 auf Port 4444", _netz("svchost.exe", _ipv4(185, 220, 101, 5), 4444, ts + 120)),
-        ("Bekannter Prozess, neues Ziel", _netz("chrome.exe", _ipv4(45, 33, 32, 156), 6667, ts + 180)),
+        ("C2 auf Port 4444", _netz("svchost.exe", "55.66.77.88", 4444, ts + 120)),
+        ("Bekannter Prozess, neues Ziel", _netz("chrome.exe", "55.66.77.99", 6667, ts + 180)),
         ("Systemprozess falsche Herkunft", _prozess("svchost.exe", r"C:\Windows\System32\svchost.exe", "chrome.exe", ts + 240)),
         ("Nachts unbekanntes Programm", _prozess("updater_x.exe", r"C:\Users\test\AppData\Roaming\x\updater_x.exe",
                                                   "explorer.exe", ANKER - 11 * 3600, nutzer="SYSTEM")),

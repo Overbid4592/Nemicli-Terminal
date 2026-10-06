@@ -117,10 +117,6 @@ def features(path: str | os.PathLike) -> list[str]:
 # Schritt 2: LERNEN – Naive-Bayes-Modell aus Beispielen
 # ---------------------------------------------------------------------------
 
-def _empty_model() -> dict:
-    return {"labels": {}, "vocab": [], "ndocs": 0}
-
-
 def _train(examples: list[tuple[str, list[str]]]) -> dict:
     """Zählt Tokens je Label. (Multinomiales Naive Bayes mit Add-1-Glättung.)"""
     labels: dict[str, dict] = {}
@@ -319,11 +315,6 @@ def _rebuild() -> dict:
     _save_json(MODEL_PATH, model)
     _MODEL_CACHE = model
     return model
-
-
-def retrain() -> dict:
-    """Öffentlich: Modell komplett neu bauen (z.B. nach dem Dazulernen)."""
-    return _rebuild()
 
 
 def _load_examples() -> list[dict]:

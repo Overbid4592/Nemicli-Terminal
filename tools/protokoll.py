@@ -4,13 +4,13 @@ protokoll.py - Aktions-Protokoll: was wann lief, dauerhaft, ohne Zutun.
 Bisher gab es drei Dinge, aber kein Protokoll: die Werkzeugbilanz nach jeder
 Runde (nur Anzeige), `learned/stats.json` (nur Zähler) und F12 (vollständig,
 aber nur wenn jemand drückt). Nach einem Vorfall konnte niemand nachsehen,
-was wann mit welchem Befehl gelaufen ist. Laras Frage 5 aus ihrem Brief.
+was wann mit welchem Befehl gelaufen ist.
 
 Jetzt schreibt jede Aktion eine Zeile nach `learned/aktionen.log`:
 
-    2026-09-15 14:02:11 | ÄNDERT | befehl        | ausgeführt | Lara | Befehl: git status
-    2026-09-15 14:02:40 | liest  | datei_lesen   | ausgeführt | Lara | Datei lesen: C:\\…\\main.py
-    2026-09-15 14:03:05 | ÄNDERT | loeschen      | ABGELEHNT  | Lara | Löschen: C:\\…\\x.txt
+    2026-09-15 14:02:11 | ÄNDERT | befehl        | ausgeführt | Nemi | Befehl: git status
+    2026-09-15 14:02:40 | liest  | datei_lesen   | ausgeführt | Nemi | Datei lesen: C:\\…\\main.py
+    2026-09-15 14:03:05 | ÄNDERT | loeschen      | ABGELEHNT  | Nemi | Löschen: C:\\…\\x.txt
 
 Auch lesende Aktionen stehen drin – bewusst. Lesen fragt nicht nach, und
 genau da könnte eine Prompt-Injection etwas auslösen. Im Protokoll fällt es

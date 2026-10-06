@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import asyncio
 import difflib
-import fnmatch
 import json
 import os
 import re
@@ -81,7 +80,7 @@ def bild_status() -> str | None:
 # ---------------------------------------------------------------------------
 # SCHUTZ: Windows-/Systemordner sind für die KI KOMPLETT tabu.
 # ---------------------------------------------------------------------------
-# Verändernde
+# Regel vom Nutzer (12.09.2026): „Da soll die KI erst gar nicht ran." Verändernde
 # Werkzeuge prüfen über _guard(), lesende über _read_guard(), Befehle über
 # _guard_command() – jeder Zielpfad wird gegen diese Liste geprüft, Pfade werden
 # vorher aufgelöst (…/.., Links, \\?\-Präfix), damit kein Umweg
@@ -160,14 +159,16 @@ def _is_protected(path: str) -> bool:
 
 # --- Eigene Sperren des Nutzers ---------------------------------------------
 # Oben ging es um Windows. Hier geht es um Orte, die dem Nutzer gehören, an
-# denen die KI aber nichts zu suchen hat (z.B. Modell-Ordner anderer
-# Programme: ein fremder VAE darin kann das Bildermalen stören). Zwei Stufen:
+# denen die KI aber nichts zu suchen hat. Anlass war der 15.09.2026: beim
+# Einrichten des Musicnemi-Workspace kam ein Audio-VAE dazu, und das Bilder-
+# malen fiel aus, weil NemiCLI seinen VAE per "nimm den ersten" wählte.
+# Kaputtgeschrieben war nichts – der Nutzer will diese Orte trotzdem
+# grundsätzlich aus der Hand der KI. Zwei Stufen:
 #
 #   ABSOLUT  – der NemiCLI-Ordner. Genau wie C:\Windows: nicht ändern und
 #              auch nicht ansehen. Damit kann sich NemiCLI nicht mehr selbst
-#              umbauen, und Lara liest ihren eigenen Quelltext nicht mehr.
-#              Das ist gewollt und ausdrücklich so bestellt.
-#   ÄNDERN   – KreaWork.json. Ansehen ist erlaubt (Lara soll Fragen zum
+#              umbauen, und die KI liest ihren eigenen Quelltext nicht.
+#   ÄNDERN   – KreaWork.json. Ansehen ist erlaubt (die KI soll Fragen zum
 #              Workflow beantworten können), Schreiben nicht.
 #
 # Beide Stufen decken auch das `befehl`-Werkzeug ab, sonst ginge ein
@@ -351,7 +352,9 @@ def _guard(*paths: str) -> str | None:
 
 
 # --- Systemordner sind komplett tabu – auch fürs Lesen -----------------------
-# Die KI hat in C:\Windows & Co. nichts zu suchen. Also sperren wir auch datei_lesen, ordner_auflisten, dateien_suchen, inhalt_suchen,
+# Ursprünglich durfte NemiCLI in C:\Windows & Co. *lesen* (nur nicht ändern).
+# Entscheidung vom 12.09.2026: Die KI hat dort gar nichts zu suchen. Also
+# sperren wir auch datei_lesen, ordner_auflisten, dateien_suchen, inhalt_suchen,
 # ordner_erkennen/ordner_lernen und jeden Befehl, der einen Systemordner nennt.
 # Die Laufwerks-Wurzel (C:\) darf weiterhin AUFGELISTET werden – nur die
 # geschützten Ordner darunter nicht.
@@ -376,9 +379,10 @@ def _in_system_dir(path: str) -> bool:
 def _read_guard(*paths: str) -> str | None:
     """Lese-Sperre: nur die absolut gesperrten Orte des Nutzers sind unsichtbar.
 
-    Windows-/Systemordner sind lesbar: Für die Systemwache (svchost am richtigen
-    Ort? Signatur von C:\\Windows\\System32\\…?) muss die KI hinschauen dürfen.
-    Nachschauen ja, ändern nie – fürs Ändern bleibt _guard() streng."""
+    Bis 18.09.2026 waren auch Windows-/Systemordner fürs Lesen tabu. Für die
+    Systemwache (svchost am richtigen Ort? Signatur von C:\\Windows\\System32\\…?)
+    muss die KI aber hinschauen dürfen. Der Nutzer hat entschieden: nachschauen
+    ja, ändern nie – fürs Ändern bleibt _guard() so streng wie vorher."""
     for path in paths:
         if path and (base := _absolut_gesperrt(path)) is not None:
             return ("Fehler: 🔒 Komplett gesperrt – der Nutzer hat diesen Bereich für "
@@ -513,8 +517,8 @@ def _guard_command(cmd: str, lesend: bool = False) -> str | None:
     Zwei Stufen:
       1. `_IMMER_STOPP` – Werkzeuge, die am System selbst arbeiten. Sofort aus.
       2. Jede Nennung eines System-Ziels – auch nur zum Anschauen
-         (Get-ChildItem C:\\Windows). Systemordner sind für Befehle komplett
-         tabu, nicht nur fürs Schreiben.
+         (Get-ChildItem C:\\Windows). Seit 12.09.2026 sind Systemordner für
+         die KI komplett tabu, nicht nur fürs Schreiben.
 
     Als System-Ziel zählen die geschützten Ordner UND die System-Zweige der
     Registry. Vor dem Vergleich werden Schrägstriche vereinheitlicht: `C:/Windows`
@@ -643,7 +647,7 @@ def _datei_lesen(a: dict) -> str | ActionResult:
 
 def _bild_ansehen(a: dict) -> ActionResult:
     """Ein Bild von der Platte ins Gespräch holen: main hängt es in der nächsten
-    Runde als echtes Bild an (Vision) – oder lässt den Qwen-Helfer beschreiben."""
+    Runde als echtes Bild an (Vision) – oder lässt den Bildbeschreiber beschreiben."""
     if (blocked := _read_guard(a.get("pfad", ""))):
         return ActionResult(blocked, ok=False)
     p = Path(str(a.get("pfad", "")).strip().strip('"'))
@@ -667,6 +671,116 @@ def _anleitung_lesen(a: dict) -> ActionResult:
     if not text:
         return ActionResult(f"Unbekanntes Thema {thema!r}. Möglich: " + ", ".join(persona.ANLEITUNGEN), ok=False)
     return ActionResult(text, ok=True)
+
+
+def _projektordner(a: dict) -> Path | None:
+    """Ordner für Abfragen im Projekt-Python: Feld `projekt`, sonst Coding-Projekt, sonst Workspace."""
+    roh = str(a.get("projekt") or "").strip().strip('"')
+    if roh and Path(roh).is_dir():
+        return Path(roh)
+    import coding
+    import workspace
+    return coding.arbeitsordner() or (Path(workspace.pfad()) if workspace.pfad() else None)
+
+
+def _api_nachschlagen(a: dict) -> ActionResult:
+    """Signatur, Doku und Version eines Namens aus der INSTALLIERTEN Bibliothek."""
+    import pyumgebung
+    text, ok = pyumgebung.nachschlagen(a.get("name"), _projektordner(a))
+    return ActionResult(fremddaten.rahmen(text, "ausgabe", "Installation") if ok else text, ok=ok)
+
+
+def _code_pruefen(a: dict) -> ActionResult:
+    """ruff über eine Datei oder einen Ordner (Standard: das Projekt)."""
+    import pyumgebung
+    projekt = _projektordner(a)
+    ziel = str(a.get("pfad") or "").strip().strip('"') or (str(projekt) if projekt else "")
+    if not ziel:
+        return ActionResult("Feld 'pfad' fehlt (Datei oder Ordner) – und kein Projekt aktiv.", ok=False)
+    if (blocked := _read_guard(ziel)):
+        return ActionResult(blocked, ok=False)
+    p = Path(ziel)
+    if not p.exists():
+        return ActionResult(f"Nicht gefunden: {p}", ok=False)
+    ergebnis = pyumgebung.ruff_pruefen([p], p if p.is_dir() else p.parent,
+                                       zielversion=pyumgebung.ziel_version(projekt))
+    if ergebnis is None:
+        return ActionResult("ruff ist nicht installiert – /update installiert es (requirements).", ok=False)
+    text, anzahl = ergebnis
+    if anzahl:
+        text += ("\nRegeln: E9 Syntax · F Namen/Importe · UP veralteter Python-Stil · B typische Fehler. "
+                 "Beheben und erneut prüfen.")
+    return ActionResult(text, ok=True)
+
+
+def _paket_info(a: dict) -> ActionResult:
+    import paketinfo
+    text, ok = paketinfo.info(a.get("name"), _projektordner(a))
+    return ActionResult(text, ok=ok)
+
+
+def _seite_ansehen(a: dict) -> ActionResult:
+    import seite
+    ziel = str(a.get("ziel") or a.get("pfad") or a.get("url") or "").strip()
+    if ziel and not re.match(r"^https?://", ziel, re.I) and (blocked := _read_guard(ziel)):
+        return ActionResult(blocked, ok=False)
+
+    def _zahl(k, standard):
+        try:
+            return int(a[k]) if a.get(k) not in (None, "") else standard
+        except (TypeError, ValueError):
+            return standard
+
+    bild, text = seite.ansehen(ziel, _zahl("breite", seite.BREITE), _zahl("hoehe", seite.HOEHE))
+    return ActionResult(text, ok=bild is not None, bilder=[str(bild)] if bild else None)
+
+
+def _doku_suchen(a: dict) -> ActionResult:
+    import doku
+    if a.get("id") not in (None, ""):
+        return ActionResult(fremddaten.rahmen(doku.lesen(a.get("id")), "suche", "Offline-Doku"), ok=True)
+    text = doku.suchen(str(a.get("frage") or a.get("suche") or ""), str(a.get("quelle") or ""))
+    return ActionResult(fremddaten.rahmen(text, "suche", "Offline-Doku"), ok=True)
+
+
+def _menue_oeffnen(a: dict) -> ActionResult:
+    """Nur der Weg außerhalb des Terminals (Browser, GUI): dort gibt es keine Auswahlmenüs.
+    Im Terminal öffnet main._converse das Menü selbst."""
+    import commands
+    befehl, fehler = commands.menue_pruefen(a.get("befehl"))
+    if fehler:
+        return ActionResult(fehler, ok=False)
+    return ActionResult(f"Menüs öffnen geht nur im NemiCLI-Fenster. Nenne dem Nutzer den Befehl {befehl}.",
+                        ok=False)
+
+
+def _theme_felder(a: dict) -> tuple:
+    import ui
+    return (a.get("name"), a.get("label") or a.get("beschreibung"), a.get("brand"), a.get("accent"),
+            a.get("verlauf") or a.get("gradient"), ui.EINGEBAUT)
+
+
+def _theme_erstellen(a: dict) -> ActionResult:
+    """Eigenes Farbschema anlegen; der Nutzer wählt es danach selbst (/theme)."""
+    import themes_eigen
+    import ui
+    try:
+        name, palette = themes_eigen.anlegen(*_theme_felder(a))
+    except ValueError as e:
+        return ActionResult(f"Theme nicht angelegt: {e}", ok=False)
+    ui.THEMES[name] = palette
+    return ActionResult(f"Theme '{name}' ({palette['label']}) angelegt. Wählbar mit /theme {name} – "
+                        "biete an, das /theme-Menü mit menue_oeffnen zu öffnen.", ok=True)
+
+
+def _einstellung_aendern(a: dict) -> ActionResult:
+    """Feste Liste von Einstellungen (tools/einstellungen.py) – fragt in jedem Modus."""
+    import einstellungen
+    try:
+        return ActionResult(einstellungen.aendern(str(a.get("was") or ""), a.get("wert"), a.get("grund") or ""),
+                            ok=True)
+    except ValueError as exc:
+        return ActionResult(str(exc), ok=False)
 
 
 def _bild_fragen(a: dict) -> ActionResult:
@@ -809,7 +923,7 @@ def _datei_schreiben(a: dict) -> str | ActionResult:
     Path(p).parent.mkdir(parents=True, exist_ok=True)
     with open(p, "w", encoding="utf-8") as f:
         f.write(inhalt)
-    return f"Datei geschrieben: {p} ({len(inhalt)} Zeichen)" + _undo_hinweis(kopie)
+    return f"Datei geschrieben: {p} ({len(inhalt)} Zeichen)" + _undo_hinweis(kopie) + _sofortcheck(p, inhalt)
 
 
 def _datei_bearbeiten(a: dict) -> str | ActionResult:
@@ -825,7 +939,16 @@ def _datei_bearbeiten(a: dict) -> str | ActionResult:
     text = text.replace(suchen, ersetzen)
     kopie = snapshot.sichern(p, "datei_bearbeiten")
     Path(p).write_text(text, encoding="utf-8")
-    return f"Datei bearbeitet: {p} ({n}× ersetzt)" + _undo_hinweis(kopie)
+    return f"Datei bearbeitet: {p} ({n}× ersetzt)" + _undo_hinweis(kopie) + _sofortcheck(p, text)
+
+
+def _sofortcheck(pfad, inhalt: str) -> str:
+    """Syntax/Struktur der gerade geschriebenen Datei – Funde gehen mit dem Ergebnis an die KI."""
+    try:
+        import sofortcheck
+        return sofortcheck.hinweis(pfad, inhalt)
+    except Exception:
+        return ""
 
 
 def _ordner_erstellen(a: dict) -> str | ActionResult:
@@ -983,6 +1106,12 @@ def _powershell(argv: list[str], ordner: Path, timeout: float | None = None):
     subprocess.TimeoutExpired bei Abbruch (Esc) oder Zeitüberschreitung."""
     from types import SimpleNamespace
     env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
+    try:
+        import coding
+        if coding.aktiv():              # Python zeigt Veraltet-Warnungen sonst meist nicht an
+            env["PYTHONWARNINGS"] = "default::DeprecationWarning,default::PendingDeprecationWarning"
+    except Exception:
+        pass
     p = subprocess.Popen(
         argv, cwd=str(ordner), env=env, stdin=subprocess.DEVNULL,
         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
@@ -1031,6 +1160,23 @@ def _powershell(argv: list[str], ordner: Path, timeout: float | None = None):
 
 
 def _befehl(a: dict, lesend: bool = False) -> ActionResult:
+    """`befehl`; im Coding-Assistenten mit Hinweis auf gemeldete Veraltet-Warnungen."""
+    res = _befehl_roh(a, lesend)
+    try:
+        import coding
+        if not coding.aktiv():
+            return res
+        import pyumgebung
+        if re.search(r"\b(pip|uv)\b", _befehl_text(a), re.I):
+            pyumgebung.vergessen()                   # Pakete geändert: Umgebung neu lesen
+        if (hinweis := pyumgebung.veraltet_hinweis(res.text)):
+            return ActionResult(res.text + hinweis, ok=res.ok, returncode=res.returncode)
+    except Exception:
+        pass
+    return res
+
+
+def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
     cmd = _befehl_text(a)
     if not cmd.strip():
         return ActionResult("Fehler: kein Befehl angegeben. Schreib den auszuführenden Befehl ins "
@@ -1061,7 +1207,7 @@ def _befehl(a: dict, lesend: bool = False) -> ActionResult:
     # Eigenschaften ändern, beginnt eine neue Tabelle.
     # Ausnahme: Objekte aus Format-Table/-List (ein Strom aus Start…End) bleiben
     # als EIN Block zusammen – ein halber Format-Strom in Out-String ist eine
-    # NullReferenceException („Der Objektverweis wurde nicht …“).
+    # NullReferenceException („Der Objektverweis wurde nicht …“, Chat 137).
     # Get-Content liest in PowerShell 5.1 ohne BOM als Windows-1252 – UTF-8-
     # Dateien kamen als „stÃ¤rkste“ zurück. Deshalb UTF-8 als Vorgabe fürs Lesen
     # (nur Lesen: beim Schreiben würde 5.1 eine BOM voranstellen).
@@ -1123,7 +1269,7 @@ def _befehl(a: dict, lesend: bool = False) -> ActionResult:
             # Fehler in den catch-Zweig geschrieben. So sieht es aus, wenn der
             # Virenschutz die Befehlszeile abgefangen hat (Bitdefender: „Schädliche
             # Befehlszeile erkannt“ – trifft lange Einzeiler mit Prozesslisten
-            # und Signaturprüfungen).
+            # und Signaturprüfungen). Chat 19.09.2026: achtmal in einer Stunde.
             text += ("\nKeine Ausgabe und kein Fehlertext – so sieht es aus, wenn der Virenschutz "
                      "(Bitdefender) die Befehlszeile geblockt hat. Lange Einzeiler, die Prozesse "
                      "auflisten und Signaturen prüfen, treffen seine Muster. Teile den Befehl in "
@@ -1539,25 +1685,31 @@ def _parse_size(v):
         return None
 
 
+def _figur(a: dict, szene: str) -> tuple[str, int | None] | ActionResult:
+    """Mit figur/outfit/pose: Prompt aus der Charakter-Datei (Kern · Outfit · Pose · Szene · Stil)
+    und ihr Referenz-Seed (None bei neues_gesicht). Sonst bleibt der Prompt, wie er ist."""
+    if not (_wahr(a.get("figur")) or a.get("outfit") or a.get("pose")):
+        return szene, None
+    import charakter
+    d = charakter.laden()
+    if d is None:
+        return ActionResult("Fehler: Es gibt noch keine Charakter-Datei für diese Persönlichkeit. "
+                            "Erst mit charakter_aendern anlegen (kern, stil, outfits, posen).", ok=False)
+    return (charakter.prompt_bauen(d, szene, a.get("outfit"), a.get("pose")),
+            charakter.seed(d, _wahr(a.get("neues_gesicht"))))
+
+
 def _bild_malen(a: dict) -> str | ActionResult:
-    """Erzeugt ein Bild mit NemiCLIs EIGENER Stable-Diffusion-Pipeline und öffnet es.
-    Felder: prompt (Pflicht); optional neg/steps/cfg/size('768x768')/seed/model."""
+    """Malt ein Bild mit dem aktiven Bild-Motor (Krea 2, WebUI oder ComfyUI) und öffnet es.
+    Felder: prompt (Pflicht); optional steps/size('1024x1024')/seed/model, bei WebUI/ComfyUI neg;
+    figur/outfit/pose/neues_gesicht für die Figur aus der Charakter-Datei."""
     import imagegen
-    # "extern" = ComfyUI ODER WebUI. Frueher stand hier nur webui - dadurch
-    # galt ComfyUI als eigene Pipeline und musste diffusers mitbringen, obwohl
-    # es nur ein HTTP-Aufruf ist. Siehe imagegen.missing_reason_aktiv().
-    ist_extern = imagegen.backend() != "builtin"
     prompt = (a.get("prompt") or a.get("beschreibung") or a.get("motiv")
               or a.get("text") or "").strip()
     if not prompt:
         return ActionResult("Fehler: kein Prompt. Feld 'prompt' mit der Bildbeschreibung füllen.", ok=False)
     if (reason := imagegen.missing_reason_aktiv()):
         return ActionResult("Fehler: Der Bild-Motor kann gerade nicht malen. " + reason, ok=False)
-    if not ist_extern:
-        # Nur die eigene Pipeline braucht einen lokalen Checkpoint auf der Platte.
-        if not imagegen.discover():
-            return ActionResult("Fehler: kein Bild-Modell gefunden. Lege eine .safetensors-Datei in "
-                    f"{imagegen.CKPT_DIRS[0]} (z.B. von Civitai).", ok=False)
 
     def _int(k):
         try:
@@ -1565,62 +1717,118 @@ def _bild_malen(a: dict) -> str | ActionResult:
         except Exception:
             return None
 
-    def _float(k):
-        try:
-            return float(a[k]) if a.get(k) not in (None, "") else None
-        except Exception:
-            return None
+    fig = _figur(a, prompt)
+    if isinstance(fig, ActionResult):
+        return fig
+    prompt, figur_seed = fig
+    seed = _int("seed") if _int("seed") is not None else figur_seed
 
-    # Modellname großzügig auflösen. Passt er zu nichts, nehmen wir das per
-    # /bildmodel gewählte Standard-Modell, statt abzubrechen – gewünscht ist
-    # ein Bild, und ein erfundener Modellname soll das nicht verhindern.
-    wunsch = a.get("model")
-    hinweis = ""
-    if wunsch and not ist_extern and imagegen.resolve(wunsch) is None:
-        hinweis = f" (Modell '{wunsch}' kenne ich nicht – Standard-Modell genommen.)"
-        wunsch = None
-
+    # Ein erfundener Modellname soll das Bild nicht verhindern: dann das gewählte Standard-Modell.
+    modell, hinweis = imagegen.modell_aufloesen(a.get("model"))
     _BILD_STATUS["msg"] = "starte …"
     try:
-        path, nachbessern = imagegen.paint(
+        path = imagegen.paint(
             prompt,
-            model=wunsch,
+            model=modell,
             neg=a.get("neg") or a.get("negativ"),
             steps=_int("steps"),
             size=_parse_size(a.get("size") or a.get("groesse")),
-            seed=_int("seed"),
+            seed=seed,
             on_status=lambda m: _BILD_STATUS.__setitem__("msg", m),
         )
     except Exception as e:
         _BILD_STATUS["msg"] = None               # Balken im Haupt-Loop beenden
         return ActionResult(f"Fehler beim Malen: {e}", ok=False)
 
-    # Automatisch nachbessern (Gesicht/Augen) – nur bei der eigenen Pipeline
-    # sinnvoll; WebUI-Modelle (Krea/Qwen) macht der OpenCV-img2img-Weg nicht mit.
-    nachgebessert = None
-    if nachbessern:
-        try:
-            nachgebessert = imagegen.auto_nachbessern(
-                path, on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
-        except Exception:
-            pass
+    text = f"Bild fertig 🎨✅ gespeichert: {path}{hinweis}"
+    try:
+        besser = imagegen.gesicht_nachbessern(
+            path, on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
+    except Exception as e:
+        besser = None
+        text += f"\nGesicht nachbessern übersprungen: {e}"
+    if besser:
+        path = besser
+        text += f"\nGesicht nachgebessert: {besser}"
     _BILD_STATUS["msg"] = None                   # Balken beenden
 
-    ziel = nachgebessert or path
-    oeffnen_fehler = None
     try:
-        os.startfile(ziel)                       # fertiges Bild anzeigen (Windows)
+        os.startfile(path)                       # fertiges Bild anzeigen (Windows)
     except Exception as e:
-        oeffnen_fehler = str(e)
-
-    if nachgebessert:
-        text = (f"Bild fertig 🎨✅ gemalt: {path}\n"
-                f"Automatisch nachgebessert (Gesicht/Augen): {nachgebessert}{hinweis}")
-    else:
-        text = f"Bild fertig 🎨✅ gespeichert: {path}{hinweis}"
-    if oeffnen_fehler is not None:
-        return ActionResult(text + f"\nÖffnen fehlgeschlagen: {oeffnen_fehler}", ok=False)
+        return ActionResult(text + f"\nÖffnen fehlgeschlagen: {e}", ok=False)
     return text + "\nÖffnen beim Anzeigeprogramm angefordert."
+
+
+MAX_SERIE = 30
+
+
+def _bild_serie(a: dict) -> ActionResult:
+    """Mehrere Bilder in einem Auftrag, gleicher Seed für alle (gleiche Figur/Szene, andere Varianten).
+    Felder: varianten (Liste: Text oder {prompt, outfit, pose, size}); optional figur, neues_gesicht,
+    size, steps, seed, model."""
+    import random
+    import imagegen
+    varianten = a.get("varianten") or a.get("bilder")
+    if isinstance(varianten, str):
+        varianten = [varianten]
+    if not isinstance(varianten, list) or not varianten:
+        return ActionResult("Fehler: 'varianten' fehlt – eine Liste, je Bild ein Text oder "
+                            '{"prompt": …, "outfit": …, "pose": …}.', ok=False)
+    if len(varianten) > MAX_SERIE:
+        return ActionResult(f"Fehler: höchstens {MAX_SERIE} Bilder je Serie (hier {len(varianten)}).", ok=False)
+    if (reason := imagegen.missing_reason_aktiv()):
+        return ActionResult("Fehler: Der Bild-Motor kann gerade nicht malen. " + reason, ok=False)
+
+    def _zahl(k):
+        try:
+            return int(a[k]) if a.get(k) not in (None, "") else None
+        except (TypeError, ValueError):
+            return None
+
+    seed, steps = _zahl("seed"), _zahl("steps")
+    modell, hinweis = imagegen.modell_aufloesen(a.get("model"))
+    n, fertig, fehler = len(varianten), [], []
+    for i, v in enumerate(varianten, 1):
+        v = v if isinstance(v, dict) else {"prompt": str(v)}
+        felder = {k: a.get(k) for k in ("figur", "neues_gesicht")} | v
+        fig = _figur(felder, str(v.get("prompt") or v.get("szene") or "").strip())
+        if isinstance(fig, ActionResult):
+            _BILD_STATUS["msg"] = None
+            return fig
+        prompt, figur_seed = fig
+        if seed is None:                          # einmal für die ganze Serie
+            seed = figur_seed if figur_seed is not None else random.randint(1, 2 ** 31 - 1)
+        melde = (lambda m, i=i: _BILD_STATUS.__setitem__("msg", f"Bild {i}/{n} · {m}"))
+        melde("starte …")
+        try:
+            pfad = imagegen.paint(prompt, model=modell, neg=v.get("neg") or a.get("neg"), steps=steps,
+                                  size=_parse_size(v.get("size") or a.get("size")), seed=seed, on_status=melde)
+            try:
+                pfad = imagegen.gesicht_nachbessern(pfad, on_status=melde) or pfad
+            except Exception:
+                pass
+            fertig.append(pfad)
+            try:
+                os.startfile(pfad)                # jedes fertige Bild gleich anzeigen, wie bei bild_malen
+            except Exception:
+                pass
+        except Exception as e:
+            fehler.append(f"Bild {i}: {e}")
+    _BILD_STATUS["msg"] = None
+    text = (f"Serie fertig 🎨✅ {len(fertig)}/{n} Bilder, Seed {seed}{hinweis}:\n"
+            + "\n".join(f"  {p}" for p in fertig) + ("\n" + "\n".join(fehler) if fehler else ""))
+    return ActionResult(text, ok=bool(fertig) and not fehler)
+
+
+def _charakter_zeigen(a: dict) -> ActionResult:
+    import charakter
+    return ActionResult(charakter.zeigen(charakter.laden()), ok=True)
+
+
+def _charakter_aendern(a: dict) -> ActionResult:
+    import charakter
+    text, ok = charakter.aendern(a)
+    return ActionResult(text, ok=ok)
 
 
 def _ordner_lernen(a: dict) -> str | ActionResult:
@@ -1668,6 +1876,12 @@ def _todo(a: dict) -> str:
     return coding.ausfuehren(a, befehl_ausfuehren)
 
 
+def _plan(a: dict) -> str | ActionResult:
+    import plan
+    text, ok = plan.ausfuehren(a)
+    return text if ok else ActionResult(text, ok=False)
+
+
 def _wache(name: str, a: dict) -> str | ActionResult:
     try:
         from wache import werkzeuge as W
@@ -1713,6 +1927,13 @@ ACTIONS: dict[str, dict] = {
     "bild_ansehen":     {"func": _bild_ansehen,     "confirm": False, "felder": ["pfad"]},
     "bild_fragen":      {"func": _bild_fragen,      "confirm": False, "felder": ["pfad", "frage"]},
     "anleitung_lesen":  {"func": _anleitung_lesen,  "confirm": False, "felder": ["thema"]},
+    "menue_oeffnen":    {"func": _menue_oeffnen,    "confirm": False, "felder": ["befehl"]},
+    # Coding: aktuell bleiben – alles nur lesend
+    "api_nachschlagen": {"func": _api_nachschlagen, "confirm": False, "felder": ["name"]},
+    "code_pruefen":     {"func": _code_pruefen,     "confirm": False, "felder": []},
+    "paket_info":       {"func": _paket_info,       "confirm": False, "felder": ["name"]},
+    "seite_ansehen":    {"func": _seite_ansehen,    "confirm": False, "felder": []},
+    "doku_suchen":      {"func": _doku_suchen,      "confirm": False, "felder": []},
     "ordner_auflisten": {"func": _ordner_auflisten, "confirm": False, "felder": []},
     "dateien_suchen":   {"func": _dateien_suchen,   "confirm": False, "felder": ["muster"]},
     "inhalt_suchen":    {"func": _inhalt_suchen,    "confirm": False, "felder": ["muster"]},
@@ -1738,6 +1959,9 @@ ACTIONS: dict[str, dict] = {
     "oeffnen":          {"func": _oeffnen,          "confirm": False, "felder": ["pfad"]},
     "loeschen":         {"func": _loeschen,         "confirm": True,  "felder": ["pfad"]},
     "befehl":           {"func": _befehl,           "confirm": True,  "felder": []},
+    # NemiCLI-Einstellungen aus fester Liste (Internet-Allowlist) – Prüffenster in jedem Modus
+    "einstellung_aendern": {"func": _einstellung_aendern, "confirm": True, "felder": ["was", "wert"]},
+    "theme_erstellen":  {"func": _theme_erstellen,  "confirm": True, "felder": ["name", "brand", "accent"]},
     # Python im AppContainer: nur Lauf-Ordner, freigegebene Projekte + Internet
     "code_ausfuehren":  {"func": _code_ausfuehren,  "confirm": True,  "felder": []},
     "paket_installieren": {"func": _paket_installieren, "confirm": True, "felder": ["pakete"]},
@@ -1755,8 +1979,11 @@ ACTIONS: dict[str, dict] = {
     "merken":           {"func": _merken,           "confirm": False, "felder": ["text"]},
     "ordner_lernen":    {"func": _ordner_lernen,    "confirm": False, "felder": ["pfad", "typ"]},
     "ml_status":        {"func": _ml_status,        "confirm": False, "felder": []},
-    # Bild erzeugen (eigene Stable-Diffusion-Pipeline – läuft auf der GPU, harmlos)
+    # Bild erzeugen (aktiver Bild-Motor: Krea 2, WebUI oder ComfyUI – harmlos)
     "bild_malen":       {"func": _bild_malen,       "confirm": False, "felder": []},
+    "bild_serie":       {"func": _bild_serie,       "confirm": False, "felder": ["varianten"]},
+    "charakter_zeigen": {"func": _charakter_zeigen, "confirm": False, "felder": []},
+    "charakter_aendern": {"func": _charakter_aendern, "confirm": True, "felder": []},
     # Systemwache (tools/wache): lesen frei; bewerten/justieren schreiben nur in die
     # Wache-Datenbank – in Grenzen des Nutzers, protokolliert, rücknehmbar.
     "wache_status":     {"func": _wache_status,     "confirm": False, "felder": []},
@@ -1770,6 +1997,8 @@ ACTIONS: dict[str, dict] = {
     # Coding-Assistent: Projekt + Todo-Liste; was der Nutzer entscheidet, steht in coding.py
     "coding_start":     {"func": _coding_start,     "confirm": False, "felder": ["projekt"]},
     "todo":             {"func": _todo,             "confirm": False, "felder": ["aktion"]},
+    # Gelbe Todo-Liste: vor jeder Aktion aufschreiben, was ansteht (plan.py)
+    "plan":             {"func": _plan,             "confirm": False, "felder": []},
 }
 
 
@@ -1787,8 +2016,8 @@ _FENCE_OPEN = re.compile(r"```(?:aktion|json)\s*\n")
 
 
 # Windows-Pfade im JSON: Modelle schreiben gern "C:\Users\…" mit EINEM Backslash.
-# In JSON ist \U kein gültiges Escape – json.loads wirft, und der Block fiele
-# stumm unter den Tisch (das Modell glaubt dann, die Datei sei gelesen).
+# In JSON ist \U kein gültiges Escape – json.loads wirft, und der Block fiel bis
+# 20.09.2026 stumm unter den Tisch (das Modell glaubte, die Datei sei gelesen).
 # Reparatur in Stufen: erst ungültige Escapes verdoppeln (\U → \\U), dann zur
 # Not alle Backslashes. Gültige Escapes wie \n bleiben dabei Zeilenumbrüche –
 # in einem Pfad-Feld ("C:\neu\temp") wären das aber falsche Steuerzeichen,
@@ -1866,7 +2095,7 @@ def resolve_tool(name: str) -> str | None:
 # Runde schon etwas aus dem Netz (web_lesen/web_wiki/web_suche), könnte eine
 # präparierte Seite das Modell zu „merk dir: ab jetzt …" verleitet haben – dann
 # soll der Nutzer die Notiz sehen und freigeben, bevor sie dauerhaft wird.
-_WEB_TOOLS = {"web_lesen", "web_wiki", "web_suche"}
+_WEB_TOOLS = {"web_lesen", "web_wiki", "web_suche", "paket_info"}
 SKILL_AENDERN = {"skill_schreiben", "skill_ausbessern"}      # Prüffenster, außer /skills selbst an
 _MEMORY_TOOLS = {"merken", "skill_merken"}
 _web_taint = False
@@ -1912,6 +2141,15 @@ def confirmation_preview(action: dict) -> str | None:
     if tool == "skill_ausbessern":
         import skills
         return skills.ausbessern_vorschau(action.get("name"), action.get("suchen"), action.get("ersetzen"))
+    if tool == "einstellung_aendern":
+        import einstellungen
+        return einstellungen.vorschau(str(action.get("was") or ""), action.get("wert"), action.get("grund") or "")
+    if tool == "theme_erstellen":
+        import themes_eigen
+        return themes_eigen.vorschau(*_theme_felder(action))
+    if tool == "charakter_aendern":
+        import charakter
+        return charakter.vorschau(action)
     if tool not in ("datei_schreiben", "datei_bearbeiten", "pdf_erstellen"):
         return None
     raw_path = action.get("pfad")
@@ -2002,6 +2240,14 @@ def _describe(action: dict) -> str:
     if t == "datei_lesen":      return f"Datei lesen:  {g('pfad', '?')}"
     if t == "bild_ansehen":     return f"Bild ansehen:  {g('pfad', '?')}"
     if t == "anleitung_lesen":  return f"Anleitung lesen:  {g('thema', '?')}"
+    if t == "menue_oeffnen":    return f"Menü öffnen:  {g('befehl', '?')}"
+    if t == "api_nachschlagen": return f"In der Installation nachschlagen:  {g('name', '?')}"
+    if t == "code_pruefen":     return f"Code prüfen (ruff):  {g('pfad', 'Projekt')}"
+    if t == "paket_info":       return f"Paket-Info (PyPI, Lücken):  {g('name', '?')}"
+    if t == "seite_ansehen":    return f"Seite ansehen:  {g('ziel', g('pfad', g('url', '?')))}"
+    if t == "doku_suchen":
+        return f"Offline-Doku lesen:  #{g('id')}" if g("id") not in (None, "") else f"Offline-Doku suchen:  {g('frage', '?')}"
+    if t == "theme_erstellen":  return f"Theme anlegen:  {g('name', '?')}  ({g('brand', '?')} / {g('accent', '?')})"
     if t == "bild_fragen":      return f"Bild nachfragen:  {g('pfad', '?')}  – {g('frage', '?')}"
     if t == "bildschirm_ansehen": return "Bildschirm fotografieren und ansehen (Screenshot)"
     if t == "ordner_auflisten": return f"Ordner auflisten:  {g('pfad', '.')}"
@@ -2040,6 +2286,9 @@ def _describe(action: dict) -> str:
             pass
         return f"LÖSCHEN:  {pf}"
     if t == "befehl":           return f"PowerShell ausführen:\n    {_befehl_text(action) or '?'}"
+    if t == "einstellung_aendern":
+        return (f"Einstellung ändern ⚙:  {g('was', '?')}  {g('wert', '?')}"
+                + (f"\n    Grund: {g('grund')}" if g("grund") else "") + _taint_hinweis())
     if t == "paket_installieren":
         p = action.get("pakete") or action.get("paket") or "?"
         return "Pakete in der Sandbox installieren: " + (", ".join(map(str, p)) if isinstance(p, list) else str(p))
@@ -2077,7 +2326,17 @@ def _describe(action: dict) -> str:
     if t == "ordner_lernen":    return f"Ordner-Typ lernen (ML):  {g('pfad', '?')} = {g('typ', '?')}"
     if t == "ml_status":        return "ML-Status / Ordner-Sinn-Bericht abrufen"
     if t == "bild_malen":
-        return f"Bild malen 🎨:  {g('prompt', g('beschreibung', g('motiv', '?')))}"
+        figur = ""
+        if _wahr(g("figur")) or g("outfit") or g("pose"):
+            figur = "  [Figur" + "".join(f" · {x}" for x in (g("outfit"), g("pose")) if x) \
+                + (" · neues Gesicht" if _wahr(g("neues_gesicht")) else "") + "]"
+        return f"Bild malen 🎨:  {g('prompt', g('beschreibung', g('motiv', '?')))}{figur}"
+    if t == "bild_serie":
+        v = g("varianten") or g("bilder") or []
+        return (f"Bilder-Serie 🎨:  {len(v) if isinstance(v, list) else 1} Bilder"
+                + ("  [Figur]" if _wahr(g("figur")) else ""))
+    if t == "charakter_zeigen": return "Charakter-Datei ansehen"
+    if t == "charakter_aendern": return "Charakter-Datei ändern 🧬"
     if t == "wache_status":     return "Wache 🛡: Lage abfragen"
     if t == "wache_alarme":
         return f"Wache 🛡: Alarm {g('id')} ansehen" if g("id") else f"Wache 🛡: Alarme auflisten ({g('status', 'alle')})"
@@ -2096,6 +2355,17 @@ def _describe(action: dict) -> str:
     if t == "todo":
         import coding
         return coding.beschreibung(action)
+    if t == "plan":
+        teile = []
+        if action.get("punkte"):
+            teile.append("Todo-Liste anlegen")
+        if action.get("neu"):
+            teile.append("Punkt ergänzen")
+        if action.get("erledigt") not in (None, ""):
+            teile.append(f"abhaken: {g('erledigt')}")
+        if action.get("streichen") not in (None, ""):
+            teile.append(f"streichen: {g('streichen')}")
+        return "🟨 Todo: " + (" · ".join(teile) or "ansehen")
     if t == "kugel":
         teile = [f"{k} {g(k)}" for k in ("stimmung", "bewegung", "ecke", "position", "groesse") if g(k)]
         if g("sagen"):

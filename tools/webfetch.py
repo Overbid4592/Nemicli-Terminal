@@ -69,7 +69,7 @@ _FALLBACK = {
 }
 
 
-def _load_allow() -> dict[str, dict]:
+def _load_base() -> dict[str, dict]:
     try:
         data = json.loads(_ALLOWLIST_FILE.read_text(encoding="utf-8"))
         out = {}
@@ -77,9 +77,38 @@ def _load_allow() -> dict[str, dict]:
             d = e.get("domain", "").lower().strip()
             if d:
                 out[d] = e
-        return out or _FALLBACK
+        return out or dict(_FALLBACK)
     except Exception:
-        return _FALLBACK
+        return dict(_FALLBACK)
+
+
+def _load_allow() -> dict[str, dict]:
+    """Mitgelieferte Liste plus eigene Änderungen (allowlist_eigen.json, siehe einstellungen.py)."""
+    out = _load_base()
+    try:
+        import einstellungen
+        eigen = einstellungen.laden()
+    except Exception:
+        return out
+    for d in eigen["weg"]:
+        out.pop(d, None)
+    for e in eigen["hinzu"]:
+        out.setdefault(e["domain"], e)
+    return out
+
+
+def mitgeliefert() -> set[str]:
+    """Domains der mitgelieferten allowlist.json (ohne eigene Änderungen)."""
+    return set(_load_base())
+
+
+def neu_laden() -> None:
+    """Nach einer Änderung über einstellung_aendern: Liste neu einlesen."""
+    neu = _load_allow()
+    _ALLOW.clear()
+    _ALLOW.update(neu)
+    ALLOWED.clear()
+    ALLOWED.update(neu)
 
 
 _ALLOW: dict[str, dict] = _load_allow()

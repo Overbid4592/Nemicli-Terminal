@@ -9,8 +9,7 @@ auf den letzten 7 Tagen. Vor jedem Lauf werden die Profile in die Merkmale
 gespiegelt und das „harmlos“-Feedback übernommen. Jeder Lauf steht in
 Wache/training.log und im Aktions-Protokoll.
 
-Verdichten und Dämpfen (sonst erzeugt derselbe Vorgang Hunderte offene
-Alarme): Regel + Subjekt ist der Schlüssel. Kommt derselbe Alarm
+Verdichten und Dämpfen (viele offene Alarme sind oft derselbe Vorgang): Regel + Subjekt ist der Schlüssel. Kommt derselbe Alarm
 innerhalb des Cooldowns wieder, wird am ersten der Zähler hochgesetzt („×37“)
 statt eine neue Zeile zu schreiben – und niemand wird erneut geweckt. Wurde ein
 Paar `daempfen_ab`-mal als harmlos beurteilt (und nie als echt), meldet der Motor
@@ -110,7 +109,7 @@ class Motor:
         self.daempfung_aktualisieren()
         # Was seit dem letzten Training reinkam, zählt weiter – sonst fängt der
         # „alle 200“-Takt nach jedem Neustart bei 0 an und ein Tag mit drei
-        # Neustarts lernt nie.
+        # Neustarts lernt nie (20.09.2026: 274 Ereignisse warteten, Zähler stand auf 0).
         try:
             zuletzt = float(self.speicher.meta("training_zuletzt", "0") or 0)
             if zuletzt:

@@ -1,13 +1,12 @@
 """
 wache – NemiCLIs Systemwache: Sensoren, Regeln, lernende Anomalie-Erkennung.
 
-Eine abgespeckte SIEM-Variante, abgesichert durch das Sicherheitsnetz
-(tools/sicherheit.py). Der Unterschied zu einem SIEM: hier gibt es keine Oberfläche mit Tabs, hier
+Abgespeckte Fassung eines eigenständigen SIEM-Projekts. Der Unterschied zum SIEM: hier gibt es keine Oberfläche mit Tabs, hier
 gibt es eine Persönlichkeit. Die Wache sammelt und bewertet; wenn etwas
 aus dem Rahmen fällt, wird die aktive Persönlichkeit geweckt, schaut nach und entscheidet – und darf
 in Grenzen selbst nachjustieren. Alles, was sie tut, steht im Protokoll.
 
-Bausteine (alles ohne Administratorrechte, alles lokal):
+Bausteine (alles ohne Administratorrechte, alles lokal auf F:):
 
   ereignisse.py   Ereignis / Alarm / Schwere – das gemeinsame Schema
   speicher.py     SQLite: Ereignisse, Alarme, Prozess-Profile, Inventar, Meta

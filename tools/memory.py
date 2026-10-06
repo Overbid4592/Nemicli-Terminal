@@ -293,7 +293,19 @@ def encoder_status() -> str:
     ordner = modell_ordner()
     if ordner is None:
         return _fehlt_text()
+    if not _ist_gguf(ordner) and not _transformers_da():
+        return (f"{ordner.name} ist ein safetensors-Modell und braucht transformers, das NemiCLI nicht "
+                "mehr mitbringt. Lege die GGUF-Fassung (z. B. Qwen3-Embedding-0.6B-Q8_0.gguf) in einen "
+                "eigenen Ordner unter Models/embeddings und wähle sie mit /embeddings.")
     return f"{ordner.name} bereit ({ordner}), lädt bei Bedarf"
+
+
+def _transformers_da() -> bool:
+    try:
+        import importlib.util
+        return importlib.util.find_spec("transformers") is not None
+    except Exception:
+        return False
 
 
 def _fehlt_text() -> str:
@@ -376,13 +388,14 @@ def modell_ordner() -> Path | None:
     """Der aktive Modell-Ordner unter Models/embeddings – oder None.
 
     Ist `embedding_modell` gesetzt, gilt nur dieser Ordner. Sonst der erste
-    vollständige Unterordner (alphabetisch), zuletzt die verschachtelte Ablage
-    älterer Installationen (models--…/snapshots/<id>)."""
+    vollständige Unterordner – GGUF vor safetensors (das braucht transformers, das
+    NemiCLI nicht mehr mitbringt) –, zuletzt die verschachtelte Ablage älterer
+    Installationen (models--…/snapshots/<id>)."""
     gewuenscht = _gewuenscht()
     if gewuenscht:
         o = EMBED_ORDNER / gewuenscht
         return o if o.is_dir() and _vollstaendig(o) else None
-    vorhanden = modelle()
+    vorhanden = sorted(modelle(), key=lambda d: not _ist_gguf(d))
     if vorhanden:
         return vorhanden[0]
     try:
@@ -670,113 +683,6 @@ def recall(query: str, k: int = RECALL_K) -> list[dict]:
     scored = [(_keyword_score(query, e["text"]), e) for e in entries]
     scored.sort(key=lambda x: -x[0])
     return [e for s, e in scored if s > 0][:k]
-
-
-CHAT_RECALL_K = 3
-
-
-def recall_chats(query: str, k: int = CHAT_RECALL_K) -> list[dict]:
-    """Passende frühere Chats (Titel + erste Prompts), semantisch oder per Stichwort."""
-    try:
-        import chatstore
-    except Exception:
-        return []
-    chats = []
-    try:
-        for p in chatstore.dateien():
-            try:
-                d = json.loads(p.read_text(encoding="utf-8"))
-            except Exception:
-                continue
-            blob = (d.get("title") or "") + "\n" + "\n".join(
-                (x or "").strip().replace("\n", " ")[:200]
-                for x in (d.get("prompts") or [])[:8]
-            )
-            chats.append({
-                "id": d.get("id"),
-                "title": d.get("title") or "",
-                "blob": blob,
-                "vec": d.get("vec"),
-                "vec_modell": d.get("vec_modell"),
-                "path": p,
-                "raw": d,
-            })
-    except Exception:
-        return []
-    if not chats or not (query or "").strip():
-        return []
-
-    qe = _embed_texts([query], query=True)
-    kennung = modell_kennung()
-    missing = [c for c in chats if not vektor_gueltig(c, kennung) and c.get("blob")]
-    if qe and missing:
-        embs = _embed_texts([c["blob"] for c in missing])
-        if embs:
-            for c, v in zip(missing, embs):
-                c["vec"], c["vec_modell"] = v, kennung
-                try:
-                    c["raw"]["vec"], c["raw"]["vec_modell"] = v, kennung
-                    c["path"].write_text(
-                        json.dumps(c["raw"], ensure_ascii=False, indent=2),
-                        encoding="utf-8",
-                    )
-                except Exception:
-                    pass
-    if qe:
-        qv = qe[0]
-        scored = [(_cos(qv, c["vec"]), c) for c in chats if vektor_gueltig(c, kennung)]
-        scored.sort(key=lambda x: -x[0])
-        hits = [c for s, c in scored if s >= MIN_SCORE][:k]
-        if hits:
-            return hits
-        if scored and scored[0][0] >= MIN_SCORE * 0.6:
-            return [scored[0][1]]
-        return []
-    scored = [(_keyword_score(query, c["blob"]), c) for c in chats]
-    scored.sort(key=lambda x: -x[0])
-    return [c for s, c in scored if s > 0][:k]
-
-
-def recall_block(query: str) -> str:
-    """Textblock aus Notizen + ähnlichen Chats. Nicht für den Chat-Prompt –
-    der Dialog spricht nur mit dem Sprachmodell. Nutzung: /gedaechtnis, Suche."""
-    hits = recall(query)
-    chats = recall_chats(query)
-    if not hits and not chats:
-        return ""
-    lines = []
-    if hits:
-        lines += ["", "# 🧠 Was du dir über den Nutzer gemerkt hast (Langzeitgedächtnis)",
-                  "Nutze diese Notizen aus früheren Gesprächen, wenn sie zur Frage passen. "
-                  "Tu nicht so, als wüsstest du es zufällig – du erinnerst dich einfach.",
-                  ""]
-        for e in hits:
-            lines.append(f"- ({e['kind']}) {e['text']}")
-    if chats:
-        lines += ["", "# 💬 Ähnliche frühere Chats",
-                  "Nur zur Orientierung. Fortsetzen geht mit /resume <nummer>.",
-                  ""]
-        for c in chats:
-            snip = " · ".join(
-                x.strip()[:80] for x in (c.get("blob") or "").split("\n")[1:3] if x.strip()
-            )
-            extra = f" — {snip}" if snip else ""
-            lines.append(f"- Chat #{c['id']}: {c.get('title') or '(ohne Titel)'}{extra}")
-    try:
-        import indexdb
-        hits_db = indexdb.search(query)
-    except Exception:
-        hits_db = []
-    if hits_db:
-        lines += ["", "# 📚 Passende Stellen aus Chats, Code und Skills",
-                  "Kurze Treffer. Volle Datei bei Bedarf mit datei_lesen holen.",
-                  ""]
-        for h in hits_db:
-            snippet = (h.get("text") or "").replace("\n", " ")
-            if len(snippet) > 280:
-                snippet = snippet[:280] + "…"
-            lines.append(f"- [{h.get('kind')}/{h.get('ref')}] {snippet}")
-    return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

@@ -8,9 +8,9 @@ sonst 403 – auch eine Webseite im Browser kann 127.0.0.1 anklopfen, deshalb.
 
 Zwei Wege, sonst nichts (keine Dateien, keine Befehle über diesen Kanal):
     POST /antwort   {"text": "...", "titel": "...", "url": "..."}  -> {"antwort": "..."}
-                    Die Persönlichkeit schreibt im Namen des Nutzers eine Antwort auf den Text.
+                    Die Persönlichkeit schreibt im Namen des Nutzers eine Antwort.
     POST /erklaer   {"text": "..."}                                 -> {"antwort": "..."}
-                    Lara erklärt den markierten Text.
+                    Die Persönlichkeit erklärt den markierten Text.
     GET  /ping                                                      -> {"ok": true}
 
 Der eigentliche Chat-Zug läuft im NemiCLI-Fenster (sichtbar, wie jede Runde).

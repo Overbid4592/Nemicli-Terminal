@@ -5,7 +5,9 @@ Kugel-Fenster) und mal im großen NemiCLI. Deshalb geht alles über EINE kleine
 Datei: `Wache/kugel_zustand.json`. Die Aktion schreibt sie, die Kugel liest sie
 alle 1,5 s und setzt um, was neu ist.
 
-  stimmung   neutral · froh · ernst · denkt · müde …  → Bild Persoenlichkeiten/<Name>_<stimmung>.png
+  stimmung   neutral · froh · ernst · denkt … oder ein Motiv (kugelmotive.py), auch frei formuliert
+             („isst Popcorn“) → Persoenlichkeiten/<Name>/<stimmung>.png
+             (ältere Bilder: Persoenlichkeiten/<Name>_<stimmung>.png)
              (fehlt es: <Name>.png; fehlt auch das: die gemalte Kugel)
   sagen      Text für eine Sprechblase (+ sekunden)
   bewegung   huepfen · wackeln · nicken
@@ -24,6 +26,7 @@ Jede Steuerung steht im Aktions-Protokoll.
 from __future__ import annotations
 
 import json
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +41,22 @@ BEWEGUNGEN = ("huepfen", "wackeln", "nicken")
 ECKEN = ("oben_links", "oben_rechts", "unten_links", "unten_rechts", "mitte")
 GROESSE_MIN, GROESSE_MAX = 48, 200
 SAGEN_MAX = 200
+
+
+_hintergrund = 0
+_hintergrund_lock = threading.Lock()
+
+
+def hintergrund(an: bool) -> None:
+    """Die Persönlichkeit arbeitet gerade im Hintergrund (Weckruf, freier Moment) – die
+    Kugel zeigt das in Regenbogenfarben. Gezählt, weil mehreres gleichzeitig laufen kann."""
+    global _hintergrund
+    with _hintergrund_lock:
+        _hintergrund = max(0, _hintergrund + (1 if an else -1))
+
+
+def im_hintergrund() -> bool:
+    return _hintergrund > 0
 
 
 def lesen() -> dict:
@@ -61,7 +80,7 @@ def _slug(name: str) -> str:
 
 def bilder(name: str) -> dict[str, Path]:
     """Alle Bilder einer Persönlichkeit: {"": <Name>.png, "froh": <Name>_froh.png, …}
-    (Groß/klein egal: „Nemi_froh.png“, „nemi-froh.PNG“, „Maia_ernst.png“ passen alle)."""
+    (Groß/klein egal: „Nemi_froh.png“, „nemi-froh.PNG“, „Mira_ernst.png“ passen alle)."""
     out: dict[str, Path] = {}
     if not BILDER_ORDNER.exists():
         return out
@@ -75,6 +94,11 @@ def bilder(name: str) -> dict[str, Path]:
         teile = p.stem.replace("-", "_").split("_", 1)
         stimmung = _slug(teile[1]) if len(teile) > 1 else ""
         out[stimmung] = p
+    for ordner in BILDER_ORDNER.iterdir():           # Persoenlichkeiten/<Name>/ – gilt vor den alten
+        if ordner.is_dir() and _slug(ordner.name) == wer:
+            for p in ordner.glob("*.png"):
+                k = _slug(p.stem)
+                out["" if k == "neutral" else k] = p
     return out
 
 
@@ -100,12 +124,18 @@ def steuern(a: dict, wer: str = "Persönlichkeit") -> str:
             z["stimmung"] = "kugel"; getan.append("wieder die Kugel")
         else:
             da = bilder(wer)
+            if stimmung not in da:
+                try:
+                    import kugelmotive
+                    stimmung = kugelmotive.finden(str(a.get("stimmung") or a.get("bild")), da) or stimmung
+                except Exception:
+                    pass
             if stimmung in da or "" in da:
                 z["stimmung"] = stimmung
                 getan.append(f"Stimmung {stimmung}" + ("" if stimmung in da else f" (kein eigenes Bild dafür – zeige {da[''].name})"))
             else:
-                abgelehnt.append(f"kein Bild für „{stimmung}“ – lege Persoenlichkeiten/{wer}_{stimmung}.png an "
-                                 f"(oder {wer}.png als Standard)")
+                abgelehnt.append(f"kein Bild für „{stimmung}“ – /kugel malen legt Bilder in "
+                                 f"Persoenlichkeiten/{wer}/ an (neutral.png = Standard)")
 
     sagen = " ".join(str(a.get("sagen") or "").split())
     if sagen:
@@ -173,8 +203,8 @@ def steuern(a: dict, wer: str = "Persönlichkeit") -> str:
         da = bilder(wer)
         return ("Nichts angegeben. Felder: stimmung, sagen (+sekunden, wichtig), bewegung, ecke, position, "
                 "versteckt, groesse. " + (f"Bilder für dich: {', '.join(sorted(k or '(Standard)' for k in da))}."
-                                          if da else f"Noch kein Bild für dich – Persoenlichkeiten/{wer}.png "
-                                                     f"(oder {wer}_froh.png …) würde die Kugel ersetzen."))
+                                          if da else f"Noch kein Bild für dich – /kugel malen legt sie in "
+                                                     f"Persoenlichkeiten/{wer}/ an."))
     if getan:
         z["zeit"] = jetzt
         z["wer"] = wer

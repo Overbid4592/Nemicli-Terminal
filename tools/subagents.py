@@ -22,7 +22,7 @@ import persona
 
 MAX = 5            # hartes Limit: maximal fünf Helfer gleichzeitig
 MAX_STEPS = 8      # Schrittbremse pro Helfer (keine Endlosschleife)
-_VERBOTEN = {"subagenten", "coding_start", "todo"}   # keine Rekursion; die Todo-Liste führt der Haupt-Agent
+_VERBOTEN = {"subagenten", "coding_start", "todo", "plan"}   # keine Rekursion; die Todo-Liste führt der Haupt-Agent
 
 # Sicherheitsstufe (/subagenten): off = gesperrt · an = Nutzer wird vor jedem
 # Losschicken gefragt · auto = der Haupt-Agent nimmt sich Helfer nach Bedarf.

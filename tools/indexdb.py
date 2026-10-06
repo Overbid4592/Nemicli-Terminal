@@ -38,7 +38,7 @@ EMBED_BATCH = 16                 # so viele Brocken je Encoder-Aufruf – dazwis
 BERICHTE_JE_RUNDE = 2            # Berichte je Bibliothekar-Lauf (ein Wache-Bericht = bis zu 60 Brocken ≈ 90 s CPU)
 WISSEN_JE_RUNDE = 3              # geänderte Wissen-Dateien je Bibliothekar-Lauf
 
-# Fortschritt nach außen: after_turn(status=fn) setzt den Melder; die Einbett-Stellen
+# Fortschritt nach außen (Balken in der Statuszeile). after_turn(status=fn) setzt den Melder; die Einbett-Stellen
 # rufen _melden("Chat #152 · Brocken 12/40"). Ein „i/n“ in der Meldung wird in der Oberfläche
 # zum Balken (ui.progress_panel). Ohne Melder passiert nichts – Tests und Skripte merken nichts.
 _status = None
@@ -487,7 +487,7 @@ def ingest_berichte(behalten: int | None = None, je_runde: int | None = BERICHTE
     """Berichte/*.md (Wache-Weckrufe, Zeitplan-Aufträge) → Vektoren (kind „bericht“).
     Danach bleiben nur die `behalten` neuesten als Datei liegen; die älteren wandern in
     den Papierkorb (snapshot, 30 Tage) – aber NUR, wenn ihre Vektoren wirklich in der
-    DB sind. Ältere Berichte bleiben übers Gedächtnis findbar, nicht als Datei.
+    DB sind. Ältere Berichte bleiben so übers Gedächtnis findbar, nicht als Datei.
     `je_runde`: höchstens so viele NEUE Berichte einbetten (neueste zuerst) – der Encoder
     braucht auf der CPU ~1,5 s je Brocken, ein dicker Wache-Bericht hat 60. None = alle.
     Rückgabe: (neue Brocken, weggeräumte Dateien)."""

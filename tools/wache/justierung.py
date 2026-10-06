@@ -16,7 +16,6 @@ Jede Änderung braucht eine Begründung, landet in der Tabelle `justierungen`
 
 from __future__ import annotations
 
-import time
 
 from .regeln import BESCHREIBUNG
 
@@ -208,7 +207,3 @@ def letzte_rueckgaengig(speicher, motor=None, wer: str = "Nutzer") -> str:
 
 def trigger_stufe(name: str) -> int:
     return {"mittel": 2, "hoch": 3, "kritisch": 4, "nie": 99}.get((name or "hoch").lower(), 3)
-
-
-def zeitstempel() -> str:
-    return time.strftime("%d.%m.%Y %H:%M:%S")

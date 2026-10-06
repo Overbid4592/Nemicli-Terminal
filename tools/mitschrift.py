@@ -21,7 +21,6 @@ Bilder und Gedächtnis auch.
 
 from __future__ import annotations
 
-import re
 from datetime import datetime
 from pathlib import Path
 
@@ -208,13 +207,6 @@ def als_markdown(kopf: dict | None = None) -> str:
 # ---------------------------------------------------------------------------
 # Speichern
 # ---------------------------------------------------------------------------
-
-def _sicherer_name(text: str) -> str:
-    """Aus einer Überschrift einen Dateinamen machen, der unter Windows geht."""
-    t = re.sub(r"[^\w\- ]+", "", str(text), flags=re.UNICODE).strip()
-    t = re.sub(r"\s+", "-", t)
-    return t[:40].strip("-")
-
 
 def dateiname(kopf: dict | None = None) -> str:
     k = dict(_kopfdaten())

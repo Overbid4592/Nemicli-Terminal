@@ -12,7 +12,8 @@ Tray-Menü, /wache stop (Stopp-Datei) oder Strg+C. Ohne Qt (fehlt PySide6)
 läuft die Wache kopflos weiter – ohne Schild und Kugel.
 
 main.py stellt: `wecken(alarme) -> str` (Weckruf, Bericht zurück),
-`chat(text, bilder) -> (antwort, neue_bilder)` (Gespräch über die Kugel),
+`chat(text, bilder) -> (antwort, neue_bilder, todo_text)` (Gespräch über die Kugel),
+`chat_neu()` (Kugel-Gespräch leeren),
 den Programm-Ordner und den Namen der aktiven Persönlichkeit.
 """
 
@@ -32,7 +33,7 @@ from .wecker import Wecker
 
 
 class Dienst:
-    def __init__(self, wecken, install_ordner: Path, *, chat=None, name: str = "Persönlichkeit",
+    def __init__(self, wecken, install_ordner: Path, *, chat=None, chat_neu=None, name: str = "Persönlichkeit",
                  nutzer: str = "du", mit_tray: bool = True, mit_kugel: bool = True):
         ordner_anlegen()
         self.install = install_ordner
@@ -50,6 +51,7 @@ class Dienst:
         self._ende = threading.Event()
         self._einstellungs_stand = ""
         self._chat = chat
+        self._chat_neu = chat_neu
         self.tray = None
         self.kugel = None
         self.gui = None
@@ -255,7 +257,8 @@ class Dienst:
                     from .kugel import Kugel
                     self.kugel = Kugel(stand=self.stand, chat=self._chat, schleife=self.loop,
                                        sichtbar=self.kugel_sichtbar, name=self.name, nutzer=self.nutzer,
-                                       nemicli_oeffnen=self.nemicli_oeffnen, screenshot=self.screenshot)
+                                       nemicli_oeffnen=self.nemicli_oeffnen, screenshot=self.screenshot,
+                                       chat_neu=self._chat_neu)
                 except Exception as exc:
                     print(f"Kugel nicht verfügbar: {exc}")
                     self.kugel = None

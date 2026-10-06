@@ -1,17 +1,22 @@
 """Die Schwebekugel: die Persönlichkeit auf dem Desktop, wenn kein Terminal offen ist.
 
-Das Schild neben der Uhr bleibt. Zusätzlich
-schwebt eine kleine Leuchtkugel frei über dem Desktop – immer oben, ohne
-Rahmen, verschiebbar. Sie ist da, wenn NemiCLI gerade nicht im Terminal läuft.
+Neben dem Schild an der Uhr schwebt eine kleine Leuchtkugel frei über dem
+Desktop – immer oben, ohne Rahmen, verschiebbar. Sie ist da, wenn NemiCLI
+gerade nicht im Terminal läuft.
 
   Farbe      🟢 ruhig · 🟠 offene Alarme · 🔴 die Persönlichkeit sagt „echt“
-  Blase      ab und an ein kurzer Gruß („Hey, alles ok 🙂“), 2–3× am Tag,
+             🌈 Regenbogen, solange sie im Hintergrund arbeitet (Gespräch, Weckruf, freier Moment)
+  Blase      ab und an ein kurzer Gruß aus Wache/gruesse.md, 2–3× am Tag,
              nie wenn rot; bei rot eine ernste Blase.
+  Impuls     /kugel impuls an: statt fester Grüße bekommt die Persönlichkeit alle 1–3 Stunden
+             einen freien Moment und entscheidet selbst – etwas sagen, malen, Bild wechseln
+             oder nichts. Nicht nachts, nicht bei Vollbild (Spiel, Präsentation).
   Klick      Chatfenster neben der Kugel: reden, Bilder bekommen,
              📸 Screenshot (sie sieht ihn), „Alles ok?“, „NemiCLI öffnen“.
+             Der Verlauf bleibt erhalten (Wache/kugel_verlauf.json), bis „+ Neu“ ihn leert.
   Ziehen     Kugel verschieben – die Stelle wird gemerkt (Wache/kugel.json).
 
-Technik (Qt, siehe oberflaeche.py): ein
+Technik (seit 20.09.2026 Qt, vorher tkinter – siehe oberflaeche.py): ein
 rahmenloses, durchsichtiges Fenster; die Kugel wird mit QPainter gemalt
 (Radialverlauf, Glanzpunkt, weicher Lichthof), atmet über einen QTimer und
 hebt sich unter der Maus leicht an. Das Chatfenster ist eine dunkle Karte mit
@@ -49,6 +54,10 @@ from .oberflaeche import THEME
 
 GRUESSE_DATEI = ORDNER / "gruesse.md"
 LAGE_DATEI = ORDNER / "kugel.json"
+VERLAUF_DATEI = ORDNER / "kugel_verlauf.json"
+VERLAUF_MAX = 200            # so viele Einträge zeigt und speichert das Chatfenster
+EINLEITUNG = ("Klick auf die Kugel schließt das Fenster. Enter sendet. Hier wird nur gelesen und "
+              "geredet – Änderungen am PC machst du im großen NemiCLI.")
 GROESSE = 64                 # Durchmesser der Kugel
 RAND = 18                    # Platz für den Lichthof rundherum
 PANEL_BREITE, PANEL_HOEHE = 420, 580
@@ -104,6 +113,89 @@ def gruesse(name: str, nutzer: str) -> list[str]:
         except OSError:
             pass
     return [z.replace("{name}", name).replace("{nutzer}", nutzer) for z in zeilen]
+
+
+def vollbild() -> bool:
+    """Läuft ein Vollbild-Programm (Spiel, Präsentation) oder ist niemand da (Sperre)?"""
+    try:
+        import ctypes
+        z = ctypes.c_int(0)
+        if ctypes.windll.shell32.SHQueryUserNotificationState(ctypes.byref(z)) == 0:
+            return z.value in (1, 2, 3, 4)     # nicht da · beschäftigt · D3D-Vollbild · Präsentation
+    except Exception:
+        pass
+    return False
+
+
+def impuls_an() -> bool:
+    try:
+        import config
+        return bool(config.load().get("kugel_impuls", False))
+    except Exception:
+        return False
+
+
+IMPULS_TEXT = (
+    "[Freier Moment · {zeit} · {tag}] Niemand hat dich gerade angesprochen. Du hast einen Moment "
+    "für dich und darfst von dir aus etwas tun – oder nichts.\n"
+    "Möglich: dem Nutzer etwas sagen (deine Antwort erscheint als Sprechblase an der Kugel, höchstens "
+    "zwei kurze Sätze) · ein Bild malen (bild_malen) · dein Kugel-Bild wechseln (kugel mit stimmung) · "
+    "den Bildschirm ansehen (bildschirm_ansehen), wenn du wissen willst, was gerade los ist.\n"
+    "Sag nur, was dir wirklich einfällt – keine Floskel, nichts, was du heute schon gesagt hast. "
+    "Willst du nichts tun, antworte genau: (still)"
+)
+_TAGE = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
+
+
+def impuls_text(name: str) -> str:
+    jetzt = datetime.now()
+    text = IMPULS_TEXT.format(zeit=jetzt.strftime("%H:%M"), tag=_TAGE[jetzt.weekday()])
+    try:
+        import kugelmotive
+        da = [k for k in steuerung.bilder(name) if k]
+        if da:
+            text += ("\nDeine Kugel-Bilder (stimmung): "
+                     + ", ".join(kugelmotive.MOTIVE.get(k, (k, ""))[0] for k in sorted(da)))
+    except Exception:
+        pass
+    return text
+
+
+def still(antwort: str) -> bool:
+    return antwort.strip().strip("()[]. *_").lower() in ("", "still")
+
+
+def verlauf_laden() -> list[dict]:
+    try:
+        d = json.loads(VERLAUF_DATEI.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    return [e for e in d if isinstance(e, dict)][-VERLAUF_MAX:] if isinstance(d, list) else []
+
+
+def verlauf_speichern(eintraege: list[dict]) -> None:
+    try:
+        VERLAUF_DATEI.parent.mkdir(parents=True, exist_ok=True)
+        VERLAUF_DATEI.write_text(json.dumps(eintraege[-VERLAUF_MAX:], ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def _ergebnis(erg) -> tuple[str, list, str]:
+    """Antwort der Chat-Coroutine: (antwort, bilder) oder (antwort, bilder, todo_text)."""
+    antwort, bilder = erg[0], erg[1]
+    return antwort, bilder, (erg[2] or "") if len(erg) > 2 else ""
+
+
+def _weg(item) -> None:
+    """Layout-Eintrag samt Inhalt entfernen."""
+    if (w := item.widget()) is not None:
+        w.hide(); w.setParent(None); w.deleteLater()        # sofort raus, gelöscht wird später
+    elif item.layout() is not None:
+        lay = item.layout()
+        while lay.count():
+            _weg(lay.takeAt(0))
+        lay.deleteLater()
 
 
 def _schirm(punkt: QPoint):
@@ -177,7 +269,7 @@ class _Kugelfenster(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        kern, glanz = FARBEN.get(self.farbe, FARBEN["gruen"])
+        kern, glanz = self._farben()
         m = self.width() / 2
         atem = 0.5 + 0.5 * math.sin(self.phase)
         hoch, dreh, stauch = self._geste()
@@ -220,6 +312,15 @@ class _Kugelfenster(QWidget):
                 p.setBrush(QColor(255, 255, 255, 235 if an else 110))
                 p.drawEllipse(QRectF(m + (k - 1) * 9 - 3, m + r * 0.5 - 3, 6, 6))
         p.end()
+
+    def _farben(self):
+        """(Kern, Glanz): Lagenfarbe – oder Regenbogen, solange sie im Hintergrund arbeitet."""
+        if not self.beschaeftigt:
+            return FARBEN.get(self.farbe, FARBEN["gruen"])
+        ton = (self.phase * 0.06) % 1.0
+        kern = QColor.fromHsvF(ton, 0.75, 0.95)
+        glanz = QColor.fromHsvF(ton, 0.35, 1.0)
+        return ((kern.red(), kern.green(), kern.blue()), (glanz.red(), glanz.green(), glanz.blue()))
 
     def _bild_malen(self, p: QPainter, kern, m: float, atem: float, hoch: float, dreh: float, stauch: float) -> None:
         """Das Bild der Persönlichkeit: Lichthof in Lagenfarbe dahinter, leichtes Atmen,
@@ -363,9 +464,10 @@ class _Bild(QLabel):
 
 
 class _Panel(QWidget):
-    """Die Karte: Kopf (Name, Status, ✕), Verlauf mit Sprechblasen, Eingabe, Knöpfe."""
+    """Die Karte: Kopf (Name, Status, + Neu, ✕), Verlauf mit Sprechblasen, Eingabe, Knöpfe."""
 
     geschlossen = Signal()
+    neu = Signal()
     senden = Signal()
     screenshot = Signal()
     alles_ok = Signal()
@@ -392,7 +494,11 @@ class _Panel(QWidget):
         self.status = QLabel(""); self.status.setObjectName("status")
         zu = QPushButton("✕"); zu.setObjectName("zu"); zu.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         zu.clicked.connect(self.geschlossen.emit)
-        k.addWidget(self.punkt); k.addWidget(self.name); k.addStretch(1); k.addWidget(self.status); k.addWidget(zu)
+        neu = QPushButton("+ Neu"); neu.setObjectName("neu"); neu.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        neu.setToolTip("Neuer Chat – der bisherige Verlauf wird geleert")
+        neu.clicked.connect(self.neu.emit)
+        k.addWidget(self.punkt); k.addWidget(self.name); k.addStretch(1); k.addWidget(self.status)
+        k.addSpacing(6); k.addWidget(neu); k.addWidget(zu)
         lay.addWidget(self.kopf)
 
         self.scroll = QScrollArea(); self.scroll.setWidgetResizable(True)
@@ -495,6 +601,27 @@ class _Panel(QWidget):
         b.addWidget(_Bild(pfad))
         self._anhaengen(rahmen)
 
+    def plan(self, text: str) -> None:
+        """Gelber Kasten mit der Todo-Liste der Runde (erste Zeile = Kopf)."""
+        zeilen = text.strip().splitlines()
+        rahmen = QFrame(); rahmen.setObjectName("plan")
+        b = QVBoxLayout(rahmen); b.setContentsMargins(12, 8, 12, 9); b.setSpacing(3)
+        kopf = QLabel(zeilen[0] if zeilen else "🟨 Todo"); kopf.setObjectName("plan_kopf")
+        b.addWidget(kopf)
+        rest = "\n".join(zeilen[1:])
+        if rest:
+            lbl = QLabel(rest)
+            lbl.setTextFormat(Qt.TextFormat.PlainText)
+            lbl.setWordWrap(True)
+            lbl.setFixedWidth(self._textbreite(rest, False, int(PANEL_BREITE * 0.85) - 26))
+            lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            b.addWidget(lbl)
+        self._anhaengen(rahmen)
+
+    def leeren(self) -> None:
+        while self.verlauf.count() > 1:          # der Stretch am Ende bleibt
+            _weg(self.verlauf.takeAt(0))
+
     def denkt(self, an: bool) -> None:
         if an:
             self._punkte = 0
@@ -527,10 +654,11 @@ class Kugel:
     `im_gui(...)`, `stop()`, `blase_spaeter(...)`."""
 
     def __init__(self, *, stand, chat, schleife: asyncio.AbstractEventLoop, sichtbar,
-                 name: str, nutzer: str, nemicli_oeffnen, screenshot):
+                 name: str, nutzer: str, nemicli_oeffnen, screenshot, chat_neu=None):
         self.app = O.anwendung()
         self._stand = stand
         self._chat = chat
+        self._chat_neu = chat_neu
         self._loop = schleife
         self._sichtbar = sichtbar
         self.name = name
@@ -550,6 +678,8 @@ class Kugel:
         self._versteckt_fuer_foto = False
         self._farbe = "gruen"
         self._naechster_gruss = self._gruss_zeit()
+        self._naechster_impuls = self._impuls_zeit()
+        self._verlauf = verlauf_laden()
         gruesse(name, nutzer)                        # legt Wache/gruesse.md mit Vorgaben an
         # Steuerung durch die Persönlichkeit (Wache/kugel_zustand.json): was beim Start schon
         # drinsteht (Stimmung, Größe, versteckt, Lage) gilt; alte Blasen/Gesten werden nicht nachgeholt.
@@ -568,6 +698,7 @@ class Kugel:
     # ------------------------------------------------------------- Takt
 
     def _tick(self) -> None:
+        self.fenster.beschaeftigt = self._beschaeftigt or steuerung.im_hintergrund()
         if self._gezeigt:
             self.fenster.takt()
 
@@ -649,6 +780,7 @@ class Kugel:
                     self._panel_schliessen()
             if self._gezeigt:
                 self._gruss_pruefen(s)
+                self._impuls_pruefen(s)
             if self._blase is not None and time.time() > self._blase_bis:
                 self._blase_weg()
         except Exception:
@@ -695,9 +827,56 @@ class Kugel:
             return
         self._naechster_gruss = self._gruss_zeit()
         stunde = datetime.now().hour
-        if s.get("farbe") != "gruen" or stunde < 8 or stunde >= 23:
+        if s.get("farbe") != "gruen" or stunde < 8 or stunde >= 23 or impuls_an():
             return
         self.blase(random.choice(gruesse(self.name, self.nutzer)), 9)
+
+    # ------------------------------------------------------------- Freier Moment
+
+    def _impuls_zeit(self) -> float:
+        return time.time() + random.uniform(1.0, 3.0) * 3600
+
+    def _impuls_pruefen(self, s: dict) -> None:
+        if not impuls_an() or time.time() < self._naechster_impuls:
+            return
+        self._naechster_impuls = self._impuls_zeit()
+        stunde = datetime.now().hour
+        if (self._chat is None or self._beschaeftigt or self._panel is not None
+                or s.get("farbe") != "gruen" or stunde < 8 or stunde >= 23 or vollbild()):
+            return
+        self._beschaeftigt = True
+        self.fenster.beschaeftigt = True
+        fut = asyncio.run_coroutine_threadsafe(self._chat(impuls_text(self.name), []), self._loop)
+
+        def fertig(f):
+            try:
+                antwort, bilder, todo = _ergebnis(f.result())
+            except Exception:
+                antwort, bilder, todo = "", [], ""
+            O.im_gui(lambda: self._impuls_antwort(antwort, bilder, todo))
+
+        fut.add_done_callback(fertig)
+
+    def _impuls_antwort(self, antwort: str, bilder: list, todo: str = "") -> None:
+        self._beschaeftigt = False
+        self.fenster.beschaeftigt = False
+        self._zustand_anwenden(steuerung.lesen())
+        bilder = [Path(b) for b in bilder]
+        text = "" if still(antwort) else antwort.strip()
+        if not text and not bilder:
+            return
+        if todo:
+            self._merken({"plan": todo})
+        if text:
+            self._schreiben("sie", text)
+        for b in bilder:
+            self._bild_zeigen(b)
+        if self._panel is not None:
+            return
+        kurz = " ".join(text.split())[:steuerung.SAGEN_MAX] if text else ""
+        if bilder:
+            kurz = (kurz + " 🎨") if kurz else "🎨"
+        self.blase(kurz, 14)
 
     def blase(self, text: str, sekunden: float = 8.0) -> None:
         """Kurze Sprechblase neben der Kugel (GUI-Thread)."""
@@ -755,6 +934,7 @@ class Kugel:
     def _panel_oeffnen(self) -> None:
         p = _Panel(self.name)
         p.geschlossen.connect(self._panel_schliessen)
+        p.neu.connect(self._neu_klick)
         p.senden.connect(self._senden_klick)
         p.screenshot.connect(self._screenshot_klick)
         p.alles_ok.connect(lambda: self.senden("Alles ok bei dir? Gib mir kurz die Lage der Wache."))
@@ -763,8 +943,9 @@ class Kugel:
         self._panel = p
         self._panel_platzieren()
         p.show()
-        p.hinweis("Klick auf die Kugel schließt das Fenster. Enter sendet. Hier wird nur gelesen und "
-                  "geredet – Änderungen am PC machst du im großen NemiCLI.")
+        p.hinweis(EINLEITUNG)
+        for e in self._verlauf:
+            self._eintrag_zeigen(e)
         if self._beschaeftigt:
             p.denkt(True)
         p.eingabe.setFocus()
@@ -781,16 +962,46 @@ class Kugel:
             self._anhaenge = []
 
     def _schreiben(self, wer: str, text: str) -> None:
-        if self._panel is None:
-            return
+        """Nachrichten kommen in den Verlauf, Hinweise nur ins offene Fenster."""
         if wer in ("du", "sie"):
-            self._panel.nachricht(wer, text, self.name)
-        else:
+            self._merken({"wer": wer, "text": text})
+        elif self._panel is not None:
             self._panel.hinweis(text)
 
     def _bild_zeigen(self, pfad: Path) -> None:
+        self._merken({"bild": str(pfad)})
+
+    def _merken(self, e: dict) -> None:
+        self._verlauf = (self._verlauf + [e])[-VERLAUF_MAX:]
+        verlauf_speichern(self._verlauf)
+        self._eintrag_zeigen(e)
+
+    def _eintrag_zeigen(self, e: dict) -> None:
+        p = self._panel
+        if p is None:
+            return
+        if e.get("plan"):
+            p.plan(str(e["plan"]))
+        elif e.get("bild"):
+            if Path(e["bild"]).exists():
+                p.bild(Path(e["bild"]))
+        elif e.get("wer") in ("du", "sie"):
+            p.nachricht(e["wer"], str(e.get("text", "")), self.name)
+
+    def _neu_klick(self) -> None:
+        """Neuer Chat: Verlauf im Fenster und Gespräch der Persönlichkeit leeren."""
+        if self._beschaeftigt:
+            self._schreiben("hinweis", "(sie antwortet gerade noch …)")
+            return
+        self._verlauf = []
+        verlauf_speichern(self._verlauf)
+        self._anhaenge = []
+        if self._chat_neu is not None:
+            asyncio.run_coroutine_threadsafe(self._chat_neu(), self._loop)
         if self._panel is not None:
-            self._panel.bild(pfad)
+            self._panel.leeren()
+            self._panel.hinweis(EINLEITUNG)
+            self._panel.eingabe.setFocus()
 
     def _senden_klick(self) -> None:
         if self._panel is None:
@@ -828,19 +1039,21 @@ class Kugel:
 
         def fertig(f):
             try:
-                antwort, bilder = f.result()
+                antwort, bilder, todo = _ergebnis(f.result())
             except Exception as exc:
-                antwort, bilder = f"(Fehler: {exc})", []
-            O.im_gui(lambda: self._antwort(antwort, bilder))
+                antwort, bilder, todo = f"(Fehler: {exc})", [], ""
+            O.im_gui(lambda: self._antwort(antwort, bilder, todo))
 
         fut.add_done_callback(fertig)
 
-    def _antwort(self, antwort: str, bilder: list) -> None:
+    def _antwort(self, antwort: str, bilder: list, todo: str = "") -> None:
         self._beschaeftigt = False
         self.fenster.beschaeftigt = False
         self._zustand_anwenden(steuerung.lesen())
         if self._panel is not None:
             self._panel.denkt(False)
+        if todo:
+            self._merken({"plan": todo})
         self._schreiben("sie", antwort.strip() or "(keine Antwort)")
         for b in bilder:
             self._bild_zeigen(Path(b))

@@ -61,7 +61,7 @@ CREATE TABLE IF NOT EXISTS justierungen (
 
 -- Bekannte harmlose Dinge: was ist das (bezeichnung) und warum harmlos. Gefüllt
 -- aus den Urteilen der Persönlichkeit (wache_bewerten mit bezeichnung). Schlüssel
--- = "prozess:winstore.app.exe", "ziel:<adresse>", "datei:c:\…", "eintrag:…".
+-- = "prozess:winstore.app.exe", "ziel:11.22.33.44", "datei:c:\…", "eintrag:…".
 CREATE TABLE IF NOT EXISTS bekannt (
     schluessel TEXT PRIMARY KEY, art TEXT NOT NULL, name TEXT NOT NULL,
     bezeichnung TEXT NOT NULL, begruendung TEXT DEFAULT '', wer TEXT DEFAULT '',
@@ -85,8 +85,8 @@ def bekannt_schluessel(ereignis) -> list[tuple[str, str, str]]:
         p = ereignis.prozess.lower()
         if p in _SKRIPT_HOSTS and ereignis.eltern:
             # Ein Skript-Host ist nur zusammen mit seinem Elternprozess „bekannt“: powershell.exe
-            # aus NemiCLI ist etwas anderes als powershell.exe aus winword.exe. Pauschal
-            # „powershell.exe = harmlos“ wäre nach einem einzigen geratenen Urteil zu grob.
+            # aus NemiCLI ist etwas anderes als powershell.exe aus winword.exe. Bis 20.09.2026 galt
+            # „powershell.exe = harmlos“ pauschal – nach einem geratenen Urteil („Comfy Desktop“).
             el = ereignis.eltern.lower()
             out.append((f"prozess:{p}<{el}", "prozess", f"{ereignis.prozess} (von {ereignis.eltern})"))
         else:
@@ -142,7 +142,7 @@ class Speicher:
         self._c.commit()
 
     def _nachruesten(self) -> None:
-        """Später hinzugekommene Spalten an bestehende Datenbanken anbauen.
+        """Spalten, die nach dem 19.09.2026 dazukamen, an bestehende Datenbanken anbauen.
         ALTER TABLE hängt hinten an – genau die Reihenfolge, die Alarm.zeile() liefert."""
         da = {r["name"] for r in self._c.execute("PRAGMA table_info(alarme)")}
         for spalte, typ in (("subjekt", "TEXT DEFAULT ''"), ("anzahl", "INTEGER DEFAULT 1"),
@@ -154,7 +154,7 @@ class Speicher:
             self._subjekte_nachtragen()
 
     def _subjekte_nachtragen(self) -> None:
-        """Alte Alarme haben kein Subjekt – aus dem Ereignis dahinter
+        """Alte Alarme (vor dem 20.09.2026) haben kein Subjekt – aus dem Ereignis dahinter
         nachholen, damit auch sie sich als Gruppe bewerten und fürs Dämpfen zählen lassen."""
         from .regeln import subjekt_fuer
         rows = self._c.execute(
@@ -207,8 +207,8 @@ class Speicher:
 
     def ereignisse_seit(self, seit: float, limit: int = 20_000) -> list[Ereignis]:
         """Fürs Training: die NEUESTEN `limit` Ereignisse seit `seit`, aufsteigend sortiert.
-        (Kein ASC LIMIT: bei mehr als `limit` Ereignissen fielen sonst die neuesten
-        weg und das Modell lernte mit dem ältesten Stand.)"""
+        (Bis 20.09.2026 stand hier ASC LIMIT – bei mehr als `limit` Ereignissen wären die
+        neuesten weggefallen und das Modell hätte mit dem ältesten Stand gelernt.)"""
         with self._lock:
             rows = self._c.execute(
                 "SELECT * FROM ereignisse WHERE zeit >= ? ORDER BY zeit DESC LIMIT ?",
@@ -222,14 +222,6 @@ class Speicher:
     def anzahl_ereignisse(self) -> int:
         with self._lock:
             return int(self._c.execute("SELECT COUNT(*) FROM ereignisse").fetchone()[0])
-
-    def top_prozesse(self, limit: int = 10, stunden: int = 24) -> list[tuple[str, int]]:
-        seit = time.time() - stunden * 3600
-        with self._lock:
-            rows = self._c.execute(
-                "SELECT prozess, COUNT(*) n FROM ereignisse WHERE zeit >= ? AND prozess != '' "
-                "GROUP BY prozess ORDER BY n DESC LIMIT ?", (seit, limit)).fetchall()
-        return [(r["prozess"], r["n"]) for r in rows]
 
     # ---------------------------------------------------------------- Alarme
 

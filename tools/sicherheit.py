@@ -1,9 +1,10 @@
 """
 sicherheit.py - Risikostufen, Befehls-Whitelist, Obergrenzen, Bündeln.
 
-Eine einzige Frage für alles Verändernde ("Ja / Immer / Nein") – ob Ordner
-anlegen oder ganzen Ordner löschen – lässt den Nutzer irgendwann blind drücken.
-Deshalb hat jede Aktion eine Stufe, und die Frage sieht danach aus:
+Vorher gab es genau EINE
+Frage für alles Verändernde ("Ja / Immer / Nein") – ob Ordner anlegen oder
+ganzen Ordner löschen. Bei zehn Fragen hintereinander drückt man irgendwann
+blind. Jetzt hat jede Aktion eine Stufe, und die Frage sieht danach aus:
 
   lesen     läuft sofort (wie bisher).
   harmlos   verändernd, aber klein und rückholbar: Ordner anlegen, Datei
@@ -146,7 +147,7 @@ def befehl_harmlos(cmd: str) -> bool:
 LESEN, HARMLOS, AENDERT, RISKANT = "lesen", "harmlos", "aendert", "riskant"
 
 _HARMLOS = {"ordner_erstellen", "bildschirm_ansehen", "merken", "skill_merken",
-            "ordner_lernen", "bild_malen", "wache_bewerten", "wache_justieren", "kugel"}
+            "ordner_lernen", "bild_malen", "bild_serie", "wache_bewerten", "wache_justieren", "kugel"}
 _MIT_VORSCHAU = {"datei_schreiben", "datei_bearbeiten", "pdf_erstellen", "skill_schreiben", "skill_ausbessern"}
 
 
@@ -204,8 +205,8 @@ def stufe(act: dict) -> str:
 # ---------------------------------------------------------------------------
 # Arbeitsbereich der Persönlichkeit: dauerhaft bearbeiten ohne Rückfrage
 # ---------------------------------------------------------------------------
-# Ohne dieses Recht hätte die Persönlichkeit ein Gedächtnis ohne Stift. Gilt
-# für jede Persönlichkeit, nicht für einen Namen. Bedingungen, alle zugleich:
+# Die Persönlichkeit pflegt ihr eigenes Gedächtnis selbst. Gilt für jede
+# Persönlichkeit, nicht für einen Namen. Bedingungen, alle zugleich:
 #   • schreibendes Datei-Werkzeug, Stufe harmlos/ändert (loeschen und Ordner-
 #     Verschieben bleiben riskant → fragen weiter)
 #   • JEDER Pfad der Aktion liegt im Daten-Ordner (paths.DATEN), und der ist
@@ -254,8 +255,9 @@ def arbeitsbereich(act: dict) -> bool:
 # ---------------------------------------------------------------------------
 # Der Schlüssel: Programm-Ordner auf Zeit, pro Aufgabe
 # ---------------------------------------------------------------------------
-# Der Programm-Ordner bleibt zu: still geänderter Programmcode würde Fehler
-# verbergen. Der Nutzer gibt mit /schluessel <minuten> [aufgabe] auf Zeit
+# Ebenfalls aus dem Wunschbrief: der Programm-Ordner bleibt zu („mein eigenes
+# Gehirn – wenn ich das still ändern könnte, würde kein Fehler sofort
+# auffallen“). Der Nutzer gibt mit /schluessel <minuten> [aufgabe] auf Zeit
 # frei; jede Änderung fragt trotzdem einzeln (F8), und danach ist wieder zu.
 _SCHLUESSEL = {"bis": 0.0, "aufgabe": ""}
 

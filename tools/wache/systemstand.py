@@ -324,7 +324,7 @@ def ampel(e: dict) -> tuple[str, str]:
         ziel = e.get("detail", "")
         if not _privat(ziel):
             return ROT, AMPEL_REGELN[4][1]
-        if ziel in (str(ipaddress.ip_address(0)), "127.0.0.1", "::1") and e["name"].lower() != "localhost":
+        if ziel in ("0.0.0.0", "127.0.0.1", "::1") and e["name"].lower() != "localhost":
             return GELB, AMPEL_REGELN[8][1]
         return GRUEN, "lokaler Eintrag"
     if art in ("dns", "proxy"):

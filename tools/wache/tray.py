@@ -1,6 +1,7 @@
 """Symbol in der Taskleiste (Infobereich) für den Hintergrund-Prozess.
 
-Qt (QSystemTrayIcon, siehe oberflaeche.py). Das Schild wird zur Laufzeit gemalt: grün = Wache läuft, alles ruhig;
+Seit 20.09.2026 Qt (QSystemTrayIcon, siehe oberflaeche.py) – vorher pystray +
+Pillow. Das Schild wird zur Laufzeit gemalt: grün = Wache läuft, alles ruhig;
 gelb = offene Alarme, noch niemand hat draufgeschaut; rot = die Persönlichkeit
 hat etwas als ECHT eingestuft; grau = Wache gestoppt. Eine Zahl zeigt offene
 Alarme.

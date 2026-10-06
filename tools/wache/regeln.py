@@ -28,7 +28,7 @@ _VERDAECHTIGE_FLAGS = ["-enc", "-encodedcommand", "-e ", "-w hidden", "-windowst
 # NemiCLIs eigener PowerShell-Rahmen (actions.py `abfragen`/`befehl`, zeitplan.py): so beginnt
 # jede Kommandozeile, die NemiCLI selbst startet. Die Wache erkannte ihn nicht und schlug mit
 # R001 „Hoch“ an (-NoProfile = drei „verdächtige Flags“) – weckte die Persönlichkeit, die machte
-# `abfragen`, neuer Alarm … – eine Schleife falscher Urteile zu powershell.exe. Wer diesen
+# `abfragen`, neuer Alarm … (20.09.2026, 23 falsche Urteile zu powershell.exe). Wer diesen
 # Rahmen fälscht, um durchzurutschen, muss ihn erst mal kennen – und das Kind sitzt dann trotzdem
 # unter einem fremden Elternprozess, was R002/Profil sehen.
 EIGENER_RAHMEN = "$progresspreference='silentlycontinue'; $outputencoding = [console]::outputencoding"
@@ -86,8 +86,9 @@ BESCHREIBUNG = {
 # Mengen-Regeln fragen „wie viel?“ (Flut, viele Verbindungen, Beaconing, Dateiwelle, ML-Abweichung)
 # – die machen Rauschen und dürfen gedämpft oder leiser werden, wenn dasselbe Subjekt wiederholt
 # harmlos war. Muster-Regeln fragen „was?“ (-enc in der Kommandozeile, Start aus Temp, C2-Port,
-# neuer Dienst …): da ist JEDER Treffer eine eigene Frage, auch beim bekannten Prozess. Sonst
-# würde ein oft harmloses R001·powershell.exe gedämpft und ein echtes `powershell -enc` bliebe stumm.
+# neuer Dienst …): da ist JEDER Treffer eine eigene Frage, auch beim bekannten Prozess. Beispiel:
+# R001·powershell.exe 23× harmlos (Abfragen der KI selbst) darf ein echtes `powershell -enc`
+# nicht stumm schalten.
 MENGENREGELN = {"R004", "R007", "R008", "R009", "ML-001"}
 
 
@@ -111,7 +112,7 @@ def subjekt_von(e: Ereignis) -> str:
 
 def subjekt_fuer(regel: str, e: Ereignis) -> str:
     """Subjekt aus Regel + Ereignis – dieselbe Zuordnung, die die Regeln selbst treffen.
-    Gebraucht, um ältere Alarme ohne Subjekt nachzurüsten."""
+    Gebraucht, um Alarme von vor dem 20.09.2026 (ohne Subjekt) nachzurüsten."""
     if regel == "R004":
         return e.eltern or "?"
     if regel == "R008":
