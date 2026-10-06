@@ -55,3 +55,8 @@ ModelGGUF/
 
 # Sicherungskopien von Editoren
 *.bak
+/ModelGGUF/
+/Vision/
+
+# Eigene Internet-Freigaben (einstellung_aendern)
+allowlist_eigen.json
