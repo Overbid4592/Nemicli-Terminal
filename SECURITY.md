@@ -9,7 +9,7 @@ jeweils neueste Version.
 
 | Version         | Unterstützt |
 |-----------------|-------------|
-| 5.1 Alpha (neu) | ✅          |
+| 6.6 Alpha (neu) | ✅          |
 | ältere          | ❌          |
 
 ## Sicherheitslücke melden
@@ -59,7 +59,7 @@ NemiCLI ist ein Ein-Personen-Projekt. Feste Antwortzeiten gibt es deshalb nicht.
 
 ## English
 
-**Supported versions:** Only the latest release (currently 5.1 Alpha) receives security fixes.
+**Supported versions:** Only the latest release (currently 6.6 Alpha) receives security fixes.
 
 **Reporting:** Please do **not** open a public issue. Use GitHub's private reporting instead:
 **Security tab → "Report a vulnerability".**

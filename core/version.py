@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "5.1 Alpha"
+VERSION = "6.6 Alpha"
 STAND = "2026.10.06"
 AUTHOR = "D. Hoffmann (Vibecoder)"
 BUILT_WITH = "Claude Opus 5 · Anthropic"

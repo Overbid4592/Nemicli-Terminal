@@ -3,6 +3,21 @@
 Das Tagebuch der Entwicklung. Die aktuelle Übersicht steht in der [README](README.md).
 
 ### 6. Oktober 2026
+- **Version 6.6 Alpha** (`core/version.py`). Die Hauptnummer stand seit dem 20.09. auf 5.1, obwohl seitdem viel Neues kam. Nachgezogen nach derselben Regel wie bisher (großes neues Paket +0.1, grundlegender Umbruch neue Hauptnummer):
+
+  | Wäre gewesen | Datum | Neu |
+  |---|---|---|
+  | 5.2 | 23.09. | Krea 2 als eigene Pipeline, Vollscan, exe als `NemiCLI.exe` + `NemiCLIT2` |
+  | 5.3 | 24.–25.09. | Agent-RAG, Sandbox (AppContainer), eigenes Terminal-Fenster |
+  | **6.0** | 26.–27.09. | **Eigener GGUF-Motor** mit Baukasten |
+  | 6.1 | 28.09. | Desktop-Fenster `/gui`, Skills |
+  | 6.2 | 29.–30.09. | Profile je Persönlichkeit, Lern-Schleife, Ling 3.0, AutoContextCleaner |
+  | 6.3 | 02.10. | Coding-Assistent, interleaved thinking, MoE-Experten im RAM |
+  | 6.4 | 03.10. | Windows Installer (MSI), 400 Kugel-Motive |
+  | 6.5 | 04.–05.10. | Todo-Liste vor jeder Aktion, SD und transformers raus, `/update` mit Lücken-Prüfung |
+  | **6.6** | 06.10. | Charakter-Datei, Coding-Assistent bleibt aktuell, Doku neu |
+
+  Weiter Alpha: vieles davon ist noch nicht im Alltag erprobt. Die Build-Nummer zählt wie bisher die Commits (jetzt 6.6.x).
 - **`requirements.txt` vollständig und mit Mindestversionen** (getesteter Stand, `>=` statt `==`, damit `/update` weiter aktualisieren kann). Neu aufgenommen: `regex` – ohne es zerlegte der Tokenizer Llama 3, DeepSeek, Ling & Co. still anders als das Original – und `packaging` (ohne es brach `/update` ab); beide kamen bisher nur zufällig über transformers mit. `requirements-dev.txt` nennt jetzt auch PyInstaller.
 - **Doku neu geordnet.** Die README ist jetzt ein Überblick (Start, Modelle, alle 55 Befehle in Gruppen, Sicherheit, Ordner); die ausführlichen Beschreibungen stehen in [docs/Funktionen.md](docs/Funktionen.md). Korrigiert: Bildbeschreiber statt des alten Qwen-Helfers, `befehl` darf Python/pip/pytest (seit 02.10.), Ordner-Bäume (`Vision/`, `Models/embeddings/` im Programm-Ordner), Voraussetzungen (numpy, ruff, pyte), feste Namen einer Persönlichkeit entfernt. `docs/TechnischeFunktion.md`: 26 fehlende Module ergänzt (u. a. cudakern, deepseek2, moe, hfladen, venvpflege, screen_tx), Zeitplan über `schtasks`, fünf Helfer, 14 Regeln, Abhängigkeiten ohne diffusers/transformers, neuer Abschnitt „Bau & Auslieferung“.
 - **Infozettel in den Modell-Ordnern.** `ModelGGUF/` und `Vision/` im Programm-Ordner bekommen einen `LIES-MICH.txt` (was hinein gehört, Beispiel, wofür). Der alte Zettel in `Models/` behauptete noch, Sprachmodelle liefen nur über Ollama und eine .gguf bringe nichts – er wird durch einen richtigen ersetzt, solange er unverändert ist. `core/paths.py`, 4 Tests.
