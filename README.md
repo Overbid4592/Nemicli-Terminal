@@ -12,7 +12,7 @@
 
 **Dein eigener KI-Agent im Terminal – Cloud & lokal, mit Werkzeugen, Gedächtnis und Herz.** ✦
 
-**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5 (Anthropic)**
+**Entwickelt von VibeCoder · gebaut mit Claude Opus 5 (Anthropic)**
 
 </div>
 
@@ -311,6 +311,5 @@ hochzufahren.
 - [ ] Installer mit eigenen Fenstern (Weiter-Weiter-Fertig, Desktop-Symbol wählbar)
 - [ ] LoRA-Unterstützung für die Bild-Pipeline
 - [ ] `Agenten/workspace.md` in den Daten-Ordner bringen (`/workspace` sucht sie dort)
-- [ ] Lizenz festlegen (Liebesprojekt – nie zum Verkauf)
 - [ ] Signatur mit einem anerkannten Zertifikat, wenn NemiCLI an andere geht
 - [ ] Build beim Bitdefender-Falsch-Positiv-Formular einreichen
