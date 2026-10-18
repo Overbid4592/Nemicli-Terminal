@@ -11,7 +11,7 @@ import random
 import threading
 from pathlib import Path
 
-from einrichtungshelfer.laufzeit import Modell, _waehlen, bereinigen
+from einrichtungshelfer.laufzeit import Modell, _waehlen, bereinigen, stuecke_zusammensetzen
 from einrichtungshelfer.wortschatz import Wortschatz
 
 MODELL = "funke-gross"
@@ -33,6 +33,7 @@ def ordner() -> Path:
 
 def verfuegbar(pfad: Path | None = None) -> bool:
     pfad = pfad or ordner()
+    stuecke_zusammensetzen(pfad / "helfer.bin")
     return all((pfad / d).is_file() for d in _DATEIEN)
 
 
@@ -45,6 +46,7 @@ def kopf(pfad: Path | None = None) -> dict:
 
     from einrichtungshelfer.laufzeit import KENNUNG
     datei = (pfad or ordner()) / "helfer.bin"
+    stuecke_zusammensetzen(datei)
     with open(datei, "rb") as f:
         if f.read(len(KENNUNG)) != KENNUNG:
             raise ValueError("unbekanntes Format")
@@ -75,6 +77,7 @@ class Motor:
     def __init__(self, pfad: Path, seed: int | None = None):
         self.ws = Wortschatz.laden(pfad / "wortschatz.json")
         self.rng = random.Random(seed)
+        stuecke_zusammensetzen(pfad / "helfer.bin")
         try:
             from einrichtungshelfer.torchmodell import Generator
             self.torch = Generator(pfad / "helfer.bin", threads=None)

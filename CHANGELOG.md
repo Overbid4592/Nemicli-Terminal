@@ -3,6 +3,7 @@
 Das Tagebuch der Entwicklung. Die aktuelle Übersicht steht in der [README](README.md).
 
 ### 18. Oktober 2026
+- **🧩 Einrichtungs-Helfer aus Stücken:** Fehlt `helfer.bin`, liegen aber Stücke daneben (`helfer.bin.001`, `.002` …), setzt NemiCLI sie beim ersten Gebrauch zusammen und prüft das Ergebnis mit `helfer.bin.sha256`. So lassen sich die Modelle des Helfers (22 und 55 MB) auch dort ablegen, wo nur kleine Einzeldateien erlaubt sind. 3 Tests.
 - **exe Build 8.9.625** (signiert, SHA-256) + **NemiCLI-Setup-8.9.625.exe** – **Version 8.9**: Wache gehärtet (Pfad-Dämpfung, Eskalation trotz Cooldown, kein Lernen aus offenen Alarmen, R009 nie gedämpft, Rechte Nutzer/KI, Modellversionen, Vollscan höchstens 3 pro Woche). Volle Testreihe grün (2137 Tests).
 - **🛡 Wache gehärtet: Was einmal harmlos war oder sich wiederholt, fällt nicht mehr aus der Erkennung (Prüfauftrag „Sicherheit vor Komfort“, Bericht in `docs/bericht_wache.md`).** Geprüft wurden ML, Folgen-Netz, Dämpfung, Justierung und FolderSense; jeder Fund mit simulierten Daten nachgerechnet. Behoben:
   - **„harmlos“ machte blind:** Ein einziges Urteil dämpfte jeden ML-Score dieses Programm*namens* für immer auf höchstens 0,35 – unter jeder erlaubten Schwelle. Eine falsche `svchost.exe` im Temp-Ordner wäre unsichtbar gewesen. Jetzt gilt die Dämpfung nur für denselben Pfad, ein „echt“ hebt sie auf, und Ausreißer (ab 0,995) oder nie Gesehenes melden immer.

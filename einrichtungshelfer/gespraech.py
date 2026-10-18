@@ -9,7 +9,7 @@ import difflib
 from dataclasses import dataclass
 from pathlib import Path
 
-from einrichtungshelfer.laufzeit import Helfer, bereinigen
+from einrichtungshelfer.laufzeit import Helfer, bereinigen, stuecke_zusammensetzen
 from einrichtungshelfer.schema import aktion_gueltig, aktion_lesen, zustand
 
 NAME = "Funke"
@@ -27,6 +27,7 @@ def ordner() -> Path:
 
 def verfuegbar(pfad: Path | None = None) -> bool:
     pfad = pfad or ordner()
+    stuecke_zusammensetzen(pfad / "helfer.bin")
     return all((pfad / d).is_file() for d in _DATEIEN)
 
 
