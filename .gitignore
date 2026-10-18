@@ -14,7 +14,9 @@ dist/
 *.exe
 
 # Große Modelle & GPU-Binaries (49 GB – liegen nur lokal)
-Models/
+/Models/
+/ModelGGUF/
+/Vision/
 
 # Persönliche Daten: Chat-Verlauf, Gedächtnis, gemalte Bilder, Übungen
 chats/
@@ -35,6 +37,8 @@ logs/
 
 # Lokale Konfig (aktives Modell etc.)
 nemicli.config.json
+nemicli.config.json.bak
+nemicli.config.json.tmp
 # Lebenszeichen/Briefkasten des laufenden Fensters (Rechtsklick-Menue)
 .nemicli.alive
 .nemicli.inbox
@@ -43,20 +47,23 @@ nemicli.config.json
 Gespraeche/
 !Gespraeche/LIES-MICH.txt
 
-# Projekt-Ablage eines Workspace (/workspace) - gehoert zum jeweiligen Projekt
+# Ablage des Coding-Assistenten - gehoert zum jeweiligen Projekt
+.nemicli/
+# Ablage des frueheren /workspace in alten Projekten
 .workspace/
 
-# Zeitplan-Auftraege, Hintergrund-Berichte, Vorschlaege der Persoenlichkeit, eigene Sperrliste (18.09.2026)
+# Eigene Internet-Freigaben (einstellung_aendern)
+allowlist_eigen.json
+
+# Zeitplan-Aufträge, Hintergrund-Berichte, Vorschläge der Persönlichkeit, eigene Sperrliste
 Zeitplan/
 Berichte/
 Vorschläge/
 schreibsperre.json
-ModelGGUF/
 
 # Sicherungskopien von Editoren
 *.bak
-/ModelGGUF/
-/Vision/
 
-# Eigene Internet-Freigaben (einstellung_aendern)
-allowlist_eigen.json
+# Sicherungen (/backup)
+Backup/
+/kernel-cache/
