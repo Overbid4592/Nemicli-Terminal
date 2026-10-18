@@ -58,7 +58,6 @@ def _uebung_gewuenscht() -> bool:
         return bool(config.load().get("uebung", True))
     except Exception:
         return True
-import chatstore
 
 
 def _checkpoint_menu() -> dict:
@@ -505,9 +504,15 @@ class Screen:
         left = [(border, "╭─"), (accent + " bold", f" {ui.persona_name()} "),
                 (muted, "· "), (accent, status), (border, " ")]
         left += self._helfer_fragments(muted, accent)
-        right = list(mascot.rprompt()) + [(border, "─╮")]
+        try:                                     # Hintergrund-Aufgabe links: sie darf nie wegfallen
+            import hintergrund
+            if (plakette := hintergrund.plakette()):
+                left += [(muted, "· "), (accent, f"{plakette[0]} {plakette[1]} ")]
+        except Exception:
+            pass
+        right = list(mascot.rprompt(mit_hintergrund=False)) + [(border, "─╮")]
         if width >= 70 and self._modal is None:
-            badge = list(mascot.workspace_badge(width=max(20, width // 2))) or                 list(mascot.folder_badge(compact=width < 105))
+            badge = list(mascot.folder_badge(compact=width < 105))
             candidate = [(muted, " ")] + badge + [(muted, "  ")] + right
             if fragment_list_width(left + candidate) + 3 <= width:
                 right = candidate
@@ -876,7 +881,6 @@ class Screen:
             get_themes=lambda: ui.THEMES,
             get_models=self._model_completions,
             get_strengths=lambda: M.strength_menu(self.session_state.get("model")),
-            get_chats=chatstore.chat_args,
             get_checkpoints=_checkpoint_menu,
             get_personas=_persona_menu,
         )

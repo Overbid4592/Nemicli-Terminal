@@ -488,6 +488,12 @@
       "note": "Ollama (Bibliothek, API, Doku)"
     },
     {
+      "domain": "krea.ai",
+      "tier": 1,
+      "category": "ml_docs",
+      "note": "Krea (Hersteller von Krea 2): Blog, Neuigkeiten, Anleitungen"
+    },
+    {
       "domain": "onnx.ai",
       "tier": 1,
       "category": "ml_docs",
@@ -684,6 +690,12 @@
       "tier": 1,
       "category": "science",
       "note": "Semantic Scholar"
+    },
+    {
+      "domain": "openalex.org",
+      "tier": 1,
+      "category": "science",
+      "note": "OpenAlex (Katalog wissenschaftlicher Werke)"
     },
     {
       "domain": "attack.mitre.org",
@@ -948,18 +960,6 @@
       "tier": 2,
       "category": "community",
       "note": "Reddit – moderierte Foren, Inhalt nutzererstellt"
-    },
-    {
-      "domain": "github.io",
-      "tier": 2,
-      "category": "docs_host",
-      "note": "GitHub Pages (Projektseiten)"
-    },
-    {
-      "domain": "readthedocs.io",
-      "tier": 2,
-      "category": "docs_host",
-      "note": "Community-Doku"
     },
     {
       "domain": "llama-cpp-python.readthedocs.io",
@@ -1401,6 +1401,6 @@
     "Foren & Imageboards ohne Moderation",
     "Beliebige private Blogs",
     "File-Locker / Direkt-Download von unbekannten Hosts",
-    "Freie Hosting-Wildcards (netlify.app, gitbook.io, readme.io …) – dort kann jeder alles hosten"
+    "Freie Hosting-Wildcards (netlify.app, gitbook.io, readme.io, github.io, readthedocs.io …) – dort kann jeder alles hosten"
   ]
 }

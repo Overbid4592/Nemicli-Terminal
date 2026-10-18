@@ -33,7 +33,7 @@ NEUTRAL_GRUSS = "{name} hier. Hallo, {nutzer}."
 
 # Tipps (helfen nebenbei)
 TIPS = [
-    "💡 Mit /resume holst du alte Chats zurück.",
+    "💡 Frag mich einfach „weißt du noch …?“ – ich suche in unseren alten Gesprächen.",
     "💡 /staerke stark lässt mich gründlicher nachdenken.",
     "💡 /theme cyber – probier mal Pink! 💖",
     "💡 Tippe nur /  und ich zeig dir alle Befehle.",
@@ -91,6 +91,12 @@ def _say(text: str) -> None:
     face = random.choice(FACES)
     name = _ps().active().name
     ui.console.print(f"  [accent]{face}[/accent] [brand]💬 {name}[/brand] [muted]{text}[/muted]")
+
+
+def gruss_text() -> str:
+    """Ein Begrüßungssatz aus den selbst geschriebenen Sprüchen der Persönlichkeit ('' ohne eigene)."""
+    zeilen = _lesen()["gruss"]
+    return _fuellen(random.choice(zeilen)) if zeilen else ""
 
 
 def greet() -> None:
@@ -187,11 +193,20 @@ _ANIM = [
 ]
 
 
-def rprompt() -> FormattedText:
-    """Wird von prompt_toolkit rechts neben der Eingabe gezeigt – animiert."""
+def rprompt(mit_hintergrund: bool = True) -> FormattedText:
+    """Wird von prompt_toolkit rechts neben der Eingabe gezeigt – animiert. Die Vollbild-Oberflächen
+    zeigen die Hintergrund-Aufgabe links (mit_hintergrund=False), dort fällt sie nicht weg."""
     frame = _ANIM[int(time.time() * 3) % len(_ANIM)]   # ~3 Frames/Sekunde
     accent = ui.THEMES[ui.current_theme()]["accent"]
-    return FormattedText([(f"fg:{accent} bold", f" {frame} ")])
+    teile = [(f"fg:{accent} bold", f" {frame} ")]
+    if mit_hintergrund:
+        try:                                            # laufende Hintergrund-Aufgabe (Video, Serie)
+            import hintergrund
+            if (p := hintergrund.plakette()):
+                teile.insert(0, (f"fg:{accent}", f" {p[0]} {p[1]} "))
+        except Exception:
+            pass
+    return FormattedText(teile)
 
 
 # ---------------------------------------------------------------------------
@@ -199,36 +214,6 @@ def rprompt() -> FormattedText:
 # ---------------------------------------------------------------------------
 
 _BAR_CELLS = 10   # Breite des Balkens
-
-
-# Gelb, fett, mit vollem Pfad: solange ein Workspace festgenagelt ist, soll auf
-# einen Blick klar sein, dass gerade NUR in diesem Ordner gearbeitet wird.
-WORKSPACE_GELB = "#ffcc00"
-
-
-def workspace_badge(width: int | None = None) -> FormattedText:
-    r"""'workspace C:\...\HTMLTEST' in Gelb-Fett - leer, wenn keiner aktiv ist.
-
-    Bei wenig Platz schrumpft der Pfad von links (die letzten Ordner sagen mehr
-    als das Laufwerk), der Ordnername bleibt immer lesbar."""
-    import workspace
-    ws = workspace.pfad()
-    if ws is None:
-        return FormattedText([])
-    stil = f"fg:{WORKSPACE_GELB} bold"
-    pfad = str(ws)
-    if width is not None:
-        platz = max(12, width - len("workspace  "))
-        if len(pfad) > platz:
-            teile = ws.parts
-            kurz = ws.name
-            for i in range(len(teile) - 2, 0, -1):
-                kandidat = "…\\" + "\\".join(teile[i:])
-                if len(kandidat) > platz:
-                    break
-                kurz = kandidat
-            pfad = kurz
-    return FormattedText([(stil, f"workspace {pfad}")])
 
 
 def folder_badge(compact: bool = False) -> FormattedText:

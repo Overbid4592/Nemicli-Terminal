@@ -26,7 +26,7 @@ Die KI wird **fest in NemiCLI verankert**.
 4. 🛠 **Betrieb übernehmen:** Schritt für Schritt Aufgaben in NemiCLI.
 
 ## Der Vater (Lehrer)
-**DeepSeek V4.1 Flash über Ollama Cloud** (Favorit).
+**DeepSeek V4.1 Flash über Ollama Cloud** .
 - Modell-Lizenz: MIT (sehr frei).
 - Ollama-Bedingungen: Antworten gehören dem Nutzer, kein Trainingsverbot für eigene Modelle.
 - Offener Punkt: Ollama verbietet, den Dienst für „konkurrierende Produkte“ zu nutzen. Für das

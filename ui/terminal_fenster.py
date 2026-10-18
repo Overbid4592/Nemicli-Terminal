@@ -9,12 +9,18 @@ Terminal, keine fremde Terminal-Software, keine Fremd-DLL.
 Einstellungen (nemicli.config.json): `terminal_thema` (breeze | mint),
 `terminal_schrift`, `terminal_groesse`, `terminal_hintergrund` (0.3–1.0, Durchsicht
 nur des Hintergrunds, verschwommen), `terminal_unschaerfe` (true/false), `terminal_deckkraft`
-(0.5–1.0, ganzes Fenster).
+(0.5–1.0, ganzes Fenster), `terminal_ki_reiter` (true/false).
+
+Reiter wie bei GNOME-Terminal: die Leiste erscheint ab dem zweiten. Strg+Umschalt+T öffnet eine
+Kommandozeile, Strg+Umschalt+W schließt, Strg+Bild↑/↓ wechselt. „🤖 KI“ (Strg+Umschalt+K) zeigt die
+Befehle der KI live – NemiCLI meldet sie über eine Named Pipe (core/ki_terminal.py).
 """
 
 from __future__ import annotations
 
+import base64
 import os
+import re
 import sys
 import threading
 from pathlib import Path
@@ -133,8 +139,63 @@ def auswahl_text(zeilen: list, start: tuple, ende: tuple) -> str:
         z = zeilen[y]
         von = x1 if y == y1 else 0
         bis = x2 if y == y2 else len(z) - 1
-        raus.append("".join(z[von:bis + 1]).rstrip())
+        raus.append("".join(c for c in z[von:bis + 1] if not ist_platzhalter(c)).rstrip())
     return "\n".join(raus)
+
+
+# ---------------------------------------------------------------------------
+# Echte Bilder: Die Sitzung füllt die Bildstelle mit Platzhaltern – Zeichen U+E000 + n·64 + z
+# (n = Bild-Nummer, z = Zeile im Bild) – und schickt den Pfad als Steuerbefehl
+# „bild<n>-<Zeilen>=<Pfad, base64>“. Das Fenster malt das Bild über die Platzhalter, scharf statt
+# aus Zeichen-Blöcken, ohne Sixel oder Zusatzpaket. Aus der Zeilennummer weiß es, wo das ganze Bild
+# säße, wenn ein Teil schon hinausgerollt ist – es wird angeschnitten, nicht gestaucht.
+# ---------------------------------------------------------------------------
+
+PLATZ_ERSTES, PLATZ_BILDER, PLATZ_ZEILEN = 0xE000, 8, 64
+BILD_ENDUNGEN = (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp")
+BILD_MAX = 50 * 1024 * 1024
+
+
+def ist_platzhalter(zeichen: str) -> bool:
+    return len(zeichen) == 1 and PLATZ_ERSTES <= ord(zeichen) < PLATZ_ERSTES + PLATZ_BILDER * PLATZ_ZEILEN
+
+
+def platzhalter(nr: int, zeile: int) -> str:
+    return chr(PLATZ_ERSTES + nr * PLATZ_ZEILEN + zeile)
+
+
+def bild_befehl(befehl: str) -> tuple[int, int, Path | None] | None:
+    """„bild<n>-<Zeilen>=<base64>“ -> (n, Zeilen, Pfad); leerer Pfad -> Pfad None = Bild weg.
+    None: kein Bild-Befehl oder keine lesbare Bilddatei."""
+    m = re.fullmatch(r"bild(\d)-(\d{1,2})=([A-Za-z0-9_=-]*)", befehl or "")
+    if not m or int(m.group(1)) >= PLATZ_BILDER or not 1 <= int(m.group(2)) <= PLATZ_ZEILEN:
+        return None
+    nr, hoehe = int(m.group(1)), int(m.group(2))
+    if not m.group(3):
+        return nr, hoehe, None
+    try:
+        pfad = Path(base64.urlsafe_b64decode(m.group(3)).decode("utf-8"))
+        if pfad.suffix.lower() in BILD_ENDUNGEN and pfad.is_file() and pfad.stat().st_size <= BILD_MAX:
+            return nr, hoehe, pfad
+    except (ValueError, OSError):
+        pass
+    return None
+
+
+def platzhalter_kaesten(zeilen: list) -> dict[int, tuple[int, int, int, int, int]]:
+    """Je Bild-Nummer der sichtbare Kasten (x0, y0, x1, y1) in Zellen und die oberste sichtbare Bildzeile."""
+    kaesten: dict[int, list[int]] = {}
+    for y, z in enumerate(zeilen):
+        for x, c in enumerate(z):
+            if ist_platzhalter(c):
+                nr, zeile = divmod(ord(c) - PLATZ_ERSTES, PLATZ_ZEILEN)
+                k = kaesten.get(nr)
+                if k is None:
+                    kaesten[nr] = [x, y, x, y, zeile]
+                else:
+                    k[0], k[1], k[2], k[3] = min(k[0], x), min(k[1], y), max(k[2], x), max(k[3], y)
+                    k[4] = min(k[4], zeile)
+    return {n: tuple(k) for n, k in kaesten.items()}
 
 
 # ---------------------------------------------------------------------------
@@ -219,7 +280,9 @@ def _einstellungen() -> dict:
             "deckkraft": zahl("terminal_deckkraft", 1.0, 0.5, 1.0),
             # nur der Hintergrund, verschwommen (Windows 11 Acrylic) – 1.0 = deckend
             "hintergrund": zahl("terminal_hintergrund", 0.82, 0.3, 1.0),
-            "unschaerfe": bool(c.get("terminal_unschaerfe", True))}
+            "unschaerfe": bool(c.get("terminal_unschaerfe", True)),
+            # Reiter „KI“: Befehle der KI live mitlesen
+            "ki_reiter": bool(c.get("terminal_ki_reiter", True))}
 
 
 def acrylic(hwnd: int) -> bool:
@@ -257,73 +320,165 @@ def _app_kennung() -> None:
             pass
 
 
+class KiSchirm(pyte.HistoryScreen):
+    """Bildschirm des Reiters „KI“: nur zum Lesen, mit Verlauf zum Zurückrollen. Er antwortet nicht,
+    kennt keine Maus- und Steuer-Modi – Ausgaben der Befehle können dort nichts auslösen."""
+
+    VERLAUF = 5000
+
+    def __init__(self, spalten: int, zeilen: int):
+        super().__init__(spalten, zeilen, history=self.VERLAUF, ratio=0.5)
+
+    def write_process_input(self, data: str) -> None:
+        pass
+
+    def maus_an(self) -> bool:
+        return False
+
+    maus_bewegung = maus_sgr = einfuegen_geklammert = fokus_melden = anwendungs_cursor = maus_an
+
+
+def ki_text(ereignis: dict) -> str:
+    """Ereignis von ki_terminal.py -> Terminal-Text (CR LF, Farben)."""
+    t = ereignis.get("t")
+    if t == "start":
+        befehl = str(ereignis.get("befehl") or "").replace("\r\n", "\n").replace("\n", "\r\n   ")
+        ordner = str(ereignis.get("ordner") or "")
+        kopf = f"\x1b[2m{ordner}\x1b[0m\r\n" if ordner else ""
+        return f"\r\n{kopf}\x1b[1;36m❯\x1b[0m \x1b[1m{befehl}\x1b[0m\r\n"
+    if t == "aus":
+        text = str(ereignis.get("text") or "").replace("\r\n", "\n").replace("\n", "\r\n")
+        return f"\x1b[31m{text}\x1b[0m" if ereignis.get("fehler") else text
+    if t == "ende":
+        dauer = str(ereignis.get("sekunden", "")).replace(".", ",")
+        if ereignis.get("abgebrochen"):
+            return f"\x1b[33m⏹ abgebrochen\x1b[0m \x1b[2m({dauer} s)\x1b[0m\r\n"
+        code = ereignis.get("code")
+        if code in (0, 250):
+            return f"\x1b[32m✓ fertig\x1b[0m \x1b[2m({dauer} s)\x1b[0m\r\n"
+        return f"\x1b[31m✗ Exitcode {code}\x1b[0m \x1b[2m({dauer} s)\x1b[0m\r\n"
+    return ""
+
+
+class KiLeitung:
+    """Named Pipe, über die NemiCLI die Befehle der KI meldet (core/ki_terminal.py). Jede Verbindung muss
+    den Schlüssel beweisen (multiprocessing-Challenge); danach kommen nur JSON-Ereignisse."""
+
+    MAX_NACHRICHT = 1 << 20
+
+    def __init__(self):
+        import secrets
+        from multiprocessing.connection import Listener
+        self.adresse = r"\\.\pipe\nemicli-ki-" + secrets.token_hex(8)
+        self.schluessel = secrets.token_bytes(32)
+        self._listener = Listener(self.adresse, family="AF_PIPE", authkey=self.schluessel)
+        self._lock = threading.Lock()
+        self._ereignisse: list[dict] = []
+        threading.Thread(target=self._annehmen, name="ki-annehmen", daemon=True).start()
+
+    def umgebung(self) -> dict:
+        return {"NEMICLI_KI_PIPE": self.adresse, "NEMICLI_KI_KEY": self.schluessel.hex()}
+
+    def _annehmen(self) -> None:
+        while True:
+            try:
+                conn = self._listener.accept()
+            except Exception:
+                return
+            threading.Thread(target=self._lesen, args=(conn,), name="ki-lesen", daemon=True).start()
+
+    def _lesen(self, conn) -> None:
+        import json
+        try:
+            while True:
+                ereignis = json.loads(conn.recv_bytes(self.MAX_NACHRICHT).decode("utf-8"))
+                if isinstance(ereignis, dict):
+                    with self._lock:
+                        self._ereignisse.append(ereignis)
+        except Exception:
+            pass
+
+    def holen(self) -> list[dict]:
+        with self._lock:
+            ereignisse, self._ereignisse = self._ereignisse, []
+        return ereignisse
+
+
+REITER_ZEICHEN = 28
+PROTOKOLL_MAX = 2_000_000            # Zeichen, die der Reiter „KI“ für den Neuaufbau behält
+
+
+def reiter_name(titel: str) -> str:
+    """Fenstertitel eines Programms -> kurzer Reitername (Pfade nur mit dem letzten Teil)."""
+    titel = titel.strip()
+    if re.match(r"^[A-Za-z]:[\\/]|^[\\/]", titel):
+        titel = re.split(r"[\\/]", titel.split(" - ")[0].rstrip("\\/"))[-1] + (
+            " - " + titel.split(" - ", 1)[1] if " - " in titel else "")
+    return titel if len(titel) <= REITER_ZEICHEN else titel[:REITER_ZEICHEN - 1] + "…"
+
+
+def _shell() -> list[str]:
+    """Befehl für einen neuen Reiter: die Windows-Kommandozeile aus COMSPEC."""
+    return [os.environ.get("COMSPEC") or "cmd.exe"]
+
+
 def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = None,
             titel: str = "NemiCLI") -> int:
-    """Öffnet das Fenster, startet `befehl` darin und kehrt zurück, wenn es zu ist."""
+    """Öffnet das Fenster, startet `befehl` darin und kehrt zurück, wenn es zu ist.
+    Weitere Reiter: Kommandozeile (Strg+Umschalt+T) und „🤖 KI“ (Befehle der KI live, nur lesen)."""
     _app_kennung()
-    from PySide6.QtCore import QRect, QRectF, Qt, QTimer
-    from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QIcon, QPainter
-    from PySide6.QtWidgets import QApplication, QMenu, QSystemTrayIcon, QWidget
+    from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
+    from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QIcon, QKeySequence,
+                               QPainter, QPixmap, QShortcut)
+    from PySide6.QtWidgets import (QApplication, QHBoxLayout, QMenu, QStackedWidget, QSystemTrayIcon, QTabBar,
+                                   QToolButton, QVBoxLayout, QWidget)
     import terminal_pty
 
     e = _einstellungen()
     thema = e["thema"]
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    try:
+        ki_leitung = KiLeitung() if e["ki_reiter"] else None
+    except Exception:
+        ki_leitung = None
 
     class Ansicht(QWidget):
-        def __init__(self):
-            super().__init__()
-            self.setWindowTitle(titel)
+        """Ein Reiter: Programm in einer Pseudokonsole – oder nur zum Lesen (Reiter „KI“)."""
+
+        def __init__(self, fenster, programm=None, *, kind_env=None, nur_lesen=False, haupt=False):
+            super().__init__(fenster)
+            self.fenster, self.programm, self.kind_env = fenster, programm, kind_env
+            self.nur_lesen, self.haupt = nur_lesen, haupt
             self.setFocusPolicy(Qt.StrongFocus)
-            self.durchsichtig = False
-            if e["unschaerfe"] and e["hintergrund"] < 1.0:
-                self.setAttribute(Qt.WA_TranslucentBackground)
-                self.durchsichtig = acrylic(int(self.winId()))
-                if not self.durchsichtig:
-                    self.setAttribute(Qt.WA_TranslucentBackground, False)
-            if not self.durchsichtig:
+            if not fenster.durchsichtig:
                 self.setAttribute(Qt.WA_OpaquePaintEvent)
             self.grund = QColor(thema["hintergrund"])
-            if self.durchsichtig:
+            if fenster.durchsichtig:
                 self.grund.setAlphaF(e["hintergrund"])
             self.setMouseTracking(True)
             self.setAttribute(Qt.WA_InputMethodEnabled, True)     # Emoji-Feld (Win + .), IME
-            self.setAcceptDrops(True)
-            schrift = QFont(e["schrift"]) if e["schrift"] else QFontDatabase.systemFont(QFontDatabase.FixedFont)
-            if not e["schrift"]:
-                for name in ("Cascadia Mono", "Cascadia Code", "Consolas"):
-                    if name in QFontDatabase.families():
-                        schrift = QFont(name)
-                        break
-            schrift.setPointSize(e["groesse"])
-            schrift.setStyleHint(QFont.Monospace)
-            self.schrift = schrift
-            self.fett = QFont(schrift)
-            self.fett.setBold(True)
-            m = QFontMetricsF(schrift)
-            self.zb, self.zh, self.oben = m.horizontalAdvance("M"), m.height(), m.ascent()
+            self.setAcceptDrops(not nur_lesen)
+            self.schrift, self.fett = fenster.schrift, fenster.fett
+            self.zb, self.zh, self.oben = fenster.zb, fenster.zh, fenster.oben
             self.lock = threading.Lock()
-            self.schirm = Schirm(100, 30, self._senden, self._steuer)
-            self.steuerbefehl = None      # aus dem Lese-Thread, ausgeführt im Takt
-            self.tray = None
+            self.schirm = KiSchirm(100, 30) if nur_lesen else Schirm(100, 30, self._senden, self._steuer)
+            self.titel_alt = ""
+            self.protokoll: list[str] = []            # Reiter „KI“: alles Eingespeiste
+            self.protokoll_laenge = 0
+            self.steuerbefehle = []       # aus dem Lese-Thread, ausgeführt im Takt
+            self.bilder = {}              # Bild-Nummer -> QPixmap (echte Bilder über Platzhaltern)
+            self.bilder_skaliert = {}
             self.strom = pyte.Stream(self.schirm)
             self.neu = False
             self.ende = False
             self.pty = None
             self.maus_knopf = None
-            # Markieren: Ziehen mit links markiert immer, ein Klick ohne Ziehen geht ans Programm.
+            # Markieren: Will das Programm die Maus (NemiCLI), bekommt es auch das Ziehen – es markiert
+            # selbst, rollt am Rand mit und kopiert. Sonst – oder mit Umschalt – markiert das Fenster
+            # (nur Sichtbares); ein Klick ohne Ziehen geht ans Programm.
             self.druck = None             # (zelle, shift, alt, strg) beim Drücken links
             self.zieht = False
             self.auswahl = None           # (start, ende) in Zellen
-            self.resize(int(self.zb * 110 + 16), int(self.zh * 32 + 16))
-            self.setWindowOpacity(e["deckkraft"])
-            # In der exe liegt das Icon in NemiCLIT2 (sys._MEIPASS), im Quelltext daneben.
-            for icon in (Path(getattr(sys, "_MEIPASS", "")) / "nemicli.ico",
-                         Path(__file__).resolve().parent.parent / "nemicli.ico"):
-                if icon.is_file():
-                    self.setWindowIcon(QIcon(str(icon)))
-                    app.setWindowIcon(QIcon(str(icon)))
-                    break
             self.takt = QTimer(self)
             self.takt.timeout.connect(self._takt)
             self.takt.start(16)
@@ -333,9 +488,9 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             sp, ze = self._raster()
             with self.lock:
                 self.schirm.resize(ze, sp)
-            kind_env = dict(env if env is not None else os.environ)
-            kind_env.update({"COLORTERM": "truecolor", "TERM": "xterm-256color", "NEMICLI_FENSTER": "1"})
-            self.pty = terminal_pty.Pty(befehl, sp, ze, ordner=ordner, env=kind_env,
+            kind_env = dict(self.kind_env if self.kind_env is not None else os.environ)
+            kind_env.update({"COLORTERM": "truecolor", "TERM": "xterm-256color"})
+            self.pty = terminal_pty.Pty(self.programm, sp, ze, ordner=ordner, env=kind_env,
                                         bei_ausgabe=self._ausgabe, bei_ende=self._beendet)
 
         def _ausgabe(self, text):                       # Lese-Thread
@@ -343,52 +498,81 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 self.strom.feed(text)
                 self.neu = True
 
+        def einspeisen(self, text):
+            """Reiter „KI“: Text ohne Programm. Er bleibt gemerkt – bei neuer Größe wird der Bildschirm
+            daraus neu aufgebaut (pyte verliert beim Verkleinern Zeilen; ein Programm zeichnet selbst neu)."""
+            self.protokoll.append(text)
+            self.protokoll_laenge += len(text)
+            while self.protokoll_laenge > PROTOKOLL_MAX and len(self.protokoll) > 1:
+                self.protokoll_laenge -= len(self.protokoll.pop(0))
+            self._ausgabe(text)
+
         def _beendet(self, _code):                      # Warte-Thread
             self.ende = True
 
         def _senden(self, text):
-            if self.pty is not None and text:
+            if self.pty is not None and text and not self.nur_lesen:
                 self.pty.schreiben(text)
 
         def _steuer(self, befehl):                      # Lese-Thread
-            self.steuerbefehl = befehl
+            self.steuerbefehle.append(befehl)
 
-        def _in_tray(self, an: bool):
-            """Solange das Desktop-Fenster (/gui) offen ist: Terminal aus dem Weg, Symbol im Tray."""
-            if an:
-                if self.tray is None:
-                    self.tray = QSystemTrayIcon(self.windowIcon(), self)
-                    self.tray.setToolTip("NemiCLI – läuft (Desktop-Fenster offen)")
-                    self.tray_menue = QMenu()                 # setContextMenu übernimmt es nicht
-                    self.tray_menue.addAction("Terminal zeigen", lambda: self._in_tray(False))
-                    self.tray_menue.addSeparator()
-                    self.tray_menue.addAction("NemiCLI beenden", self.close)
-                    self.tray.setContextMenu(self.tray_menue)
-                    self.tray.activated.connect(
-                        lambda grund: self._in_tray(False)
-                        if grund in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
-                self.tray.show()
-                self.hide()
-            else:
-                self.showNormal()
-                self.raise_()
-                self.activateWindow()
-                if self.tray is not None:
-                    self.tray.hide()
+        def beenden(self):
+            if self.pty is not None and self.pty.laeuft():
+                self.pty.beenden()
 
         def _takt(self):
             if self.ende:
                 self.takt.stop()
-                if self.tray is not None:
-                    self.tray.hide()
-                self.close()
+                self.fenster.programm_zu(self)
                 return
-            befehl, self.steuerbefehl = self.steuerbefehl, None
-            if befehl in ("tray", "zeigen"):
-                self._in_tray(befehl == "tray")
+            befehle, self.steuerbefehle = self.steuerbefehle, []
+            for befehl in befehle:
+                if befehl in ("tray", "zeigen"):
+                    self.fenster.in_tray(befehl == "tray")
+                elif (bild := bild_befehl(befehl)) is not None:
+                    self._bild_setzen(*bild)
+            if not self.haupt and not self.nur_lesen and self.schirm.title != self.titel_alt:
+                self.titel_alt = self.schirm.title
+                self.fenster.reiter_benennen(self, self.titel_alt)
             if self.neu:
                 self.neu = False
                 self.update()
+
+        def _bild_setzen(self, nr, hoehe, pfad):
+            self.bilder_skaliert = {k: v for k, v in self.bilder_skaliert.items() if k[0] != nr}
+            bild = QPixmap(str(pfad)) if pfad is not None else None
+            if bild is None or bild.isNull():
+                self.bilder.pop(nr, None)
+            else:
+                self.bilder[nr] = (bild, hoehe)
+            self.update()
+
+        def _bilder_malen(self, p, zeilen):
+            """Echte Bilder über ihre Platzhalter: eingepasst in den ganzen Bildkasten (auch den
+            hinausgerollten Teil), gezeichnet nur im sichtbaren."""
+            if not self.bilder:
+                return
+            dpr = self.devicePixelRatioF()
+            for nr, (x0, y0, x1, y1, erste) in platzhalter_kaesten(zeilen).items():
+                if nr not in self.bilder:
+                    continue
+                bild, hoehe = self.bilder[nr]
+                sichtbar = QRectF(8 + x0 * self.zb, 8 + y0 * self.zh,
+                                  (x1 - x0 + 1) * self.zb, (y1 - y0 + 1) * self.zh)
+                ganz = QRectF(sichtbar.x(), sichtbar.y() - erste * self.zh, sichtbar.width(), hoehe * self.zh)
+                f = min(ganz.width() / max(1, bild.width()), ganz.height() / max(1, bild.height()))
+                b, h = bild.width() * f, bild.height() * f
+                schluessel = (nr, int(b * dpr), int(h * dpr))
+                klein = self.bilder_skaliert.get(schluessel)
+                if klein is None:
+                    klein = bild.scaled(schluessel[1], schluessel[2], Qt.IgnoreAspectRatio, Qt.SmoothTransformation)
+                    klein.setDevicePixelRatio(dpr)
+                    self.bilder_skaliert[schluessel] = klein
+                p.save()
+                p.setClipRect(sichtbar)
+                p.drawPixmap(QPointF(ganz.x() + (ganz.width() - b) / 2, ganz.y() + (ganz.height() - h) / 2), klein)
+                p.restore()
 
         # -- Raster --------------------------------------------------------------
         def _raster(self):
@@ -403,7 +587,12 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             sp, ze = self._raster()
             if (sp, ze) != (self.schirm.columns, self.schirm.lines):
                 with self.lock:
-                    self.schirm.resize(ze, sp)
+                    if self.nur_lesen:
+                        self.schirm = KiSchirm(sp, ze)
+                        self.strom = pyte.Stream(self.schirm)
+                        self.strom.feed("".join(self.protokoll))
+                    else:
+                        self.schirm.resize(ze, sp)
                 if self.pty is not None:
                     self.pty.groesse(sp, ze)
             super().resizeEvent(ev)
@@ -431,6 +620,8 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                             zellen.append(n.data)
                             x += 1
                         self._lauf(p, start, y, x - start, zellen, stil)
+                self._bilder_malen(p, [[z.data for z in (s.buffer[y][x] for x in range(s.columns))]
+                                       for y in range(s.lines)])
                 if self.auswahl:
                     (x1, y1), (x2, y2) = geordnet(*self.auswahl)
                     farbe_a = QColor(thema["hell"][4])
@@ -441,7 +632,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                         p.fillRect(QRectF(8 + von * self.zb, 8 + y * self.zh,
                                           (bis - von + 1) * self.zb, self.zh), farbe_a)
                 c = s.cursor
-                if not c.hidden and 0 <= c.y < s.lines and 0 <= c.x < s.columns:
+                if not self.nur_lesen and not c.hidden and 0 <= c.y < s.lines and 0 <= c.x < s.columns:
                     r = QRectF(8 + c.x * self.zb, 8 + c.y * self.zh, self.zb, self.zh)
                     farbe_c = QColor(thema["cursor"])
                     if self.hasFocus():
@@ -470,7 +661,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 # Jede Zelle an ihre Rasterposition. Breite Zeichen (Emojis) belegen zwei
                 # Zellen, die zweite ist leer – sie zählt trotzdem mit, sonst rutscht der Rest.
                 for i, ch in enumerate(zellen):
-                    if ch and ch != " ":
+                    if ch and ch != " " and not ist_platzhalter(ch):
                         p.drawText(r.left() + i * self.zb, r.top() + self.oben, ch)
                 if unter:
                     p.drawLine(r.left(), r.bottom() - 1, r.right(), r.bottom() - 1)
@@ -509,6 +700,10 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             if self.auswahl:
                 self.auswahl = None
                 self.update()
+            if self.nur_lesen:
+                if ev.key() in (Qt.Key_PageUp, Qt.Key_PageDown):
+                    self._blaettern(ev.key() == Qt.Key_PageUp)
+                return
             name = self._QT_NAMEN.get(ev.key(), "")
             text = ev.text()
             if strg and not text and Qt.Key_A <= ev.key() <= Qt.Key_Z:
@@ -516,6 +711,11 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             folge = taste_zu_folge(name, text, shift=shift, strg=strg, alt=alt,
                                    anwendungs_cursor=self.schirm.anwendungs_cursor())
             self._senden(folge)
+
+        def _blaettern(self, zurueck: bool):
+            with self.lock:
+                (self.schirm.prev_page if zurueck else self.schirm.next_page)()
+            self.update()
 
         def _kopieren(self):
             if not self.auswahl:
@@ -531,7 +731,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             self._text_einfuegen(QGuiApplication.clipboard().text())
 
         def _text_einfuegen(self, text):
-            if not text:
+            if not text or self.nur_lesen:
                 return
             text = text.replace("\r\n", "\r").replace("\n", "\r")
             if self.schirm.einfuegen_geklammert():
@@ -540,7 +740,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
 
         # -- Eingabemethode (Emoji-Feld, IME) ---------------------------------------
         def inputMethodEvent(self, ev):
-            if ev.commitString():
+            if ev.commitString() and not self.nur_lesen:
                 if self.auswahl:
                     self.auswahl = None
                     self.update()
@@ -552,7 +752,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 c = self.schirm.cursor
                 return QRect(int(8 + c.x * self.zb), int(8 + c.y * self.zh), int(self.zb), int(self.zh))
             if frage == Qt.ImEnabled:
-                return True
+                return not self.nur_lesen
             return super().inputMethodQuery(frage)
 
         # -- Ablegen (Drag & Drop) ---------------------------------------------------
@@ -574,7 +774,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             if text:
                 ev.acceptProposedAction()
                 self._text_einfuegen(text)
-                self.activateWindow()
+                self.window().activateWindow()
                 self.setFocus()
 
         def focusInEvent(self, ev):
@@ -607,8 +807,20 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
         def _maus(self, ev, knopf, **kw):
             self._maus_an(knopf, self._zelle(ev.position()), self._tasten(ev), **kw)
 
+        def _programm_markiert(self, ev) -> bool:
+            """Das Programm markiert selbst (Maus mit Bewegung angefordert, ohne Umschalt)."""
+            return self.schirm.maus_an() and self.schirm.maus_bewegung() and not self._tasten(ev)[0]
+
         def mousePressEvent(self, ev):
             k = self._KNOPF.get(ev.button())
+            if k == 0 and self._programm_markiert(ev):
+                if self.auswahl:
+                    self.auswahl = None
+                    self.update()
+                self.druck = None
+                self.maus_knopf = 0
+                self._maus(ev, 0)
+                return
             if k == 0:
                 # Noch nicht weitergeben: erst beim Loslassen steht fest, ob es ein Klick
                 # oder eine Markierung war.
@@ -650,19 +862,240 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 self._maus(ev, self.maus_knopf if self.maus_knopf is not None else 3, bewegung=True)
 
         def wheelEvent(self, ev):
-            if self.schirm.maus_an():
+            if self.nur_lesen:
+                self._blaettern(ev.angleDelta().y() > 0)
+            elif self.schirm.maus_an():
                 self._maus(ev, 64 if ev.angleDelta().y() > 0 else 65)
             else:
                 self._senden(taste_zu_folge("up" if ev.angleDelta().y() > 0 else "down"))
 
-        def closeEvent(self, ev):
-            if self.pty is not None and self.pty.laeuft():
-                self.pty.beenden()
-            super().closeEvent(ev)
+    class Fenster(QWidget):
+        """Das Fenster: Reiterleiste (ab zwei Reitern sichtbar), Durchsicht, Tray, Tastenkürzel."""
 
-    fenster = Ansicht()
+        def __init__(self):
+            super().__init__()
+            self.setWindowTitle(titel)
+            self.durchsichtig = False
+            if e["unschaerfe"] and e["hintergrund"] < 1.0:
+                self.setAttribute(Qt.WA_TranslucentBackground)
+                self.durchsichtig = acrylic(int(self.winId()))
+                if not self.durchsichtig:
+                    self.setAttribute(Qt.WA_TranslucentBackground, False)
+            schrift = QFont(e["schrift"]) if e["schrift"] else QFontDatabase.systemFont(QFontDatabase.FixedFont)
+            if not e["schrift"]:
+                for name in ("Cascadia Mono", "Cascadia Code", "Consolas"):
+                    if name in QFontDatabase.families():
+                        schrift = QFont(name)
+                        break
+            schrift.setPointSize(e["groesse"])
+            schrift.setStyleHint(QFont.Monospace)
+            self.schrift = schrift
+            self.fett = QFont(schrift)
+            self.fett.setBold(True)
+            m = QFontMetricsF(schrift)
+            self.zb, self.zh, self.oben = m.horizontalAdvance("M"), m.height(), m.ascent()
+            self.tray = None
+            self.haupt = None
+            self.ki = None
+            self.ki_zu = False            # Reiter „KI“ geschlossen: erst Strg+Umschalt+K öffnet ihn wieder
+            self.reiter: list = []
+            self.resize(int(self.zb * 110 + 16), int(self.zh * 32 + 16))
+            self.setWindowOpacity(e["deckkraft"])
+            # In der exe liegt das Icon in NemiCLIT2 (sys._MEIPASS), im Quelltext daneben.
+            for icon in (Path(getattr(sys, "_MEIPASS", "")) / "nemicli.ico",
+                         Path(__file__).resolve().parent.parent / "nemicli.ico"):
+                if icon.is_file():
+                    self.setWindowIcon(QIcon(str(icon)))
+                    app.setWindowIcon(QIcon(str(icon)))
+                    break
+            spalte = QVBoxLayout(self)
+            spalte.setContentsMargins(0, 0, 0, 0)
+            spalte.setSpacing(0)
+            self.leiste = QWidget(self)
+            self.leiste.setAttribute(Qt.WA_StyledBackground, True)
+            reihe = QHBoxLayout(self.leiste)
+            reihe.setContentsMargins(6, 4, 6, 0)
+            reihe.setSpacing(4)
+            self.tabs = QTabBar(self.leiste)
+            self.tabs.setTabsClosable(True)
+            self.tabs.setMovable(True)
+            self.tabs.setExpanding(False)
+            self.tabs.setDrawBase(False)
+            self.tabs.setFocusPolicy(Qt.NoFocus)
+            self.tabs.currentChanged.connect(self._gewechselt)
+            self.tabs.tabCloseRequested.connect(lambda i: self.reiter_schliessen(self._ansicht(i)))
+            self.tabs.tabMoved.connect(self._verschoben)
+            plus = QToolButton(self.leiste)
+            plus.setText("+")
+            plus.setToolTip("Neue Kommandozeile (Strg+Umschalt+T)")
+            plus.setFocusPolicy(Qt.NoFocus)
+            plus.clicked.connect(self.neue_shell)
+            reihe.addWidget(self.tabs, 1)
+            reihe.addWidget(plus)
+            self.leiste.setStyleSheet(self._leisten_stil())
+            self.leiste.hide()
+            self.stapel = QStackedWidget(self)
+            spalte.addWidget(self.leiste)
+            spalte.addWidget(self.stapel, 1)
+            for tasten, aktion in (("Ctrl+Shift+T", self.neue_shell), ("Ctrl+Shift+W", self._aktuellen_schliessen),
+                                   ("Ctrl+PgDown", lambda: self._weiter(1)), ("Ctrl+PgUp", lambda: self._weiter(-1)),
+                                   ("Ctrl+Shift+K", self.ki_zeigen)):
+                kurz = QShortcut(QKeySequence(tasten), self)
+                kurz.setContext(Qt.WindowShortcut)
+                kurz.activated.connect(aktion)
+            if ki_leitung is not None:
+                self.ki_takt = QTimer(self)
+                self.ki_takt.timeout.connect(self._ki_ereignisse)
+                self.ki_takt.start(50)
+
+        def _leisten_stil(self) -> str:
+            grund = QColor(thema["hintergrund"])
+            if self.durchsichtig:
+                grund.setAlphaF(e["hintergrund"])
+            gewaehlt = QColor(thema["hintergrund"]).lighter(140)
+            return (f"QWidget {{ background: rgba({grund.red()},{grund.green()},{grund.blue()},{grund.alpha()}); }}"
+                    f"QTabBar::tab {{ background: transparent; color: {thema['normal'][7]}; padding: 4px 12px;"
+                    f" border: none; border-bottom: 2px solid transparent; margin-right: 2px; }}"
+                    f"QTabBar::tab:selected {{ color: {thema['vordergrund']}; background: {gewaehlt.name()};"
+                    f" border-bottom: 2px solid {thema['hell'][4]}; border-radius: 4px; }}"
+                    f"QTabBar::tab:hover {{ color: {thema['vordergrund']}; }}"
+                    f"QToolButton {{ color: {thema['vordergrund']}; background: transparent; border: none;"
+                    f" padding: 2px 8px; font-size: 14px; }}"
+                    f"QToolButton:hover {{ background: {gewaehlt.name()}; border-radius: 4px; }}")
+
+        # -- Reiter --------------------------------------------------------------
+        def _ansicht(self, i: int):
+            return self.reiter[i] if 0 <= i < len(self.reiter) else None
+
+        def hinzufuegen(self, ansicht, name: str, zeigen: bool = True):
+            self.reiter.append(ansicht)
+            self.stapel.addWidget(ansicht)
+            i = self.tabs.addTab(name)
+            if ansicht.haupt:                              # NemiCLI selbst schließt man über das Fenster
+                for seite in (QTabBar.RightSide, QTabBar.LeftSide):
+                    if self.tabs.tabButton(i, seite) is not None:
+                        self.tabs.tabButton(i, seite).hide()
+            self.leiste.setVisible(len(self.reiter) > 1)
+            if zeigen:
+                self.tabs.setCurrentIndex(i)
+                self.stapel.setCurrentWidget(ansicht)
+                ansicht.setFocus()
+
+        def reiter_benennen(self, ansicht, name: str):
+            if ansicht in self.reiter and name:
+                self.tabs.setTabText(self.reiter.index(ansicht), reiter_name(name))
+
+        def neue_shell(self):
+            kind_env = {k: v for k, v in os.environ.items() if not k.upper().startswith("NEMICLI_")}
+            ansicht = Ansicht(self, _shell(), kind_env=kind_env)
+            self.hinzufuegen(ansicht, "Kommandozeile")
+            ansicht.programm_starten()
+
+        def ki_zeigen(self):
+            self.ki_zu = False
+            self._ki_ansicht(zeigen=True)
+
+        def _ki_ansicht(self, zeigen: bool = False):
+            if self.ki is None:
+                self.ki = Ansicht(self, nur_lesen=True)
+                self.hinzufuegen(self.ki, "🤖 KI", zeigen=zeigen)
+                self.ki.einspeisen("\x1b[2mHier erscheinen die Befehle der KI live (nur lesen, "
+                                   "Mausrad/Bild↑↓ blättert zurück).\x1b[0m\r\n")
+            elif zeigen:
+                self.tabs.setCurrentIndex(self.reiter.index(self.ki))
+            return self.ki
+
+        def _ki_ereignisse(self):
+            for ereignis in ki_leitung.holen():
+                if self.ki is None and (self.ki_zu or ereignis.get("t") != "start"):
+                    continue
+                self._ki_ansicht().einspeisen(ki_text(ereignis))
+
+        def reiter_schliessen(self, ansicht):
+            # schon zu: von Hand geschlossen, danach meldet das beendete Programm sich noch einmal
+            if ansicht is None or ansicht.haupt or ansicht not in self.reiter:
+                return
+            ansicht.takt.stop()
+            ansicht.beenden()
+            i = self.reiter.index(ansicht)
+            self.reiter.pop(i)
+            self.tabs.removeTab(i)
+            self.stapel.removeWidget(ansicht)
+            if ansicht is self.ki:
+                self.ki, self.ki_zu = None, True
+            ansicht.deleteLater()
+            self.leiste.setVisible(len(self.reiter) > 1)
+            aktuell = self._ansicht(self.tabs.currentIndex())
+            if aktuell is not None:
+                self.stapel.setCurrentWidget(aktuell)
+                aktuell.setFocus()
+
+        def programm_zu(self, ansicht):
+            """Programm eines Reiters beendet: NemiCLI schließt das Fenster, eine Kommandozeile ihren Reiter."""
+            if ansicht.haupt:
+                if self.tray is not None:
+                    self.tray.hide()
+                self.close()
+            else:
+                self.reiter_schliessen(ansicht)
+
+        def _aktuellen_schliessen(self):
+            self.reiter_schliessen(self._ansicht(self.tabs.currentIndex()))
+
+        def _weiter(self, schritt: int):
+            if len(self.reiter) > 1:
+                self.tabs.setCurrentIndex((self.tabs.currentIndex() + schritt) % len(self.reiter))
+
+        def _gewechselt(self, i: int):
+            ansicht = self._ansicht(i)
+            if ansicht is not None:
+                self.stapel.setCurrentWidget(ansicht)
+                ansicht.setFocus()
+
+        def _verschoben(self, von: int, nach: int):
+            self.reiter.insert(nach, self.reiter.pop(von))
+
+        # -- Tray ------------------------------------------------------------------
+        def in_tray(self, an: bool):
+            """Solange das Desktop-Fenster (/gui) offen ist: Terminal aus dem Weg, Symbol im Tray."""
+            if an:
+                if self.tray is None:
+                    self.tray = QSystemTrayIcon(self.windowIcon(), self)
+                    self.tray.setToolTip("NemiCLI – läuft (Desktop-Fenster offen)")
+                    self.tray_menue = QMenu()                 # setContextMenu übernimmt es nicht
+                    self.tray_menue.addAction("Terminal zeigen", lambda: self.in_tray(False))
+                    self.tray_menue.addSeparator()
+                    self.tray_menue.addAction("NemiCLI beenden", self.close)
+                    self.tray.setContextMenu(self.tray_menue)
+                    self.tray.activated.connect(
+                        lambda grund: self.in_tray(False)
+                        if grund in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
+                self.tray.show()
+                self.hide()
+            else:
+                self.showNormal()
+                self.raise_()
+                self.activateWindow()
+                if self.tray is not None:
+                    self.tray.hide()
+
+        def closeEvent(self, ev):
+            for ansicht in list(self.reiter):
+                ansicht.beenden()
+            super().closeEvent(ev)
+            # ausdrücklich: hat jemand setQuitOnLastWindowClosed(False) gesetzt (Wache), liefe exec() sonst weiter
+            QTimer.singleShot(0, app.quit)
+
+    fenster = Fenster()
+    haupt_env = dict(env if env is not None else os.environ)
+    haupt_env["NEMICLI_FENSTER"] = "1"
+    if ki_leitung is not None:
+        haupt_env.update(ki_leitung.umgebung())
+    fenster.haupt = Ansicht(fenster, befehl, kind_env=haupt_env, haupt=True)
+    fenster.hinzufuegen(fenster.haupt, titel)
     fenster.show()
-    fenster.programm_starten()
-    fenster.setFocus()
+    fenster.haupt.programm_starten()
+    fenster.haupt.setFocus()
     app.exec()
-    return fenster.pty.exitcode or 0 if fenster.pty is not None else 0
+    pty = fenster.haupt.pty
+    return (pty.exitcode or 0) if pty is not None else 0

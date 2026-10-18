@@ -12,9 +12,9 @@ if not exist "%PY%" set "PY=python"
 
 REM WICHTIG: KEIN pushd/cd hierhin! Hier stand frueher "pushd %~dp0", damit
 REM main.py gefunden wird - dadurch war der aktuelle Ordner aber IMMER der
-REM NemiCLI-Ordner, egal wo man "nemicli" getippt hat. Dann nahm /workspace den
-REM falschen Ordner, die Ordner-Erkennung analysierte NemiCLI statt des
-REM Projekts, und der Auto-Modus galt fuer den falschen Ort.
+REM NemiCLI-Ordner, egal wo man "nemicli" getippt hat. Dann analysierte die
+REM Ordner-Erkennung NemiCLI statt des Projekts, und der Auto-Modus galt fuer
+REM den falschen Ort.
 REM main.py mit vollem Pfad aufrufen loest das: NemiCLI wird gefunden UND der
 REM Ordner, aus dem du startest, bleibt dein Ordner.
 "%PY%" "%~dp0main.py" %*

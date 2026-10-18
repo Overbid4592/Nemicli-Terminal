@@ -14,11 +14,16 @@ $("save").onclick = async () => {
 
 $("test").onclick = async () => {
   const port = Number($("port").value) || 9000;
+  const key = $("key").value.trim();
   $("status").textContent = "Prüfe …";
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/ping`);
+    const r = await fetch(`http://127.0.0.1:${port}/ping`, { headers: { "X-Nemi-Key": key } });
+    if (r.status === 403) {
+      $("status").textContent = "✗ Port " + port + " antwortet, aber der Schlüssel stimmt nicht (/chrome zeigt ihn)";
+      return;
+    }
     const j = await r.json();
-    $("status").textContent = j.nemicli ? "✓ NemiCLI antwortet auf Port " + port : "Antwort, aber kein NemiCLI?";
+    $("status").textContent = j.nemicli ? "✓ NemiCLI antwortet auf Port " + port + ", Schlüssel stimmt" : "Antwort, aber kein NemiCLI?";
   } catch (e) {
     $("status").textContent = "✗ Kein NemiCLI auf Port " + port + " – läuft es? (/chrome zeigt Port und Schlüssel)";
   }

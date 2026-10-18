@@ -36,10 +36,10 @@ Die **gelbe Todo-Liste** gilt auch dort: Man sieht immer, was sie auf ihrem PC v
 2. Darf sie auf **ihrem** PC Adminrechte (sudo) haben? (Auf dem echten PC: nie.)
 3. Internet: frei, oder nur bestimmte Seiten? Darf die VM ins Heimnetz?
 4. Wie viel RAM/Platte bekommt sie (64 GB RAM vorhanden)?
-5. Darf sie arbeiten, wenn niemand am PC ist? Wenn ja: wie berichtet sie?
+5. Darf sie arbeiten, wenn der Nutzer nicht da ist? Wenn ja: wie berichtet sie?
 6. Wie kommen Ergebnisse auf den echten PC – nur auf Zuruf, mit Prüfung?
 
 ## Erste Schritte (wenn es losgeht)
-1. Hyper-V einschalten, Ubuntu-VM anlegen (von Hand – braucht Adminrechte).
+1. Hyper-V einschalten, Ubuntu-VM anlegen (der Nutzer selbst – braucht Adminrechte).
 2. SSH in der VM, Verbindung von NemiCLI testen.
 3. Werkzeug für Befehle auf ihrem PC, dann Bildschirm-Anzeige, dann Klicken/Tippen.

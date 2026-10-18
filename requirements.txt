@@ -1,38 +1,41 @@
-# Mindestversion = getesteter Stand (pip freeze, 06.10.2026). Obergrenzen nur, wo eine
+# Mindestversion = getesteter Stand (pip freeze, 12.10.2026). Obergrenzen nur, wo eine
 # neue Hauptversion etwas Benötigtes entfernt. torch installiert /einrichten getrennt (CUDA-Bau).
-anthropic>=1.5.0
-openai>=3.14.0
+# Python 3.14 (exe und das venv von /einrichten müssen dieselbe Version haben, siehe uvsetup.venv_passt).
+anthropic>=1.13.0
+openai>=3.29.0
 httpx>=0.28.1
 rich>=15.0.0
 # Vollbild-Oberflaeche (ui/screen_tx.py); prompt_toolkit bleibt fuer den alten Screen + Menues.
 textual>=8.2.8,<9
 prompt_toolkit>=3.0.53
-python-dotenv>=1.2.3
+python-dotenv>=1.2.4
 # Versionsvergleiche für /update und die Lücken-Prüfung (tools/venvpflege.py, tools/luecken.py).
 packaging>=26.3
 # GGUF-Motor: Vorverarbeitung des Tokenizers (Llama 3, DeepSeek, Ling …) wie im Original.
-regex>=2026.9.10
+regex>=2026.9.29
 # Krea 2: Gewichte, Wortliste, Rechnen, Bilder (der Gedächtnis-Encoder läuft als GGUF im eigenen Motor)
 safetensors>=0.8.0
-tokenizers>=0.23.2
-numpy>=2.5.3
+tokenizers>=0.23.3
+numpy>=2.5.4
 pillow>=12.3.0
-# Krea 2: Gesichter finden (Haar-Cascades) fürs Nachmalen. OpenCV 5 hat sie nicht mehr.
-opencv-python>=4.14.0.94,<5
 # Coding-Assistent: ruff prüft Python-Code (Syntax, Namen, veralteter Stil). Ein einzelnes Programm, kein Node.
-ruff>=0.16.10,<1
+ruff>=0.17.0,<1
 # PDF per Drag & Drop in den Chat ziehen: Text wird herausgezogen (reines Python, klein).
-pypdf>=6.19.0
+pypdf>=6.20.0
 # /kugel malen: Hintergrund freistellen (Modell isnet-general-use, 176 MB, lädt beim ersten Mal nach ~/.rembg)
-rembg[cpu]>=2.0.84
+rembg[cpu]>=2.0.85
+# Porträt-Motor (engines/liveportrait): Gesichtspunkte mit landmark.onnx auf der CPU. Kam bisher nur über rembg.
+onnxruntime>=1.31.0
+# Musik-Cover: Vorlagen in anderer Abtastrate (meist 44,1 kHz) auf 48 kHz umrechnen. Kam bisher nur über rembg.
+scipy>=1.18.1
 # GGUF-Motor, Krea 2 und Gedächtnis rechnen mit torch auf der GPU, wenn es der CUDA-Bau ist, z. B.
-#   pip install torch==2.14.0+cu132 --index-url https://download.pytorch.org/whl/cu132
+#   pip install torch==2.14.1+cu132 --index-url https://download.pytorch.org/whl/cu132
 # (Config embedding_geraet: auto | cuda | cpu). Der reine CPU-Build tut's auch, nur ~50× langsamer.
 # Systemwache (tools/wache): Sensoren für Prozesse, Netz und Dateien + Schild, Kugel, Chatfenster.
 # Kein scikit-learn – der Isolation Forest steht selbst in tools/wache/wald.py (numpy).
 # PySide6-Essentials (nicht das volle PySide6): QtCore/QtGui/QtWidgets reichen – Kugel, Tray, Chat.
 psutil>=7.2.2
 watchdog>=6.0.0
-PySide6-Essentials>=6.11.2
+PySide6-Essentials>=6.12.0
 # Eigenes Terminal-Fenster (ui/terminal_fenster.py): Terminal-Nachbau in reinem Python.
 pyte>=0.8.2

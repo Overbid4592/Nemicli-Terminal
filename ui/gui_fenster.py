@@ -516,7 +516,9 @@ class NutzerBlase(QWidget):
 
 
 class KiBlock(QWidget):
-    """Eine Antwort: aufklappbare Gedanken, Text, darunter Kopieren."""
+    """Eine Antwort: aufklappbare Gedanken, Text, darunter Kopieren und Vorlesen."""
+    vorlesen_wunsch = Signal(object)
+    stimme_da = True                               # Stimme nicht „aus“ und ein Modell vorhanden
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -546,6 +548,10 @@ class KiBlock(QWidget):
         self.kopieren.clicked.connect(self._kopieren)
         self.kopieren.hide()
         self.leiste.addWidget(self.kopieren)
+        self.vorlesen = Knopf("Vorlesen", "🔊", klein=True)
+        self.vorlesen.clicked.connect(lambda: self.vorlesen_wunsch.emit(self))
+        self.vorlesen.hide()
+        self.leiste.addWidget(self.vorlesen)
         self.leiste.addStretch(1)
         v.addLayout(self.leiste)
         self._uhr = QTimer(self)
@@ -585,6 +591,7 @@ class KiBlock(QWidget):
         self.text.setzen(self.antwort)
         self.text.setVisible(bool(self.antwort.strip()))
         self.kopieren.setVisible(bool(self.antwort.strip()))
+        self.vorlesen.setVisible(bool(self.antwort.strip()) and KiBlock.stimme_da)
         if self.gedanken_text:
             self.gedanken.setText(self.gedanken_text[-4000:])
             self.gedanken_knopf.setText(f"Gedanken ({len(self.gedanken_text) // 4} Token)")
@@ -593,6 +600,11 @@ class KiBlock(QWidget):
         if not self.gedanken.isVisible():
             self.gedanken.setText(self.gedanken_text[-4000:])
         self.gedanken.setVisible(not self.gedanken.isVisible())
+
+    def liest(self, an: bool) -> None:
+        self.vorlesen.setText("Stopp" if an else "Vorlesen")
+        self.vorlesen.symbol = "⏹" if an else "🔊"
+        self.vorlesen.update()
 
     def _kopieren(self):
         QApplication.clipboard().setText(self.antwort)
@@ -1028,6 +1040,7 @@ class ChatSeite(QWidget):
     def ki(self) -> KiBlock:
         if self.aktuell is None or self.aktuell.fertig:
             self.aktuell = KiBlock()
+            self.aktuell.vorlesen_wunsch.connect(self.fenster.vorlesen)
             self._hinzu(self.aktuell)
         return self.aktuell
 
@@ -1200,7 +1213,7 @@ class SkillSeite(QWidget):
             w = self.raster.takeAt(0).widget()
             if w is not None:
                 w.deleteLater()
-        self.status.setText(("Selbst anlegen: an – ohne Rückfrage, außer nach Web-Inhalt"
+        self.status.setText(("Selbst anlegen: an – ohne Prüffenster, der Skill-Wächter passt auf"
                              if selbst else "Selbst anlegen: aus – jeder Skill geht durchs Prüffenster")
                             + "   ·   im Terminal: /skills selbst an|aus")
         if not skills:
@@ -1211,6 +1224,91 @@ class SkillSeite(QWidget):
             k = SkillKarte(d)
             k.geklickt.connect(lambda kennung: self.fenster.leitung.senden({"op": "skill", "kennung": kennung}))
             self.raster.addWidget(k, i // spalten, i % spalten)
+
+
+class EinstellKarte(Flaeche):
+    """Eine Einstellung: Titel, ein Satz Erklärung, die Wahlmöglichkeiten als Knöpfe (aktiv = hervorgehoben)."""
+    gewaehlt = Signal(str, str)                      # Befehl, Wert
+
+    def __init__(self, eintrag: dict, parent=None):
+        super().__init__(parent)
+        self.setMaximumWidth(780)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 12, 16, 12)
+        v.setSpacing(6)
+        v.addWidget(label(str(eintrag.get("titel") or ""), 11, "text", fett=True))
+        if eintrag.get("erklaerung"):
+            v.addWidget(label(str(eintrag["erklaerung"]), 9.5, "blass"))
+        raster = QGridLayout()
+        raster.setSpacing(6)
+        self.knoepfe = []
+        for i, o in enumerate(eintrag.get("optionen") or []):
+            k = Knopf(("✓ " if o.get("aktiv") else "") + str(o.get("text") or o.get("wert")), klein=True,
+                      mitte=True)
+            k.akzent = bool(o.get("aktiv"))
+            k.setToolTip(f"{eintrag.get('befehl')} {o.get('wert')}")
+            befehl, wert = str(eintrag.get("befehl")), str(o.get("wert"))
+            k.clicked.connect(lambda _=False, b=befehl, w=wert: self.gewaehlt.emit(b, w))
+            raster.addWidget(k, i // 3, i % 3)
+            self.knoepfe.append(k)
+        v.addLayout(raster)
+
+
+class EinstellSeite(QWidget):
+    """Die wichtigsten Schalter auf einen Blick, der Rest unter „Für Profis“. Jede Wahl führt die Sitzung
+    als Befehl aus – wie im Terminal."""
+
+    def __init__(self, fenster: "Fenster"):
+        super().__init__()
+        self.fenster = fenster
+        self.profi_offen = False
+        self._eintraege: list = []
+        v = QVBoxLayout(self)
+        v.setContentsMargins(32, 16, 32, 16)
+        v.addWidget(label("Einstellungen", 18, "text", fett=True))
+        v.addWidget(label("Ein Klick genügt – die Wahl gilt sofort und bleibt gespeichert. Was hier fehlt, "
+                          "kannst du der KI sagen.", 9.5, "blass"))
+        self.status = label("", 9.5, "dim")
+        v.addWidget(self.status)
+        self.innen = QWidget()
+        self.liste = QVBoxLayout(self.innen)
+        self.liste.setSpacing(10)
+        self.liste.setAlignment(Qt.AlignmentFlag.AlignTop)
+        v.addWidget(rollbereich(self.innen), 1)
+
+    def fuellen(self, eintraege: list, gemeldet: str = "") -> None:
+        self._eintraege = list(eintraege or [])
+        self.status.setText(gemeldet)
+        while self.liste.count():
+            w = self.liste.takeAt(0).widget()
+            if w is not None:
+                w.deleteLater()
+        einfach = [e for e in self._eintraege if e.get("bereich") != "profi"]
+        profi = [e for e in self._eintraege if e.get("bereich") == "profi"]
+        for e in einfach:
+            self._karte(e)
+        if profi:
+            schalter = Knopf(f"Für Profis ({len(profi)})", "▾" if self.profi_offen else "▸")
+            schalter.clicked.connect(self._profi_umschalten)
+            self.liste.addWidget(schalter)
+            if self.profi_offen:
+                for e in profi:
+                    self._karte(e)
+        if not self._eintraege:
+            self.liste.addWidget(label("Die Sitzung hat noch keine Einstellungen geschickt.", 10, "dim"))
+
+    def _karte(self, eintrag: dict) -> None:
+        k = EinstellKarte(eintrag)
+        k.gewaehlt.connect(self._waehlen)
+        self.liste.addWidget(k)
+
+    def _profi_umschalten(self) -> None:
+        self.profi_offen = not self.profi_offen
+        self.fuellen(self._eintraege, self.status.text())
+
+    def _waehlen(self, befehl: str, wert: str) -> None:
+        self.status.setText(f"⏳ {befehl} {wert} …")
+        self.fenster.leitung.senden({"op": "einstellung", "befehl": befehl, "wert": wert})
 
 
 class SkillDialog(QDialog):
@@ -1349,18 +1447,11 @@ class Seitenleiste(QWidget):
         self.skills.clicked.connect(lambda: self.fenster.seite("skills"))
         self.personas = Knopf("Persönlichkeiten", "✦")
         self.personas.clicked.connect(lambda: self.fenster.seite("personas"))
-        for k in (self.neu, self.galerie, self.skills, self.personas):
+        self.einstellungen = Knopf("Einstellungen", "⚙")
+        self.einstellungen.clicked.connect(lambda: self.fenster.seite("einstellungen"))
+        for k in (self.neu, self.galerie, self.skills, self.personas, self.einstellungen):
             v.addWidget(k)
-        v.addSpacing(14)
-        titel = label("Letzte", 9, "blass")
-        titel.setContentsMargins(12, 0, 0, 4)
-        v.addWidget(titel)
-        self.chats_w = QWidget()
-        self.chats = QVBoxLayout(self.chats_w)
-        self.chats.setContentsMargins(0, 0, 0, 0)
-        self.chats.setSpacing(1)
-        self.chats.setAlignment(Qt.AlignmentFlag.AlignTop)
-        v.addWidget(rollbereich(self.chats_w), 1)
+        v.addStretch(1)                          # keine Chat-Liste: das Gespräch geht von selbst weiter
         self.unten = Klickflaeche()
         self.unten.setToolTip("Über dich – Name, Anrede und was die KI wissen soll")
         self.unten.geklickt.connect(lambda: self.fenster.profil_oeffnen())
@@ -1390,17 +1481,6 @@ class Seitenleiste(QWidget):
         self.avatar.buchstabe = (persona.get("name") or "N")[:1].upper()
         self.avatar.update()
         self.modell.setText(str(z.get("model") or ""))
-        while self.chats.count():
-            w = self.chats.takeAt(0).widget()
-            if w is not None:
-                w.deleteLater()
-        aktiv = z.get("chat")
-        for c in z.get("chats") or []:
-            k = Knopf(c.get("title") or f"Chat #{c.get('id')}", klein=False)
-            k.aktiv = c.get("id") == aktiv
-            k.setToolTip(f"Chat #{c.get('id')} · {c.get('model') or ''}")
-            k.clicked.connect(lambda _=False, cid=c.get("id"): self.fenster.chat_oeffnen(cid))
-            self.chats.addWidget(k)
 
 
 class Fenster(QWidget):
@@ -1411,6 +1491,7 @@ class Fenster(QWidget):
         self.persona_name = "NemiCLI"
         self.ordner = ""
         self.beschaeftigt = False
+        self._liest: KiBlock | None = None             # Antwort, die gerade vorgelesen wird
         self.setWindowTitle("NemiCLI")
         self.resize(1320, 840)
         self.setMinimumSize(900, 600)
@@ -1446,7 +1527,8 @@ class Fenster(QWidget):
         self.galerie = GalerieSeite(self)
         self.skills = SkillSeite(self)
         self.personas = PersonaSeite(self)
-        for s in (self.chat, self.galerie, self.skills, self.personas):
+        self.einstellungen = EinstellSeite(self)
+        for s in (self.chat, self.galerie, self.skills, self.personas, self.einstellungen):
             self.stapel.addWidget(s)
         rechts.addWidget(self.stapel, 1)
         h.addLayout(rechts, 1)
@@ -1469,9 +1551,9 @@ class Fenster(QWidget):
 
     def seite(self, name: str, neu: bool = False) -> None:
         self.stapel.setCurrentWidget({"chat": self.chat, "galerie": self.galerie, "skills": self.skills,
-                                      "personas": self.personas}[name])
+                                      "personas": self.personas, "einstellungen": self.einstellungen}[name])
         for k, seite in ((self.leiste.galerie, "galerie"), (self.leiste.skills, "skills"),
-                         (self.leiste.personas, "personas")):
+                         (self.leiste.personas, "personas"), (self.leiste.einstellungen, "einstellungen")):
             k.aktiv = name == seite
             k.update()
         if name == "galerie":
@@ -1481,6 +1563,8 @@ class Fenster(QWidget):
                                 bool(self._letzter_zustand.get("skills_selbst")))
         elif name == "personas":
             self.personas.fuellen(self._letzter_zustand.get("personas") or [])
+        elif name == "einstellungen":
+            self.leitung.senden({"op": "einstellungen"})
         if neu:
             self.leitung.senden({"op": "neu"})
 
@@ -1488,10 +1572,6 @@ class Fenster(QWidget):
         dialog = ProfilDialog(self._letzter_zustand.get("profil") or {}, self)
         if dialog.exec() == QDialog.DialogCode.Accepted:
             self.leitung.senden({"op": "profil", **dialog.werte()})
-
-    def chat_oeffnen(self, cid) -> None:
-        self.seite("chat")
-        self.leitung.senden({"op": "fortsetzen", "chat": cid})
 
     def senden(self, text: str) -> None:
         self.seite("chat")
@@ -1507,12 +1587,41 @@ class Fenster(QWidget):
         self.chat.tippen.stop()
         QTimer.singleShot(1500, QApplication.quit)
 
+    # -- Vorlesen ---------------------------------------------------------------
+    def vorlesen(self, block: "KiBlock") -> None:
+        """Antwort vorlesen lassen; ein zweiter Klick auf dieselbe hält an."""
+        if self._liest is block:
+            self.leitung.senden({"op": "vorlesen_stopp"})
+            self._liest_aus()
+            return
+        self._liest_aus()
+        self._liest = block
+        block.liest(True)
+        self.leitung.senden({"op": "vorlesen", "text": block.antwort})
+
+    def _liest_aus(self) -> None:
+        try:
+            if self._liest is not None:
+                self._liest.liest(False)
+        except RuntimeError:                       # Block schon gelöscht (neuer Chat, Verlauf neu)
+            pass
+        self._liest = None
+
+    def _stimme_zeigen(self, stimme) -> None:
+        """Ohne Stimme (aus oder kein Modell) keine Vorlese-Knöpfe."""
+        if not isinstance(stimme, dict):
+            return
+        KiBlock.stimme_da = stimme.get("modus") != "aus" and bool(stimme.get("modell"))
+        for block in self.findChildren(KiBlock):
+            block.vorlesen.setVisible(block.fertig and bool(block.antwort.strip()) and KiBlock.stimme_da)
+
     # -- Ereignisse der Sitzung -------------------------------------------------
     def ereignis(self, ev: dict) -> None:
         t = ev.get("t")
         c = self.chat
         if t == "state":
             self._letzter_zustand = ev
+            self._stimme_zeigen(ev.get("stimme"))
             self.leiste.zustand(ev)
             self.persona_name = (ev.get("persona") or {}).get("name") or "NemiCLI"
             self.ordner = str(ev.get("ordner") or "")
@@ -1524,6 +1633,12 @@ class Fenster(QWidget):
                 self.skills.fuellen(ev.get("skills") or [], bool(ev.get("skills_selbst")))
         elif t == "verlauf":
             c.verlauf(ev.get("eintraege") or [])
+        elif t == "einstellungen":
+            self.einstellungen.fuellen(ev.get("eintraege") or [], str(ev.get("gemeldet") or ""))
+        elif t == "vorlesen_ende":
+            self._liest_aus()
+            if ev.get("hinweis"):
+                c.hinweis_zeile(str(ev["hinweis"]))
         elif t == "nutzer":
             c.nutzer(str(ev.get("text") or ""))
         elif t == "busy":
@@ -1614,11 +1729,12 @@ def _dunkler_rahmen(fenster: QWidget) -> None:
         pass
 
 
-def starten() -> int:
+def app_vorbereiten(kennung: str = "NemiCLI.GUI") -> QApplication:
+    """QApplication mit dunkler Palette, Schrift und Symbol."""
     if os.name == "nt":
         try:
             import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("NemiCLI.GUI")
+            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(kennung)
         except Exception:
             pass
     app = QApplication.instance() or QApplication(sys.argv[:1])
@@ -1636,24 +1752,35 @@ def starten() -> int:
         if icon.is_file():
             app.setWindowIcon(QIcon(str(icon)))
             break
+    return app
 
+
+def leitung_oeffnen(befehl: str = "/gui") -> Leitung | None:
+    """Verbindung zur Sitzung aus NEMICLI_GUI_PIPE/-KEY – ohne sie ein Hinweis und None."""
     adresse = os.environ.pop("NEMICLI_GUI_PIPE", "")       # pop: nicht an geöffnete Programme vererben
     schluessel = os.environ.pop("NEMICLI_GUI_KEY", "")
     try:
-        leitung = Leitung(adresse, bytes.fromhex(schluessel))
+        return Leitung(adresse, bytes.fromhex(schluessel))
     except Exception:
         hinweis = QDialog()
         hinweis.setWindowTitle("NemiCLI")
         v = QVBoxLayout(hinweis)
         v.setContentsMargins(24, 20, 24, 20)
         v.addWidget(label("Das Fenster startet aus einer laufenden NemiCLI-Sitzung:\n"
-                          "im Terminal  /gui  eingeben.", 11))
+                          f"im Terminal  {befehl}  eingeben.", 11))
         ok = Knopf("OK", mitte=True)
         ok.akzent = True
         ok.clicked.connect(hinweis.accept)
         v.addWidget(ok)
         _dunkler_rahmen(hinweis)
         hinweis.exec()
+        return None
+
+
+def starten() -> int:
+    app = app_vorbereiten()
+    leitung = leitung_oeffnen()
+    if leitung is None:
         return 1
     fenster = Fenster(leitung)
     _dunkler_rahmen(fenster)

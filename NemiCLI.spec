@@ -31,6 +31,25 @@ for d in SUBDIRS:
 HIDDEN += ["ggufengine"] + ["ggufengine." + ".".join(f.relative_to(ROOT / "ggufengine").with_suffix("").parts)
                              for f in sorted((ROOT / "ggufengine").rglob("*.py")) if f.stem != "__init__"]
 HIDDEN += ["ggufengine.models"]
+# LoRA-Motor (Coding-LoRA, getrennt vom GGUF-Motor)
+HIDDEN += ["loramotor"] + ["loramotor." + f.stem for f in sorted((ROOT / "loramotor").glob("*.py"))
+                           if f.stem != "__init__"]
+# TensorRT-Zusatz (trtmotor); tensorrt_rtx kommt wie torch aus dem venv, das SDK legt der Nutzer ab
+HIDDEN += ["trtmotor"] + ["trtmotor." + f.stem for f in sorted((ROOT / "trtmotor").glob("*.py"))
+                          if f.stem != "__init__"]
+# Einrichtungs-Helfer: nur die Laufzeit (reines Python); Training/Lernstoff bleiben in der Werkstatt
+HIDDEN += ["einrichtungshelfer"] + ["einrichtungshelfer." + m for m in ("schema", "wortschatz", "laufzeit", "gespraech",
+                                                                          "fehlerart", "funkechat", "torchmodell")]
+EXCLUDES_HELFER = ["einrichtungshelfer." + m for m in ("training", "daten", "daten_notfall", "daten_gross", "pruefen",
+                                                       "plaudern")]
+# main.py ist auf vier Dateien verteilt; die Teile lädt main._teil_laden (kein import)
+HIDDEN += ["main_dienste", "main_befehle", "main_start"]
+# Porträt-Motor (LivePortrait-Nachbau) – Paket unter engines/
+HIDDEN += ["liveportrait"] + ["liveportrait." + f.stem for f in sorted((ROOT / "engines" / "liveportrait").glob("*.py"))
+                              if f.stem != "__init__"]
+# Musik-Motor (ACE-Step 1.5) – Paket unter engines/, Fenster für /musik
+HIDDEN += ["musik", "musik_fenster"] + ["musik." + f.stem for f in sorted((ROOT / "engines" / "musik").glob("*.py"))
+                                        if f.stem != "__init__"]
 HIDDEN += [
     "anthropic", "openai", "httpx", "httpcore", "h11", "certifi",
     "dotenv", "rich", "prompt_toolkit",
@@ -73,9 +92,17 @@ HIDDEN = sorted(set(HIDDEN))
 
 # Mitgelieferte Dateien (Daten, kein Code).
 DATAS = [(str(ROOT / "allowlist.json"), ".")]
-for extra in ("README.md", ".env.example", "requirements.txt", "nemicli.ico"):
+for extra in ("README.md", "CHANGELOG.md", ".env.example", "requirements.txt", "nemicli.ico"):
     if (ROOT / extra).exists():
         DATAS.append((str(ROOT / extra), "."))
+DATAS.append((str(ROOT / "engines" / "liveportrait" / "LIZENZ.txt"), "liveportrait"))   # MIT-Hinweis des Originals
+DATAS.append((str(ROOT / "engines" / "musik" / "LIZENZ.txt"), "musik"))                 # MIT-Hinweise der Vorbilder
+for _db in sorted((ROOT / "ggufengine" / "daten").glob("*.json")):      # Modell-Datenbank
+    DATAS.append((str(_db), "ggufengine/daten"))
+for _ordner in ("modell", "modell_gross"):           # Funke (gespraech.ordner) und Funke Groß (funkechat.ordner)
+    for _helfer in ("helfer.bin", "wortschatz.json"):
+        if (ROOT / "einrichtungshelfer" / _ordner / _helfer).exists():
+            DATAS.append((str(ROOT / "einrichtungshelfer" / _ordner / _helfer), f"einrichtungshelfer/{_ordner}"))
 
 # Build-Nummer in die exe: dort gibt es kein Git, das die Commits zählt.
 _sys.path.insert(0, str(ROOT / "core"))
@@ -88,10 +115,11 @@ DATAS.append((str(_BUILD_TXT), "."))
 # Bewusst draußen: die schweren Bild-Pakete (siehe Kopf) und Bau-Werkzeug.
 EXCLUDES = [
     "torch", "torchvision", "torchaudio", "diffusers", "transformers",
+    "tensorrt_rtx",                                  # NVIDIA-Lizenz: nie mitliefern, kommt aus dem venv
     "numpy", "scipy", "cv2", "PIL", "safetensors", "accelerate",
     "matplotlib", "pandas", "IPython", "pytest", "setuptools", "pip",
     "ruff",                        # Programm im venv; extlibs bindet es zur Laufzeit ein
-]
+] + EXCLUDES_HELFER
 
 a = Analysis(
     ["main.py"],

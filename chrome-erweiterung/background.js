@@ -1,8 +1,11 @@
-// NemiCLI – Nemi antwortet: Rechtsklick-Menü in Chrome.
+// NemiCLI – Rechtsklick-Menü und Seitenleiste in Chrome.
 // Redet NUR mit dem laufenden NemiCLI auf http://127.0.0.1:<port> (Standard 9000),
 // mit dem Geheimschlüssel aus den Einstellungen (X-Nemi-Key).
 
 const STANDARD_PORT = 9000;
+
+// Klick aufs Symbol öffnet die Seitenleiste (Chat).
+chrome.sidePanel.setPanelBehavior({ openPanelOnActionClick: true }).catch(() => {});
 
 chrome.runtime.onInstalled.addListener(() => {
   chrome.contextMenus.create({

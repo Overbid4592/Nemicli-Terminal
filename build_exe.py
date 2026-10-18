@@ -1,11 +1,13 @@
 """
 build_exe.py - Macht aus NemiCLI eine NemiCLI.exe.
 
-Aufruf:   python build_exe.py            exe bauen
-          python build_exe.py --msi      exe bauen + dist/NemiCLI-<Build>.msi (Windows Installer)
-          python build_exe.py --nur-msi  nur die MSI aus dem vorhandenen dist/NemiCLI
+Aufruf:   python build_exe.py              exe bauen + Setup-Datei
+          python build_exe.py --nur-setup  nur die Setup-Datei aus dem vorhandenen dist/NemiCLI
+          python build_exe.py --msi        exe bauen + dist/NemiCLI-<Build>.msi (Windows Installer)
+          python build_exe.py --nur-msi    nur die MSI aus dem vorhandenen dist/NemiCLI
 Ergebnis: dist/NemiCLI/NemiCLI.exe  +  dist/NemiCLI/NemiCLIT2/  (Python, Bibliotheken, Code)
           dist/NemiCLI/SHA256SUMS.txt    (Prüfsummen der exe-Dateien)
+          dist/NemiCLI-Setup-<Build>.exe (eine Datei: installiert oder aktualisiert .ncli2)
 
 Liegt ein Code-Signatur-Zertifikat "CN=NemiCLI" im Zertifikatsspeicher des
 Nutzers (anlegen: python zertifikat.py), werden die exe-Dateien signiert.
@@ -23,6 +25,7 @@ Die großen Modelle kommen NICHT mit – jeder sucht sich selbst aus, welche.
 from __future__ import annotations
 
 import hashlib
+import shutil
 import subprocess
 import sys
 import time
@@ -146,6 +149,12 @@ def msi_bauen() -> Path | None:
         build = (ZIEL / "NemiCLIT2" / "build.txt").read_text(encoding="utf-8").strip()
     except OSError:
         build = "0.0.0"
+    import importlib.util
+    if importlib.util.find_spec("msilib") is None:          # aus der Standardbibliothek entfernt ab Python 3.13
+        print(f"  Übersprungen: msilib gibt es nur bis Python 3.12, gebaut wird mit Python "
+              f"{sys.version_info.major}.{sys.version_info.minor}. Die exe ist fertig, "
+              "die MSI braucht eine neue Bauart.")
+        return None
     sys.path.insert(0, str(ROOT / "installer"))
     import msi
     paket = msi.bauen(ZIEL, DIST, build, ROOT / "nemicli.ico")
@@ -159,7 +168,50 @@ def msi_bauen() -> Path | None:
     return paket
 
 
+def setup_bauen() -> Path | None:
+    """dist/NemiCLI-Setup-<Build>.exe: eine Datei, die dist/NemiCLI als ZIP trägt und es in eine
+    vorhandene Installation (.ncli2) aufspielt oder neu installiert (installer/nemicli_setup.py).
+    Sie packt sich nur zum Installieren aus, NemiCLI selbst startet weiter aus seinem Ordner."""
+    import zipfile
+    _step("Setup-Datei")
+    try:
+        build = (ZIEL / "NemiCLIT2" / "build.txt").read_text(encoding="utf-8").strip()
+    except OSError:
+        print("  Kein Bau in dist/NemiCLI.")
+        return None
+    arbeit = ROOT / "build" / "setup"
+    arbeit.mkdir(parents=True, exist_ok=True)
+    paket = arbeit / "nutzlast.zip"
+    with zipfile.ZipFile(paket, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
+        for f in sorted(ZIEL.rglob("*")):
+            if f.is_file():
+                z.write(f, f.relative_to(ZIEL).as_posix())
+    name = f"NemiCLI-Setup-{build}"
+    icon = ROOT / "nemicli.ico"
+    befehl = [sys.executable, "-m", "PyInstaller", str(ROOT / "installer" / "nemicli_setup.py"),
+              "--onefile", "--windowed", "--noconfirm", "--name", name,
+              "--paths", str(ROOT / "installer"),
+              "--add-data", f"{paket};.", "--add-data", f"{icon};.", "--icon", str(icon),
+              "--distpath", str(DIST), "--workpath", str(arbeit / "werk"), "--specpath", str(arbeit)]
+    for weg in ("torch", "numpy", "PIL", "tkinter", "matplotlib"):
+        befehl += ["--exclude-module", weg]
+    if subprocess.run(befehl, cwd=str(ROOT)).returncode != 0:
+        print("  Bau der Setup-Datei fehlgeschlagen – Meldung oben lesen.")
+        return None
+    datei = DIST / f"{name}.exe"
+    ergebnis = signieren([datei])
+    print("  " + ("unsigniert (kein Zertifikat)" if "kein-zertifikat" in ergebnis
+                  else ergebnis.replace("\n", "\n  ")))
+    h = hashlib.sha256(datei.read_bytes()).hexdigest()
+    (DIST / f"{datei.name}.sha256").write_text(f"{h}  {datei.name}\n", encoding="utf-8")
+    print(f"  {datei}")
+    print(f"  SHA-256: {h}")
+    return datei
+
+
 def main() -> int:
+    if "--nur-setup" in sys.argv:
+        return 0 if setup_bauen() else 1
     if "--nur-msi" in sys.argv:
         return 0 if msi_bauen() else 1
     t0 = time.time()
@@ -182,6 +234,10 @@ def main() -> int:
     if not EXE.exists():
         print("\nKeine NemiCLI.exe entstanden.")
         return 1
+    _step("Chrome-Erweiterung")
+    erweiterung = ZIEL / "chrome-erweiterung"          # dorthin zeigt /chrome (paths.INSTALL)
+    shutil.copytree(ROOT / "chrome-erweiterung", erweiterung, dirs_exist_ok=True)
+    print(f"  {erweiterung}")
     _step("Signieren")
     ergebnis = signieren()
     if "kein-zertifikat" in ergebnis:
@@ -197,7 +253,10 @@ def main() -> int:
     print(f"  Größe: {groesse / (1024**2):.0f} MB   ·   Dauer: {time.time() - t0:.0f} s")
     if "--msi" in sys.argv:
         return 0 if msi_bauen() else 1
-    print("\n  Weitergeben: den ganzen Ordner 'dist/NemiCLI' kopieren oder zippen.")
+    setup = setup_bauen()
+    if setup is None:
+        return 1
+    print(f"\n  Weitergeben: die eine Datei {setup.name}.")
     return 0
 
 

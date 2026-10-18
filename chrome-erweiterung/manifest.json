@@ -1,14 +1,17 @@
 {
   "manifest_version": 3,
   "name": "NemiCLI – Nemi antwortet",
-  "version": "1.0",
-  "description": "Rechtsklick auf einer Webseite: die aktive Persönlichkeit schreibt die Antwort direkt ins Textfeld oder erklärt den markierten Text. Redet nur mit dem laufenden NemiCLI auf 127.0.0.1.",
-  "permissions": ["contextMenus", "storage", "activeTab", "scripting", "notifications"],
-  "host_permissions": ["http://127.0.0.1:9000/*", "http://127.0.0.1/*"],
+  "version": "2.3.4",
+  "minimum_chrome_version": "116",
+  "description": "Chat in der Seitenleiste und Rechtsklick-Hilfe: die aktive Persönlichkeit antwortet, liest die Seite oder ein Bildschirmfoto mit. Redet nur mit dem laufenden NemiCLI auf 127.0.0.1.",
+  "permissions": ["contextMenus", "storage", "activeTab", "scripting", "notifications", "sidePanel"],
+  "host_permissions": ["<all_urls>"],
   "background": { "service_worker": "background.js" },
   "content_scripts": [
     { "matches": ["<all_urls>"], "js": ["content.js"], "run_at": "document_idle" }
   ],
+  "side_panel": { "default_path": "seitenleiste.html" },
+  "action": { "default_title": "NemiCLI – Chat öffnen", "default_icon": "icon.png" },
   "options_page": "options.html",
   "icons": { "16": "icon.png", "48": "icon.png", "128": "icon.png" }
 }

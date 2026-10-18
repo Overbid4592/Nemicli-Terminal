@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NemiCLI</title>
+<link rel="stylesheet" href="seitenleiste.css">
+</head>
+<body>
+  <header id="kopf">
+    <div class="avatar gross"></div>
+    <div class="wer">
+      <div id="persona" class="verlauf-text">NemiCLI</div>
+      <div id="modell" class="dim">verbinde …</div>
+    </div>
+    <button id="neu" class="knopf-klein" title="Neuer Chat">＋ Neu</button>
+  </header>
+
+  <div id="hinweis" hidden></div>
+
+  <main id="chat">
+    <div id="leer" class="leer">
+      <div class="logo"></div>
+      <div class="leer-titel">Frag mich etwas</div>
+      <div class="dim">📄 schickt die Seite mit, 📸 ein Bildschirmfoto.</div>
+    </div>
+  </main>
+
+  <footer id="unten">
+    <div id="anhaenge"></div>
+    <div class="eingabe">
+      <textarea id="feld" rows="1" placeholder="Frag NemiCLI …"></textarea>
+      <div class="leiste">
+        <button id="seite" class="knopf-anhang" title="Diese Seite mitschicken (oder den markierten Text)">📄 Seite</button>
+        <button id="foto" class="knopf-anhang" title="Bildschirmfoto der Seite mitschicken">📸 Foto</button>
+        <span class="frei"></span>
+        <button id="senden" class="senden" title="Senden (Enter)" disabled>➤</button>
+      </div>
+    </div>
+  </footer>
+
+  <script src="markdown.js"></script>
+  <script src="seitenleiste.js"></script>
+</body>
+</html>

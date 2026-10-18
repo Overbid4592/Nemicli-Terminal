@@ -11,8 +11,9 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 - **Eigener GGUF-Motor 🧠** (`ggufengine/`, `/model` → „Lokal (eigener Motor)“): lokale Modelle
   ohne llama.cpp, Ollama oder Server – reines Python + torch **im NemiCLI-Prozess**, kein Port, kein
   Kindprozess. Gehärteter GGUF-Leser (jede Zahl aus der Datei wird vor Gebrauch geprüft, das
-  Chat-Template der Datei wird nie ausgeführt), Gewichte bleiben quantisiert (Int4) im VRAM, CUDA
-  Graphs. **Baukasten:** das Modell setzt sich aus der GGUF-Datei selbst zusammen – Llama 2/3.x, Mistral, Mixtral, Ministral 3, Qwen2/2.5/3 (auch MoE), Gemma 1–4, Phi-3/4, Granite, OLMo 2, Qwen3.5, K2-Horizon u. a. laufen ohne eigenen Code; dazu **Ling 3.0** (`bailingmoe3`: Kimi-Delta-Attention + MLA + 128 Experten, 1,3B aktiv – ~40–65 Token/s); Chat-Format und Tokenizer-Regeln werden erkannt. Jedes Modell ist ein Ordner
+  Chat-Template der Datei wird nie ausgeführt), Gewichte bleiben quantisiert im VRAM (Q4_K/Q6_K im
+  Blockformat mit eigenen int8-Kernen wie llama.cpp, andere als Int4), CUDA Graphs, ein Token je Schritt über
+  verschmolzene Kerne (Norm, RoPE + KV-Cache, Flash-Decoding-Attention). **Baukasten:** das Modell setzt sich aus der GGUF-Datei selbst zusammen – Llama 2/3.x, Mistral, Mixtral, Ministral 3, Qwen2/2.5/3 (auch MoE), Gemma 1–4, Phi-3/4, Granite, OLMo 2, Qwen3.5, Qwen3-VL, K2-Horizon u. a. laufen ohne eigenen Code; dazu **Ling 3.0** (`bailingmoe3`: Kimi-Delta-Attention + MLA + 128 Experten, 1,3B aktiv – ~40–65 Token/s); Chat-Format und Tokenizer-Regeln werden erkannt. Jedes Modell ist ein Ordner
   in `ModelGGUF/` im Programm-Ordner (`ModelGGUF/Gemma4/…gguf`, eine `.gguf` mit „mmproj“ im Namen
   daneben ist der Bild-Teil).
   - **Eigener Code für besondere Bauarten:** die ganze Gemma-4-Familie (E2B/E4B, 12B/31B, MoE 26B-A4B),
@@ -24,7 +25,10 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     PyTorch-Paket, kein CUDA-Toolkit nötig). Gemma 4 26B-A4B: ~45 Token/s.
   - **MoE-Experten im RAM, automatisch** (Config `gguf_experten`: `auto` · `vram` · `ram`): Passt ein
     MoE-Modell samt Kontext nicht in den VRAM, bleiben so viele Experten im VRAM wie Platz ist; der Rest
-    liegt in festgesetztem RAM und wird direkt über PCIe gelesen.
+    liegt in festgesetztem RAM und wird direkt über PCIe gelesen. Das **Experten-Lager** zählt, welche
+    Experten gewählt werden, und sortiert auch während einer Antwort alle 32 Token nach – bei Gemma 4
+    26B-A4B mit 3–5 GB Experten-VRAM bis zu 80 % schneller, Antwort Token für Token gleich. Die Zählung
+    bleibt für den nächsten Start gespeichert.
   - **Modelle von Hugging Face holen** (`/model huggingface`): Größe und MoE wählen, gezeigt werden nur
     Modelle, die der Motor laden kann (ab 4B), jede Datei mit SHA-256 geprüft, Abbruch wird fortgesetzt.
   - **⏱ Ladezeit je Schritt** nach dem ersten Laden: Datei, Tokenizer, Gewichte, Aufwärmen, Bildteil,
@@ -40,7 +44,7 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     gemerkt (`Cache/gguf/<Modell>.safetensors`, nur Daten): Nach einem Neustart muss die Anleitung
     gar nicht mehr eingelesen werden, solange Modell und Anleitung gleich sind.
   - **Schnelles Einlesen:** lange Texte liest der Motor blockweise (Qwen3.5-DeltaNet in Blöcken,
-    Int4-Gewichte fürs Einlesen kurz ausgepackt) – NemiCLIs Anleitung bei Qwen3.5-9B in ~5 s statt ~32 s.
+    Gewichte fürs Einlesen kurz nach bf16 ausgepackt) – NemiCLIs Anleitung bei Qwen3.5-9B in ~5 s statt ~32 s.
   - **Schlanke Anleitung:** lokale Modelle bekommen ~5.600 statt ~11.000 Token Anleitung; Details
     (Internet, Wache, Gedächtnis, Helfer, Werkzeuge) liest die KI bei Bedarf mit `anleitung_lesen`
     oder NemiCLI reicht sie selbst nach – beim passenden Stichwort oder beim ersten Werkzeug dazu.
@@ -69,7 +73,8 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
       Positionstabellen, Projektion; die Bild-Token liest das 12B in beide Richtungen (wie llama.cpp).
     - **Qwen3.5 / Qwen3-VL** (`qwen3vl_merger`): ViT mit 2D-RoPE, 2×2-Zusammenfassung, bis
       1024 Bild-Token je Bild (Text auf Screenshots lesbar); im Sprachmodell M-RoPE (Zeit,
-      Zeile, Spalte) für die Bild-Positionen.
+      Zeile, Spalte) für die Bild-Positionen. Qwen3-VL zusätzlich mit **DeepStack**: Bild-Merkmale aus
+      drei Encoder-Schichten fließen in die ersten Schichten des Sprachmodells (feinere Details).
     - **Ministral 3 / Mistral Small 3.x** (`pixtral`): ViT mit 2D-RoPE, 14×14-Patches,
       2×2-Patch-Merger, bis 1024 Bild-Token je Bild; jede Bildzeile endet mit `[IMG_BREAK]`.
 
@@ -77,9 +82,12 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     Bild wird einmal gelesen und bleibt im Präfix-Cache.
   - **Bildbeschreiber 🖼** für lokale Modelle ohne Sehen (z. B. DeepSeek-R1-Distill): eigene
     Abteilung `Vision/<Name>/` im Programm-Ordner mit einem kleinen sehenden Modell
-    (Gemma-4-E2B + mmproj). Es beschreibt Bilder als Text – Art, Personen und Tiere, Dinge mit
-    Farbe und Lage, Text wörtlich – und beantwortet Nachfragen über `bild_fragen`. Das
-    Sprachmodell geht dafür kurz in den RAM. Nur für den eigenen Motor, nie für Cloud-Modelle.
+    (empfohlen: Qwen3-VL-4B-Instruct + mmproj, kleiner: Gemma-4-E2B). Es beschreibt Bilder als Text –
+    Art, Personen und Tiere, Dinge mit Farbe und Lage, Text wörtlich – und beantwortet Nachfragen über
+    `bild_fragen`. Qwen3-VL-4B im Test: 10 von 10 Nachfragen richtig (Anzahl, Lage, Farben, Fangfragen
+    nach Dingen, die es nicht gibt), Beschreibung 2–5 s, Nachfrage < 1 s, VRAM-Spitze ~4,8 GB. Auch
+    „Gesichter nachmalen“ findet die Gesichter damit. Das Sprachmodell geht dafür kurz in den RAM.
+    Nur für den eigenen Motor, nie für Cloud-Modelle.
 - **Ollama:** läuft es, ist es da – Modelle direkt aus NemiCLI laden (Größe wählen, Live-Liste).
   Vision-Modelle werden erkannt und mit 👁 markiert.
 - **Denken sichtbar:** Denk-Modelle (DeepSeek, Kimi, Gemma …) zeigen ihr Nachdenken kompakt;
@@ -97,6 +105,9 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Auftragskarte → Recherche → Todo-Liste (🔴 offen · 🟠 Frage · 🟢 geprüft) → Punkt für Punkt. Grün setzt
   nur die Prüfung (Prüfbefehl mit Exitcode 0) oder du – nie die KI. Ablage im Projekt unter `.nemicli/`,
   `/code status` zeigt die Liste, `/codeend` beendet. Kein zweites Modell.
+  **Projektgrenze:** Dateiaktionen außerhalb des Projektordners legt NemiCLI dir zur Freigabe vor – in jedem
+  Modus, auch Auto. **Projekt-Gedächtnis:** `merken` mit Art `projektnotiz` schreibt datiert nach
+  `.nemicli/memory.md`; das Wissen bleibt beim Projekt.
 - **Coding-Assistent bleibt aktuell:** sieht die installierten Versionen des Projekts, schlägt Funktionen in
   der **installierten** Bibliothek nach (`api_nachschlagen`), bekommt Veraltet-Warnungen und ruff-Funde
   (`code_pruefen`) als Aufgabe, prüft jede geschriebene Datei sofort (Python, JSON, HTML, CSS, JS), sieht
@@ -124,7 +135,7 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   lesen) oder `… schreiben` (darf dort auch ändern), `/sandbox entziehen <Ordner>` nimmt es zurück.
   Ganze Laufwerke, das Profil, Desktop/Dokumente/Downloads, System- und NemiCLI-Ordner gehen nicht.
 - **Befehle direkt** (`befehl`): PowerShell-Befehle – auch `python`, `pip` und `pytest` – laufen nach deiner
-  Freigabe im Arbeitsordner (Workspace, sonst Startordner), ohne Zeitgrenze, mit Live-Anzeige; **Esc** beendet
+  Freigabe im Arbeitsordner (Coding-Projekt, sonst Startordner), ohne Zeitgrenze, mit Live-Anzeige; **Esc** beendet
   den ganzen Prozessbaum. Die Sandbox bleibt der Ort zum gefahrlosen Ausprobieren.
 - **Zeitplan** (`zeitplan`): Die Persönlichkeit trägt sich selbst in die **Windows-Aufgabenplanung** ein –
   „täglich 09:00", „alle 2 stunden", „wöchentlich montag 08:30", „anmeldung", „einmal 20.09.2026 14:00".
@@ -185,6 +196,24 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 - **Papierkorb & Undo** (`/undo`, `Papierkorb/` im Daten-Ordner): `loeschen` vernichtet nichts,
   sondern verschiebt; vor Überschreiben/Bearbeiten wird der alte Stand gesichert. `/undo` holt eine
   der letzten zehn Sicherungen zurück. Nach 30 Tagen räumt sich der Papierkorb selbst auf.
+- **Backup 💾** (`/backup`, Werkzeug `backup_erstellen`): sichert als Zip mit einer `.sha256`-Datei daneben
+  in den Ordner `Backup/` des Daten-Ordners. **Teil** = Bilder, Persönlichkeiten und Profile. **Vollständig** =
+  der ganze Daten-Ordner und die Programmdateien, ohne venv, `.runtime`, build, `.git`, `__pycache__`, Cache
+  und frühere Backups; Modelldateien (`ModelGGUF/`, `Vision/`, `Models/`) nur mit `/backup voll modelle`.
+  Vorher zeigt NemiCLI Anzahl und Größe und fragt; Esc bricht ab, ein halbes Zip bleibt nie liegen. Im Zip
+  stehen `BACKUP.json` (was, wann, welche Version) und `SHA256SUMS.txt` (jede Datei einzeln). Datenbanken
+  (Gedächtnis, Wache) werden stimmig kopiert, auch wenn die Wache gerade schreibt; Verknüpfungen und
+  Cloud-Platzhalter bleiben draußen. `/backup pruefen` rechnet alle Prüfsummen nach. Die Persönlichkeit
+  kann es auf Wunsch selbst auslösen (`backup_erstellen`, du bestätigst) und nachsehen (`backup_liste`).
+  Alte Backups löscht NemiCLI nie.
+  **Differenziell:** Gibt es schon ein volles Backup derselben Art (höchstens 30 Tage alt), entsteht ein
+  **Nachtrag** (`…_nachtrag_….zip`) nur mit dem, was seit diesem vollen Backup neu oder geändert ist, dazu die
+  Liste gelöschter Dateien – ein paar MB statt GB. Geprüft wird über Größe und Zeit, bei Abweichung über die
+  SHA-256 (eine nur „angefasste“ Datei zählt als unverändert). Datenbanken kommen jedes Mal mit. Danach wieder
+  ganz: automatisch nach 30 Tagen oder mit `/backup teil ganz` / `/backup voll ganz`.
+  **Wiederherstellen:** `/backup auspacken <name>` packt das volle Backup und den Nachtrag in einen **neuen**
+  Ordner `Backup/Wiederhergestellt_<name>/` – gelöschte Dateien fehlen, jede Datei wird gegen ihre SHA-256
+  geprüft, deine echten Daten werden nie überschrieben.
 - **Lösch-Limit** (`/limit`): Standard 20 Dateien pro Sitzung – mehr in Summe oder in einem Ordner
   auf einmal → STOPP, ohne Rückfrage. Nur der Nutzer hebt es an.
 - **Ihr Arbeitsbereich, ihr Stift:** Im Daten-Ordner (learned, Berichte, Bilder, Agenten,
@@ -214,12 +243,27 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 - **Skills 🧩** (`/skills`, `Skills/<name>/SKILL.md` im Daten-Ordner): Anleitungen für wiederkehrende
   Aufgaben – Name, Beschreibung, **wann** er greift, dann die Schritte. Im Prompt stehen nur Name,
   Beschreibung und „wann“; passt einer, lädt die KI ihn mit `skill_laden` und folgt ihm. Ein Skill
-  entsteht im Gespräch („Lass uns einen Skill machen“): die KI fragt nach Zweck und Auslöser, fasst
-  zusammen, schreibt – und du siehst den **ganzen Text im Prüffenster** (F8, bei Änderungen
-  Vorher/Nachher). Was du freigibst, ist Anleitung; alles andere bleibt draußen. `/skills selbst an`
-  erlaubt der KI, ohne Rückfrage anzulegen und zu ergänzen – kam in der Runde etwas aus dem Netz,
-  fragt es trotzdem. Per `datei_schreiben` kommt nichts am Prüffenster vorbei (der Ordner ist kein
-  freier Arbeitsbereich), und ein Skill wird nie mit anderen in einer Sammelfrage freigegeben.
+  entsteht im Gespräch („Lass uns einen Skill machen“) oder von selbst. Skills sind Anleitungen für die
+  KI, nicht für Menschen: Sie speichert sie **ohne Prüffenster**, ein **Skill-Wächter** hält Unsinniges
+  auf – zu kurze Anleitungen, Aushöhlen eines Skills, Doppelte, Zugangsdaten, private Daten (E-Mail,
+  Telefon, IP, Benutzerpfade; bei Skills für alle auch dein Name), riskante Aktionen laut NemiCLIs
+  Risiko-Einstufung, eingeschleuste Befehle, Versuche, Schutz oder Freigaben zu umgehen, mehr als drei
+  Änderungen je Runde und mehr als drei je Skill und Tag. Zuletzt liest eine **KI-Zweitmeinung** den
+  Skill auf Sinn (riskant? gegen deine Vorlieben? zu speziell?). `/skills` zeigt den Wächter-Bericht. Er sperrt
+  Skill-Änderungen in Runden mit Inhalt aus dem Netz oder einer Chrome-Seite. `/skills selbst aus`
+  holt das Prüffenster zurück. Per `datei_schreiben` kommt nichts am Wächter vorbei (der Ordner ist
+  kein freier Arbeitsbereich).
+  **Geschlossene Lern-Schleife:** Jeder Skill führt eine Strichliste (benutzt · Probleme · verbessert,
+  zu sehen in `/skills`). Schlägt nach einem Skill ein Werkzeug fehl oder korrigierst du das Ergebnis,
+  bessert NemiCLI im Hintergrund genau diesen Skill nach (oder lässt ihn, wenn er nicht schuld war).
+  Nach einer größeren gelungenen Aufgabe ohne Skill prüft es, ob sich ein neuer lohnt. Skills, die oft
+  Probleme machen, sind markiert – die KI liest sie dann kritisch.
+  **Die Persönlichkeit erfährt, was im Hintergrund geschah:** gemerkte Lektionen, verbesserte oder neue
+  Skills (mit der Änderung), was der Wächter aufhielt – als kurze Notiz an deiner nächsten Nachricht.
+  Das gilt je Persönlichkeit: Nach einem Wechsel bekommt keine andere fremde Notizen, mit dem Löschen
+  einer Persönlichkeit verfallen ihre.
+  **Nach einem Update** bekommt jede Persönlichkeit einmal eine Notiz, was NemiCLI jetzt neu kann – die
+  Überschriften aus der CHANGELOG seit ihrem letzten Stand (beim ersten Mal die letzten zwei Tage).
   Alte Notizen aus `learned/skills` zeigt `/skills alte` einzeln: übernehmen, weglassen oder später.
 - **Lernt von selbst 🪞:** Nach einer Runde mit Anlass – du hast korrigiert („nein“, „falsch“, „künftig“,
   „ab jetzt“ …), ein Werkzeug schlug fehl oder wurde abgelehnt, oder eine größere Aufgabe (ab 3 Werkzeugen)
@@ -263,24 +307,6 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   ist (Python-Projekt, Bilder, Musik …) – sichtbar im ML-Balken, lernt mit `ordner_lernen` dazu.
 - **Übungsmodus** (`/uebung`): im Leerlauf baut und testet NemiCLI kleine Programme in `NemiSandbox/`
   – jede Fassung vor Schreiben/Ausführen von dir mit F8 freigegeben; ausgeführt wird in der Sandbox.
-- **Workspace** (`/workspace`): nagelt einen **Projektordner** fest – ab dann arbeitet sie **nur dort**
-  (lesen, schreiben, suchen, Befehle), gegen das Abdriften in zwanzig Ordner. Der Pfad steht **gelb** in
-  der Kopfzeile. Im Projekt entsteht `.workspace/` mit `memory.md`, `Absprache.md` und `Dateien.md` –
-  das Projekt-Gedächtnis liegt beim Projekt und wandert mit ihm, `merken` schreibt dorthin statt nach
-  `learned/`. Danach liest sie `Agenten/workspace.md`: Ordner ansehen → besprechen → Unklares
-  nachschlagen → **Plan vorlegen** → dein Ja → README, `venv` (nie `.venv`, mit geprüfter Version und
-  Aktiv-Status), coden. Memory und README werden erst fortgeschrieben, wenn der Code **dreimal
-  hintereinander** sauber lief **und** du zufrieden bist. Sicherheit hat Vorrang. Schalten kannst nur
-  **du** – sie hat dafür kein Werkzeug. `/workspaceend` hebt es auf.
-- **Arbeitsmodus im Workspace:** Sie bleibt **dieselbe Person**, arbeitet aber anders – sachlich,
-  strukturiert, knapp. Wie jemand, der bei der Arbeit anders redet als zu Hause. Im **Agentloop**
-  arbeitet sie eine abgesegnete Aufgabe selbst ab (planen → umsetzen → testen → prüfen → weiter) und
-  hält von sich aus an, wenn sie fertig ist, nicht weiterkommt, oder eine Entscheidung ansteht, die
-  dir gehört. **Dein Wunsch hat Vorrang:** kein Zerreden, keine Moralpredigten – ein Einwand, dann
-  wird gebaut, wie du es willst. **Rücksicht auf LRS und Sprachstörungen** ist Teil der Anweisung:
-  kurze Sätze, eine Frage auf einmal, Listen statt Absätze, Rechtschreibung nie kommentiert,
-  Rückfragen mit Auswahl statt offen. Nach `/workspaceend` ist sie wieder ganz sie selbst – der Modus
-  hängt am Workspace, nicht an ihr.
 
 ### 👁 Sehen & 🎨 Malen
 - **Dateien reinziehen (Drag & Drop):** Datei aus dem Explorer ins Terminal ziehen, Enter – fertig.
@@ -306,7 +332,7 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   `/bild schritte` (Auswahl mit Enter, bleibt gespeichert als `bild_krea_schritte`, Standard 14).
   Die ComfyUI-Dateien werden direkt gelesen: NVFP4-Modell (auf Blackwell über die FP4-Tensorkerne,
   sonst entpackt), FP8-Text-Encoder, bf16-VAE. Speicher wie ComfyUI mit `--disable-smart-memory`:
-  jedes Teil ist nur für seinen Rechenschritt im VRAM, dazwischen im RAM; **nach 2 Minuten ohne
+  jedes Teil ist nur für seinen Rechenschritt im VRAM, dazwischen im RAM; **nach 15 Minuten ohne
   Bild wird auch der RAM geräumt** (`bild_krea_entladen`, Sekunden). Ordner `Models/Krea2/`:
   Modell, `text_encoders/`, `vae/`, `tokenizer/` (vocab.json + merges.txt). Nichts wird aus dem Netz
   geladen. Krea 2 ist **der** Bild-Motor (`/bildmodel` → 🟣); eine gewählte WebUI oder ComfyUI malt
@@ -317,10 +343,13 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   daraus den Prompt und nimmt den Seed – gleiche Figur in jedem Bild; `neues_gesicht` würfelt neu.
   `bild_serie` malt bis zu 30 Varianten in einem Auftrag mit gleichem Seed. Die KI pflegt die Datei
   mit `charakter_aendern` (du bestätigst), von Hand per `/charakter oeffnen`.
-- **Gesichter nachmalen (Krea 2):** Nach `/bild` und `bild_malen` sucht OpenCV die Gesichter
-  (Haar-Cascades, Gegenprobe mit den Augen). Jedes kleine Gesicht wird ausgeschnitten, auf 1024 px
-  vergrößert, von Krea 2 ab Rauschstärke 0,45 in 10 Schritten nachgemalt (eigener VAE-Encoder, gleicher
-  Prompt) und weich zurückgesetzt. Das Original bleibt, daneben liegt `<name>_gesicht.png`.
+- **Gesichter nachmalen (Krea 2):** Nach `/bild` und `bild_malen` sucht das **Seh-Modell** aus
+  `Vision/` (der Bildbeschreiber) die Gesichter und nennt sie als Kästen; jeder Kasten muss plausibel sein
+  und eine Gegenfrage am Ausschnitt bestehen („ein Gesicht mit beiden Augen?“) – im Zweifel bleibt das
+  Original. Jedes kleine Gesicht wird ausgeschnitten, auf 1024 px vergrößert, von Krea 2 ab Rauschstärke
+  0,35 in 10 Schritten nachgemalt (eigener VAE-Encoder, nur ein Gesichts-Prompt statt der ganzen Szene)
+  und weich zurückgesetzt. Ohne Seh-Modell sagt NemiCLI einmal, warum es nicht nachbessert. Kein OpenCV.
+  Das Original bleibt, daneben liegt `<name>_gesicht.png`.
   `/bild … --ohne-gesicht` lässt es aus; Config: `bild_krea_gesicht` (an/aus),
   `bild_krea_gesicht_staerke`, `bild_krea_gesicht_schritte`, `bild_krea_gesicht_kante`.
 - **ComfyUI** (`/bildmodel` → 🧩, Standard `127.0.0.1:8188`): NemiCLI schickt einen fertigen
@@ -336,11 +365,55 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Sperrwörter im Code (`pov`, `1boy`, `group` …). Alles per `bild_webui_*` in der Config änderbar.
   Nur `127.0.0.1:7860`; NemiCLI startet die WebUI nicht.
 
+### 🎬 Video, 🎭 Porträt & 🎵 Musik
+- **Eigener Video-Motor** (`engines/video.py`, `/video`, Werkzeug `video_erstellen`): Wan 2.2 TI2V 5B als
+  GGUF, Text-Encoder umT5 als GGUF, alles in torch nachgebaut. 704×1024 hochkant, 24 Bilder/s, Clips à 5 s
+  aneinander bis 20 s. Ein **Startbild** (z. B. von Krea 2) hält die Figur, **Schlüsselbilder** (eines je 5 s,
+  Fun InP) lenken lange Videos. Turbo-Fassung mit 4 Schritten, MagCache, Mini-VAE zum schnellen Auspacken,
+  Schärfen nach dem Inhalt (`schaerfe` aus · leicht · mittel · stark – die KI wählt). Bei Cloud-Modellen läuft
+  es **im Hintergrund**: weiterreden, Stand neben der Eingabe, Fertigmeldung von selbst. Dateien in `VideoGen/`.
+- **Charakter-LoRA** (Werkzeuge `lora_trainieren`, `lora`; nur mit einem Cloud-Modell): Die Persönlichkeit
+  bringt den Motoren bei, wie sie aussieht – aus ihren eigenen Bildern, die die KI vorher ansieht und auswählt.
+  `motor: video` (`Profile/<Name>/LoRA/wan22-5b.safetensors`) mischt sie in jedes Video dieser Persönlichkeit
+  (`video_lora`, `video_lora_staerke`); `motor: bild` (`krea2.safetensors`) nimmt Krea 2 dazu, wenn sie sich
+  **selbst** malt (`figur`, `outfit` oder `pose`, auch in Serien und Comics; `bild_lora`, `bild_lora_staerke`).
+  Training läuft lokal im Hintergrund (Video ~1,2 s, Bild ~5 s je Schritt), sichert alle 100 Schritte und macht
+  nach einem Abbruch dort weiter. Bilder mit LoRA rechnen ohne TensorRT.
+- **Porträt-Motor** (`engines/liveportrait`, Werkzeug `portraet_bewegen`): LivePortrait in torch – ein
+  vorhandenes Bild bewegt sich mit einem fertigen Ablauf (lebendig, hallo, lächeln, zwinkern, nicken …) oder
+  eigenen Schlüsselbildern, bis 60 s. Mit `sagen` **spricht das Porträt**: die Stimme sagt den Text, der Mund
+  folgt der Lautstärke, MP4 mit Ton. Anzeige im kleinen Fenster unten rechts, in der Kugel oder im Player;
+  `vorschau_schliessen` schließt das Fenster.
+- **Comic** (`comic_malen`): eine erfundene Geschichte als fertige Comicseite – bis 9 Felder mit derselben Figur
+  und demselben Seed, Sprechblasen, Erzählkästen, Titel. Bei Cloud-Modellen nebenbei.
+- **Tagesrückblick** (`tagesrueckblick`): aus den Bildern des Tages ein Video mit Titelkarte, sanftem Zoom und
+  Überblendungen, dazu der Erzähltext der KI in ihrer Stimme (wenn die Stimme nicht „aus“ ist), bis 2 Minuten;
+  auch für gestern, ein Datum oder eigene Bilder.
+- **Musik-Motor** (`engines/musik`, Werkzeug `musik_machen`, Fenster `/musik`): ACE-Step 1.5 Turbo als GGUF,
+  in torch nachgebaut – 48 kHz Stereo, 10 bis 240 s, 30 s Musik in wenigen Sekunden. Die KI übersetzt einen
+  Wunsch in einen englischen Stil (Genre, Instrumente, Stimme) und schreibt den Liedtext mit
+  `[Verse]`/`[Chorus]`-Marken selbst. Der **Song-Planer** (1,7B, optional) plant vorher Aufbau und Melodie,
+  Stille am Ende wird abgeschnitten. Jeder Song heißt nach seinem **Titel** (`<Titel>_<Datum>.wav` in
+  `Profile/<Name>/Musik/`), Titel, Interpret, Genre und Liedtext stehen auch in der Datei. Im Fenster: Wunsch
+  eintippen → ✨ Ausarbeiten → anpassen → 🎵 Komponieren. Modelle unter `Models/Musik` oder `Models/Music`,
+  jede Datei wird vor dem ersten Laden per SHA-256 geprüft.
+- **Musik-Cover** (`musik_cover`, im `/musik`-Fenster „🎙 Als Cover“ / „📁 Cover aus Datei“): ein vorhandener
+  Song im anderen Stil neu eingespielt – Melodie und Aufbau bleiben. Vorlage: eigener Song („letzter“ oder ein
+  Teil des Titels) oder eine Audiodatei (WAV selbst, MP3/M4A/FLAC/WMA über die Decoder von Windows).
+  **Nähe** 0–90 %: höher hält auch Klang und Instrumente näher am Original.
+
 ### 🌐 Browser & 🖱 Rechtsklick
 - **Chrome-Erweiterung** (`chrome-erweiterung/`, `/chrome`): Rechtsklick auf einer Webseite →
   **„Nemi antwortet"** – die Persönlichkeit liest die Seite, schreibt in deinem Namen eine Antwort und setzt sie
   **direkt ins Textfeld**; „… und sendet" drückt auch den Senden-Knopf. **„Nemi, erklär mir das"**
   erklärt markierten Text. Redet nur mit dem laufenden NemiCLI auf `127.0.0.1:9000`, mit Geheimschlüssel.
+- **Chrome-Seitenleiste** (Klick aufs 🐈-Symbol): Chat wie im Desktop-Fenster im Modus „Chat“, Antwort
+  erscheint live. **📄 Seite** schickt die Seite (oder den markierten Text) mit, **📸 Foto** ein
+  Bildschirmfoto. Derselbe Chat wie im Terminal und in `/gui`; gemalte Bilder erscheinen in der Leiste.
+  Seiteninhalt gilt als Fremdinhalt: Merken braucht dann eine Freigabe (Karte in der Leiste), Skills ändern
+  sperrt der Skill-Wächter in dieser Runde.
+  Hat die Persönlichkeit Kugel-Bilder, zeigt die Leiste ihr Bild in der aktuellen Stimmung (beim Nachdenken „denkt“).
+  Vorgeschriebene Texte erscheinen umrandet als Entwurf mit **✍ Ins Textfeld** und **⧉ Kopieren**.
 - **Windows-Rechtsklick-Menü** (`/kontextmenue an`): auf dem Desktop „Bildschirm erfassen" und
   „Nemi antwortet (in das Fenster daneben)", auf Bildern „Mit NemiCLI ansehen". Läuft NemiCLI,
   landet es dort – sonst öffnet sich ein neues Fenster. Windows 11: unter „Weitere Optionen anzeigen".
@@ -366,8 +439,29 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     „Neuen Skill besprechen“), **Persönlichkeiten** (Klick
     wechselt für Terminal und Fenster) und den letzten Chats; Antworten mit Markdown und aufklappbarem
     Denktext, Bilder direkt im Chat, Dateien per **+** oder Drag & Drop.
+  - Unter jeder Antwort **⧉ Kopieren** und **🔊 Vorlesen** (die Stimme der Persönlichkeit, wie `/voice jetzt`;
+    ein zweiter Klick stoppt; ohne Stimme kein Knopf).
+  - **⚙ Einstellungen:** vorne Stimme, Arbeitsweise, Denkstufe und Farben, eingeklappt „Für Profis“ (Kontext,
+    Gedächtnis-Modell, Reflektieren, Skills, Übung, Helfer, Fremdseiten, Kugel-Schalter, Rechtsklick-Menü,
+    Debugbericht). Ein Klick führt den passenden Befehl aus wie im Terminal; Werte zum Eintippen bleiben dort.
   - Verbindung über eine Windows Named Pipe ohne Port, mit neuem Geheimschlüssel je Sitzung; nur
     JSON, nie pickle. Links aus Antworten öffnen nur mit `http`/`https`, nachgeladen wird nichts.
+- **Eigenes Terminal-Fenster** (`NemiCLI.exe`): selbst gezeichnet (pyte + ConPTY), Themes Breeze und Mint,
+  durchscheinender Hintergrund. **Reiter** wie bei GNOME-Terminal: Strg+Umschalt+T öffnet eine Kommandozeile im
+  selben Ordner, Strg+Umschalt+W schließt, Strg+Bild↑/↓ wechselt. Der Reiter **„🤖 KI“** (Strg+Umschalt+K) zeigt
+  jeden Befehl der KI mit Ausgabe live, nur zum Lesen, und geht beim ersten Befehl von selbst auf
+  (`terminal_ki_reiter`; Aussehen: `terminal_thema`, `terminal_hintergrund`, `terminal_schrift`, `terminal_groesse`).
+- **Befehls-Palette** (`Strg+K`): ein Suchfenster für alle Befehle, die Punkte ihrer Menüs (mit ✓ für das
+  Aktive), Modelle und Persönlichkeiten. Die Suche verzeiht Tippfehler und Umlaute („musick“ → `/musik`, „stime“ →
+  `/voice`, „farbe“ → `/theme`); ↑/↓ oder Klick wählt, Enter führt aus, Befehle mit Eingabe kommen in die Zeile.
+- **Cockpit** (`F3`, bleibt gemerkt): rechts live die Grafikkarte (VRAM, Last, Temperatur über den NVIDIA-Treiber),
+  das Tempo (jetzt, zuletzt, Mittel und als Kurve), wie voll der Kontext ist, laufende Hintergrund-Aufgaben mit
+  Fortschritt, die gelbe Todo-Liste und die Wache. Der Chat rückt dafür zur Seite.
+- **Lebendige Antworten:** Arbeitet die KI, läuft ein Lichtschweif in der Farbe der Persönlichkeit über die Linie
+  der Eingabe. Werkzeuge erscheinen als kurze Zeilen („⚙ Musik …“, „✓ Song fertig … · 6 s ▸ 2 Zeilen mehr“), ein
+  Klick klappt sie auf; Fehler und Rückfragen stehen gleich offen da.
+- **Mini-Player:** Ein fertiger Song kommt als Karte in den Chat – Titel, Länge, Wellenform und die Knöpfe
+  ▶ Abspielen, 🎙 Als Cover (legt „Mach ein Cover von …“ in die Eingabe) und 📂 Ordner.
 - **Vollbild auf Textual:** Verlauf oben mit echtem Scrollen, Eingabe unten. Fenster ziehen – alles
   passt sich an. Text mit der Maus markieren, **Strg+C** kopiert (ohne Rahmen). Klickbare Dialoge.
   Rückfall auf die alte Oberfläche: `NEMICLI_TUI=alt`.

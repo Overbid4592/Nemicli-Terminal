@@ -155,7 +155,10 @@ function zeigen(text, kopierbar) {
 
 chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
   if (msg.typ === "status") { status(msg.text); sendResponse({ ok: true }); }
-  else if (msg.typ === "sammeln") { sendResponse({ text: seitentext(msg.auswahl) }); }
+  else if (msg.typ === "sammeln") {
+    const markiert = (msg.auswahl || "").trim() || String(window.getSelection ? window.getSelection() : "").trim();
+    sendResponse({ text: seitentext(msg.auswahl), auswahl: !!markiert });
+  }
   else if (msg.typ === "einfuegen") { einsetzen(msg.text || "", !!msg.senden); sendResponse({ ok: true }); }
   else if (msg.typ === "zeigen") { zeigen(msg.text || "", true); sendResponse({ ok: true }); }
   return true;

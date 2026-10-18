@@ -27,7 +27,7 @@ from rich.rule import Rule
 from rich.columns import Columns
 from rich.table import Table
 from rich.spinner import Spinner
-from rich.box import ROUNDED, HEAVY
+from rich.box import ROUNDED, HEAVY, Box
 from rich.markup import escape
 
 from prompt_toolkit.styles import Style as PTStyle
@@ -40,7 +40,7 @@ from prompt_toolkit.utils import get_cwidth
 # ---------------------------------------------------------------------------
 
 APP_NAME = "NemiCLI"
-APP_SUBTITLE = "dein eigener Coding-Agent"
+APP_SUBTITLE = "deine eigene KI · Code · Bilder · Video · Wache"
 
 # ---------------------------------------------------------------------------
 # Themes  -  jede Palette: brand, brand_dim, accent, accent_dim + Logo-Verlauf
@@ -246,10 +246,40 @@ def _banner_panel(logo: Text, width: int | None = None) -> Panel:
                  padding=(1, _banner_pad(width)))
 
 
+BANNER_KOMPAKT = False   # True, sobald im Vollbild die erste Nachricht abgeschickt ist
+
+
+def _banner_kompakt() -> Panel:
+    """Schmale Kopfzeile statt Block-Logo: Name im Verlauf der Palette, Hauptversion, dazu der Untertitel."""
+    zeile = Text(justify="center", no_wrap=True, overflow="ellipsis")
+    for i, ch in enumerate(APP_NAME):
+        zeile.append(ch, style=f"bold {_gradient[int(i / max(len(APP_NAME) - 1, 1) * (len(_gradient) - 1))]}")
+    try:
+        from version import VERSION
+        zeile.append(f" {VERSION.split()[0]}", style=f"bold {_gradient[-1]}")
+    except Exception:
+        pass
+    zeile.append("  ✦  ", style="accent")
+    zeile.append(APP_SUBTITLE, style="muted")
+    return Panel(zeile, box=HEAVY, border_style="brand.dim", padding=(0, 1))
+
+
 def banner_renderable(width: int | None = None) -> Panel:
     """Der ruhige Standard-Banner in der AKTUELLEN Konsolenbreite (oder `width`).
-    Wird vom TUI bei jeder Breitenänderung neu abgerufen (Reflow)."""
+    Wird vom TUI bei jeder Breitenänderung neu abgerufen (Reflow); nach der ersten
+    Nachricht als schmale Kopfzeile (BANNER_KOMPAKT), damit der Chat Platz hat."""
+    if hasattr(TUI, "reflow_auffrischen"):  # Vollbild (Textual): Startseite – bleibt über dem Chat stehen
+        import startseite
+        return startseite.renderable(_banner_kompakt(), width or console.width)
+    if BANNER_KOMPAKT:
+        return _banner_kompakt()
     return _banner_panel(_render_logo(APP_NAME), width or console.width)
+
+
+def leiste_renderable(width: int | None = None):
+    """Feste Leiste über dem Chat im Vollbild (nach der ersten Nachricht)."""
+    import startseite
+    return startseite.leiste(width or console.width)
 
 
 def banner(animate: bool = False) -> None:
@@ -272,26 +302,23 @@ def banner(animate: bool = False) -> None:
 
 
 def welcome(model: str, mode: str = "Normal", strength: str | None = None) -> None:
-    sep = Text("   ·   ", style="brand.dim")
-    status = Text("  ")
-    status.append("● ", style="ok")
-    status.append("bereit", style="muted")
-    status.append_text(sep)
-    status.append("⌬ ", style="muted")
-    status.append(model, style="accent")
-    if strength:
-        status.append_text(sep)
-        status.append("⚡ ", style="muted")
-        status.append(strength, style="brand")
-    status.append_text(sep)
-    status.append("🎨 ", style="muted")
-    status.append(_active, style="brand")
-    console.print(status)
+    """Kurzbefehle unter dem Banner. Modell, Modus und Stärke zeigt die Statusleiste
+    unter der Eingabe – hier stünden sie doppelt und blieben als alter Stand im Verlauf."""
+    if TUI is None:                        # klassisch: keine feste Statusleiste
+        status = Text("  ")
+        status.append("⌬ ", style="muted")
+        status.append(model, style="accent")
+        if strength:
+            status.append("   ·   ", style="brand.dim")
+            status.append("⚡ ", style="muted")
+            status.append(strength, style="brand")
+        console.print(status)
+    else:                                  # Vollbild: die Startseite zeigt, was wichtig ist
+        return
 
     hints = [
         _hint("/help", "alle Befehle"),
         _hint("/model", "Modell wechseln"),
-        _hint("/resume", "Chat fortsetzen"),
         _hint("/wissen", "Gelerntes"),
         _hint("/exit", "Beenden"),
     ]
@@ -323,7 +350,8 @@ def help_panel() -> None:
     )
     # Start-Tipps (früher beim Start angezeigt – jetzt hier, damit der Start sauber bleibt)
     console.print('  💡 Tippe "/" für Befehle, oder schreib einfach los.', style="muted")
-    console.print("  📒 /resume <#> setzt einen früheren Chat fort.", style="muted")
+    console.print("  📒 Das Gespräch geht beim Start weiter, wo ihr aufgehört habt – /reset fängt neu an.",
+                  style="muted")
     try:
         import keyvault
         if keyvault.available():
@@ -505,25 +533,6 @@ def knowledge_menu(skills: list, snippets: list) -> None:
     )
 
 
-def chats_menu(chats: list) -> None:
-    """Zeigt die gespeicherten Chats für /resume."""
-    if not chats:
-        info("Noch keine gespeicherten Chats. Sobald du losschreibst, wird einer angelegt.")
-        return
-    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
-    table.add_column("#", style="accent", no_wrap=True, justify="right")
-    table.add_column("Titel", style="assistant")
-    table.add_column("Modell", style="muted", no_wrap=True)
-    table.add_column("Runden", style="muted", justify="right")
-    table.add_column("Aktualisiert", style="muted", no_wrap=True)
-    for c in chats:
-        table.add_row(str(c["id"]), c["title"], c["model"], str(c["turns"]), c["updated"])
-    console.print(
-        Panel(table, title="[brand]Gespeicherte Chats[/brand]  ·  /resume <#>", title_align="left",
-              box=ROUNDED, border_style="brand.dim", padding=(1, 1))
-    )
-
-
 def strength_menu(strengths: dict, current: str | None = None) -> None:
     """Zeigt die Denk-Stärken für den /staerke-Befehl."""
     table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
@@ -689,17 +698,33 @@ def _coding_an() -> bool:
         return False
 
 
+# Nur eine Leiste links (Zeilen: oben, Kopf, Kopftrenner, Mitte, Zeile, Fußtrenner, Fuß, unten –
+# je links, waagrecht, Kreuzung, rechts). Der Titel steht auf der leeren oberen Kante.
+LEISTE = Box("    \n▎  ▎\n▎  ▎\n▎   \n▎   \n▎   \n▎   \n    \n")
+
+# Feste Farbe je Persönlichkeit, aus ihrem Namen abgeleitet – gleicher Name, gleiche Farbe.
+PERSONA_FARBEN = ["#41e0d0", "#8b7cff", "#f472b6", "#fbbf24", "#4ade80", "#60a5fa", "#fb923c", "#c084fc"]
+
+
+def persona_farbe(name: str | None = None) -> str:
+    import zlib
+    name = (name if name is not None else persona_name()).strip().lower()
+    return PERSONA_FARBEN[zlib.crc32(name.encode("utf-8")) % len(PERSONA_FARBEN)]
+
+
 def assistant_panel(text: str):
-    """Antwort-Panel; solange der Coding-Assistent an ist, mit blauem Rahmen."""
+    """Antwort mit Leiste links in der Farbe der Persönlichkeit; im Coding-Assistenten blau."""
+    name = persona_name()
     if _coding_an():
-        titel = f"[bold {CODING_BLAU}]🟦 Coding · {escape(persona_name())}[/bold {CODING_BLAU}]"
+        titel = f"[bold {CODING_BLAU}]🟦 Coding · {escape(name)}[/bold {CODING_BLAU}]"
         rahmen = CODING_BLAU
     else:
-        titel, rahmen = f"[brand]🐈 {escape(persona_name())}[/brand]", "accent"
+        rahmen = persona_farbe(name)
+        titel = f"[bold {rahmen}]🐈 {escape(name)}[/bold {rahmen}]"
     return Panel(
         NemiMarkdown(text or " ", code_theme=code_theme_name()),
         title=titel, title_align="left",
-        box=ROUNDED, border_style=rahmen, padding=(1, 2),
+        box=LEISTE, border_style=rahmen, padding=(0, 1, 0, 1),
     )
 
 
@@ -804,12 +829,22 @@ def working_meter(verb: str, elapsed: float, tokens: int):
 
 def stream_meter(verb: str, elapsed: float, tokens: int) -> Text:
     """Dezente Zeile unter der Antwort, während sie noch strömt."""
+    try:
+        import cockpit
+        cockpit.tempo_live(tokens, elapsed)
+    except Exception:
+        pass
     return _meter_text(verb, elapsed, tokens)
 
 
 def done_meter(elapsed: float, tokens: int, tps: float | None = None,
                in_tokens: int = 0) -> Text:
     """Kompakte Zusammenfassung nach der Antwort: Tokens · Zeit · Tempo."""
+    try:
+        import cockpit
+        cockpit.tempo_merken(tps)
+    except Exception:
+        pass
     t = Text("  ")
     t.append("⌁ ", style="accent.dim")
     parts = []
@@ -889,6 +924,33 @@ def thinking_panel(text: str, collapsed: bool = False,
     )
 
 
+class Klapp:
+    """Ein Block, der im Vollbild als eine Zeile erscheint und per Klick aufgeht (screen_tx._KlappBlock);
+    überall sonst wird er voll gedruckt."""
+
+    def __init__(self, kurz, lang, offen: bool = False):
+        self.kurz, self.lang, self.offen = kurz, lang, offen
+
+    def __rich_console__(self, console, options):
+        yield self.lang
+
+
+def _erste_zeile(text: str) -> tuple[str, int]:
+    """(erste nicht leere Zeile, Zahl der übrigen Zeilen)."""
+    zeilen = [z.strip() for z in str(text).splitlines() if z.strip()]
+    return (zeilen[0] if zeilen else ""), max(0, len(zeilen) - 1)
+
+
+def _chip(symbol: str, stil: str, text: str, rest: int, zusatz: str = "") -> Text:
+    t = Text("  ", no_wrap=True, overflow="ellipsis")
+    t.append(f"{symbol} ", style=stil)
+    t.append(text, style="assistant")
+    if zusatz:
+        t.append(f"  ·  {zusatz}", style="brand.dim")
+    t.append(f"  ▸ {rest} Zeile{'n' if rest != 1 else ''} mehr" if rest else "  ▸", style="accent.dim")
+    return t
+
+
 def action_request(desc: str, confirm: bool, kopf: str | None = None, risiko: bool = False):
     """Panel: NemiCLI möchte eine Aktion ausführen.
     risiko=True (löschen, fremder Befehl, Zeitplan, ganzer Ordner): roter Rahmen
@@ -899,11 +961,15 @@ def action_request(desc: str, confirm: bool, kopf: str | None = None, risiko: bo
     if risiko and confirm:
         border = "bold red"
         title = f"[bold red]{head}[/bold red]"
-    return Panel(
+    panel = Panel(
         Text(desc, style="bold red" if (risiko and confirm) else "assistant"),
         title=title, title_align="left",
         box=ROUNDED, border_style=border, padding=(0, 2),
     )
+    if TUI is None or confirm:                 # Rückfragen bleiben groß: da soll man hinsehen
+        return panel
+    erste, rest = _erste_zeile(desc)
+    return Klapp(_chip("⚙", "accent", erste, rest), panel)
 
 
 def subagent_panel(idx: int, rolle: str, task: str, result: str):
@@ -981,17 +1047,103 @@ def show_image_preview(path, title: str | None = None) -> bool:
     return True
 
 
-def action_result(result: str, ok: bool | None = None):
-    """Panel: Ergebnis einer Aktion."""
+def anzeige_kurz(text: str, zeilen: int = 14) -> str:
+    """Lange Werkzeug-Ausgaben (Webseiten) für die Anzeige kürzen – das Modell bekommt den vollen Text."""
+    teile = str(text).splitlines()
+    if len(teile) <= zeilen + 2:
+        return str(text)
+    rest = len(teile) - zeilen
+    return "\n".join(teile[:zeilen]) + f"\n… {rest} weitere Zeilen – die KI hat alles gelesen."
+
+
+def action_result(result: str, ok: bool | None = None, sekunden: float | None = None):
+    """Panel: Ergebnis einer Aktion. Im Vollbild als Chip „✓ erste Zeile · 6 s ▸“, der per Klick aufgeht;
+    Fehler stehen offen da."""
     if ok is None:
         title = Text("◇ Ergebnis · Status ungeprüft", style="muted")
     else:
         title = Text("✓ Ergebnis" if ok else "✗ Ergebnis", style="ok" if ok else "err")
-    return Panel(
+    if sekunden is not None:
+        title.append(f"  ·  {fmt_elapsed(sekunden)}", style="brand.dim")
+    panel = Panel(
         Text(str(result), style="assistant"),
         title=title, title_align="left",
         box=ROUNDED, border_style="accent.dim", padding=(0, 2),
     )
+    if TUI is None:
+        return panel
+    erste, rest = _erste_zeile(result)
+    symbol, stil = ("◇", "muted") if ok is None else ("✓", "ok") if ok else ("✗", "err")
+    return Klapp(_chip(symbol, stil, erste, rest, fmt_elapsed(sekunden) if sekunden is not None else ""),
+                 panel, offen=ok is False)
+
+
+# Mini-Player für fertige Songs: Klicks im Vollbild laufen über App-Aktionen (screen_tx._NemiApp.action_musik)
+MUSIK_KARTEN: dict[str, str] = {}
+_WAV_PFAD = re.compile(r"[A-Za-z]:\\[^\n„“\"]*?\.wav", re.IGNORECASE)
+
+
+def _songtitel(pfad) -> str:
+    from pathlib import Path
+    stamm = Path(str(pfad)).stem
+    return re.sub(r"_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?(_\d+)?$", "", stamm).strip(" _") or stamm
+
+
+class _Welle:
+    """Wellenform eines Songs über die ganze verfügbare Breite (bei jeder Breite neu gerechnet, gemerkt)."""
+
+    def __init__(self, pfad, farbe: str):
+        self.pfad, self.farbe, self._je_breite = pfad, farbe, {}
+
+    def __rich_console__(self, console, options):
+        import cockpit
+        breite = max(8, options.max_width)
+        if breite not in self._je_breite:
+            self._je_breite[breite] = cockpit.wellenform(self.pfad, breite) or "♪"
+        yield Text(self._je_breite[breite], style=self.farbe, no_wrap=True, overflow="crop")
+
+
+def musik_karte(pfad, titel: str | None = None, info: str = ""):
+    """Karte eines Songs: Titel, Länge, Wellenform, ▶ Abspielen · 🎙 Als Cover · 📂 Ordner."""
+    import hashlib
+    import wave
+    from pathlib import Path
+    pfad = Path(str(pfad))
+    titel = titel or _songtitel(pfad)
+    try:
+        with wave.open(str(pfad), "rb") as w:
+            sek = w.getnframes() / max(1, w.getframerate())
+    except Exception:
+        sek = 0.0
+    kennung = hashlib.sha1(str(pfad).encode("utf-8")).hexdigest()[:10]
+    MUSIK_KARTEN[kennung] = str(pfad)
+    farbe = persona_farbe()
+    knoepfe = Text(no_wrap=True, overflow="crop")
+    for i, (zeichen, was) in enumerate((("▶ Abspielen", "spielen"), ("🎙 Als Cover", "cover"), ("📂 Ordner", "ordner"))):
+        if i:
+            knoepfe.append("   ")
+        knoepfe.append(f" {zeichen} ", style=Style(color="#e4e7f2", bgcolor="#1c1f30", bold=True,
+                                                   meta={"@click": f"app.musik('{kennung}', '{was}')"}))
+    teile = [_Welle(pfad, farbe)]
+    if info:
+        teile.append(Text(info, style="muted"))
+    teile.append(knoepfe)
+    body = Group(*teile)
+    kopf = Text("🎵 ", style="accent")
+    kopf.append(f"„{titel}“", style=f"bold {farbe}")
+    if sek:
+        kopf.append(f"  ·  {int(sek) // 60}:{int(sek) % 60:02d}", style="brand.dim")
+    return Panel(body, title=kopf, title_align="left", box=ROUNDED, border_style=farbe, padding=(0, 2))
+
+
+def musik_karte_aus(text: str) -> bool:
+    """Steht in einem Werkzeug-Ergebnis ein vorhandener Song, seine Karte drucken. True, wenn gedruckt."""
+    from pathlib import Path
+    for m in _WAV_PFAD.finditer(str(text or "")):
+        if Path(m.group(0)).is_file():
+            console.print(musik_karte(m.group(0)))
+            return True
+    return False
 
 
 def execution_receipt(records):
@@ -1038,6 +1190,18 @@ def tool_result(name: str, result: str):
 
 def info(msg: str) -> None:
     console.print(f"[muted]ℹ {msg}[/muted]")
+
+
+def helfer_zeile(name: str, text: str) -> Text:
+    """Zeile des Einrichtungs-Helfers – Text ohne Markup, er stammt vom Modell."""
+    zeile = Text()
+    zeile.append(f"✨ {name}  ", style="accent")
+    zeile.append(text)
+    return zeile
+
+
+def helfer_sagt(name: str, text: str) -> None:
+    console.print(helfer_zeile(name, text))
 
 
 def success(msg: str) -> None:
@@ -1138,11 +1302,13 @@ def _fortschritt_balken(i: int, n: int, cells: int = 30) -> Text:
     return bar
 
 
-def progress_panel(title: str, msg: str):
+def progress_panel(title: str, msg: str, live: bool = True):
     """Fortschritts-Panel. Steckt in der Meldung ein 'i/n' (z.B. 'Schritt 12/30'),
     zeigen wir zusätzlich einen echten Ladebalken – sonst nur den Spinner
-    (z.B. beim Laden des Modells oder VAE-Dekodieren, wo es keine Schritte gibt)."""
-    spinner = Spinner("dots", text=Text(f"  {msg}", style="muted"), style="accent")
+    (z.B. beim Laden des Modells oder VAE-Dekodieren, wo es keine Schritte gibt).
+    live=False: fest gedruckter Stand ohne Spinner, der sonst nach Bewegung aussieht."""
+    spinner = (Spinner("dots", text=Text(f"  {msg}", style="muted"), style="accent") if live
+               else Text(f"  {msg}", style="muted"))
     m = _SCHRITT_RE.search(msg)
     if m:
         i, n = int(m.group(1)), int(m.group(2))
@@ -1491,8 +1657,8 @@ def input_hints(width: int, busy=False, practicing=False, modal=False,
         choices = [[("Enter", "wählen"), ("Esc", "zurück")],
                    [("Enter", "OK"), ("Esc", "zurück")], [("Enter", "OK")]]
     else:
-        actions = [("Enter", "senden"), ("Strg+J", "neue Zeile"), ("/", "Befehle"),
-                   ("Shift+Tab", "Modus"), ("F12", "Chat sichern")]
+        actions = [("Enter", "senden"), ("Strg+J", "neue Zeile"), ("/", "Befehle"), ("Strg+K", "Suche"),
+                   ("Shift+Tab", "Modus"), ("F3", "Cockpit"), ("F12", "Chat sichern")]
         if has_thinking:
             actions.append(("F2", "Denktext"))
         stop = [("Esc", "Übung stoppen" if practicing else "abbrechen")]
@@ -1556,8 +1722,6 @@ def _responsive_toolbar(state: dict, width: int):
     model = " ".join(str(state.get("model") or "—").split())
     if width < 118 and ":" in model:
         model = model.split(":", 1)[1]
-    chat = [(muted, "Chat " if width >= 65 else ""),
-            (brand, f"#{state.get('chat', 0)}")]
     used, total = state.get("ctx", 0), state.get("ctx_max", 0) or 1
     if width >= 80:
         context = [(muted, "Kontext ")] + _ctx_fragments(used, total, bg)
@@ -1569,7 +1733,7 @@ def _responsive_toolbar(state: dict, width: int):
         context = [(muted, "Ctx "),
                    (f"fg:{_ctx_color(used / total)} bg:{bg}",
                     f"{min(100, max(0, round(used / total * 100)))}%")]
-    details = sep + _mode_fragments(bg) + _coding_fragments(bg, sep) + sep + chat + sep + context
+    details = sep + _mode_fragments(bg) + _coding_fragments(bg, sep) + sep + context
     model_room = max(1, width - 4 - fragment_list_width(details))
     model_room = min(model_room, max(12, width * 2 // 5))
     fragments = [(muted, "  ")] + fit_fragments([(acc, model)], model_room) + details
@@ -1603,7 +1767,6 @@ def bottom_toolbar(state: dict, width: int | None = None):
     frags += [sep] + _mode_fragments(bg) + _coding_fragments(bg, [sep])
     if state.get("strength"):
         frags += [sep, (mut, "⚡ "), (brand, state["strength"])]
-    frags += [sep, (mut, "📒 "), (brand, f"#{state.get('chat', 0)}")]
     # Kontext-Balken (Ampel): wie voll ist das Modell-Gedächtnis?
     frags += [sep] + _ctx_fragments(state.get("ctx", 0),
                                     state.get("ctx_max", 0) or 1, bg)
