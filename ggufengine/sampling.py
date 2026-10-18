@@ -113,5 +113,7 @@ class Sampler:
         if 0 < cfg.top_p < 1:
             cum = torch.cumsum(probs, dim=-1)
             probs = torch.where(cum - probs > cfg.top_p, torch.zeros_like(probs), probs)
+        if not bool(torch.isfinite(probs).all()):        # multinomial bräche sonst die CUDA-Sitzung ab
+            raise RuntimeError("model produced invalid values (NaN/Inf) – generation stopped")
         choice = torch.multinomial(probs, 1, generator=self.gen)
         return int(idx[choice].item())

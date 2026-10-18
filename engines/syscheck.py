@@ -24,6 +24,7 @@ from pathlib import Path
 
 import models as M
 import setup as S
+import systemprofil
 
 try:
     from paths import ROOT
@@ -52,22 +53,37 @@ def sm_tag(cap: str) -> str:
     return f"sm_{major}{minor}"
 
 
-# Was für ein torch braucht diese Rechen-Stufe mindestens?
-# Blackwell (sm_120, RTX 50xx) läuft erst ab CUDA 12.8 (empfohlen: 13.2) – ältere torch-Räder
-# haben den Code für sm_120 gar nicht drin.
+# Was für ein torch braucht diese Rechen-Stufe mindestens? (hardware.json, „torch_baus“)
+# Blackwell (sm_120, RTX 50xx) läuft erst ab CUDA 12.8 – ältere torch-Räder haben den Code
+# für sm_120 gar nicht drin.
+_UNBEKANNT = {"kanal": "cu126", "cuda": 12.6, "grund": "Standard-CUDA-Bau"}
+
+
 def _wheel_for(cap: str) -> tuple[str, str]:
     """Gibt (kanal, grund) zurück. kanal = pip-Index-Kürzel wie 'cu132'."""
+    nv = systemprofil.nvidia()
+    unbekannt = nv.get("unbekannt") or _UNBEKANNT
+    baus = nv.get("torch_baus") or []
     try:
         major = int(float(cap))
     except Exception:
-        return "cu126", "Standard-CUDA-Bau"
-    if major >= 12:            # Blackwell und neuer
-        return "cu132", "Blackwell (sm_120): CUDA-13.2-Bau (torch 2.14), FP4-Tensorkerne für Krea 2"
-    if major >= 8:             # Ampere / Ada (RTX 30xx, 40xx)
-        return "cu126", "passt für Ampere/Ada (RTX 30xx/40xx)"
-    if major >= 7:             # Turing / Volta (RTX 20xx, GTX 16xx)
-        return "cu126", "passt für Turing (RTX 20xx / GTX 16xx)"
-    return "cpu", "diese Karte ist für CUDA zu alt – nur CPU"
+        return unbekannt["kanal"], unbekannt["grund"]
+    if not baus:
+        return unbekannt["kanal"], unbekannt["grund"]
+    for bau in baus:
+        if major >= bau["ab_stufe"]:
+            return bau["kanal"], bau["grund"]
+    zu_alt = nv.get("zu_alt") or {"kanal": "cpu", "grund": "diese Karte ist für CUDA zu alt – nur CPU"}
+    return zu_alt["kanal"], zu_alt["grund"]
+
+
+def _cuda_fuer(kanal: str) -> float:
+    """Treiber-CUDA-Version, die ein torch-Kanal mindestens braucht."""
+    nv = systemprofil.nvidia()
+    for bau in nv.get("torch_baus") or []:
+        if bau["kanal"] == kanal:
+            return bau["cuda"]
+    return (nv.get("unbekannt") or _UNBEKANNT)["cuda"]
 
 
 _TORCH_URL = "https://download.pytorch.org/whl/"
@@ -77,7 +93,7 @@ def torch_plan(gpu: dict | None = None, cap: str = "") -> dict:
     """Der passende Installations-Plan für Bild-Erzeugung auf DIESEM PC.
 
     Rückgabe: {ok, kanal, grund, cmd, extra, warnung}
-      cmd     = pip-Befehl für torch (zum Kopieren)
+      cmd     = pip-Befehl für torch (zum Kopieren ins venv-Fenster, /venv)
       extra   = pip-Befehl für den Rest (Krea 2)
       warnung = Hinweis, wenn etwas nicht zusammenpasst
     """
@@ -91,35 +107,38 @@ def torch_plan(gpu: dict | None = None, cap: str = "") -> dict:
         kanal, grund = _wheel_for(cap or compute_cap())
         if kanal == "cpu":
             return {"ok": True, "kanal": "cpu", "grund": grund,
-                    "cmd": f"{py} torch --index-url {_TORCH_URL}cpu",
+                    "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}cpu",
                     "extra": extra,
                     "warnung": "Bilder malen dauert auf der CPU sehr lange (Minuten pro Bild)."}
         warn = ""
+        if not systemprofil.nvidia().get("torch_baus"):
+            warn = ("Hardware-Datenbank (hardware.json) nicht lesbar – der CUDA-Bau ist nur geraten. "
+                    "NemiCLI neu installieren.")
         cuda_max = gpu.get("cuda_max") or 0
-        need = {"cu132": 13.2, "cu128": 12.8}.get(kanal, 12.6)
+        need = _cuda_fuer(kanal)
         if cuda_max and cuda_max < need:
             warn = (f"Dein Grafik-Treiber kann nur CUDA {cuda_max}, gebraucht wird "
                     f"{need}. Erst den NVIDIA-Treiber aktualisieren.")
         return {"ok": True, "kanal": kanal, "grund": grund,
-                "cmd": f"{py} torch --index-url {_TORCH_URL}{kanal}",
+                "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}{kanal}",
                 "extra": extra, "warnung": warn}
 
     if vendor == "amd":
         return {"ok": True, "kanal": "directml", "grund":
                 "AMD unter Windows: ROCm gibt es nur für Linux",
-                "cmd": f"{py} torch-directml",
+                "cmd": "pip3 install torch-directml",
                 "extra": extra,
                 "warnung": "AMD auf Windows läuft über DirectML – langsamer und nicht überall stabil."}
 
     if vendor == "intel":
         return {"ok": True, "kanal": "cpu",
                 "grund": "Intel-Grafik: läuft praktisch auf der CPU",
-                "cmd": f"{py} torch --index-url {_TORCH_URL}cpu",
+                "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}cpu",
                 "extra": extra,
                 "warnung": "Bilder malen dauert damit sehr lange."}
 
     return {"ok": True, "kanal": "cpu", "grund": "keine nutzbare Grafikkarte gefunden",
-            "cmd": f"{py} torch --index-url {_TORCH_URL}cpu", "extra": extra,
+            "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}cpu", "extra": extra,
             "warnung": "Ohne Grafikkarte dauert ein Bild mehrere Minuten."}
 
 
@@ -181,8 +200,10 @@ def packages() -> list[dict]:
         ("tokenizers", "Wortliste für Krea 2 und den Gedächtnis-Encoder", False),
         ("numpy", "Rechnen für Wache, Kugel und Bilder", False),
         ("PIL", "Bilder speichern und lesen (Pillow)", False),
+        ("tensorrt_rtx", "Zusatz TensorRT-RTX: Prompts schneller lesen, schneller malen (SDK unter "
+                         "Models/TensorRT-RTX ablegen, das Paket kommt von selbst)", False),
     ]
-    dist = {"dotenv": "python-dotenv", "PIL": "pillow"}
+    dist = {"dotenv": "python-dotenv", "PIL": "pillow", "tensorrt_rtx": "tensorrt-rtx"}
     out = []
     for mod, zweck, pflicht in rows:
         v = _version(dist.get(mod, mod))
@@ -216,6 +237,12 @@ def model_stock() -> dict:
     except Exception:
         bilder, ordner = 0, str(ROOT / "Models" / "Krea2")
 
+    try:
+        import gguflokal
+        gguf = len(gguflokal.modelle())
+    except Exception:
+        gguf = 0
+
     frei = 0
     try:
         frei = shutil.disk_usage(str(ROOT)).free // (1024 ** 3)
@@ -225,6 +252,7 @@ def model_stock() -> dict:
     return {
         "bildmodelle": bilder,
         "bild_ordner": ordner,
+        "gguf": gguf,
         "ollama": S.ollama_running(),
         "frei_gb": frei,
     }
@@ -277,9 +305,9 @@ def todo(rep: dict) -> list[str]:
     """Kurze Liste: was fehlt noch? (Klartext, in der Reihenfolge sinnvoll)"""
     out: list[str] = []
     st = rep["stock"]
-    if not st["ollama"]:
-        out.append("Kein lokales Modell: Ollama installieren "
-                   "(ollama.com/download) und /model → 'Ollama einrichten'.")
+    if not st["ollama"] and not st.get("gguf"):
+        out.append("Kein lokales Modell: eine GGUF-Datei in einen Ordner unter ModelGGUF/ legen "
+                   "(eigener Motor) oder Ollama einrichten (/model).")
     if st["bildmodelle"] == 0:
         out.append(f"Zum Bilder-Malen fehlt ein Krea-2-Modell in {st['bild_ordner']} "
                    "(siehe LIES-MICH dort).")

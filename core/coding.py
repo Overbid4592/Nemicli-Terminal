@@ -33,6 +33,7 @@ ABLAGE = ".nemicli"
 TODO_JSON = "todo.json"
 TODO_MD = "Todo.md"
 AUFTRAG_MD = "Auftrag.md"
+MEMORY_MD = "memory.md"
 
 OFFEN, FRAGE, FERTIG, GESTRICHEN = "offen", "frage", "fertig", "gestrichen"
 ZEICHEN = {OFFEN: "🔴", FRAGE: "🟠", FERTIG: "🟢", GESTRICHEN: "⚪"}
@@ -77,8 +78,32 @@ def ablage(p: Path | None = None) -> Path | None:
 
 
 def _sammelordner() -> list[Path]:
-    import workspace
-    return workspace._keine_projektordner()
+    """Desktop, Benutzerprofil & Co.: Sammelbecken, keine Projekte. Ein Ordner darin schon."""
+    heim = Path.home()
+    orte = [Path(p) for p in (os.environ.get("USERPROFILE"), os.environ.get("HOME")) if p]
+    orte.append(heim)
+    orte += [heim / name for name in ("Desktop", "Downloads", "Dokumente", "Documents", "Bilder",
+                                      "Pictures", "Musik", "Music", "Videos", "OneDrive")]
+    raus = []
+    for p in orte:
+        try:
+            raus.append(p.resolve())
+        except Exception:
+            pass
+    return raus
+
+
+def drin(kandidat: str | os.PathLike) -> bool:
+    """Liegt der Pfad im Projekt (oder ist er es)? Ohne aktiven Assistenten immer ja."""
+    p = projekt()
+    if p is None:
+        return True
+    try:
+        k = Path(os.path.expandvars(str(kandidat))).expanduser().resolve()
+        p = p.resolve()
+    except Exception:
+        return False
+    return k == p or p in k.parents
 
 
 def pruefe_projekt(ziel: str) -> tuple[Path | None, str]:
@@ -96,9 +121,6 @@ def pruefe_projekt(ziel: str) -> tuple[Path | None, str]:
     if p in _sammelordner():
         return None, (f"'{p.name}' ist ein Sammelordner, kein Projekt. "
                       f"Nimm einen Ordner darin, z.B. {p / 'MeinProjekt'}.")
-    import workspace
-    if workspace.aktiv() and not workspace.drin(p):
-        return None, f"Der Projektordner muss im Workspace liegen ({workspace.pfad()})."
     return p, ""
 
 
@@ -123,6 +145,24 @@ def beenden() -> Path | None:
 
 def ist_ende_ansage(text: str) -> bool:
     return bool(_ENDE_ANSAGE.search(text or ""))
+
+
+def memory_anhaengen(text: str, ueberschrift: str = "") -> Path | None:
+    """Datierter Eintrag in `.nemicli/memory.md` – Wissen, das nur dieses Projekt betrifft."""
+    a = ablage()
+    if a is None or not str(text or "").strip():
+        return None
+    a.mkdir(parents=True, exist_ok=True)
+    ziel = a / MEMORY_MD
+    if not ziel.exists():
+        ziel.write_text("# Projekt-Gedächtnis\n\nEntscheidungen und Fallstricke dieses Projekts.\n",
+                        encoding="utf-8")
+    kopf = f"\n## {datetime.now().strftime('%d.%m.%Y, %H:%M')}"
+    if ueberschrift.strip():
+        kopf += f" — {ueberschrift.strip()}"
+    with open(ziel, "a", encoding="utf-8") as f:
+        f.write(f"{kopf}\n\n{str(text).strip()}\n")
+    return ziel
 
 
 # ---------------------------------------------------------------------------
@@ -348,6 +388,21 @@ def _gruen(daten: dict, punkt: dict, durch: str) -> None:
     if daten.get("aktuell") == punkt["nr"]:
         daten["aktuell"] = None
     _speichern(daten)
+    try:                                 # Code zu diesem Punkt gilt in der Coding-Sammlung als geprüft
+        import codesammlung
+        codesammlung.punkt_geprueft(projekt(), punkt["nr"])
+    except Exception:
+        pass
+
+
+def kontext() -> tuple[str, str, int | None]:
+    """(Auftrag, Punkt in Arbeit, dessen Nummer) – für die Coding-Sammlung."""
+    daten = laden()
+    if daten is None:
+        return str(_zustand().get("aufgabe") or ""), "", None
+    nr = daten.get("aktuell")
+    punkt = next((p["text"] for p in daten["punkte"] if p["nr"] == nr), "") if nr else ""
+    return str(daten.get("ziel") or ""), punkt, nr
 
 
 # ---------------------------------------------------------------------------
@@ -473,6 +528,10 @@ _WEG = """\
   requirements an den echten Stand anpassen.
 - Lies eine Datei, bevor du sie änderst.
 - `befehl` läuft im Projektordner. Fürs Projekt immer das Python aus `venv\\Scripts`.
+- Bleib im Projektordner. Dateiaktionen außerhalb legt NemiCLI dem Nutzer zur Freigabe vor – in jedem
+  Modus, auch Auto. Brauchst du etwas von draußen, sag kurz, warum.
+- Was nur dieses Projekt betrifft (Entscheidungen, Fallstricke): merken mit art "projektnotiz" – landet in
+  `.nemicli/memory.md`. Nimmst du ein Projekt wieder auf, lies diese Datei. Paket-Lehren: skill_merken.
 - Charme ja, Schönfärben nein. Ergebnisse mit Fakten beschreiben: was lief, was nicht, Zahlen.
 
 ## Aktuell bleiben (dein Wissen hat ein Datum, die Bibliotheken nicht)
@@ -480,6 +539,8 @@ _WEG = """\
 - Bist du bei einer Funktion, Klasse oder einem Parameter unsicher: api_nachschlagen (z. B. "requests.get")
   – das liest Signatur und Doku aus der INSTALLIERTEN Version. Grundlagen zu Python, HTML, CSS, JS:
   doku_suchen. Neuere Version oder Lücken eines Pakets: paket_info.
+- Ähnliches schon einmal gebaut? coding_sammlung mit frage durchsucht bewährten Code aus früheren
+  Projekten (freigegeben und sauber, „geprüft“ = Todo-Punkt wurde grün) – als Vorlage für Stil und Weg.
 - Nach dem Schreiben meldet NemiCLI Syntax- und Strukturfehler sofort. Vor todo "pruefen" eines
   Python-Punktes: code_pruefen (ruff: undefinierte Namen, veralteter Stil, typische Fehler).
 - Web-Punkte (HTML/CSS/JS): seite_ansehen zeigt dir die Seite als Bild – prüf, ob sie aussieht wie verlangt.

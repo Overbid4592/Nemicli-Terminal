@@ -23,7 +23,8 @@ import torch
 import torch.nn.functional as F
 
 from ..gguf import GGUFError, GGUFFile
-from .common import GraphDecoder, KVCache, RoPE, WeightLoader, attention, rms_norm, swiglu_mlp
+from .common import (GraphDecoder, KVCache, RoPE, WeightLoader, attention, letzte_zeilen, logit_zeilen,
+                     rms_norm, swiglu_mlp, fenster_nachholen, mischer_nachholen, zeilen_merken)
 from .moe import Experten
 
 GATING_SOFTMAX, GATING_SIGMOID = 1, 2
@@ -36,6 +37,134 @@ def _zahl(gg: GGUFFile, key: str, default=None, lo=None, hi=None, ganz: bool = F
     if (lo is not None and v < lo) or (hi is not None and v > hi) or v != v:
         raise GGUFError(f"{key} = {v} is implausible")
     return int(v) if ganz else float(v)
+
+
+KDA_BLOCK_AB = 32       # Kimi Delta Attention: ab so vielen Token blockweise
+KDA_BLOCK = 64
+
+
+class _OhneRope:
+    """Kimi Linear: MLA ohne Positionen (der RoPE-Teil des Schlüssels bleibt ungedreht)."""
+
+    def __call__(self, x, pos_idx):
+        return x
+
+
+def kda_blockweise(q, k, v, g, beta, S, C: int = KDA_BLOCK):
+    """Kimi Delta Attention über eine Folge in Blöcken zu C Token – gleiches Ergebnis wie die
+    Token-Schleife.  q, k (L, H, Dk) normiert, q skaliert; v (L, H, Dv); g (L, H, Dk) log. Zerfall
+    je Kanal; beta (L, H); S (H, Dk, Dv) wird fortgeschrieben.  Ergebnis (L, H, Dv)."""
+    L, H, Dk = k.shape
+    Dv = v.shape[-1]
+    out = torch.empty(L, H, Dv, device=q.device, dtype=torch.float32)
+    eins = torch.eye(C, device=q.device, dtype=torch.float32)
+    for a in range(0, L, C):
+        e = min(L, a + C)
+        n = e - a
+        qc, kc, vc = (x[a:e].transpose(0, 1) for x in (q, k, v))             # (H, n, D)
+        gc = g[a:e].transpose(0, 1).cumsum(1)                                  # (H, n, Dk)
+        bc = beta[a:e].t().unsqueeze(-1)                                       # (H, n, 1)
+        zerfall = torch.exp(gc.unsqueeze(2) - gc.unsqueeze(1))                 # (H, i, j, Dk)
+        unter = torch.tril(torch.ones(n, n, dtype=torch.bool, device=q.device), -1)
+        bis = torch.tril(torch.ones(n, n, dtype=torch.bool, device=q.device))
+        kk = (kc.unsqueeze(2) * kc.unsqueeze(1) * zerfall).sum(-1)            # (H, i, j)
+        N = (kk * bc).masked_fill(~unter, 0) + eins[:n, :n]
+        T = torch.linalg.solve_triangular(N, eins[:n, :n].expand_as(N), upper=False, unitriangular=True)
+        u = T @ (vc * bc)
+        w = T @ (kc * bc * gc.exp())
+        innen = (qc.unsqueeze(2) * kc.unsqueeze(1) * zerfall).sum(-1).masked_fill(~bis, 0)
+        v_neu = u - w @ S
+        out[a:e] = ((qc * gc.exp()) @ S + innen @ v_neu).transpose(0, 1)
+        letzt = gc[:, -1:]                                                     # (H, 1, Dk)
+        S.mul_(letzt.exp().transpose(1, 2))
+        S.add_((kc * (letzt - gc).exp()).transpose(1, 2) @ v_neu)
+    return out
+
+
+class _KDA:
+    """Kimi Delta Attention (llama.cpp kimi-linear): q/k/v mit eigener kausaler Faltung + SiLU,
+    q/k L2-normiert, Zerfall je Kanal g = ssm_a * softplus(f_b(f_a(x)) + dt), beta = sigmoid,
+    Delta-Regel; Ausgang RMS-normiert je Kopf mal sigmoid(g_b(g_a(x)))."""
+
+    def __init__(self, ld: WeightLoader, i: int, hp: dict):
+        p = f"blk.{i}."
+        self.H, self.Dk, self.eps = hp["n_heads"], hp["kda_dim"], hp["eps"]
+        self.q, self.k, self.v = (ld.linear(p + f"attn_{n}.weight") for n in "qkv")
+        self.o = ld.linear(p + "attn_output.weight")
+        self.Dv = self.v.n_out // self.H
+        self.K = hp["kda_conv"]
+        self.conv = []
+        for n, breite in (("q", self.H * self.Dk), ("k", self.H * self.Dk), ("v", self.H * self.Dv)):
+            w = ld.norm(p + f"ssm_conv1d_{n}.weight").float()
+            if w.numel() != breite * self.K:
+                raise GGUFError(f"layer {i}: unexpected ssm_conv1d_{n} size")
+            self.conv.append(w.reshape(breite, 1, self.K).contiguous())
+        self.f_a, self.f_b = ld.linear(p + "ssm_f_a.weight"), ld.linear(p + "ssm_f_b.weight")
+        self.g_a, self.g_b = ld.linear(p + "ssm_g_a.weight"), ld.linear(p + "ssm_g_b.weight")
+        self.beta = ld.linear(p + "ssm_beta.weight")
+        self.a = ld.norm(p + "ssm_a").float().reshape(-1)                     # (H,) = -exp(A_log)
+        self.dt = ld.norm(p + "ssm_dt.bias").float().reshape(-1)              # (H*Dk,)
+        self.norm = ld.norm(p + "ssm_norm.weight").float()
+        if self.a.numel() != self.H or self.dt.numel() != self.H * self.Dk or self.f_b.n_out != self.H * self.Dk:
+            raise GGUFError(f"layer {i}: KDA tensors do not match the head sizes")
+        dev = self.a.device
+        self.zust = [torch.zeros(self.K - 1, w.shape[0], device=dev, dtype=torch.float32) for w in self.conv]
+        self._merk: dict = {}                                     # rows of the last check, by its length
+        self.S = torch.zeros(self.H, self.Dk, self.Dv, device=dev, dtype=torch.float32)
+
+    def reset(self):
+        with torch.inference_mode():
+            for z in self.zust:
+                z.zero_()
+            self.S.zero_()
+
+    def snapshot(self):
+        return [z.clone() for z in self.zust] + [self.S.clone()]
+
+    def restore(self, snap):
+        for z, s in zip(self.zust + [self.S], snap):
+            z.copy_(s)
+
+    def _falten(self, j: int, x: torch.Tensor) -> torch.Tensor:
+        full = torch.cat([self.zust[j], x], dim=0)
+        self.zust[j].copy_(full[-(self.K - 1):])
+        return F.silu(F.conv1d(full.t().unsqueeze(0), self.conv[j], groups=self.conv[j].shape[0])[0].t())
+
+    def __call__(self, x: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+        L, H, Dk, Dv = x.shape[0], self.H, self.Dk, self.Dv
+        ein = (self.q(x).float(), self.k(x).float(), self.v(x).float())
+        q = self._falten(0, ein[0]).view(L, H, Dk)
+        k = self._falten(1, ein[1]).view(L, H, Dk)
+        v = self._falten(2, ein[2]).view(L, H, Dv)
+        q = q / torch.sqrt(q.pow(2).sum(-1, keepdim=True) + self.eps) * Dk ** -0.5
+        k = k / torch.sqrt(k.pow(2).sum(-1, keepdim=True) + self.eps)
+        g = self.a.view(1, H, 1) * F.softplus((self.f_b(self.f_a(x)).float() + self.dt).view(L, H, Dk))
+        beta = torch.sigmoid(self.beta(x).float())                            # (L, H)
+        S = self.S
+        if L >= KDA_BLOCK_AB:
+            o = kda_blockweise(q, k, v, g, beta, S)
+        else:
+            o = torch.empty(L, H, Dv, device=x.device, dtype=torch.float32)
+            if zeilen_merken():
+                self._merk[L] = (ein, g, k, v, beta)
+            for t in range(L):
+                S.mul_(g[t].exp().unsqueeze(-1))
+                delta = (v[t] - torch.einsum("hk,hkv->hv", k[t], S)) * beta[t].unsqueeze(-1)
+                S.add_(k[t].unsqueeze(-1) * delta.unsqueeze(1))
+                o[t] = torch.einsum("hk,hkv->hv", q[t], S)
+        tor = torch.sigmoid(self.g_b(self.g_a(x)).float().view(L, H, Dv))
+        o = rms_norm(o, self.norm, self.eps) * tor
+        return self.o(o.reshape(L, H * Dv))
+
+    def nachholen(self, L: int, n: int) -> None:
+        ein, g, k, v, beta = self._merk[L]
+        for j in range(3):
+            fenster_nachholen(self.zust[j], ein[j], n)
+        S = self.S
+        for t in range(n):                                                    # the steps of the token loop
+            S.mul_(g[t].exp().unsqueeze(-1))
+            delta = (v[t] - torch.einsum("hk,hkv->hv", k[t], S)) * beta[t].unsqueeze(-1)
+            S.add_(k[t].unsqueeze(-1) * delta.unsqueeze(1))
 
 
 class _MLA:
@@ -151,7 +280,7 @@ class _Block:
         self.eps = hp["eps"]
         self.attn_norm = ld.norm(p + "attn_norm.weight")
         self.ffn_norm = ld.norm(p + "ffn_norm.weight")
-        self.attn = _MLA(ld, i, hp, rope, n_ctx)
+        self.attn = _KDA(ld, i, hp) if ld.has(p + "ssm_f_a.weight") else _MLA(ld, i, hp, rope, n_ctx)
         moe = i >= hp["n_dense"] and ld.has(p + "ffn_gate_inp.weight")
         self.ffn = _MoE(ld, i, hp) if moe else _Dense(ld, i)
 
@@ -161,7 +290,8 @@ class _Block:
 
 
 class DeepSeek2Model:
-    arch_names = ("deepseek2",)
+    alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
+    arch_names = ("deepseek2", "kimi-linear")
     prefill_chunk = 2048            # full KV caches only: long chunks read faster (qlinear)
 
     def __init__(self, gg: GGUFFile, device: torch.device, dtype: torch.dtype, n_ctx: int = 8192, progress=None,
@@ -173,11 +303,13 @@ class DeepSeek2Model:
         n_layer = _zahl(gg, k("block_count"), lo=1, hi=512, ganz=True)
         rope_dim = _zahl(gg, k("rope.dimension_count"), lo=2, hi=1024, ganz=True)
         # files with split k_b/v_b store the per-head sizes as *_mla, the others directly
-        qk_head = _zahl(gg, k("attention.key_length_mla"), _zahl(gg, k("attention.key_length"), lo=1, hi=4096,
-                                                                 ganz=True), lo=1, hi=4096, ganz=True)
-        v_dim = _zahl(gg, k("attention.value_length_mla"), _zahl(gg, k("attention.value_length"), lo=1, hi=4096,
-                                                                 ganz=True), lo=1, hi=4096, ganz=True)
+        def mla_oder(name):                      # *_mla, sonst der allgemeine Schlüssel
+            if gg.get(k(f"attention.{name}_mla")) is not None:
+                return _zahl(gg, k(f"attention.{name}_mla"), lo=1, hi=4096, ganz=True)
+            return _zahl(gg, k(f"attention.{name}"), lo=1, hi=4096, ganz=True)
+        qk_head, v_dim = mla_oder("key_length"), mla_oder("value_length")
         n_expert = _zahl(gg, k("expert_count"), 0, lo=0, hi=1024, ganz=True)
+        kimi = a == "kimi-linear"
         hp = dict(
             n_layer=n_layer,
             n_embd=_zahl(gg, k("embedding_length"), lo=1, hi=65536, ganz=True),
@@ -191,8 +323,11 @@ class DeepSeek2Model:
             n_group=_zahl(gg, k("expert_group_count"), 1, lo=1, hi=1024, ganz=True),
             group_used=_zahl(gg, k("expert_group_used_count"), 1, lo=1, hi=1024, ganz=True),
             weights_scale=_zahl(gg, k("expert_weights_scale"), 1.0, lo=0, hi=1e4),
-            norm_topk=bool(gg.get(k("expert_weights_norm"), False)),
-            gating=_zahl(gg, k("expert_gating_func"), GATING_SOFTMAX, lo=1, hi=2, ganz=True),
+            # Kimi Linear: llama.cpp normiert die Experten-Gewichte immer, Router Sigmoid
+            norm_topk=bool(gg.get(k("expert_weights_norm"), kimi)),
+            gating=_zahl(gg, k("expert_gating_func"), GATING_SIGMOID if kimi else GATING_SOFTMAX, lo=1, hi=2, ganz=True),
+            kda_dim=_zahl(gg, k("kda.head_dim"), 128, lo=1, hi=4096, ganz=True) if kimi else 0,
+            kda_conv=_zahl(gg, k("ssm.conv_kernel"), 4, lo=1, hi=16, ganz=True) if kimi else 0,
         )
         if hp["qk_nope"] < 0 or rope_dim % 2:
             raise GGUFError("key length and rope dimension do not fit together")
@@ -200,7 +335,7 @@ class DeepSeek2Model:
                          or hp["group_used"] > hp["n_group"]
                          or hp["n_used"] > hp["group_used"] * (n_expert // hp["n_group"])):
             raise GGUFError("inconsistent expert routing parameters")
-        rope, mscale = self._rope(gg, k, rope_dim, n_ctx, device)
+        rope, mscale = (_OhneRope(), 1.0) if kimi else self._rope(gg, k, rope_dim, n_ctx, device)
         hp["attn_scale"] = mscale * mscale / math.sqrt(qk_head)
         self.hp = hp
         self.n_ctx = n_ctx
@@ -212,6 +347,7 @@ class DeepSeek2Model:
         self.out_norm = ld.norm("output_norm.weight")
         self.lm_head = head if tied else ld.linear("output.weight")
         self.blocks: List[_Block] = [_Block(ld, i, hp, rope, n_ctx) for i in range(n_layer)]
+        self.rekurrent = [b.attn for b in self.blocks if isinstance(b.attn, _KDA)]
         self.n_vocab = self.embed.n_vocab
         self.n_quant = ld.n_quant
         # single steps as CUDA graph: possible when every MoE layer picks its experts on the GPU
@@ -235,31 +371,39 @@ class DeepSeek2Model:
             raise GGUFError(f"unsupported rope.scaling.type {art!r}")
         return RoPE(dim, basis, device, max_pos=n_ctx, neox=False, yarn=yarn), mscale
 
-    # -- state (only KV caches: slots are overwritten by position) ------------------
+    # -- state: KV caches are overwritten by position; KDA layers (Kimi) carry a recurrent state -----
     def reset(self):
-        pass
+        for m in self.rekurrent:
+            m.reset()
 
     def snapshot_state(self):
-        return None
+        return [m.snapshot() for m in self.rekurrent] if self.rekurrent else None
 
     def restore_state(self, snap):
-        pass
+        for m, s in zip(self.rekurrent, snap or ()):
+            m.restore(s)
+
+    def zeilen_nachholen(self, L: int, n: int) -> bool:
+        """State after row n of the last check with L rows, without reading the tokens again."""
+        return mischer_nachholen(self.rekurrent, L, n)
 
     def resume_from(self, common: int, old_len: int) -> Optional[int]:
+        if self.rekurrent:                       # the recurrent state only exists for the end
+            return common if common == old_len else None
         return common
 
     def checkpoint_state(self):
-        return None
+        return self.snapshot_state()
 
     def restore_checkpoint(self, snap):
-        pass
+        self.restore_state(snap)
 
     # -- compute ---------------------------------------------------------------------
     def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
         h = self.embed(tok)
         for b in self.blocks:
             h = b(h, pos_idx, kv_len)
-        return self.lm_head(rms_norm(h[-1:], self.out_norm, self.hp["eps"]))[0].float()
+        return logit_zeilen(self, self.lm_head(rms_norm(letzte_zeilen(self, h), self.out_norm, self.hp["eps"]))).float()
 
     @torch.inference_mode()
     def forward(self, tokens: List[int], pos: int) -> torch.Tensor:

@@ -3,7 +3,8 @@ Baukasten: ein Decoder-Transformer, der sich aus der GGUF-Datei selbst zusammens
 
 Wie in llama.cpp teilen sich die Bauarten dieselben Bausteine (Norm, Attention, RoPE, FFN,
 MoE); was eine Bauart ausmacht, steht in der Datei – vorhandene Tensoren und Metadaten –
-plus eine kleine Tabelle je Architektur (RoPE-Art, Aktivierung, Muster der Fenster-Schichten).
+plus die Bauanleitung je Architektur aus der Modell-Datenbank (daten/bauarten.json: RoPE-Art,
+Aktivierung, Muster der Fenster-Schichten, ...).
 
 Erkannt je Schicht:
 * Norm vor und/oder nach Attention und FFN (`attn_norm`, `post_attention_norm`, `ffn_norm`,
@@ -26,6 +27,10 @@ Erkannt je Schicht:
   YaRN-Lautstärke aus `yarn_log_multiplier` (= mscale_all_dim)
 
 Jede Zahl aus der Datei wird vor Gebrauch auf Plausibilität geprüft.
+
+Ein Token je Schritt (Schreiben) läuft, wo die Schicht es zulässt, über verschmolzene Kerne
+(mmvq: Norm + int8-Eingang, RoPE + KV-Cache, Attention, Aktivierung) – rund 14 statt 80 Kerne je
+Schicht; Matrizen ohne int8-Weg rechnen dort auf ihrem eigenen Weg mit.
 """
 from __future__ import annotations
 
@@ -35,37 +40,14 @@ from typing import List, Optional
 import torch
 import torch.nn.functional as F
 
+from .. import ausfuellen, mmvq
 from ..gguf import GGUFError, GGUFFile
-from .common import (GraphDecoder, KVCache, RoPE, WeightLoader, attention, attention_softcap,
-                     group_rms_norm, layer_norm, rms_norm)
+from .common import (GraphDecoder, KVCache, PackedLinear, RoPE, WeightLoader, attention, attention_softcap,
+                     group_rms_norm, layer_norm, letzte_zeilen, logit_zeilen, rms_norm)
 from .moe import Experten
 
-ARCHS = ("llama", "mistral", "mistral3", "qwen2", "qwen3", "qwen2moe", "qwen3moe", "k2-horizon",
-         "gemma", "gemma2", "gemma3", "phi3", "granite", "granitemoe", "olmo2", "olmo3", "gpt-oss",
-         "ernie4_5", "ernie4_5-moe", "seed_oss", "exaone4", "cohere2", "command-r", "glm4", "glm4moe",
-         "smollm3")
-
-# llama.cpp-RoPE-Art „normal“ (benachbarte Paare; der Konverter hat Q/K dafür umsortiert)
-_PAARE = {"llama", "mistral", "mistral3", "granite", "granitemoe", "ernie4_5", "ernie4_5-moe", "cohere2",
-          "command-r", "glm4", "smollm3"}
-# YaRN-Lautstärke = get_mscale(f, 1) / get_mscale(f, yarn_log_multiplier) wie transformers mit
-# mscale=1, mscale_all_dim=yarn_log_multiplier (DeepSeek V2 rechnet anders, eigenes Modul)
-_YARN_LOG_MUL_ALL_DIM = {"mistral3"}
-_GELU = {"gemma", "gemma2", "gemma3"}                    # GELU (tanh) statt SiLU
-_EINBETTUNG_WURZEL = {"gemma", "gemma2", "gemma3"}      # Einbettung * sqrt(n_embd)
-_FENSTER_MUSTER = {"gemma2": 2, "gemma3": 6, "gpt-oss": 2,   # jede n-te Schicht global, Rest Fenster
-                   "olmo3": 4, "exaone4": 4, "cohere2": 4}
-_GLOBAL_OHNE_ROPE = {"exaone4", "cohere2"}             # mit Fenster: globale Schichten ohne RoPE
-_OHNE_ROPE_JEDE = {"smollm3": 4}                       # ohne Fenster: jede n-te Schicht ohne RoPE (NoPE)
-_FENSTER_ROPE_SCHLICHT = {"olmo3"}                     # Fenster-Schichten: RoPE ohne Skalierung (YaRN nur global)
-_PARALLEL = {"cohere2", "command-r"}                   # Attention und FFN auf derselben Norm, beide aufs Residuum
-_LOGITS_MAL_SKALA = {"cohere2", "command-r"}           # logit_scale multipliziert (Granite: teilt)
+ARCHS = ausfuellen.bauarten_der_klasse("baukasten")
 GATING_SOFTMAX, GATING_SIGMOID = 1, 2
-_FENSTER_BASIS = {"gemma3": 10000.0}                    # RoPE-Basis der Fenster-Schichten
-_TOPK_NORMIEREN = {"qwen2moe": False}                   # sonst True
-_SOFTMAX_NACH_AUSWAHL = {"gpt-oss"}                     # Top-k der Router-Logits, dann Softmax über diese
-_FFN_NORM_HEISST_POST_ATTN = {"gpt-oss"}                # llama.cpp: post_attention_norm = Norm vor dem FFN
-_YARN_UNGERUNDET = {"gpt-oss"}                          # YaRN-Grenzen ohne Runden (transformers truncate=False)
 _OAI_GRENZE, _OAI_ALPHA = 7.0, 1.702
 
 
@@ -73,6 +55,18 @@ def _glu_oai(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
     """gpt-oss: gate und up begrenzt, gate * sigmoid(1.702 gate) * (up + 1)."""
     g = g.clamp(max=_OAI_GRENZE)
     return g * torch.sigmoid(_OAI_ALPHA * g) * (u.clamp(-_OAI_GRENZE, _OAI_GRENZE) + 1)
+
+
+def _mal(lin, e: "mmvq.Eingang", x: torch.Tensor, bias: bool = True) -> torch.Tensor:
+    """Ein Token (float32, n_in) -> (n_out) float32: über den int8-Eingang, wenn die Matrix es kann."""
+    if _int8_weg(lin):
+        y = mmvq.mv(lin.name, lin.raw, e, lin.n_out, lin.n_in)
+        return y + lin.b if bias and lin.b is not None else y
+    return lin(x.view(1, -1)).float().view(-1)
+
+
+def _int8_weg(lin) -> bool:
+    return isinstance(lin, PackedLinear) and lin.mmvq and lin.band is None and not lin.im_ram
 
 
 def _zahl(gg: GGUFFile, key: str, default=None, *, ganz: bool = False, lo=None, hi=None):
@@ -102,7 +96,7 @@ class _Schicht:
             return ld.norm(p + name + ".weight"), b
         self.attn_norm, self.attn_post = norm("attn_norm"), norm("post_attention_norm")
         self.ffn_norm, self.ffn_post = norm("ffn_norm"), norm("post_ffw_norm")
-        if hp["arch"] in _FFN_NORM_HEISST_POST_ATTN:
+        if hp["ffn_norm_post_attn"]:
             self.ffn_norm, self.attn_post = self.attn_post, None
         self.sinks = ld.norm(p + "attn_sinks.weight") if ld.has(p + "attn_sinks.weight") else None
         if self.sinks is not None and self.sinks.numel() != hp["n_heads"]:
@@ -131,7 +125,7 @@ class _Schicht:
         self.moe = ld.has(p + "ffn_gate_inp.weight")
         if self.moe:
             self.router = ld.linear(p + "ffn_gate_inp.weight", p + "ffn_gate_inp.bias")
-            self.experten = Experten(ld, p, self._akt, _glu_oai if hp["arch"] == "gpt-oss" else None)
+            self.experten = Experten(ld, p, self._akt, _glu_oai if hp["glu_oai"] else None)
             n_exp = len(self.experten)
             # Korrektur nur für die Auswahl, nicht für die Gewichte (ERNIE 4.5)
             self.wahl_bias = ld.norm(p + "exp_probs_b.bias").reshape(-1) if ld.has(p + "exp_probs_b.bias") else None
@@ -152,6 +146,7 @@ class _Schicht:
             self.down = ld.linear(p + "ffn_down.weight", p + "ffn_down.bias")
             self.gate_up = self.gate is None and self.up.n_out == 2 * self.down.n_in
         self.cache = KVCache(Hkv, D, n_ctx, ld.device, ld.dtype, ld.kv_bits)
+        self._plan = None                 # verschmolzener Ein-Token-Schritt: None = noch nicht geprüft
 
     # -- Bausteine ---------------------------------------------------------------
     def _norm(self, x, nw, gruppen=True):
@@ -166,7 +161,9 @@ class _Schicht:
         return F.gelu(x, approximate="tanh") if self.hp["gelu"] else F.silu(x)
 
     def _mlp(self, x, gate, up, down):
-        return down(self._akt(gate(x).float()) * up(x).float()).float()
+        with mmvq.eingang_teilen():
+            g, u = gate(x).float(), up(x).float()
+        return down(self._akt(g) * u).float()
 
     def _ffn(self, x):
         if self.moe:
@@ -181,7 +178,7 @@ class _Schicht:
 
     def _experten(self, x):
         logits = self.router(x).float()
-        if self.hp["arch"] in _SOFTMAX_NACH_AUSWAHL:
+        if self.hp["softmax_nach_auswahl"]:
             w, idx = logits.topk(self.hp["n_expert_used"], dim=-1)
             w = torch.softmax(w, dim=-1)
         else:
@@ -215,14 +212,70 @@ class _Schicht:
             w = w / (w.sum(-1, keepdim=True) + 1e-20)
         return idx, w * hp["weights_scale"]
 
+    def _schritt_planen(self):
+        """Was der verschmolzene Ein-Token-Schritt braucht – False, wenn die Schicht etwas hat, das er
+        nicht kennt (dann bleibt der allgemeine Weg)."""
+        hp, c = self.hp, self.cache
+        H, Hkv, D = self.H, self.Hkv, self.D
+        if (self.moe or hp["layernorm"] or hp["norm_groups"] != 1 or hp["parallel"] or hp["attn_softcap"]
+                or self.attn_post is not None or self.ffn_post is not None or self.attn_norm is None
+                or self.ffn_norm is None or self.attn_norm[1] is not None or self.ffn_norm[1] is not None
+                or self.gate_up or not isinstance(c, KVCache) or c.int8 or c.geteilt
+                or c.k.dtype != torch.bfloat16 or not c.k.is_cuda
+                or any(n is not None and n.numel() != D for n in (self.q_norm, self.k_norm))
+                or (self.rope is not None and self.rope.dim > D)
+                or hp["n_embd"] % 32 or self.down.n_in % 32 or (H * D) % 32
+                or not mmvq.schritt_moeglich(c.k.device, H, Hkv, D)):
+            return False
+        # Bias von Q/K/V im RoPE-Kern, wenn alle drei über den int8-Weg rechnen (sonst in ihrem Weg)
+        bias = (None, None, None)
+        if self.qkv is not None:
+            if _int8_weg(self.qkv) and self.qkv.b is not None:
+                b = self.qkv.b.float()
+                bias = (b[:H * D], b[H * D:(H + Hkv) * D], b[(H + Hkv) * D:])
+        elif all(_int8_weg(lin) for lin in (self.q, self.k, self.v)):
+            bias = tuple(None if lin.b is None else lin.b.float() for lin in (self.q, self.k, self.v))
+        return {"bias": bias, "kern_bias": any(b is not None for b in bias)}
+
+    def _schritt(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+        """Ein Token über die verschmolzenen Kerne; gleiche Rechnung wie der allgemeine Weg."""
+        hp, p = self.hp, self._plan
+        H, Hkv, D = self.H, self.Hkv, self.D
+        h = h.reshape(-1)
+        xn, e, _ = mmvq.norm_q8(h, self.attn_norm[0], hp["eps"])
+        mit = not p["kern_bias"]
+        if self.qkv is not None:
+            qkv = _mal(self.qkv, e, xn, mit)
+            q, k, v = qkv[:H * D], qkv[H * D:(H + Hkv) * D], qkv[(H + Hkv) * D:]
+        else:
+            q, k, v = (_mal(lin, e, xn, mit) for lin in (self.q, self.k, self.v))
+        qo = mmvq.rope_kv(q, k, v, p["bias"], self.rope, pos_idx, (self.q_norm, self.k_norm), hp["eps"],
+                          hp["q_temp"], self.cache.k, self.cache.v, H, Hkv, D)
+        o, eo = mmvq.attention1(qo, self.cache.k, self.cache.v, pos_idx, kv_len, hp["attn_scale"], self.fenster,
+                                self.sinks, H, Hkv, D)
+        o = _mal(self.o, eo, o)
+        rs = hp["residual_scale"]
+        xn, e, h = mmvq.norm_q8(h, self.ffn_norm[0], hp["eps"], rest=o, rs=rs)
+        if self.gate is not None:
+            a, ea = mmvq.akt_q8(_mal(self.gate, e, xn), _mal(self.up, e, xn), hp["gelu"])
+        else:
+            a, ea = mmvq.akt_q8(_mal(self.up, e, xn), None, hp["gelu"])
+        return torch.add(h, _mal(self.down, ea, a), alpha=rs).view(1, -1)
+
     def __call__(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
         hp, L = self.hp, h.shape[0]
+        if L == 1 and h.is_cuda and h.dtype == torch.float32:
+            if self._plan is None:
+                self._plan = self._schritt_planen()
+            if self._plan:
+                return self._schritt(h, pos_idx, kv_len)
         H, Hkv, D = self.H, self.Hkv, self.D
         x = self._norm(h, self.attn_norm) if self.attn_norm is not None else h
         if self.qkv is not None:
             q, k, v = self.qkv(x).float().split([H * D, Hkv * D, Hkv * D], dim=-1)
         else:
-            q, k, v = self.q(x).float(), self.k(x).float(), self.v(x)
+            with mmvq.eingang_teilen():
+                q, k, v = self.q(x).float(), self.k(x).float(), self.v(x)
         if self.q_norm is not None and self.q_norm.numel() != D:       # über alle Köpfe (OLMo 2)
             q = rms_norm(q, self.q_norm, hp["eps"])
         if self.k_norm is not None and self.k_norm.numel() != D:
@@ -257,68 +310,121 @@ class _Schicht:
         return h + y * hp["residual_scale"]
 
 
+def parameter(gg: GGUFFile) -> tuple[dict, dict, int]:
+    """(hp, Bauanleitung, rope_dim) einer Baukasten-Bauart – geprüft, ohne Gewichte zu laden."""
+    a = gg.architecture
+    if a not in ARCHS:
+        raise GGUFError(f"architecture {a!r} not handled by the Baukasten")
+    b = ausfuellen.bauart(a) or {}
+    k = lambda s: f"{a}.{s}"
+    n_layer = _zahl(gg, k("block_count"), ganz=True, lo=1, hi=512)
+    # Zusatzschichten für Mehr-Token-Vorhersage (GLM-4.5) am Ende: beim Erzeugen nicht gebraucht
+    n_layer -= _zahl(gg, k("nextn_predict_layers"), 0, ganz=True, lo=0, hi=n_layer - 1)
+    n_embd = _zahl(gg, k("embedding_length"), ganz=True, lo=1, hi=65536)
+    n_heads = _zahl(gg, k("attention.head_count"), ganz=True, lo=1, hi=1024)
+    n_kv = _zahl(gg, k("attention.head_count_kv"), n_heads, ganz=True, lo=1, hi=1024)
+    head_dim = _zahl(gg, k("attention.key_length"), n_embd // n_heads, ganz=True, lo=1, hi=1024)
+    if _zahl(gg, k("attention.value_length"), head_dim, ganz=True) != head_dim:
+        raise GGUFError("different key and value head sizes are not supported")
+    if n_heads % n_kv:
+        raise GGUFError("head_count must be a multiple of head_count_kv")
+    rms_eps = gg.get(k("attention.layer_norm_rms_epsilon"))
+    eps = _zahl(gg, k("attention.layer_norm_rms_epsilon") if rms_eps is not None
+                else k("attention.layer_norm_epsilon"), 1e-5, lo=0, hi=1)
+    rope_dim = _zahl(gg, k("rope.dimension_count"), head_dim, ganz=True, lo=2, hi=head_dim)
+    if rope_dim % 2:
+        raise GGUFError("rope.dimension_count must be even")
+    groesse = "27b" if n_layer == b.get("gross_27b_bei_schichten") else ""
+    attn_scale = _zahl(gg, k("attention.scale"), None, lo=0, hi=100)
+    if attn_scale is None:                     # Gemma 2/3 27B: 1/sqrt(n_embd/n_head) (query_pre_attn_scalar)
+        attn_scale = (n_embd / n_heads) ** -0.5 if groesse else head_dim ** -0.5
+    hp = dict(
+        arch=a, n_layer=n_layer, n_embd=n_embd, n_heads=n_heads, n_kv_heads=n_kv, head_dim=head_dim, eps=eps,
+        layernorm=rms_eps is None and gg.get(k("attention.layer_norm_epsilon")) is not None,
+        norm_groups=_zahl(gg, k("attention.group_norm_groups"), 1, ganz=True, lo=1, hi=n_embd),
+        gelu=b.get("aktivierung") == "gelu",
+        attn_scale=attn_scale,
+        attn_softcap=_zahl(gg, k("attn_logit_softcapping"), 0.0, lo=0, hi=1e4) or 0.0,
+        final_softcap=_zahl(gg, k("final_logit_softcapping"), 0.0, lo=0, hi=1e4) or 0.0,
+        residual_scale=_zahl(gg, k("residual_scale"), 1.0, lo=0, hi=100),
+        logit_scale=_zahl(gg, k("logit_scale"), 1.0, lo=1e-6, hi=1e4),
+        embedding_scale=(n_embd ** 0.5 if b.get("einbettung_wurzel")
+                         else _zahl(gg, k("embedding_scale"), 1.0, lo=0, hi=1e4)),
+        n_expert_used=_zahl(gg, k("expert_used_count"), 0, ganz=True, lo=0, hi=1024),
+        topk_normieren=bool(gg.get(k("expert_weights_norm"), b.get("topk_normieren", True))),
+        gating=_zahl(gg, k("expert_gating_func"), GATING_SOFTMAX, ganz=True, lo=1, hi=2),
+        n_group=_zahl(gg, k("expert_group_count"), 1, ganz=True, lo=1, hi=1024),
+        group_used=_zahl(gg, k("expert_group_used_count"), 1, ganz=True, lo=1, hi=1024),
+        weights_scale=_zahl(gg, k("expert_weights_scale"), 1.0, lo=0, hi=1e4),
+        parallel=bool(b.get("parallel")),
+        logits_mal=bool(b.get("logits_mal_skala")),
+        q_temp=None,
+        ffn_norm_post_attn=bool(b.get("ffn_norm_heisst_post_attn")),
+        softmax_nach_auswahl=bool(b.get("softmax_nach_auswahl")),
+        glu_oai=bool(b.get("glu_oai")),
+    )
+    temp = _zahl(gg, k("attention.temperature_scale"), 0.0, lo=0, hi=10) if b.get("temperatur_skala") else 0.0
+    if temp:
+        n = (_zahl(gg, k("rope.scaling.original_context_length"), 0, ganz=True, lo=0, hi=1 << 26)
+             or _zahl(gg, k("context_length"), 0, ganz=True, lo=0, hi=1 << 26))
+        if not n:
+            raise GGUFError("attention.temperature_scale needs an original context length")
+        hp["q_temp"] = (temp, n)
+    if n_embd % hp["norm_groups"]:
+        raise GGUFError("group_norm_groups must divide embedding_length")
+    return hp, b, rope_dim
+
+
+def rope_plan(gg: GGUFFile, ld, hp: dict, b: dict, rope_dim: int, n_ctx: int, device) -> list:
+    """Je Schicht (RoPE oder None, Fenstergröße oder 0). `ld` braucht nur has() und norm()."""
+    a, n_layer = hp["arch"], hp["n_layer"]
+    k = lambda s: f"{a}.{s}"
+    neox = not b.get("rope_paare")
+    global_rope = BaukastenModel._rope(gg, ld, a, b, rope_dim, neox, n_ctx, device)
+    fenster = _zahl(gg, k("attention.sliding_window"), 0, ganz=True, lo=0, hi=1 << 24) or 0
+    muster = gg.get(k("attention.sliding_window_pattern"), b.get("fenster_muster"))
+    if isinstance(muster, bool) or (muster is not None and not isinstance(muster, (int, list))):
+        raise GGUFError("invalid attention.sliding_window_pattern")
+    if isinstance(muster, list) and (len(muster) != n_layer or any(not isinstance(m, bool) for m in muster)):
+        raise GGUFError("attention.sliding_window_pattern has the wrong length")
+    if isinstance(muster, int) and not 1 <= muster <= n_layer:
+        raise GGUFError("implausible attention.sliding_window_pattern")
+    fenster_rope = global_rope
+    if fenster and b.get("fenster_rope_schlicht"):
+        fenster_rope = RoPE(rope_dim, _zahl(gg, k("rope.freq_base"), 10000.0, lo=1, hi=1e12), device,
+                            max_pos=n_ctx, neox=neox)
+    if fenster and "fenster_basis" in b:
+        basis = _zahl(gg, k("rope.freq_base_swa"), float(b["fenster_basis"]), lo=1, hi=1e12)
+        fenster_rope = RoPE(rope_dim, basis, device, max_pos=n_ctx, neox=neox)
+
+    def ist_fenster(i):
+        if not fenster:
+            return False
+        if muster is None:
+            return True                         # Fenster in allen Schichten (Mistral)
+        if isinstance(muster, list):
+            return muster[i]
+        return (i % muster) != muster - 1
+    ohne_rope_jede = b.get("ohne_rope_jede")
+
+    def rope_von(i):
+        if ist_fenster(i):
+            return fenster_rope
+        if ohne_rope_jede and (i + 1) % ohne_rope_jede == 0:
+            return None
+        return None if fenster and b.get("global_ohne_rope") else global_rope
+    return [(rope_von(i), fenster if ist_fenster(i) else 0) for i in range(n_layer)]
+
+
 class BaukastenModel:
+    alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
     arch_names = ARCHS
+    schnell = None           # Leser für lange Stücke (trtmotor.chat), liefert Logits oder None
     prefill_chunk = 2048            # full KV caches only: long chunks read faster (qlinear)
 
     def __init__(self, gg: GGUFFile, device: torch.device, dtype: torch.dtype, n_ctx: int = 8192, progress=None,
                  quant: bool = True, kv_bits: int = 16, experten_vram: Optional[int] = None):
-        a = gg.architecture
-        if a not in self.arch_names:
-            raise GGUFError(f"architecture {a!r} not handled by the Baukasten")
-        k = lambda s: f"{a}.{s}"
-        n_layer = _zahl(gg, k("block_count"), ganz=True, lo=1, hi=512)
-        # Zusatzschichten für Mehr-Token-Vorhersage (GLM-4.5) am Ende: beim Erzeugen nicht gebraucht
-        n_layer -= _zahl(gg, k("nextn_predict_layers"), 0, ganz=True, lo=0, hi=n_layer - 1)
-        n_embd = _zahl(gg, k("embedding_length"), ganz=True, lo=1, hi=65536)
-        n_heads = _zahl(gg, k("attention.head_count"), ganz=True, lo=1, hi=1024)
-        n_kv = _zahl(gg, k("attention.head_count_kv"), n_heads, ganz=True, lo=1, hi=1024)
-        head_dim = _zahl(gg, k("attention.key_length"), n_embd // n_heads, ganz=True, lo=1, hi=1024)
-        if _zahl(gg, k("attention.value_length"), head_dim, ganz=True) != head_dim:
-            raise GGUFError("different key and value head sizes are not supported")
-        if n_heads % n_kv:
-            raise GGUFError("head_count must be a multiple of head_count_kv")
-        rms_eps = gg.get(k("attention.layer_norm_rms_epsilon"))
-        eps = _zahl(gg, k("attention.layer_norm_rms_epsilon") if rms_eps is not None
-                    else k("attention.layer_norm_epsilon"), 1e-5, lo=0, hi=1)
-        rope_dim = _zahl(gg, k("rope.dimension_count"), head_dim, ganz=True, lo=2, hi=head_dim)
-        if rope_dim % 2:
-            raise GGUFError("rope.dimension_count must be even")
-        groesse = "27b" if (a == "gemma2" and n_layer == 46) or (a == "gemma3" and n_layer == 62) else ""
-        attn_scale = _zahl(gg, k("attention.scale"), None, lo=0, hi=100)
-        if attn_scale is None:                     # Gemma 2/3 27B: 1/sqrt(n_embd/n_head) (query_pre_attn_scalar)
-            attn_scale = (n_embd / n_heads) ** -0.5 if groesse else head_dim ** -0.5
-        hp = dict(
-            arch=a, n_layer=n_layer, n_embd=n_embd, n_heads=n_heads, n_kv_heads=n_kv, head_dim=head_dim, eps=eps,
-            layernorm=rms_eps is None and gg.get(k("attention.layer_norm_epsilon")) is not None,
-            norm_groups=_zahl(gg, k("attention.group_norm_groups"), 1, ganz=True, lo=1, hi=n_embd),
-            gelu=a in _GELU,
-            attn_scale=attn_scale,
-            attn_softcap=_zahl(gg, k("attn_logit_softcapping"), 0.0, lo=0, hi=1e4) or 0.0,
-            final_softcap=_zahl(gg, k("final_logit_softcapping"), 0.0, lo=0, hi=1e4) or 0.0,
-            residual_scale=_zahl(gg, k("residual_scale"), 1.0, lo=0, hi=100),
-            logit_scale=_zahl(gg, k("logit_scale"), 1.0, lo=1e-6, hi=1e4),
-            embedding_scale=(n_embd ** 0.5 if a in _EINBETTUNG_WURZEL
-                             else _zahl(gg, k("embedding_scale"), 1.0, lo=0, hi=1e4)),
-            n_expert_used=_zahl(gg, k("expert_used_count"), 0, ganz=True, lo=0, hi=1024),
-            topk_normieren=bool(gg.get(k("expert_weights_norm"), _TOPK_NORMIEREN.get(a, True))),
-            gating=_zahl(gg, k("expert_gating_func"), GATING_SOFTMAX, ganz=True, lo=1, hi=2),
-            n_group=_zahl(gg, k("expert_group_count"), 1, ganz=True, lo=1, hi=1024),
-            group_used=_zahl(gg, k("expert_group_used_count"), 1, ganz=True, lo=1, hi=1024),
-            weights_scale=_zahl(gg, k("expert_weights_scale"), 1.0, lo=0, hi=1e4),
-            parallel=a in _PARALLEL,
-            logits_mal=a in _LOGITS_MAL_SKALA,
-            q_temp=None,
-        )
-        temp = _zahl(gg, k("attention.temperature_scale"), 0.0, lo=0, hi=10) if a == "mistral3" else 0.0
-        if temp:
-            n = (_zahl(gg, k("rope.scaling.original_context_length"), 0, ganz=True, lo=0, hi=1 << 26)
-                 or _zahl(gg, k("context_length"), 0, ganz=True, lo=0, hi=1 << 26))
-            if not n:
-                raise GGUFError("attention.temperature_scale needs an original context length")
-            hp["q_temp"] = (temp, n)
-        if n_embd % hp["norm_groups"]:
-            raise GGUFError("group_norm_groups must divide embedding_length")
+        hp, b, rope_dim = parameter(gg)
         self.hp = hp
         self.n_ctx = n_ctx
         self.device = device
@@ -329,40 +435,9 @@ class BaukastenModel:
         self.out_norm_b = ld.norm("output_norm.bias") if ld.has("output_norm.bias") else None
         self.lm_head = head if tied else ld.linear("output.weight", "output.bias")
 
-        neox = a not in _PAARE
-        global_rope = self._rope(gg, ld, a, rope_dim, neox, n_ctx, device)
-        fenster = _zahl(gg, k("attention.sliding_window"), 0, ganz=True, lo=0, hi=1 << 24) or 0
-        muster = gg.get(k("attention.sliding_window_pattern"), _FENSTER_MUSTER.get(a))
-        if isinstance(muster, bool) or (muster is not None and not isinstance(muster, (int, list))):
-            raise GGUFError("invalid attention.sliding_window_pattern")
-        if isinstance(muster, list) and (len(muster) != n_layer or any(not isinstance(m, bool) for m in muster)):
-            raise GGUFError("attention.sliding_window_pattern has the wrong length")
-        if isinstance(muster, int) and not 1 <= muster <= n_layer:
-            raise GGUFError("implausible attention.sliding_window_pattern")
-        fenster_rope = global_rope
-        if fenster and a in _FENSTER_ROPE_SCHLICHT:
-            fenster_rope = RoPE(rope_dim, _zahl(gg, k("rope.freq_base"), 10000.0, lo=1, hi=1e12), device,
-                                max_pos=n_ctx, neox=neox)
-        if fenster and a in _FENSTER_BASIS:
-            basis = _zahl(gg, k("rope.freq_base_swa"), _FENSTER_BASIS[a], lo=1, hi=1e12)
-            fenster_rope = RoPE(rope_dim, basis, device, max_pos=n_ctx, neox=neox)
-
-        def ist_fenster(i):
-            if not fenster:
-                return False
-            if muster is None:
-                return True                         # Fenster in allen Schichten (Mistral)
-            if isinstance(muster, list):
-                return muster[i]
-            return (i % muster) != muster - 1
-        def rope_von(i):
-            if ist_fenster(i):
-                return fenster_rope
-            if a in _OHNE_ROPE_JEDE and (i + 1) % _OHNE_ROPE_JEDE[a] == 0:
-                return None
-            return None if fenster and a in _GLOBAL_OHNE_ROPE else global_rope
+        plan = rope_plan(gg, ld, hp, b, rope_dim, n_ctx, device)
         self.layers: List[_Schicht] = [
-            _Schicht(ld, i, hp, rope_von(i), n_ctx, fenster if ist_fenster(i) else 0) for i in range(n_layer)]
+            _Schicht(ld, i, hp, r, n_ctx, f) for i, (r, f) in enumerate(plan)]
         self.moe = any(l.moe for l in self.layers)
         if self.moe and not 0 < hp["n_expert_used"]:
             raise GGUFError("expert_used_count missing for a mixture-of-experts model")
@@ -373,7 +448,7 @@ class BaukastenModel:
         self.graph = GraphDecoder(self, n_ctx) if device.type == "cuda" and ohne_sync else None
 
     @staticmethod
-    def _rope(gg, ld, a, dim, neox, n_ctx, device) -> RoPE:
+    def _rope(gg, ld, a, b, dim, neox, n_ctx, device) -> RoPE:
         k = lambda s: f"{a}.{s}"
         basis = _zahl(gg, k("rope.freq_base"), 10000.0, lo=1, hi=1e12)
         art = gg.get(k("rope.scaling.type"), "none")
@@ -394,9 +469,9 @@ class BaukastenModel:
         elif art == "yarn" and faktor > 1.0 and orig:
             yarn = (faktor, orig,
                     _zahl(gg, k("rope.scaling.yarn_beta_fast"), 32.0, lo=0, hi=1e4),
-                    _zahl(gg, k("rope.scaling.yarn_beta_slow"), 1.0, lo=0, hi=1e4), a not in _YARN_UNGERUNDET)
+                    _zahl(gg, k("rope.scaling.yarn_beta_slow"), 1.0, lo=0, hi=1e4), not b.get("yarn_ungerundet"))
             log_mul = _zahl(gg, k("rope.scaling.yarn_log_multiplier"), None, lo=0, hi=100)
-            if mscale is None and a in _YARN_LOG_MUL_ALL_DIM and log_mul is not None:
+            if mscale is None and b.get("yarn_log_mul_all_dim") and log_mul is not None:
                 mscale = (0.1 * math.log(faktor) + 1.0) / (0.1 * log_mul * math.log(faktor) + 1.0)
             if mscale is None:
                 mscale = 0.1 * math.log(faktor) + 1.0
@@ -429,30 +504,40 @@ class BaukastenModel:
                    inject=None) -> torch.Tensor:
         """Zustand nach der Schluss-Norm: letzte Zeile oder (alle=True) jede Zeile.
         inject: (Zeilen, Einbettungen) – Bild-Einbettungen ersetzen dort die Token-Einbettung."""
-        hp = self.hp
+        h = self.einbettung(tok, inject)
+        for layer in self.layers:
+            h = layer(h, pos_idx, kv_len)
+        return self.schluss_norm(h if alle else letzte_zeilen(self, h))
+
+    def einbettung(self, tok: torch.Tensor, inject=None) -> torch.Tensor:
+        """Eingang der ersten Schicht (Token-Einbettung, Skala, Bild-Zeilen)."""
         h = self.embed(tok)
-        if hp["embedding_scale"] != 1.0:
-            h = h * hp["embedding_scale"]
+        if self.hp["embedding_scale"] != 1.0:
+            h = h * self.hp["embedding_scale"]
         if inject is not None:
             rows, emb = inject
             h = h.index_copy(0, rows, emb.to(h.device, h.dtype))
-        for layer in self.layers:
-            h = layer(h, pos_idx, kv_len)
-        x = h if alle else h[-1:]
+        return h
+
+    def schluss_norm(self, x: torch.Tensor) -> torch.Tensor:
+        hp = self.hp
         if hp["layernorm"]:
             return layer_norm(x, self.out_norm, self.out_norm_b, hp["eps"])
         return group_rms_norm(x, self.out_norm, hp["eps"], hp["norm_groups"])
 
-    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, inject=None) -> torch.Tensor:
+    def kopf(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits aus dem Zustand nach der Schluss-Norm (Skala, Softcap)."""
         hp = self.hp
-        x = self._verborgen(tok, pos_idx, kv_len, inject=inject)
-        logits = self.lm_head(x)[0].float()
+        logits = logit_zeilen(self, self.lm_head(x)).float()
         if hp["logit_scale"] != 1.0:                   # Granite teilt die Logits, Cohere multipliziert
             logits = logits * hp["logit_scale"] if hp["logits_mal"] else logits / hp["logit_scale"]
         if hp["final_softcap"]:
             c = hp["final_softcap"]
             logits = torch.tanh(logits / c) * c
         return logits
+
+    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, inject=None) -> torch.Tensor:
+        return self.kopf(self._verborgen(tok, pos_idx, kv_len, inject=inject))
 
     @torch.inference_mode()
     def einbetten(self, tokens: List[int], pooling: str = "last") -> torch.Tensor:
@@ -478,6 +563,20 @@ class BaukastenModel:
             return summe / len(tokens)
         return erstes if pooling == "cls" else x[-1]
 
+    def _in_stuecken(self, tokens: List[int], pos: int, inject, grenze: int) -> torch.Tensor:
+        logits = None
+        for s in range(0, len(tokens), grenze):
+            teil, ij = tokens[s:s + grenze], None
+            if inject is not None:
+                rows, emb = inject
+                drin = (rows >= s) & (rows < s + len(teil))
+                if bool(drin.any()):
+                    ij = (rows[drin] - s, emb[drin])
+            tok = torch.tensor(teil, device=self.device, dtype=torch.long)
+            pos_idx = torch.arange(pos + s, pos + s + len(teil), device=self.device, dtype=torch.long)
+            logits = self._run(tok, pos_idx, pos + s + len(teil), ij)
+        return logits
+
     supports_images = True          # Bild-Einbettungen über `inject` (Pixtral bei Mistral/Ministral 3)
 
     @torch.inference_mode()
@@ -488,6 +587,13 @@ class BaukastenModel:
             raise ValueError("token id out of range")
         if len(tokens) == 1 and self.graph is not None and inject is None:
             return self.graph(tokens[0], pos)
+        if self.schnell is not None and len(tokens) >= self.schnell.ab and not self.alle_logits:
+            logits = self.schnell(self, tokens, pos, inject)       # trtmotor: langes Stück über TensorRT
+            if logits is not None:
+                return logits
+        grenze = BaukastenModel.prefill_chunk
+        if len(tokens) > grenze:                  # langes Stück für den Leser, das er nicht nahm
+            return self._in_stuecken(tokens, pos, inject, grenze)
         tok = torch.tensor(tokens, device=self.device, dtype=torch.long)
         pos_idx = torch.arange(pos, pos + len(tokens), device=self.device, dtype=torch.long)
         return self._run(tok, pos_idx, pos + len(tokens), inject)

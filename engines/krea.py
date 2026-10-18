@@ -16,7 +16,7 @@ Ablauf:
 Krea 2 kennt keinen Negativ-Prompt und läuft mit CFG 1: ein Modelldurchlauf
 pro Schritt. Speicher wie ComfyUI mit --disable-smart-memory: jedes Teil ist
 nur während seines Rechenschritts im VRAM und wartet sonst im Arbeitsspeicher.
-Kommt 2 Minuten kein Bild (Config: `bild_krea_entladen`), wird auch der
+Kommt 15 Minuten kein Bild (Config: `bild_krea_entladen`), wird auch der
 Arbeitsspeicher geräumt.
 
 Alle Netze sind hier von Hand nachgebaut. Es wird nichts aus dem Netz geladen.
@@ -28,6 +28,26 @@ import json
 import math
 import struct
 import threading
+
+try:
+    import debugbericht as _DBG
+except Exception:                                    # Selbsttest ohne core/ im Pfad
+    class _DBG:                                      # type: ignore[no-redef]
+        @staticmethod
+        def ereignis(*a, **k): pass
+
+        @staticmethod
+        def fehler(*a, **k): pass
+
+        @staticmethod
+        def motor_log(): pass
+
+        class messen:
+            def __init__(self, *a): pass
+
+            def __enter__(self): return self
+
+            def __exit__(self, *a): return False
 import time
 from pathlib import Path
 
@@ -46,16 +66,20 @@ DEFAULTS = {
     "size": (832, 1216),
     "sampler": "euler_ancestral",       # oder "euler"
     "shift": 1.15,
-    "entladen_nach": 120,               # Sekunden ohne Bild, dann auch RAM frei
+    "entladen_nach": 900,               # Sekunden ohne Bild, dann auch RAM frei (nächstes Bild lädt neu)
     "gesicht": True,                    # Gesichter nach dem Malen vergrößert nachmalen
-    "gesicht_staerke": 0.45,            # Rauschstärke beim Nachmalen (0 = nichts, 1 = neu)
+    "gesicht_staerke": 0.35,            # Rauschstärke beim Nachmalen: Augen und Mund bleiben, wo sie sind
     "gesicht_schritte": 10,
     "gesicht_kante": 1024,              # Arbeitsgröße des Ausschnitts (längere Kante)
 }
 
-# Vorsatz beim Nachmalen; danach folgt der ursprüngliche Prompt (Figur, Licht, Stil).
-GESICHT_SATZ = ("A close-up of the face with clear, detailed eyes, sharp irises, "
-                "natural skin texture and fine detail, in sharp focus.")
+# Prompt beim Nachmalen eines Gesichts-Ausschnitts. Nur das Gesicht beschreiben: der ganze Bild-Prompt („steht am Strand, rote Schuhe …“) ließe Krea
+# die Szene in den kleinen Ausschnitt malen. Aussehen, Stil und Licht kommen aus dem Ausschnitt selbst.
+# Krea-Prosa statt Stichworten; ohne Bildart („photograph“), damit gezeichnete Bilder ihren Stil behalten.
+GESICHT_SATZ = ("A close-up of the same face, with the same expression, hairstyle, makeup, lighting and art "
+                "style as before. Both eyes are clear and evenly shaped, the irises show natural patterns, "
+                "and a small reflection of the light sits on the wet surface of each eye. Every eyelash is "
+                "cleanly defined, and the skin keeps its natural texture.")
 
 # Qwen3-VL-Eingabe: dieselbe Systemvorlage wie Qwen-Image. Vor dem Weiterreichen
 # wird alles bis einschließlich "<|im_start|>user\n" abgeschnitten.
@@ -365,21 +389,29 @@ class _Linear:
             if _fp4_bereit(w.device):
                 self.art = "nvfp4_mm"
                 self.bs, self.ts = bs.reshape(-1), ts
+                self.scale = None                           # entpackt nur bei Bedarf (LoRA-Rückweg)
             else:
                 self.art = "nvfp4"
                 bs = _from_blocked(bs, self.out_f, self.in_f // 16)
                 self.scale = (bs.float() * ts).to(dtype)
         elif w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             s = sd.pop(name + ".weight_scale", None)
+            self.out_f, self.in_f = w.shape
             self.w = w
             self.scale = s.float().to(dtype) if s is not None else None
             self.art = "fp8"
         else:
+            self.out_f, self.in_f = w.shape
             self.w = w.to(dtype)
             self.art = "plain"
 
     def weight(self):
         import torch.nn.functional as F
+        if self.art == "nvfp4_mm":
+            skala = _from_blocked(self.bs, self.out_f, self.in_f // 16).float() * self.ts
+            w = F.embedding(self.q.int(), _lut256(self.q.device, self.dtype))
+            return (w.view(self.out_f, self.in_f // 16, 16) * skala.to(self.dtype).unsqueeze(-1)).view(
+                self.out_f, self.in_f)
         if self.art == "nvfp4":
             w = F.embedding(self.q.int(), _lut256(self.q.device, self.dtype))
             w = w.view(self.out_f, self.in_f // 16, 16) * self.scale.unsqueeze(-1)
@@ -526,7 +558,6 @@ class _Attn:
 
     def __call__(self, x, rope=None):
         import torch
-        import torch.nn.functional as F
         B, L, _ = x.shape
         e = Eingabe(x)
         q = self.wq(e).view(B, L, self.heads, -1).transpose(1, 2)
@@ -662,13 +693,95 @@ class _DiT:
         pos[L:, 2] = torch.arange(w, device=x.device).repeat(h).float()
         rope = _rope_tab(pos)
 
-        z = torch.cat((txt, img), 1)
-        for blk in self.blocks:
-            z = blk(z, vec, rope)
+        z = self.bloecke(torch.cat((txt, img), 1), vec, rope)
         scale, shift = (t + self.last_mod.unsqueeze(0)).chunk(2, dim=1)
         z = self.last((1 + scale) * _rms(z, self.last_norm, 1e-5) + shift)
         z = z[:, L:].reshape(B, h, w, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)
         return z.float()
+
+    def bloecke(self, z, vec, rope):
+        """Die Transformer-Blöcke (dort liegt fast die ganze Rechenzeit; trtmotor ersetzt nur sie)."""
+        for blk in self.blocks:
+            z = blk(z, vec, rope)
+        return z
+
+
+# ===========================================================================
+#  LoRA an den Transformer-Blöcken (Charakter-LoRA einer Persönlichkeit)
+# ===========================================================================
+
+LORA_ZIEL = "krea2"                                    # Profile/<Name>/LoRA/krea2.safetensors
+LORA_SCHICHTEN = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo", "mlp.gate", "mlp.up", "mlp.down")
+
+
+def lora_anbringen(dit: _DiT, rang: int, alpha: float, device, dtype) -> dict:
+    """Jede Ziel-Linear der Blöcke bekommt eine LoRA daneben (B = 0: rechnet zunächst wie vorher).
+    Gibt {"blocks.<i>.<teil>.<name>": LoraLinear} zurück."""
+    import lora as L
+    schichten = {}
+    for i, blk in enumerate(dit.blocks):
+        for ziel in LORA_SCHICHTEN:
+            teil, attr = ziel.split(".")
+            halter = getattr(blk, teil)
+            basis = getattr(halter, attr)
+            basis = basis.basis if isinstance(basis, L.LoraLinear) else basis
+            schicht = L.LoraLinear(basis, rang, alpha, device, dtype)
+            setattr(halter, attr, schicht)
+            schichten[f"blocks.{i}.{ziel}"] = schicht
+    return schichten
+
+
+def lora_einsetzen(dit: _DiT, pfad: Path, staerke: float, device, dtype) -> int:
+    """Gespeicherte LoRA neben die Gewichte setzen (die Grundgewichte bleiben, wie sie sind – auch NVFP4).
+    Gibt die Zahl der Schichten zurück; passt die LoRA nicht zu diesem Modell: RuntimeError."""
+    import torch
+    import lora as L
+    teile_, meta = L.laden(pfad)
+    if not teile_:
+        raise RuntimeError("die LoRA ist leer")
+    rang = next(iter(teile_.values()))[0].shape[0]
+    schichten = lora_anbringen(dit, rang, float(meta.get("alpha") or rang), device, dtype)
+    fremd = set(teile_) - set(schichten)
+    try:
+        if fremd:
+            raise RuntimeError(f"{len(fremd)} Schichten gibt es in diesem Modell nicht (z. B. {sorted(fremd)[0]})")
+        with torch.no_grad():
+            for name, s in schichten.items():
+                a, b, skala = teile_.get(name, (None, None, 0.0))
+                if a is None:
+                    s.B.zero_()
+                    continue
+                if tuple(a.shape) != tuple(s.A.shape) or tuple(b.shape) != tuple(s.B.shape):
+                    raise RuntimeError(f"{name} hat eine andere Form")
+                s.A.copy_(a)
+                s.B.copy_(b)
+                s.skala = skala * float(staerke)
+    except Exception:
+        lora_abnehmen(dit)
+        raise
+    return len(teile_)
+
+
+def lora_abnehmen(dit: _DiT) -> None:
+    import lora as L
+    for blk in dit.blocks:
+        for ziel in LORA_SCHICHTEN:
+            teil, attr = ziel.split(".")
+            halter = getattr(blk, teil)
+            if isinstance(getattr(halter, attr), L.LoraLinear):
+                setattr(halter, attr, getattr(halter, attr).basis)
+
+
+def lora_fuer_figur() -> Path | None:
+    """Die Krea-LoRA der aktiven Persönlichkeit, wenn sie existiert und `bild_lora` an ist (Vorgabe)."""
+    if not _cfg("bild_lora", True):
+        return None
+    try:
+        import profilordner
+        p = profilordner.lora_pfad(LORA_ZIEL)
+        return p if p.is_file() else None
+    except Exception:
+        return None
 
 
 # ===========================================================================
@@ -705,7 +818,6 @@ class _VAEBasis:
         return h + sc
 
     def _attn(self, x, p):
-        import torch.nn.functional as F
         b, c, hh, ww = x.shape
         q, k, v = self._conv(self._norm(x, p + ".norm"), p + ".to_qkv", 0).chunk(3, dim=1)
         q, k, v = (t.reshape(b, 1, c, hh * ww).transpose(-1, -2) for t in (q, k, v))
@@ -874,8 +986,10 @@ def _auf_gpu(art: str, pfad: Path, bauen, device):
     """
     eintrag = _RAM.get(art)
     if eintrag is not None and eintrag[0] == pfad:
+        _DBG.ereignis(f"Bildmotor: {art} aus dem RAM auf die GPU")
         return _kopie(eintrag[1], device)
     _RAM.pop(art, None)
+    _DBG.ereignis(f"Bildmotor: {art} von der Platte")
     obj = bauen()
     _RAM[art] = (pfad, _kopie(obj, "cpu", pin=True))
     return obj
@@ -892,7 +1006,14 @@ def entladen() -> None:
         if _TIMER is not None:
             _TIMER.cancel()
             _TIMER = None
-        _RAM.clear()
+        while _RAM:                         # Stück für Stück: Freigeben hält Python kurz fest
+            _RAM.popitem()
+            time.sleep(0.02)
+        try:
+            from trtmotor import bild as _tb
+            _tb.entladen()
+        except Exception:
+            pass
         _frei()
         try:                                # gepinnten RAM an Windows zurückgeben
             import torch
@@ -901,6 +1022,7 @@ def entladen() -> None:
                 leeren()
         except Exception:
             pass
+    _DBG.ereignis("Bildmotor entladen")
 
 
 # Kommt eine Weile kein Bild mehr, wird auch der Arbeitsspeicher geräumt.
@@ -930,10 +1052,63 @@ def _uhr_neu() -> None:
     _TIMER.start()
 
 
+def _trt():
+    """trtmotor.bild, wenn TensorRT-RTX abgelegt ist und Config bild_trt nicht aus – sonst None."""
+    try:
+        import config
+        if not config.load().get("bild_trt", True):
+            return None
+        import torch
+        from trtmotor import bild, laufzeit
+        return bild if torch.cuda.is_available() and laufzeit.bereit() else None
+    except Exception:
+        return None
+
+
+def _dit_holen(pfad: Path, device, dtype, on_status, trt: bool = True):
+    """Das DiT für dieses Bild. Mit fertigem TensorRT-Netz kommen nur die kleinen Teile auf die Karte,
+    die Blöcke rechnet TensorRT. Sonst wie bisher – trtmotor misst dabei ein und baut danach.
+    `trt=False` (mit LoRA): immer die eigenen Blöcke, ohne Einmessen."""
+    tb = _trt() if trt else None
+    ram = _RAM.get("dit")
+    if tb is not None and ram is not None and ram[0] == pfad:
+        bloecke = tb.bloecke(pfad)
+        if bloecke is not None:
+            leer = object.__new__(_DiT)
+            leer.__dict__.update({k: v for k, v in vars(ram[1]).items() if k != "blocks"})
+            leer.blocks = []
+            dit = _kopie(leer, device)
+            dit.bloecke = bloecke
+            _DBG.ereignis("Bildmotor: Blöcke über TensorRT")
+            return dit
+    dit = _auf_gpu("dit", pfad, lambda: _DiT(pfad, device, dtype, on_status), device)
+    if tb is not None:
+        try:
+            tb.einmessen(pfad, dit)
+        except Exception as exc:
+            _DBG.ereignis(f"TensorRT-Einmessung übersprungen: {exc}")
+    return dit
+
+
+def _trt_nach_bild(pfad: Path) -> None:
+    """Gewichte des TensorRT-Netzes aus dem VRAM; ist die Einmessung fertig, im Hintergrund bauen."""
+    tb = _trt()
+    if tb is None:
+        return
+    try:
+        tb.nach_bild(pfad)
+        ram = _RAM.get("dit")
+        if ram is not None and ram[0] == pfad:
+            tb.vorbereiten(pfad, ram[1])
+    except Exception as exc:
+        _DBG.ereignis(f"TensorRT-Krea: {exc}")
+
+
 def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype, on_status,
-          bild=None, staerke: float = 1.0):
+          bild=None, staerke: float = 1.0, lora: Path | None = None, lora_staerke: float = 1.0):
     """Die eigentliche Rechnung. Gibt das Bild als uint8-Array zurück.
-    Mit `bild` (uint8, H×W×3) wird es ab Rauschstärke `staerke` nachgemalt statt neu."""
+    Mit `bild` (uint8, H×W×3) wird es ab Rauschstärke `staerke` nachgemalt statt neu.
+    Mit `lora` rechnet sie neben den Blöcken mit (ohne TensorRT – dessen Netz kennt sie nicht)."""
     import numpy as np
     import torch
 
@@ -959,7 +1134,11 @@ def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype
 
     if on_status:
         on_status("Krea 2: Modell in den VRAM …")
-    dit = _auf_gpu("dit", pfad, lambda: _DiT(pfad, device, dtype, on_status), device)
+    dit = _dit_holen(pfad, device, dtype, on_status, trt=lora is None)
+    if lora is not None:
+        if on_status:
+            on_status("Krea 2: LoRA dazu …")
+        lora_einsetzen(dit, lora, lora_staerke, device, dtype)        # nur in der Arbeitskopie auf der Karte
     with torch.no_grad():
         txt = dit.text(ctx)
     del ctx
@@ -973,6 +1152,8 @@ def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype
         x0 = (1.0 - sig[0]) * start + sig[0] * noise       # Flow-Matching: Bild + Rauschen
     lat = _sample(dit, x0, txt, sig, sampler, seed, on_status)
     del dit, txt, noise, sig, x0, start
+    if lora is None:
+        _trt_nach_bild(pfad)
     _frei()
 
     if on_status:
@@ -1004,8 +1185,12 @@ def _geraet():
 def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
              size: tuple[int, int] | None = None, seed: int | None = None,
              sampler: str | None = None, shift: float | None = None,
-             on_status=None) -> str:
-    """Malt EIN Bild mit Krea 2 und gibt den Pfad zurück. Blockiert."""
+             on_status=None, vorlage: str | None = None, staerke: float = 0.6, lora: str | Path | None = None,
+             lora_staerke: float | None = None) -> str:
+    """Malt EIN Bild mit Krea 2 und gibt den Pfad zurück. Blockiert.
+    Mit `vorlage` (Bildpfad) wird dieses Bild ab Rauschstärke `staerke` umgezeichnet statt neu gemalt:
+    Figur, Kleidung und Licht bleiben, der Prompt ändert Pose und Handlung (z. B. Schlüsselbilder fürs Video).
+    `lora`: Charakter-LoRA (z. B. lora_fuer_figur()), Stärke aus `bild_lora_staerke` (Vorgabe 1.0)."""
     grund = missing_reason()
     if grund:
         raise RuntimeError(grund)
@@ -1026,14 +1211,25 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
         seed = int(time.time() * 1000) & 0x7FFFFFFF
 
     device, dtype = _geraet()
+    lora = Path(lora) if lora else None
+    if lora is not None and not lora.is_file():
+        raise RuntimeError(f"LoRA-Datei nicht gefunden: {lora}")
+    lora_staerke = float(_cfg("bild_lora_staerke", 1.0) if lora_staerke is None else lora_staerke)
 
     fehler = None
     with _LOCK:
         if _TIMER is not None:
             _TIMER.cancel()                 # neues Bild: nicht mittendrin entladen
         try:
+            bild = None
+            if vorlage:
+                import numpy as np
+                from PIL import Image, ImageOps
+                with Image.open(vorlage) as im:
+                    bild = np.asarray(ImageOps.fit(im.convert("RGB"), (W, H), Image.LANCZOS))
             arr = _male(prompt, ref, modelle[ref], t, steps, sampler, shift, W, H, seed,
-                        device, dtype, on_status)
+                        device, dtype, on_status, bild=bild, staerke=float(staerke), lora=lora,
+                        lora_staerke=lora_staerke)
         except Exception as e:
             # Nur den Text behalten: der Traceback hielte sonst alle Tensoren fest.
             fehler = f"{type(e).__name__}: {e}"
@@ -1048,7 +1244,8 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
     meta.add_text("prompt", prompt)
     meta.add_text("model", ref)
     meta.add_text("params", f"steps={steps}, cfg=1, size={W}x{H}, seed={seed}, "
-                            f"sampler={sampler}, shift={shift}, backend=krea2")
+                            f"sampler={sampler}, shift={shift}, backend=krea2"
+                            + (f", lora={lora.stem}:{lora_staerke:g}" if lora else ""))
     Image.fromarray(arr).save(out, pnginfo=meta)
     return str(out)
 
@@ -1058,10 +1255,15 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
 # ===========================================================================
 
 def _cfg(key: str, standard):
+    """Config-Wert im Typ des Standards; Schalter verstehen auch "false"/"aus"/"nein"/"0" als Text."""
     try:
         import config
         wert = config.load().get(key)
-        return standard if wert is None else type(standard)(wert)
+        if wert is None:
+            return standard
+        if isinstance(standard, bool) and isinstance(wert, str):
+            return wert.strip().lower() not in ("false", "aus", "nein", "no", "off", "0", "")
+        return type(standard)(wert)
     except Exception:
         return standard
 
@@ -1079,16 +1281,30 @@ def _arbeitsgroesse(cw: int, ch: int, kante: int) -> tuple[int, int, float]:
     return W, H, lupe
 
 
+_GESICHT_HINWEIS = False          # fehlendes Seh-Modell nur einmal je Sitzung melden
+
+
+GESICHTSZUEGE = "Gesichtszuege"      # Unterordner neben dem Original für nachgemalte Gesichter
+
+
 def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None = None,
                         on_status=None) -> str | None:
     """Gesichter eines Krea-Bildes vergrößert nachmalen und weich einsetzen.
 
-    Das Original bleibt; das Ergebnis liegt daneben als `<name>_gesicht.png`.
-    None, wenn kein Gesicht gefunden wurde, alle schon groß genug sind oder
-    OpenCV fehlt. Blockiert."""
+    Gesichter findet das Seh-Modell (gesichter.finden); nachgemalt wird nur mit GESICHT_SATZ,
+    nicht mit dem Szenen-Prompt. Das Original bleibt; das Ergebnis liegt im Unterordner
+    `Gesichtszuege/<name>.png` (GESICHTSZUEGE). None, wenn kein sicheres Gesicht gefunden wurde oder alle schon groß
+    genug sind. Fehlt das Seh-Modell, einmal je Sitzung RuntimeError mit dem Grund, danach None.
+    Blockiert."""
+    global _GESICHT_HINWEIS
     import gesichter
-    if not gesichter.verfuegbar() or missing_reason():
+    if missing_reason():
         return None
+    if (grund := gesichter.grund()):
+        if _GESICHT_HINWEIS:
+            return None
+        _GESICHT_HINWEIS = True
+        raise RuntimeError(grund)
 
     import re
     import numpy as np
@@ -1109,7 +1325,7 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
     sampler = m.group(1) if m and m.group(1) in ("euler", "euler_ancestral") else DEFAULTS["sampler"]
     m = re.search(r"seed=(\d+)", params)
     seed = (int(m.group(1)) if m else int(time.time() * 1000)) + 1
-    prompt = f"{GESICHT_SATZ} {meta.get('prompt', '')}".strip()
+    prompt = GESICHT_SATZ
 
     modelle = discover()
     ref = _modell(meta.get("model"), modelle)
@@ -1144,7 +1360,8 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
         return None
 
     p = Path(path)
-    ziel = p.with_name(f"{p.stem}_gesicht.png")
+    ziel = p.parent / GESICHTSZUEGE / f"{p.stem}.png"
+    ziel.parent.mkdir(parents=True, exist_ok=True)
     info = PngImagePlugin.PngInfo()
     for k, v in meta.items():
         info.add_text(k, str(v))

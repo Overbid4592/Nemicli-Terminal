@@ -51,7 +51,7 @@ _current = DEFAULT
 _auto_until: float | None = None     # monotonic-Zeit, zu der der Zünder auslöst
 
 # Werkzeuge, die auch im Chat-Modus frei bleiben (schreiben nur nach learned/).
-MEMORY_TOOLS = {"merken", "skill_merken"}
+MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen"}
 
 # Reine LESE-Werkzeuge: NUR diese dürfen im Modus „lesen" laufen. Alles andere
 # blockt dort – ausdrücklich als Allowlist, damit ein neues oder unbekanntes
@@ -64,12 +64,20 @@ READ_TOOLS = {
     "charakter_zeigen",
     "api_nachschlagen", "code_pruefen", "paket_info", "seite_ansehen", "doku_suchen",
     "dateien_suchen", "inhalt_suchen",
-    "web_lesen", "web_wiki", "web_suche", "ml_status",
+    "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
     "gedaechtnis_suchen", "gedaechtnis_lesen", "skill_laden",
     # feste Systemabfragen (systemabfrage.py) + Zeitplan ansehen
     "abfragen", "zeitplan_anzeigen",
     # Systemwache: nachsehen ist lesen
     "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar",
+    # Sicherungen ansehen und Prüfsummen nachrechnen
+    "backup_liste",
+    # Entwicklung: den laufenden Debugbericht lesen, sich selbst prüfen
+    "debugbericht", "selbstdiagnose",
+    # Hintergrund-Aufgaben nachsehen
+    "aufgaben",
+    # bewährten Code aus früheren Projekten nachschlagen
+    "coding_sammlung",
 }
 # Im Hintergrund-Prozess der Wache (Modus lesen, niemand drückt F8) sind ein
 # paar schreibende Werkzeuge trotzdem frei: Urteilen und Justieren schreiben
@@ -77,7 +85,8 @@ READ_TOOLS = {
 # nach Bilder/ – das Kugel-Fenster soll Bilder liefern können. Dateien, Befehle,
 # Löschen bleiben gesperrt: dafür gibt es das große NemiCLI.
 WACHE_URTEIL_TOOLS = {"wache_bewerten", "wache_justieren", "merken", "skill_merken", "bild_malen",
-                      "bildschirm_ansehen", "kugel"}
+                      "bildschirm_ansehen", "kugel", "tagebuch", "lieblingsbild", "profilbild", "portraet_bewegen",
+                      "vorschau_schliessen", "erinnern", "kugel_anziehen"}
 _wache_dienst = False
 
 
@@ -166,10 +175,10 @@ def fuse_message() -> str:
 
 def _inside_cwd(action: dict) -> bool:
     """Liegen ALLE Pfade der Aktion im aktuellen Ordner (oder darunter)?
-    Ohne Pfadfeld (z.B. befehl) gilt: ja."""
-    import workspace
-    ws = workspace.pfad()
-    cwd = ws if ws else Path(os.getcwd()).resolve()
+    Ohne Pfadfeld (z.B. befehl) gilt: ja. Läuft der Coding-Assistent, zählt sein Projekt."""
+    import coding
+    p = coding.projekt()
+    cwd = p.resolve() if p else Path(os.getcwd()).resolve()
     for f in _PATH_FIELDS:
         v = action.get(f)
         if not isinstance(v, str) or not v.strip():
@@ -183,20 +192,17 @@ def _inside_cwd(action: dict) -> bool:
     return True
 
 
-def _ausserhalb_workspace(action: dict) -> str | None:
-    """Bricht diese Aktion aus dem festgenagelten Workspace aus?
+def _ausserhalb_projekt(action: dict) -> str | None:
+    """Erstes Pfadfeld außerhalb des Coding-Projekts – sonst None (auch ohne Assistent).
 
-    Gibt das erste verletzende Pfadfeld zurueck, sonst None. Ohne aktiven
-    Workspace immer None. Werkzeuge OHNE Pfadfeld (z.B. `befehl`) fangen wir
-    hier nicht ab - die haben ihren eigenen Filter und laufen im Arbeitsordner."""
-    import workspace
-    if not workspace.aktiv():
+    Werkzeuge ohne Pfadfeld (z.B. `befehl`) zählen nicht: sie haben ihren eigenen
+    Filter und laufen ohnehin im Projektordner."""
+    import coding
+    if coding.projekt() is None:
         return None
     for f in _PATH_FIELDS:
         v = action.get(f)
-        if not isinstance(v, str) or not v.strip():
-            continue
-        if not workspace.drin(v):
+        if isinstance(v, str) and v.strip() and not coding.drin(v):
             return v
     return None
 
@@ -213,10 +219,10 @@ def decide(action: dict, needs_confirm: bool) -> str:
         return "run"
     if tool == "menue_oeffnen":        # das Menü IST die Rückfrage: der Nutzer wählt selbst
         return "run"
-    # Der Workspace-Riegel steht VOR den Modi: hat der Nutzer einen Ordner
-    # festgenagelt, kommt da nichts raus - auch nicht im Auto-Modus.
-    if _ausserhalb_workspace(action) is not None:
-        return "block"
+    # Coding-Assistent an: Dateiaktionen außerhalb des Projekts sieht der Nutzer
+    # in jedem Modus, auch Auto – so driftet die KI nicht unbemerkt ab. Fragen
+    # statt sperren, weil die KI den Assistenten selbst einschaltet.
+    draussen = _ausserhalb_projekt(action) is not None
     if mode == "lesen":
         # Nur echte Lese-Werkzeuge laufen – ausdrücklich per Allowlist. Alles,
         # was irgendwo schreibt (auch confirm=False wie bild_malen, merken,
@@ -225,13 +231,21 @@ def decide(action: dict, needs_confirm: bool) -> str:
             return "run"
         if tool not in READ_TOOLS:
             return "block"
-        return "ask" if needs_confirm else "run"        # Netz-Taint kann selbst Lesen bremsen
+        return "ask" if needs_confirm or draussen else "run"   # Netz-Taint kann selbst Lesen bremsen
+    if draussen:
+        return "ask"
     if tool in ("skill_schreiben", "skill_ausbessern"):
         # Skills werden später befolgt: Prüffenster in jedem Modus, auch Auto –
         # frei nur mit /skills selbst an (steckt in needs_confirm, samt Netz-Taint).
         return "ask" if needs_confirm else "run"
     if tool == "einstellung_aendern":
         return "ask"                    # Prüffenster in jedem Modus, auch Auto
+    try:                                # Wächter: Persönlichkeit, Anleitungen, Zeitplan, Skripte
+        import sicherheit
+        if sicherheit.steuerdatei_grund(action):
+            return "ask"
+    except ImportError:
+        pass
     if tool == "todo":
         # Mit Prüfbefehl gelten die Regeln von `befehl`. Sonst entscheidet der
         # Nutzer in jedem Modus: Liste abnicken, Kriterium ändern, streichen,
@@ -248,18 +262,23 @@ def decide(action: dict, needs_confirm: bool) -> str:
     if mode in AUTO_MODES:
         if tool in MEMORY_TOOLS and needs_confirm:      # Netz-Taint bleibt
             return "ask"
+        if needs_confirm and _nach_netz_inhalt(action):  # Netz-Sperre: Auto hebt sie nicht auf
+            return "ask"
         if needs_confirm and tool != "befehl" and not _inside_cwd(action):
             return "ask"                                 # Datei außerhalb des Ordners
         return "run"
     return "ask" if needs_confirm else "run"             # normal
 
 
+def _nach_netz_inhalt(action: dict) -> bool:
+    try:
+        import actions
+        return actions.fremd_grund(action) is not None
+    except ImportError:
+        return False
+
+
 def block_message(action: dict) -> str:
-    draussen = _ausserhalb_workspace(action)
-    if draussen is not None:
-        import workspace
-        return (f"'{draussen}' liegt außerhalb des Workspace. "
-                + workspace.grenze_text())
     return (f"Im Modus {label('lesen')} ist '{action.get('tool', '?')}' gesperrt – "
             "hier wird nur gelesen, nichts angerührt. Schlag dem Nutzer vor, was du tun "
             "würdest; zum Ausführen schaltet er mit Shift+Tab auf Normal oder Auto.")

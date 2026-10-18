@@ -9,6 +9,8 @@ es nur mit NVIDIA, sonst die CPU) und wie viel Speicher ein Modell dort nutzen k
 from __future__ import annotations
 
 import ctypes
+import functools
+import json
 import re
 import shutil
 import sys
@@ -21,9 +23,27 @@ _GRAFIK_KLASSE = r"SYSTEM\CurrentControlSet\Control\Class\{4d36e968-e325-11ce-bf
 _CPU_SCHLUESSEL = r"HARDWARE\DESCRIPTION\System\CentralProcessor\0"
 _KEINE_KARTE = ("basic", "virtual", "remote", "parsec", "idd", "mirror", "displaylink", "citrix", "vmware")
 _PF_AVX2, _PF_AVX512F = 40, 41    # IsProcessorFeaturePresent
-# Rechen-Stufe → Generation (genaue Stufe vor der Hauptnummer)
-_GENERATION = {"8.9": "Ada", "7.5": "Turing", "12": "Blackwell", "10": "Blackwell", "9": "Hopper",
-               "8": "Ampere", "7": "Volta", "6": "Pascal"}
+# Modell-Datenbank, Teil Hardware – direkt als JSON gelesen (ggufengine lädt beim Import torch)
+try:                                     # exe: mitgeliefert im Bündel
+    from paths import ASSETS as _BASIS
+except ImportError:                      # ohne Bootstrap
+    _BASIS = Path(__file__).resolve().parent.parent
+_DB_HARDWARE = _BASIS / "ggufengine" / "daten" / "hardware.json"
+
+
+@functools.lru_cache(maxsize=1)
+def hardware() -> dict:
+    """hardware.json (Generationen, torch-Baus je Rechen-Stufe); leer, wenn die Datei fehlt."""
+    try:
+        daten = json.loads(_DB_HARDWARE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return daten if isinstance(daten, dict) else {}
+
+
+def nvidia() -> dict:
+    nv = hardware().get("nvidia")
+    return nv if isinstance(nv, dict) else {}
 
 
 @dataclass
@@ -40,9 +60,10 @@ class Grafikkarte:
         """NVIDIA-Generation aus der Rechen-Stufe."""
         if not self.cuda_cap:
             return ""
-        if self.cuda_cap in _GENERATION:
-            return _GENERATION[self.cuda_cap]
-        return _GENERATION.get(self.cuda_cap.split(".")[0], "")
+        generation = nvidia().get("generationen") or {}
+        if self.cuda_cap in generation:
+            return generation[self.cuda_cap]
+        return generation.get(self.cuda_cap.split(".")[0], "")
 
 
 @dataclass

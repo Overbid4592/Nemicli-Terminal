@@ -172,7 +172,7 @@ def detected() -> dict[str, Provider]:
 # Die Modell-Liste holen wir aber aus /api/tags, weil die (anders als /v1/models)
 # die Capabilities mitliefert: so filtern wir Embeddings raus und erkennen Vision.
 def _norm_host(raw: str) -> str:
-    host = (raw or "http://localhost:11434").strip().rstrip("/")
+    host = (raw or "http://127.0.0.1:11434").strip().rstrip("/")   # nicht localhost: Ollama lauscht nur auf IPv4
     if not host.startswith(("http://", "https://")):
         host = "http://" + host
     return host
@@ -181,6 +181,7 @@ def _norm_host(raw: str) -> str:
 OLLAMA_HOST = _norm_host(os.getenv("OLLAMA_HOST", ""))
 _ollama_cache: dict = {"t": -1e9, "tags": None}
 _OLLAMA_TTL = 8.0          # Sekunden: so lange gilt eine Erreichbarkeits-Abfrage
+_OLLAMA_TTL_AUS = 30.0     # „nicht erreichbar“ gilt länger: jede neue Abfrage kostet Wartezeit
 
 
 def ollama_host() -> str:
@@ -195,10 +196,13 @@ def ollama_base() -> str:
 def _ollama_tags(force: bool = False) -> list | None:
     """Gecachte /api/tags-Antwort. None = Ollama nicht erreichbar."""
     now = time.monotonic()
-    if not force and now - _ollama_cache["t"] < _OLLAMA_TTL:
+    ttl = _OLLAMA_TTL if _ollama_cache["tags"] is not None else _OLLAMA_TTL_AUS
+    if not force and now - _ollama_cache["t"] < ttl:
         return _ollama_cache["tags"]
     try:
-        r = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=0.8)
+        # Kurzer Verbindungsaufbau: ein laufendes Ollama nimmt sofort an. Ein abgelehnter
+        # Aufbau zu localhost dauert unter Windows sonst rund 2 s je Adresse (::1, 127.0.0.1).
+        r = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=httpx.Timeout(0.8, connect=0.25))
         r.raise_for_status()
         tags = r.json().get("models") or []
     except Exception:
@@ -280,7 +284,8 @@ def _ollama_capabilities(model_id: str) -> list:
     if model_id in _ollama_caps_cache:
         return _ollama_caps_cache[model_id]
     try:
-        r = httpx.post(f"{OLLAMA_HOST}/api/show", json={"model": model_id}, timeout=3.0)
+        r = httpx.post(f"{OLLAMA_HOST}/api/show", json={"model": model_id},
+                       timeout=httpx.Timeout(3.0, connect=0.25))
         r.raise_for_status()
         caps = r.json().get("capabilities") or []
     except Exception:
@@ -331,7 +336,17 @@ def _auth_headers(p: Provider) -> dict:
     key = p.key() or ""
     if p.kind == "anthropic":
         return {"x-api-key": key, "anthropic-version": "2023-06-01"}
+    if p.id == "google":                       # Gemini: Schlüssel im Kopf – in der Adresse stünde er in Fehlermeldungen
+        return {"x-goog-api-key": key}
     return {"Authorization": f"Bearer {key}"}
+
+
+def status_text(anbieter: str, status: int) -> str:
+    """Fehler einer Anfrage ohne Adresse und Schlüssel – nur der Status, bei 401/403 mit Hinweis."""
+    if status in (401, 403):
+        return (f"{anbieter} lehnt den API-Schlüssel ab ({status}) – ist er gültig und für diese Schnittstelle "
+                "freigeschaltet? Neu eintragen unter /model.")
+    return f"{anbieter} antwortet mit Fehler {status}."
 
 
 def _parse_models(p: Provider, data: dict) -> list[str]:
@@ -392,14 +407,10 @@ async def list_models(provider_id: str, limit: int = 40,
     if not force and hit and time.monotonic() - hit[0] < _MODELS_TTL:
         return list(hit[1])
 
-    url = p.list_url
-    params = {}
-    if p.id == "google":                       # Gemini will den Key als ?key=
-        params["key"] = p.key() or ""
-
     async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(url, headers=_auth_headers(p), params=params)
-        r.raise_for_status()
+        r = await client.get(p.list_url, headers=_auth_headers(p))
+        if r.status_code >= 400:
+            raise RuntimeError(status_text(p.label, r.status_code))
         data = r.json()
 
     ids = [mid for mid in _parse_models(p, data) if p.keep(mid)]

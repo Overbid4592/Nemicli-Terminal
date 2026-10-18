@@ -1,0 +1,47 @@
+{
+ "version": 1,
+ "beschreibung": "Hardware: Generation je NVIDIA-Rechen-Stufe (Compute Capability) und welcher torch-Bau (CUDA-Kanal) zu welcher Stufe passt, samt nötiger Treiber-CUDA-Version.",
+ "nvidia": {
+  "generationen": {
+   "8.9": "Ada",
+   "7.5": "Turing",
+   "12": "Blackwell",
+   "10": "Blackwell",
+   "9": "Hopper",
+   "8": "Ampere",
+   "7": "Volta",
+   "6": "Pascal"
+  },
+  "generationen_hinweis": "genaue Stufe (z. B. 8.9) vor der Hauptnummer (z. B. 8)",
+  "torch_baus": [
+   {
+    "ab_stufe": 12,
+    "kanal": "cu132",
+    "cuda": 13.2,
+    "grund": "Blackwell (sm_120): CUDA-13.2-Bau (torch 2.14), FP4-Tensorkerne für Krea 2"
+   },
+   {
+    "ab_stufe": 8,
+    "kanal": "cu126",
+    "cuda": 12.6,
+    "grund": "passt für Ampere/Ada (RTX 30xx/40xx)"
+   },
+   {
+    "ab_stufe": 7,
+    "kanal": "cu126",
+    "cuda": 12.6,
+    "grund": "passt für Turing (RTX 20xx / GTX 16xx)"
+   }
+  ],
+  "torch_baus_hinweis": "der erste Eintrag mit ab_stufe <= Hauptnummer gilt; cuda = nötige Treiber-CUDA-Version",
+  "zu_alt": {
+   "kanal": "cpu",
+   "grund": "diese Karte ist für CUDA zu alt – nur CPU"
+  },
+  "unbekannt": {
+   "kanal": "cu126",
+   "cuda": 12.6,
+   "grund": "Standard-CUDA-Bau"
+  }
+ }
+}

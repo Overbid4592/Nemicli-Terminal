@@ -27,7 +27,8 @@ import torch.nn.functional as F
 
 from ..gguf import GGUFError, GGUFFile
 from ..quant import dequantize
-from .common import PREFILL_CHUNK, GraphDecoder, KVCache, RingKVCache, RoPE, WeightLoader, attention, rms_norm
+from .common import (PREFILL_CHUNK, GraphDecoder, KVCache, RingKVCache, RoPE, WeightLoader, attention,
+                     letzte_zeilen, logit_zeilen, rms_norm)
 from .moe import Experten
 
 
@@ -169,6 +170,7 @@ class _Layer:
 
 
 class Gemma4Model:
+    alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
     arch_names = ("gemma4",)
 
     def __init__(self, gg: GGUFFile, device: torch.device, dtype: torch.dtype, n_ctx: int = 8192, progress=None,
@@ -318,12 +320,19 @@ class Gemma4Model:
             ple = (proj + pl) * (1.0 / math.sqrt(2.0))                   # (L, n_layer, Epl)
         for i, layer in enumerate(self.layers):
             h = layer(h, pos_idx, kv_len, ple[:, i] if ple is not None else None, spans)
-        h = rms_norm(h[-1:], self.out_norm, self.hp["eps"])
-        logits = self.lm_head(h)[0].float()
+        h = rms_norm(letzte_zeilen(self, h), self.out_norm, self.hp["eps"])
+        logits = logit_zeilen(self, self.lm_head(h)).float()
         cap = self.hp["softcap"]
         if cap > 0:
             logits = cap * torch.tanh(logits / cap)
         return logits
+
+    def vor_graph(self, tokens: List[int]) -> None:
+        """Host-side step before every run, also before a captured graph: the per-layer rows of
+        the tokens from the table in RAM into the GPU buffer the graph reads."""
+        if self.ple_ram:
+            packed = self.pl_embed.rows.index_select(0, torch.tensor(tokens, dtype=torch.long))
+            self._pl_raw[:len(tokens)].copy_(packed)
 
     @torch.inference_mode()
     def forward(self, tokens: List[int], pos: int, inject=None) -> torch.Tensor:
@@ -333,9 +342,7 @@ class Gemma4Model:
             raise ValueError(f"at most {PREFILL_CHUNK} tokens per call (sliding-window ring cache)")
         if any(not 0 <= t < self.n_vocab for t in tokens):
             raise ValueError("token id out of range")
-        if self.ple_ram:
-            packed = self.pl_embed.rows.index_select(0, torch.tensor(tokens, dtype=torch.long))
-            self._pl_raw[:len(tokens)].copy_(packed)
+        self.vor_graph(tokens)
         if len(tokens) == 1 and self.graph is not None and inject is None:
             return self.graph(tokens[0], pos)
         tok = torch.tensor(tokens, device=self.device, dtype=torch.long)

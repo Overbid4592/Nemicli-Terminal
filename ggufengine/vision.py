@@ -4,12 +4,13 @@ the file and picks the matching encoder:
 
 * "gemma4v"         -> Gemma4Vision  (Gemma 4)
 * "gemma4uv"        -> Gemma4UnifiedVision (Gemma 4 12B, no encoder layers)
-* "qwen3vl_merger"  -> Qwen3VLVision (Qwen3-VL / Qwen3.5)
+* "qwen3vl_merger"  -> Qwen3VLVision (Qwen3-VL with DeepStack / Qwen3.5)
 * "pixtral"         -> PixtralVision (Mistral Small 3.x, Ministral 3)
 
 Every encoder exposes `marks` (begin, placeholder, end token of an image in the
 prompt), `n_out` (width of the embeddings), `default_tokens`, `load()`, `unload()`
-and `encode()`.
+and `encode()`.  Encoders with DeepStack (`n_deepstack` > 0) return `n_out * (1 +
+n_deepstack)` columns: the input embeddings, then one block per early LM layer.
 
 Gemma 4 vision encoder ("gemma4v" mmproj), following llama.cpp's
 tools/mtmd/models/gemma4v.cpp and the transformers reference:
@@ -30,6 +31,7 @@ image is encoded (`load()` / `unload()`).
 from __future__ import annotations
 
 import math
+import re
 from typing import List, Optional, Tuple
 
 import torch
@@ -303,6 +305,9 @@ class Qwen3VLVision:
       rotary frequencies, column on the second, NeoX pairs over the full head) ->
       bidirectional attention -> LayerNorm -> GELU(tanh) MLP, all linears with bias
     * merger: LayerNorm -> 4 neighbouring patches concatenated -> linear -> GELU -> linear
+    * DeepStack (Qwen3-VL, tensors v.deepstack.<block>.*): after the marked blocks a
+      second merger – 4 patches concatenated -> LayerNorm -> linear -> GELU -> linear –
+      makes features for the first LM layers; appended as extra columns in block order
     The embeddings come out row-major over the merged grid; `encode` also returns its
     shape for the M-RoPE positions of the language model."""
 
@@ -332,6 +337,8 @@ class Qwen3VLVision:
         self.head_dim = self.n_embd // self.n_head
         if self.head_dim % 4:
             raise GGUFError("vision head size must be a multiple of 4")
+        self.deepstack = _deepstack_blocks(g, self.n_layer)
+        self.n_deepstack = len(self.deepstack)
         self.device = torch.device(device)
         self.dtype = dtype
         self.loaded = False
@@ -371,13 +378,23 @@ class Qwen3VLVision:
         self.mm2 = (ld.get("mm.2.weight"), opt("mm.2.bias"))
         if self.mm0[0].shape[1] != E * self.merge ** 2 or self.mm2[0].shape[0] != self.n_out:
             raise GGUFError("merger has an unexpected shape")
+        self.ds = {}
+        for i in self.deepstack:
+            p = f"v.deepstack.{i}."
+            ds = {"norm": (ld.get(p + "norm.weight", f32), ld.get(p + "norm.bias", f32)),
+                  "fc1": (ld.get(p + "fc1.weight"), opt(p + "fc1.bias")),
+                  "fc2": (ld.get(p + "fc2.weight"), opt(p + "fc2.bias"))}
+            if (ds["norm"][0].shape[0] != E * self.merge ** 2 or ds["fc1"][0].shape[1] != E * self.merge ** 2
+                    or ds["fc2"][0].shape[0] != self.n_out):
+                raise GGUFError(f"deepstack merger {i} has an unexpected shape")
+            self.ds[i] = ds
         rot = self.head_dim // 2                                          # rotary dims of one axis pair
         self.inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rot, 2, device=self.device,
                                                          dtype=torch.float32) / rot))
         self.loaded = True
 
     def unload(self):
-        for name in ("patch_w", "patch_b", "pos_table", "blocks", "post_ln", "mm0", "mm2", "inv_freq"):
+        for name in ("patch_w", "patch_b", "pos_table", "blocks", "post_ln", "mm0", "mm2", "ds", "inv_freq"):
             self.__dict__.pop(name, None)
         self.loaded = False
         if self.device.type == "cuda":
@@ -428,7 +445,9 @@ class Qwen3VLVision:
         cos, sin = ang.cos().unsqueeze(1), ang.sin().unsqueeze(1)
         N, H, D = h.shape[0], self.n_head, self.head_dim
         lin = lambda t, wb: F.linear(t.to(wb[0].dtype), wb[0], wb[1]).float()
-        for b in self.blocks:
+        m = self.merge
+        tief = []
+        for nr, b in enumerate(self.blocks):
             y = F.layer_norm(h, (E,), *b["ln1"], self.eps)
             q, k, v = lin(y, b["qkv"]).view(N, 3, H, D).unbind(1)
             q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
@@ -439,9 +458,13 @@ class Qwen3VLVision:
             h = h + lin(a, b["out"])
             y = F.layer_norm(h, (E,), *b["ln2"], self.eps)
             h = h + lin(F.gelu(lin(y, b["up"]), approximate="tanh"), b["down"])
-        m = self.merge
+            if nr in self.ds:
+                ds = self.ds[nr]
+                y = F.layer_norm(h.reshape(-1, E * m * m), (E * m * m,), *ds["norm"], self.eps)
+                tief.append(lin(F.gelu(lin(y, ds["fc1"])), ds["fc2"]))
         y = F.layer_norm(h, (E,), *self.post_ln, self.eps).reshape(-1, E * m * m)
-        return lin(F.gelu(lin(y, self.mm0)), self.mm2), (gy // m, gx // m)
+        out = lin(F.gelu(lin(y, self.mm0)), self.mm2)
+        return (torch.cat([out] + tief, dim=1) if tief else out), (gy // m, gx // m)
 
 
 class PixtralVision:
@@ -626,6 +649,19 @@ def _fit_grid(width: int, height: int, tokens: int) -> Tuple[int, int]:
         else:
             ny -= 1
     return nx, ny
+
+
+def _deepstack_blocks(gg: GGUFFile, n_layer: int) -> List[int]:
+    """ViT blocks with a DeepStack merger, from the tensor names (the converter also
+    writes clip.vision.is_deepstack_layers; both must agree when present)."""
+    bloecke = sorted({int(m.group(1)) for t in gg.tensor_list
+                      if (m := re.fullmatch(r"v\.deepstack\.(\d+)\.fc1\.weight", t.name))})
+    flags = gg.get("clip.vision.is_deepstack_layers")
+    if isinstance(flags, list) and any(flags) and [i for i, f in enumerate(flags) if f] != bloecke:
+        raise GGUFError("clip.vision.is_deepstack_layers does not match the deepstack tensors")
+    if any(not 0 <= i < n_layer for i in bloecke):
+        raise GGUFError("deepstack block index out of range")
+    return bloecke
 
 
 # -- automatic selection -------------------------------------------------------

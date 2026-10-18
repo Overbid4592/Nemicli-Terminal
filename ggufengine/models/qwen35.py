@@ -1,7 +1,10 @@
 """
 Qwen3.5 (arch "qwen35"): hybrid of Gated DeltaNet linear-attention layers and
 gated full-attention layers (every `full_attention_interval`-th layer), SwiGLU
-MLP, tied embeddings.
+MLP, tied embeddings.  Also "qwen35moe" (Qwen3.5/3.6 MoE) and "qwen3next": the same
+layers with a mixture-of-experts FFN (softmax router, top-k renormalised, a shared
+expert behind a sigmoid gate).  The MTP layer at the end (nextn_predict_layers) is not
+part of the main model; it proposes tokens for speculative decoding (see `_Mtp`).
 
 Tensor layout notes (from llama.cpp's converter, conversion/qwen.py):
 * attn_qkv = [q (Hk*Dk) | k (Hk*Dk) | v (Hv*Dv)] contiguous.
@@ -11,6 +14,8 @@ Tensor layout notes (from llama.cpp's converter, conversion/qwen.py):
 * Layer norm weights already include the +1 of the zero-centred RMSNorm,
   ssm_norm (the gated group norm) does not.
 * attn_q of the attention layers holds [query | gate] per head (2*head_dim).
+* qwen3next keeps the V heads *grouped* (v-head j belongs to k-head j // (Hv/Hk):
+  repeat_interleave) and stores beta/alpha fused as ssm_ba, per k-head [b (Hv/Hk) | a (Hv/Hk)].
 
 All state (recurrent S, conv window, KV cache) is updated in place so that a
 single-token step can be captured as a CUDA graph.
@@ -23,7 +28,21 @@ import torch
 import torch.nn.functional as F
 
 from ..gguf import GGUFError, GGUFFile
-from .common import GraphDecoder, KVCache, Linear, WeightLoader, attention, rms_norm, swiglu_mlp
+from .common import (
+    GraphDecoder,
+    KVCache,
+    WeightLoader,
+    attention,
+    delta_nachholen,
+    fenster_nachholen,
+    letzte_zeilen,
+    logit_zeilen,
+    mischer_nachholen,
+    rms_norm,
+    swiglu_mlp,
+    zeilen_merken,
+)
+from .moe import Experten
 
 
 def _l2norm(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -83,10 +102,18 @@ class _GatedDeltaNetLayer:
         self.Dk, self.Dv = hp["d_k"], hp["d_v"]
         self.K = hp["conv_kernel"]
         self.eps = hp["eps"]
+        self.gruppiert = hp.get("gruppiert", False)
         self.qkv = ld.linear(p + "attn_qkv.weight")
         self.z = ld.linear(p + "attn_gate.weight")
-        self.beta = ld.linear(p + "ssm_beta.weight")
-        self.alpha = ld.linear(p + "ssm_alpha.weight")
+        if ld.has(p + "ssm_ba.weight"):                            # qwen3next: [b | a] je k-Kopf
+            self.ba = ld.linear(p + "ssm_ba.weight")
+            self.beta = self.alpha = None
+            if self.ba.n_out != 2 * self.Hv:
+                raise GGUFError(f"unexpected ssm_ba shape in layer {i}")
+        else:
+            self.ba = None
+            self.beta = ld.linear(p + "ssm_beta.weight")
+            self.alpha = ld.linear(p + "ssm_alpha.weight")
         self.a = ld.norm(p + "ssm_a")                              # (Hv,)  = -exp(A_log)
         self.dt_bias = ld.norm(p + "ssm_dt.bias")                  # (Hv,)
         conv = ld.norm(p + "ssm_conv1d.weight")                    # (C, K)
@@ -99,6 +126,7 @@ class _GatedDeltaNetLayer:
         dev = self.a.device
         self.conv_state = torch.zeros(self.K - 1, self.conv_channels, device=dev, dtype=torch.float32)
         self.S = torch.zeros(self.Hv, self.Dk, self.Dv, device=dev, dtype=torch.float32)
+        self._merk: dict = {}                                      # rows of the last check, by its length
 
     def reset(self):
         with torch.inference_mode():
@@ -116,8 +144,14 @@ class _GatedDeltaNetLayer:
         L = x.shape[0]
         qkv = self.qkv(x).float()                                   # (L, C)
         z = self.z(x).float()                                       # (L, Hv*Dv)
-        beta = torch.sigmoid(self.beta(x).float())                  # (L, Hv)
-        g = self.a * F.softplus(self.alpha(x).float() + self.dt_bias)   # (L, Hv), <= 0
+        if self.ba is not None:
+            rep = self.Hv // self.Hk
+            ba = self.ba(x).float().view(L, self.Hk, 2 * rep)
+            b, a = ba[..., :rep].reshape(L, self.Hv), ba[..., rep:].reshape(L, self.Hv)
+        else:
+            b, a = self.beta(x).float(), self.alpha(x).float()
+        beta = torch.sigmoid(b)                                     # (L, Hv)
+        g = self.a * F.softplus(a + self.dt_bias)                   # (L, Hv), <= 0
 
         # causal depthwise conv over time with carried window
         full = torch.cat([self.conv_state, qkv], dim=0)             # (K-1+L, C)
@@ -133,8 +167,12 @@ class _GatedDeltaNetLayer:
         k = _l2norm(k)
         if self.Hv != self.Hk:
             rep = self.Hv // self.Hk
-            q = q.repeat(1, rep, 1)                                 # tiled: head j -> k-head j % Hk
-            k = k.repeat(1, rep, 1)
+            if self.gruppiert:                                      # grouped: head j -> k-head j // rep
+                q = q.repeat_interleave(rep, dim=1)
+                k = k.repeat_interleave(rep, dim=1)
+            else:
+                q = q.repeat(1, rep, 1)                             # tiled: head j -> k-head j % Hk
+                k = k.repeat(1, rep, 1)
 
         S = self.S                                                  # (Hv, Dk, Dv), updated in place
         if L >= BLOCK_AB:
@@ -144,6 +182,8 @@ class _GatedDeltaNetLayer:
         out = torch.empty(L, self.Hv, self.Dv, device=x.device, dtype=torch.float32)
         gexp = torch.exp(g).view(L, self.Hv, 1, 1)
         beta = beta.view(L, self.Hv, 1, 1)
+        if zeilen_merken():
+            self._merk[L] = (qkv, k, v, gexp, beta)
         for t in range(L):
             S.mul_(gexp[t])
             kt = k[t].unsqueeze(1)                                  # (Hv,1,Dk)
@@ -154,6 +194,11 @@ class _GatedDeltaNetLayer:
         # gated RMS norm per head, then output projection
         o = rms_norm(out, self.norm_w, self.eps) * F.silu(z.view(L, self.Hv, self.Dv))
         return self.out(o.reshape(L, -1))
+
+    def nachholen(self, L: int, n: int) -> None:
+        qkv, k, v, gexp, beta = self._merk[L]
+        fenster_nachholen(self.conv_state, qkv, n)
+        delta_nachholen(self.S, gexp, k, v, beta, n)
 
 
 class MRoPE:
@@ -188,7 +233,7 @@ class MRoPE:
 
 
 class _AttentionLayer:
-    def __init__(self, ld: WeightLoader, i: int, hp: dict, rope: RoPE, n_ctx: int):
+    def __init__(self, ld: WeightLoader, i: int, hp: dict, rope: "MRoPE", n_ctx: int):
         p = f"blk.{i}."
         self.H, self.Hkv, self.D = hp["n_heads"], hp["n_kv_heads"], hp["head_dim"]
         self.eps = hp["eps"]
@@ -234,20 +279,146 @@ class _Block:
         self.eps = hp["eps"]
         self.attn_norm = ld.norm(p + "attn_norm.weight")
         self.ffn_norm = ld.norm(p + "post_attention_norm.weight")
-        self.gate = ld.linear(p + "ffn_gate.weight")
-        self.up = ld.linear(p + "ffn_up.weight")
-        self.down = ld.linear(p + "ffn_down.weight")
         self.is_attn = isinstance(mixer, _AttentionLayer)
+        self.moe = ld.has(p + "ffn_gate_inp.weight")
+        if self.moe:
+            self.k_exp, self.topk_norm = hp["n_expert_used"], hp["topk_norm"]
+            self.router = ld.linear(p + "ffn_gate_inp.weight")
+            self.experten = Experten(ld, p, F.silu)
+            if not (self.experten.pruefen() and len(self.experten) == self.router.n_out
+                    and 0 < self.k_exp <= len(self.experten)):
+                raise GGUFError(f"layer {i}: inconsistent expert tensors")
+            self.s_gate = self.s_up = self.s_down = self.s_inp = None
+            if ld.has(p + "ffn_up_shexp.weight"):                   # geteilter Experte
+                self.s_gate = ld.linear(p + "ffn_gate_shexp.weight")
+                self.s_up = ld.linear(p + "ffn_up_shexp.weight")
+                self.s_down = ld.linear(p + "ffn_down_shexp.weight")
+                if ld.has(p + "ffn_gate_inp_shexp.weight"):
+                    self.s_inp = ld.norm(p + "ffn_gate_inp_shexp.weight").reshape(-1)
+        else:
+            self.gate = ld.linear(p + "ffn_gate.weight")
+            self.up = ld.linear(p + "ffn_up.weight")
+            self.down = ld.linear(p + "ffn_down.weight")
+
+    def _experten(self, x: torch.Tensor) -> torch.Tensor:
+        """Softmax über alle Experten, die k besten (renormiert), dazu der geteilte Experte."""
+        p = torch.softmax(self.router(x).float(), dim=-1)
+        w, idx = p.topk(self.k_exp, dim=-1)
+        if self.topk_norm:
+            w = w / w.sum(-1, keepdim=True)
+        out = self.experten(x, idx, w)
+        if self.s_up is not None:
+            y = swiglu_mlp(x, self.s_gate, self.s_up, self.s_down).float()
+            if self.s_inp is not None:
+                y = y * torch.sigmoid(x.float() @ self.s_inp.float().unsqueeze(-1))
+            out = out + y
+        return out
 
     def __call__(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, pos3: torch.Tensor) -> torch.Tensor:
         x = rms_norm(h, self.attn_norm, self.eps)
         h = h + (self.mixer(x, pos_idx, kv_len, pos3) if self.is_attn else self.mixer(x)).float()
         x = rms_norm(h, self.ffn_norm, self.eps)
+        if self.moe:
+            return h + self._experten(x)
         return h + swiglu_mlp(x, self.gate, self.up, self.down).float()
 
 
+class _MtpAttention(_AttentionLayer):
+    """Attention of the MTP block.  Its entry for (hidden of position t, token t+1) sits in
+    slot t+1; slot 0 has no pair and is masked."""
+
+    def __init__(self, ld: WeightLoader, i: int, hp: dict, rope: "MRoPE", n_ctx: int):
+        super().__init__(ld, i, hp, rope, n_ctx)
+        self.key_pos = torch.arange(n_ctx, device=ld.device)
+        self.key_pos[0] = -1
+
+    def __call__(self, x: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, pos3: torch.Tensor) -> torch.Tensor:
+        L = x.shape[0]
+        qg = self.q(x).float().view(L, self.H, 2, self.D)
+        q, gate = qg[:, :, 0], qg[:, :, 1]
+        k = self.k(x).float().view(L, self.Hkv, self.D)
+        v = self.v(x).view(L, self.Hkv, self.D)
+        q = self.rope(rms_norm(q, self.q_norm, self.eps), pos3)
+        k = self.rope(rms_norm(k, self.k_norm, self.eps), pos3)
+        self.cache.write(k, v, pos_idx)
+        o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, self.scale,
+                      key_pos=self.key_pos[:kv_len]).float() * torch.sigmoid(gate)
+        return self.o(o.reshape(L, -1))
+
+
+class _Mtp:
+    """MTP (NextN) head, as llama.cpp's qwen35moe graph_mtp: from the post-norm hidden state of
+    position t and the token at t+1 it predicts the token at t+2 -
+    eh_proj([enorm(embed(token)) | hnorm(hidden)]) -> full-attention block -> head norm -> LM head.
+    Its own post-norm output chains further proposals."""
+    TEILE = ("nextn.eh_proj.weight", "nextn.enorm.weight", "nextn.hnorm.weight", "attn_q.weight",
+             "attn_norm.weight", "post_attention_norm.weight")
+
+    @classmethod
+    def vorhanden(cls, ld: WeightLoader, i: int) -> bool:
+        return all(ld.has(f"blk.{i}.{n}") for n in cls.TEILE)
+
+    def __init__(self, ld: WeightLoader, i: int, hp: dict, rope: "MRoPE", n_ctx: int, model: "Qwen35Model"):
+        p = f"blk.{i}.nextn."
+        self.eps = hp["eps"]
+        self.eh = ld.linear(p + "eh_proj.weight")                     # (E, 2E)
+        self.enorm = ld.norm(p + "enorm.weight")
+        self.hnorm = ld.norm(p + "hnorm.weight")
+        self.block = _Block(ld, i, hp, _MtpAttention(ld, i, hp, rope, n_ctx))
+        eigen = ld.has(p + "embed_tokens.weight")
+        self.embed = ld.embedding(p + "embed_tokens.weight", tied_head=False)[0] if eigen else model.embed
+        eigen = ld.has(p + "shared_head_norm.weight")
+        self.head_norm = ld.norm(p + "shared_head_norm.weight") if eigen else model.out_norm
+        eigen = ld.has(p + "shared_head_head.weight")
+        self.head = ld.linear(p + "shared_head_head.weight") if eigen else model.lm_head
+
+    def __call__(self, tok: torch.Tensor, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int,
+                 pos3: torch.Tensor) -> torch.Tensor:
+        """tok (L,) at slots pos_idx, h (L, E) post-norm hidden states of the slots before ->
+        post-norm MTP output (L, E)."""
+        e = rms_norm(self.embed(tok).float(), self.enorm, self.eps)
+        x = self.eh(torch.cat([e, rms_norm(h.float(), self.hnorm, self.eps)], dim=-1)).float()
+        return rms_norm(self.block(x, pos_idx, kv_len, pos3), self.head_norm, self.eps)
+
+
+class _MtpSchritt:
+    """One MTP proposal step with static buffers (for a CUDA graph): reads `h`, writes the
+    MTP output back to `h` for the next step, returns (token id, its probability) as (2,) float32.
+    The proposal comes from the full LM head: a smaller vocabulary missed a third of the
+    tokens of German answers (Qwen3.8-27B: 49 % instead of 71 % proposals right)."""
+
+    def __init__(self, model: "Qwen35Model"):
+        self.model = model
+        self.device = model.device
+        self.alle_logits = False
+        self.h = torch.zeros(1, model.hp["n_embd"], device=model.device, dtype=torch.float32)
+
+    def snapshot_state(self):
+        return self.h.clone()
+
+    def restore_state(self, snap):
+        self.h.copy_(snap)
+
+    def _ausgabe(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+        m = self.model
+        pos3 = (pos_idx + m._roff).unsqueeze(1).expand(-1, 3)
+        g = m.mtp(tok, self.h, pos_idx, kv_len, pos3)
+        self.h.copy_(g)
+        return g
+
+    def logits(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+        """The step with the full head (V,)."""
+        return self.model.mtp.head(self._ausgabe(tok, pos_idx, kv_len))[0].float()
+
+    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+        logits = self.model.mtp.head(self._ausgabe(tok, pos_idx, kv_len))[0].float()
+        p, tid = torch.softmax(logits, dim=-1).max(dim=-1)
+        return torch.stack([tid.float(), p])
+
+
 class Qwen35Model:
-    arch_names = ("qwen35",)
+    alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
+    arch_names = ("qwen35", "qwen35moe", "qwen3next")
     prefill_chunk = 2048            # no sliding-window ring: long chunks read faster (qlinear)
     supports_images = True
     uses_mrope = True
@@ -259,6 +430,7 @@ class Qwen35Model:
             raise GGUFError(f"{a} is not a qwen35 model")
         k = lambda s: f"{a}.{s}"
         n_layer = int(gg.require(k("block_count")))
+        n_layer -= int(gg.get(k("nextn_predict_layers"), 0) or 0)      # MTP-Schichten am Ende
         n_embd = int(gg.require(k("embedding_length")))
         n_heads = int(gg.require(k("attention.head_count")))
         hp = dict(
@@ -272,6 +444,9 @@ class Qwen35Model:
             d_k=int(gg.require(k("ssm.state_size"))),
             n_k_heads=int(gg.require(k("ssm.group_count"))),
             n_v_heads=int(gg.require(k("ssm.time_step_rank"))),
+            gruppiert=a == "qwen3next",
+            n_expert_used=int(gg.get(k("expert_used_count"), 0) or 0),
+            topk_norm=bool(gg.get(k("expert_weights_norm"), True)),
         )
         inner = int(gg.require(k("ssm.inner_size")))
         if inner % hp["n_v_heads"]:
@@ -308,24 +483,34 @@ class Qwen35Model:
                 raise GGUFError(f"layer {i}: neither attention nor delta-net tensors found")
             self.blocks.append(_Block(ld, i, hp, mixer))
         self.n_vocab = self.embed.n_vocab
+        # MTP head (first nextn layer): proposals for speculative decoding
+        self.mtp = _Mtp(ld, n_layer, hp, rope, n_ctx, self) if _Mtp.vorhanden(ld, n_layer) else None
+        self._mtp_h = torch.zeros(1, n_embd, device=device, dtype=torch.float32)   # post-norm hidden, last slot
+        self._h_zeilen: dict = {}                                 # post-norm rows of the last check
         self.n_quant = ld.n_quant
         self.graph = GraphDecoder(self, n_ctx) if device.type == "cuda" else None
+        if self.mtp is not None:
+            self._mtp_schritt = _MtpSchritt(self)
+            self._mtp_graph = (GraphDecoder(self._mtp_schritt, n_ctx, haupt=self.graph, name="mtp")
+                               if self.graph is not None else None)
 
     # -- state ---------------------------------------------------------------
     def reset(self):
         for b in self.blocks:
             b.mixer.reset()
         self._roff.zero_()
+        self._mtp_h.zero_()
 
     def set_rope_offset(self, offset: int) -> None:
         self._roff.fill_(int(offset))
 
     def snapshot_state(self):
-        return [b.mixer.snapshot() for b in self.blocks]
+        return [b.mixer.snapshot() for b in self.blocks] + [self._mtp_h.clone()]
 
     def restore_state(self, snap):
         for b, s in zip(self.blocks, snap):
             b.mixer.restore(s)
+        self._mtp_h.copy_(snap[-1])
 
     # -- prefix cache ----------------------------------------------------------
     def resume_from(self, common: int, old_len: int) -> Optional[int]:
@@ -352,8 +537,51 @@ class Qwen35Model:
             pos3 = (pos_idx + self._roff).unsqueeze(1).expand(-1, 3)
         for blk in self.blocks:
             h = blk(h, pos_idx, kv_len, pos3)
-        h = rms_norm(h[-1:], self.out_norm, self.hp["eps"])
-        return self.lm_head(h)[0].float()
+        if self.mtp is None:
+            h = rms_norm(letzte_zeilen(self, h), self.out_norm, self.hp["eps"])
+            return logit_zeilen(self, self.lm_head(h)).float()
+        h = rms_norm(h, self.out_norm, self.hp["eps"])
+        if zeilen_merken():
+            self._h_zeilen[h.shape[0]] = h
+        # MTP cache entries for these tokens: (hidden of the slot before, token)
+        self.mtp(tok, torch.cat([self._mtp_h, h[:-1].float()]), pos_idx, kv_len, pos3)
+        self._mtp_h.copy_(h[-1:])
+        return logit_zeilen(self, self.lm_head(letzte_zeilen(self, h))).float()
+
+    MTP_SICHER = 0.5         # a further proposal only from this probability on (the first one always)
+
+    @torch.inference_mode()
+    def mtp_vorschlag(self, token: int, pos: int, n: int) -> List[int]:
+        """Up to n greedy MTP proposals for the tokens after `token` at slot `pos` (the model has
+        read the slots before); after the first one only while the MTP head is sure
+        (`MTP_SICHER`) – an unsure guess costs a longer check and is mostly wrong."""
+        schritt = self._mtp_schritt
+        schritt.h.copy_(self._mtp_h)
+        raus = []
+        for j in range(min(n, self.n_ctx - pos)):
+            if self._mtp_graph is not None and self.graph is not None:
+                aus = self._mtp_graph(token, pos + j)
+            else:
+                t = torch.tensor([token], device=self.device)
+                p = torch.tensor([pos + j], device=self.device)
+                aus = schritt._run(t, p, pos + j + 1)
+            tid, sicher = aus.tolist()
+            if raus and sicher < self.MTP_SICHER:
+                break
+            token = int(tid)
+            raus.append(token)
+        return raus
+
+    def zeilen_nachholen(self, L: int, n: int) -> bool:
+        """State after row n of the last check with L rows, without reading the tokens again."""
+        mischer = [b.mixer for b in self.blocks if isinstance(b.mixer, _GatedDeltaNetLayer)]
+        if self.mtp is not None and L not in self._h_zeilen:
+            return False
+        if not mischer_nachholen(mischer, L, n):
+            return False
+        if self.mtp is not None:
+            self._mtp_h.copy_(self._h_zeilen[L][n - 1:n])
+        return True
 
     def _check(self, tokens: List[int], pos: int):
         if pos < 0 or pos + len(tokens) > self.n_ctx:

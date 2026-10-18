@@ -166,8 +166,8 @@ _REGELN = {
     "gpt2": [_GPT2],
     "starcoder": [r"\p{N}", _GPT2],
     "falcon": [r"[\p{P}\$\+<=>\^~\|`]+", _GPT2, r"[0-9][0-9][0-9]"],
-    "deepseek-coder": [r"[\r\n]", r"\s?\p{L}+", r"\s?\p{P}+", r"[一-龥ࠀ-一가-퟿]+", r"\p{N}"],
-    "deepseek-v3": [r"\p{N}{1,3}", r"[一-龥぀-ゟ゠-ヿ]+",
+    "deepseek-coder": [r"[\r\n]", r"\s?\p{L}+", r"\s?\p{P}+", r"[\u4e00-\u9fa5\u0800-\u4e00\uac00-\ud7ff]+", r"\p{N}"],
+    "deepseek-v3": [r"\p{N}{1,3}", r"[\u4e00-\u9fa5\u3040-\u309f\u30a0-\u30ff]+",
                     r"[!" + '"' + r"#$%&'()*+,\-./:;<=>?@\[\\\]^_`{|}~][A-Za-z]+|[^\r\n\p{L}\p{P}\p{S}]?[\p{L}\p{M}]+"
                     r"| ?[\p{P}\p{S}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"],
     "tekken": [r"[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))*((?=[\p{L}])([^A-Z]))+|[^\r\n\p{L}\p{N}]?((?=[\p{L}])([^a-z]))+"
@@ -178,6 +178,11 @@ _REGELN = {
     "default": [r"[\p{P}\$\+<=>\^~\|]+", _GPT2, r"\p{N}+", r"[0-9][0-9][0-9]"],
     "bailingmoe": [r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*"
                    r"|\s*[\r\n]|\s+(?!\S)|\s+"],
+    # Kimi K2 / Kimi-Linear (tokenization_kimi.py): Han runs apart, letter runs without Han; V1 for the set &&
+    "kimi-k2": [r"(?V1)[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*"
+                r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?"
+                r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*"
+                r"(?i:'s|'t|'re|'ve|'m|'ll|'d)?|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"],
 }
 _PRE_TYP = {
     **dict.fromkeys(("llama3", "llama-v3", "llama-bpe", "falcon3", "falcon-h1", "pixtral", "midm-2.0", "lfm2",
@@ -187,6 +192,7 @@ _PRE_TYP = {
     "falcon": "falcon", "deepseek-coder": "deepseek-coder", "deepseek-v3": "deepseek-v3", "tekken": "tekken",
     **dict.fromkeys(("gpt-4o", "llama4"), "gpt4o"),
     **dict.fromkeys(("bailingmoe", "bailingmoe2", "llada-moe"), "bailingmoe"),
+    "kimi-k2": "kimi-k2",
 }
 _QWEN_ARTIG = ("qwen2", "deepseek-r1-qwen", "megrez")        # eigener Scanner (_pretokenize_qwen)
 
@@ -413,7 +419,10 @@ class StreamDecoder:
         self.tok = tok
         self.buf = bytearray()
 
-    VISIBLE_CONTROL = ("<think>", "</think>", "<|channel>", "<channel|>", "[THINK]", "[/THINK]")
+    VISIBLE_CONTROL = ("<think>", "</think>", "<|channel>", "<channel|>", "[THINK]", "[/THINK]",
+                       # tool calls in the model's own format (read by NemiCLI's werkzeugsprache)
+                       "<tool_call>", "</tool_call>", "<|tool_call>", "<tool_call|>", '<|"|>',
+                       "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", "[TOOL_CALLS]", "[ARGS]")
 
     def push(self, tid: int) -> str:
         if self.tok.is_control(tid):

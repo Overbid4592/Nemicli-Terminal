@@ -1,25 +1,30 @@
 """High-level API: load a GGUF model and generate text."""
 from __future__ import annotations
 
+import gc
 import itertools
 import sys
 import time
-from typing import Iterator, List, Optional
+from typing import Callable, Iterator, List, Optional
 
 import torch
 
 from . import debuglog as dbg
-from . import hostmem
+from . import hostmem, schichten
 from .chat import ChatFormatter, Message, detect_format
 from .gguf import GGUFFile
 from .models import build_model
-from .models.common import GPU_SPERRE, PREFILL_CHUNK, release_pinned_memory
+from .models.common import GPU_SPERRE, PREFILL_CHUNK, ZeilenMerken, release_pinned_memory
 from .qlinear import UNPACK_FROM
 from .sampling import Sampler, SamplerConfig
+from .spekulativ import MtpEntwurf, NGramEntwurf, Nutzen
 from .tokenizer import StreamDecoder, Tokenizer
 
 RELEASE_FROM = UNPACK_FROM   # reads this long allocate scratch worth releasing afterwards
+SPEKULATIV = 8               # proposed tokens per check (prompt lookup)
+VORSCHLAG_STUFEN = (8, 4, 3, 2, 1)  # a proposal is cut to one of these lengths
 HOSTMEM_AB = 1 << 20          # offload: tensors from this size go to exact-size pinned blocks
+LAGER_TAKT = 32              # MoE storeroom: re-sort the VRAM slots every this many answer tokens (0: off)
 
 _BILD_NR = itertools.count(1)
 
@@ -55,20 +60,33 @@ _DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp16": torch.flo
            "float16": torch.float16, "fp32": torch.float32, "float32": torch.float32}
 
 
-def _move_tensors(root, select, convert) -> set:
+def _move_tensors(root, select, convert, ansichten: bool = False) -> set:
     """Replaces every tensor reachable from `root` (attributes, __slots__, lists, tuples,
     dicts of engine objects) for which `select(t)` holds by `convert(t)`.  A tensor
-    referenced twice is converted once and stays shared.  Returns the ids of the new
+    referenced twice is converted once and stays shared; with `ansichten` (moving between devices) also
+    tensors that are views on one storage stay views on one storage.  Returns the ids of the new
     tensors."""
     memo: dict = {}
     seen: set = set()
+    speicher: dict = {}            # Speicher -> verschobener Speicher: Ansichten bleiben Ansichten
+
+    def neu(v: torch.Tensor) -> torch.Tensor:
+        """Den ganzen Speicher einmal verschieben, `v` als Ansicht darauf neu anlegen (z. B. teilen sich
+        Einbettung und Ausgabe-Kopf denselben Speicher – getrennt verschoben wären es zwei Kopien)."""
+        schluessel = (v.device, v.untyped_storage().data_ptr())
+        if schluessel not in speicher:
+            ganz = torch.empty(0, dtype=torch.uint8, device=v.device).set_(v.untyped_storage())
+            speicher[schluessel] = convert(ganz)
+        ziel = speicher[schluessel]
+        return torch.empty(0, dtype=v.dtype, device=ziel.device).set_(
+            ziel.untyped_storage(), v.storage_offset(), v.size(), v.stride())
 
     def conv(v):
         if isinstance(v, torch.Tensor):
             if not select(v):
                 return v
             if id(v) not in memo:
-                memo[id(v)] = convert(v)
+                memo[id(v)] = neu(v) if ansichten else convert(v)
             return memo[id(v)]
         if isinstance(v, list):
             v[:] = [conv(x) for x in v]
@@ -100,11 +118,43 @@ def _move_tensors(root, select, convert) -> set:
     return {id(t) for t in memo.values()}
 
 
+def _haelt_tensor(v, tiefe: int = 3) -> bool:
+    """Does `v` (a tensor, or a list/tuple/dict a few levels deep) hold a tensor?"""
+    if isinstance(v, torch.Tensor):
+        return True
+    if tiefe <= 0:
+        return False
+    if isinstance(v, (list, tuple)):
+        return any(_haelt_tensor(x, tiefe - 1) for x in v)
+    if isinstance(v, dict):
+        return any(_haelt_tensor(x, tiefe - 1) for x in v.values())
+    return False
+
+
+class _Pruefpunkte:
+    """Die Prüfpunkte des Motors (nach dem Systemteil, vor der Antwort) – sie hängen nicht am Modell und
+    werden beim Auslagern über dieses Objekt mitgenommen."""
+
+    def __init__(self, eng):
+        self.system = getattr(eng, "_checkpoint", None)
+        self.antwort = getattr(eng, "_answer_checkpoint", None)
+
+    def zurueck(self, eng) -> None:
+        eng._checkpoint, eng._answer_checkpoint = self.system, self.antwort
+
+
+def _im_vram(t: torch.Tensor) -> bool:
+    """Tensor in VRAM – not a weight mapped from pinned RAM (Schichten im RAM), which holds no
+    VRAM and stays where it is when the model is parked."""
+    return t.device.type == "cuda" and not hostmem.abgebildet(t)
+
+
 class Engine:
     def __init__(self, path: str, device: Optional[str] = None, dtype: str = "bf16",
                  n_ctx: int = 8192, thinking: bool = False, verbose: bool = True, weights: str = "quant",
                  progress=None, max_tok_s: Optional[float] = None, kv_bits: int = 16,
-                 experts_vram: Optional[int] = None):
+                 experts_vram: Optional[int] = None, kv_gpu_tokens: Optional[int] = None,
+                 weights_vram: Optional[int] = None):
         """`denk_budget` (attribute): max. thinking tokens per answer in chat() (None: no limit).
         progress: optional callback(fraction 0..1) for loading progress (used by the GUI).
         max_tok_s: upper limit for generated tokens per second (None = as fast as possible);
@@ -112,7 +162,11 @@ class Engine:
         kv_bits: 16 = KV cache in the compute dtype, 8 = int8 with a scale per 32 values
         (about half the VRAM per token of context).
         experts_vram: VRAM budget in bytes for MoE experts (None: all in VRAM, 0: all in pinned
-        RAM); experts beyond it stay in RAM and the GPU reads the chosen ones over PCIe."""
+        RAM); experts beyond it stay in RAM and the GPU reads the chosen ones over PCIe.
+        kv_gpu_tokens: positions of each full KV cache kept in VRAM (None: all); the rest of
+        n_ctx lives in RAM and is copied to the GPU per attention call (no CUDA graphs then).
+        weights_vram: VRAM budget in bytes for the weights (None: all in VRAM, 0: everything that
+        can move in pinned RAM); see ggufengine.schichten – the GPU reads those matrices over PCIe."""
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -148,9 +202,21 @@ class Engine:
         t = time.time()
         # pinned allocations, frees and synchronize would break a graph capture of another
         # engine in this process
+        from .models import common as _common
+        self.schichten_plan = None
+        if weights_vram is not None and self.device.type == "cuda":
+            self.schichten_plan = schichten.planen(self.gg, weights_vram)
         with GPU_SPERRE:
-            self.model = build_model(self.gg, self.device, self.dtype, n_ctx, progress, quant=(weights == "quant"),
-                                     kv_bits=kv_bits, experten_vram=experts_vram)
+            _common.KV_GPU_SLOTS = kv_gpu_tokens if kv_gpu_tokens and kv_gpu_tokens < n_ctx else None
+            _common.SCHICHTEN_RAM = self.schichten_plan.ram if self.schichten_plan else frozenset()
+            try:
+                self.model = build_model(self.gg, self.device, self.dtype, n_ctx, progress,
+                                         quant=(weights == "quant"), kv_bits=kv_bits, experten_vram=experts_vram)
+            finally:
+                _common.KV_GPU_SLOTS = None
+                _common.SCHICHTEN_RAM = frozenset()
+            if any(c.geteilt for c in self._full_caches()):
+                self.model.graph = None                  # RAM copies cannot be captured
             if self.device.type == "cuda":
                 torch.cuda.synchronize(self.device)      # queued conversions count as weights
                 release_pinned_memory()
@@ -169,8 +235,9 @@ class Engine:
                     else f"weights in {self.dtype}")
             sys.stderr.write(f"\rloaded {self.gg.get('general.name', path)} ({self.gg.architecture}) "
                              f"in {time.time() - t0:.1f}s on {self.device}{mem}; {mode}\n")
-        fmt = detect_format(self.gg.get("tokenizer.chat_template"), self.gg.architecture)
-        self.chat_format = ChatFormatter(self.tokenizer, fmt, thinking=thinking)
+        vorlage = self.gg.get("tokenizer.chat_template")
+        fmt = detect_format(vorlage, self.gg.architecture)
+        self.chat_format = ChatFormatter(self.tokenizer, fmt, thinking=thinking, template=vorlage)
         self.n_ctx = n_ctx
         self._pos = 0
         self._history: List[int] = []
@@ -191,6 +258,9 @@ class Engine:
         self.checkpoint_new = False      # set when chat() made a new checkpoint (save_prefix)
         self.last_cached = 0             # prompt tokens taken from the cache in the last chat()
         self.last_ids: List[int] = []    # token ids generated in the last call
+        # speculative decoding: max. proposed tokens checked per pass (0 = off), see spekulativ.py
+        self.spekulativ = SPEKULATIV
+        self._vorrat: list = []          # (proposed token, logits after it) not taken yet
 
     # -- debug log -------------------------------------------------------------
     def _log_model_header(self, path, weights, n_ctx):
@@ -220,6 +290,9 @@ class Engine:
         mem = f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB" if self.device.type == "cuda" else "-"
         dbg.kv({"Ladezeit inkl. Warmup": f"{self.load_seconds:.1f}s", "VRAM nach dem Laden": mem,
                 "quantisierte Matrizen": self.model.n_quant,
+                "Schichten im RAM": (f"{len(self.schichten_plan.ram)} Matrizen, "
+                                     f"{self.schichten_plan.ram_bytes / 2**30:.2f} GiB" if self.schichten_plan
+                                     and self.schichten_plan.ram else "keine"),
                 "Modellklasse": type(self.model).__name__}, "Geladen")
 
     def _warmup(self):
@@ -260,10 +333,11 @@ class Engine:
         return out, (nxt, start)
 
     def feed(self, tokens: List[int], chunk: Optional[int] = None, keys: Optional[list] = None,
-             own: Optional[list] = None) -> torch.Tensor:
+             own: Optional[list] = None, abbruch: Optional[Callable[[], bool]] = None) -> torch.Tensor:
         """Run tokens through the model (in chunks); returns logits of the last token.
         `keys` marks image positions (see `chat`); their embeddings come from `_images`.
-        `own`: per token, generated by the model (default: no)."""
+        `own`: per token, generated by the model (default: no).  `abbruch()` True stops
+        before the next chunk; only what was read counts."""
         if self.offloaded:
             self.restore()
         keys = list(tokens) if keys is None else list(keys)
@@ -274,6 +348,8 @@ class Engine:
         ganz = bool(getattr(self.model, "images_bidirectional", False))
         i = 0
         while i < len(tokens):
+            if abbruch is not None and abbruch():
+                break
             ende = min(i + chunk, len(tokens))
             if ganz:                                    # an image is read in one call (bidirectional)
                 ende = _bild_nicht_teilen(keys, i, ende)
@@ -295,6 +371,9 @@ class Engine:
             else:
                 logits = self.model.forward(part, self._pos)
             self._pos += len(part)
+        if i < len(tokens):                             # stopped: only the part read is cached
+            tokens, keys = tokens[:i], keys[:i]
+            own = own[:i] if own is not None else None
         if len(tokens) >= RELEASE_FROM and self.device.type == "cuda":
             self._release_scratch()
         self._history.extend(tokens)
@@ -328,6 +407,8 @@ class Engine:
             raise ValueError("the model has no image tokens for this mmproj")
         if vision.uses_grid and not self._mrope:
             raise ValueError("this mmproj needs a model with M-RoPE")
+        if getattr(vision, "n_deepstack", 0) and not getattr(self.model, "uses_deepstack", False):
+            raise ValueError("this mmproj has DeepStack features (Qwen3-VL) the model cannot take")
         self.chat_format.image_marks = vision.marks
         self.vision = vision
 
@@ -378,6 +459,145 @@ class Engine:
             self._breaker = (b, w)
         return self._breaker
 
+    # -- speculative decoding ------------------------------------------------------
+    # A proposal of k tokens is read together with the sampled token in one forward pass
+    # (logits of every row).  Each position is still sampled from the model's own logits,
+    # with the history up to it; a proposed token is kept only if it equals that sample.
+    def _entwurf(self) -> Optional[NGramEntwurf]:
+        model = getattr(self, "model", None)
+        n = getattr(self, "spekulativ", 0)
+        if not n or not hasattr(model, "alle_logits"):
+            return None
+        if getattr(model, "mtp", None) is not None:
+            return MtpEntwurf(self._history, model, lambda: self._pos, max_neu=n)
+        return NGramEntwurf(self._history, max_neu=n)
+
+    def _rekurrent(self) -> bool:
+        """The model state cannot step back (recurrent layers): it is saved before a check."""
+        return self.model.resume_from(1, 2) != 1
+
+    def _vorwaerts(self, tokens: List[int], pos: int, alle: bool = False) -> torch.Tensor:
+        """Text tokens at cache slots pos.. without bookkeeping; alle: logits of every row."""
+        if self._mrope:                     # text: the rotary offset is the same for every slot
+            self.model.set_rope_offset(self._rope_state[0] - self._pos)
+        self._kv_room(pos + len(tokens))
+        graph = getattr(self.model, "graph", None)
+        if len(tokens) > 1 and graph is not None:
+            with torch.inference_mode():
+                out = graph.mehrere(tokens, pos)
+            if out is not None:
+                return out if alle else out[-1]
+        self.model.alle_logits = alle
+        try:
+            if alle:                                 # a check: recurrent layers keep their rows
+                with ZeilenMerken():
+                    return self.model.forward(tokens, pos)
+            return self.model.forward(tokens, pos)
+        finally:
+            self.model.alle_logits = False
+
+    def _eintragen(self, tokens: List[int]) -> None:
+        n = len(tokens)
+        self._pos += n
+        self._history.extend(tokens)
+        self._own.extend([True] * n)
+        self._keys.extend(tokens)
+        if self._mrope:
+            self._rope_state = (self._rope_state[0] + n, self._rope_state[1])
+
+    def _uhr(self) -> float:
+        if self.device.type == "cuda":      # the sampler waits for the GPU right after anyway
+            torch.cuda.synchronize()
+        return time.perf_counter()
+
+    def _graph_aufnahmen(self) -> int:
+        graph = getattr(getattr(self, "model", None), "graph", None)
+        return getattr(graph, "aufnahmen", 0)
+
+    def _spek_ende(self, entwurf: Optional[NGramEntwurf], angenommen: int) -> None:
+        if entwurf is None:
+            return
+        if self._graph_aufnahmen() != getattr(self, "_aufnahmen", 0):
+            self._nutzen.ungueltig()                 # this check captured a graph: not a typical one
+        entwurf.ergebnis(angenommen)
+        pause = self._nutzen.pause()
+        if pause:
+            entwurf.pausieren(pause)
+
+    def _weiter(self, tid: int, entwurf: Optional[NGramEntwurf], vorschlagen: bool = True) -> torch.Tensor:
+        """Takes the sampled `tid` at position `_pos`; returns the logits for the next position."""
+        if entwurf is not None:
+            entwurf.zufuegen(tid)
+        if self._vorrat:
+            gedacht, zeile = self._vorrat.pop(0)
+            if gedacht == tid:                       # already in the cache
+                self._eintragen([tid])
+                self._spek_stat[1] += 1
+                self._nutzen.pruefung(0.0, 1)
+                if not self._vorrat:
+                    self._spek_ende(entwurf, self._spek_n)
+                return zeile
+            angenommen = self._spek_n - len(self._vorrat) - 1
+            self._vorrat = []
+            basis, zustand = self._spek_basis
+            logits = None
+            if zustand is not None:                  # state of the kept rows: rebuilt, else read again
+                t0 = self._uhr()
+                self.model.restore_state(zustand)
+                if not self._nachholen(basis):
+                    logits = self._vorwaerts(self._history[basis:self._pos] + [tid], basis)
+                    self._eintragen([tid])
+                self._nutzen.pruefung(self._uhr() - t0, 0 if logits is None else 1)
+            self._spek_ende(entwurf, angenommen)     # after the rebuild: it is part of the check
+            if logits is not None:
+                return logits
+            # attention caches: the slots behind _pos are masked and get overwritten; `tid` is read
+            # next, like after a check without proposals
+        platz = min(self.n_ctx - self._pos - 1, PREFILL_CHUNK - 1)
+        # the sampler has just waited for the GPU: the clock starts without a synchronize
+        t0 = time.perf_counter()                     # proposing counts as part of the check
+        vorschlag = entwurf.vorschlag(platz) if entwurf is not None and vorschlagen else []
+        grenze = self._nutzen.erlaubt(len(vorschlag)) if vorschlag else 0
+        k = next((s for s in VORSCHLAG_STUFEN if s <= min(len(vorschlag), grenze)), 0)
+        vorschlag = vorschlag[:k]                    # few sizes: few captured graphs
+        if not vorschlag:
+            vorher = self._graph_aufnahmen() if entwurf is not None else 0
+            logits = self.feed([tid], own=[True])
+            if entwurf is not None and self._nutzen.einzeln_messen():   # a synchronize only now and then
+                dauer = self._uhr() - t0
+                if self._graph_aufnahmen() == vorher:   # not a step that captured its graph
+                    self._nutzen.einzeln(dauer)
+            return logits
+        self._nutzen.start(len(vorschlag))
+        self._aufnahmen = self._graph_aufnahmen()
+        zustand = self.model.snapshot_state() if self._rekurrent() else None
+        self._spek_basis = (self._pos, zustand)
+        self._spek_L = 1 + len(vorschlag)
+        zeilen = self._vorwaerts([tid] + vorschlag, self._pos, alle=True)
+        self._eintragen([tid])
+        self._vorrat = list(zip(vorschlag, zeilen[1:]))
+        self._spek_n = len(vorschlag)
+        self._spek_stat[0] += len(vorschlag)
+        self._nutzen.pruefung(self._uhr() - t0, 1)
+        return zeilen[0]
+
+    def _verwerfen(self) -> None:
+        """Drops proposed tokens not taken (end of the answer, forced end of thinking)."""
+        if not self._vorrat:
+            return
+        self._vorrat = []
+        basis, zustand = self._spek_basis
+        if zustand is not None:
+            self.model.restore_state(zustand)
+            if not self._nachholen(basis):
+                self._vorwaerts(self._history[basis:self._pos], basis)
+
+    def _nachholen(self, basis: int) -> bool:
+        """Recurrent state after the rows of the last check kept up to `_pos` (state before the
+        check restored), from the per-row inputs the layers kept - no reading again."""
+        f = getattr(self.model, "zeilen_nachholen", None)
+        return f is not None and f(self._spek_L, self._pos - basis)
+
     def generate_tokens(self, prompt_ids: List[int], max_tokens: int = 512,
                         sampler: Optional[SamplerConfig] = None, stop_ids=None,
                         prompt_keys: Optional[list] = None, prompt_own: Optional[list] = None,
@@ -397,46 +617,59 @@ class Engine:
             raise RuntimeError("prompt does not fit into the context window")
         t0 = time.time()
         logits = self.feed(prompt_ids, keys=prompt_keys, own=prompt_own)
+        self._lager_umsortieren()                            # what the prompt chose goes to VRAM
         self._prefill_seconds = time.time() - t0
         step = 1.0 / self.max_tok_s if self.max_tok_s else 0.0
         next_at = time.perf_counter()
         dry = cfg.dry_multiplier > 0
         breaker, word_start = self._breakers() if dry else (None, None)
         erzeugt = b""                                        # for code blocks: DRY stays off inside
-        for _ in range(max_tokens):
-            code = erzeugt.count(b"```") % 2 == 1
-            tid = smp.sample(logits, self._history, self._own if dry and not code else None, breaker,
-                             word_start)
-            if tid in stop:
-                break
-            yield tid
-            if self._pos + 1 > self.n_ctx:
-                break
-            if denk_budget:
-                zuletzt = (zuletzt + [tid])[-len(auf):]
-                if not drin and zuletzt == auf:
-                    drin, gedacht = True, 0
-                elif drin and tid == zu[0]:
-                    drin = False
-                elif drin:
-                    gedacht += 1
-                    if gedacht >= grenze and self._pos + 1 + len(zu) <= self.n_ctx:
-                        self.feed([tid], own=[True])         # last thinking token, then close the block
-                        for t in zu:
-                            yield t
-                        logits = self.feed(zu, own=[True] * len(zu))
-                        drin, denk_budget = False, None
-                        continue
-            if step:
-                next_at += step
-                wait = next_at - time.perf_counter()
-                if wait > 0:
-                    time.sleep(wait)
-                else:
-                    next_at = time.perf_counter()   # slower than the limit: do not catch up
-            if dry:
-                erzeugt += self.tokenizer.token_bytes(tid)
-            logits = self.feed([tid], own=[True])
+        entwurf = self._entwurf()
+        self._vorrat, self._spek_stat = [], [0, 0]           # proposed, taken
+        if entwurf is not None and getattr(self, "_nutzen", None) is None:
+            self._nutzen = Nutzen()                          # kept across answers (same model)
+        try:
+            for nr in range(1, max_tokens + 1):
+                if LAGER_TAKT and nr % LAGER_TAKT == 0:
+                    self._lager_umsortieren(melden=False)   # experts of this answer into VRAM
+                code = erzeugt.count(b"```") % 2 == 1
+                tid = smp.sample(logits, self._history, self._own if dry and not code else None, breaker,
+                                 word_start)
+                if tid in stop:
+                    break
+                yield tid
+                if self._pos + 1 > self.n_ctx:
+                    break
+                if denk_budget:
+                    zuletzt = (zuletzt + [tid])[-len(auf):]
+                    if not drin and zuletzt == auf:
+                        drin, gedacht = True, 0
+                    elif drin and tid == zu[0]:
+                        drin = False
+                    elif drin:
+                        gedacht += 1
+                        if gedacht >= grenze and self._pos + 1 + len(zu) <= self.n_ctx:
+                            self._weiter(tid, entwurf, vorschlagen=False)   # last thinking token
+                            self._verwerfen()
+                            for t in zu:                                     # then close the block
+                                yield t
+                                if entwurf is not None:
+                                    entwurf.zufuegen(t)
+                            logits = self.feed(zu, own=[True] * len(zu))
+                            drin, denk_budget = False, None
+                            continue
+                if step:
+                    next_at += step
+                    wait = next_at - time.perf_counter()
+                    if wait > 0:
+                        time.sleep(wait)
+                    else:
+                        next_at = time.perf_counter()   # slower than the limit: do not catch up
+                if dry:
+                    erzeugt += self.tokenizer.token_bytes(tid)
+                logits = self._weiter(tid, entwurf)
+        finally:
+            self._verwerfen()
 
     # -- high level ----------------------------------------------------------
     def complete(self, text: str, **kw) -> Iterator[str]:
@@ -485,6 +718,30 @@ class Engine:
         if getattr(self, "denk_budget", None) and marken and "denk_budget" not in kw:
             kw["denk_budget"] = (self.denk_budget, marken[0], marken[1], self.chat_format.opens_thinking)
         yield from self._stream(ids[start:], keys=keys[start:], own=own[start:], **kw)
+
+    def vorlesen(self, messages: List[Message], abbruch: Optional[Callable[[], bool]] = None) -> int:
+        """Reads `messages` into the cache without answering – the beginning of the next
+        prompt, so the next chat() that starts with it only reads its new message (prefix
+        cache).  `abbruch()` True stops between chunks; what was read stays cached.
+        Returns the tokens read."""
+        ids = self.chat_format.encode(messages, add_generation_prompt=False)
+        if not ids:
+            return 0
+        keys = self._image_keys(messages, ids)
+        own = self._own_mask(messages, ids)
+        start = self._resume(keys)
+        anfang = len(self._history)
+        if (cut := self._system_end(messages, ids)) and start < cut < len(ids):
+            self.feed(ids[start:cut], keys=keys[start:cut], own=own[start:cut], abbruch=abbruch)
+            if len(self._history) < cut:
+                return len(self._history) - anfang
+            self._checkpoint = (cut, keys[:cut], self.model.checkpoint_state())
+            self.checkpoint_new = True
+            start = cut
+        if start < len(ids):
+            self.feed(ids[start:], keys=keys[start:], own=own[start:], abbruch=abbruch)
+        self._lager_umsortieren()
+        return len(self._history) - anfang
 
     @staticmethod
     def _own_mask(messages: List[Message], ids: List[int]) -> List[bool]:
@@ -535,7 +792,7 @@ class Engine:
         return keys
 
     # -- system prompt on disk ------------------------------------------------------
-    PREFIX_FORMAT = 1
+    PREFIX_FORMAT = 2                # 2: Qwen3.5 state with the MTP hidden state
 
     def _kv_room(self, n: int) -> None:
         """Grow the full KV caches to hold n positions; drop captured decode graphs if a
@@ -548,33 +805,86 @@ class Engine:
         graph = getattr(self.model, "graph", None)
         if moved and graph is not None:            # graphs and their memory pool, as in offload()
             torch.cuda.synchronize()
-            graph.graphs.clear()
-            graph.pool = None
+            graph.leeren()
 
     def _full_caches(self) -> list:
         """Full-context KV caches of the model in a fixed order (ring caches belong to
         the checkpoint state)."""
         from .models.common import KVCache
+        return self._objekte(KVCache)
+
+    def _lager(self) -> list:
+        """Storerooms of the MoE layers (VRAM slots for the most used experts)."""
+        if getattr(self, "_lager_liste", None) is None:
+            from .models.moe import ExpertenLager
+            self._lager_liste = self._objekte(ExpertenLager) if getattr(self, "model", None) is not None else []
+        return self._lager_liste
+
+    def _lager_umsortieren(self, melden: bool = True) -> None:
+        """Most used experts into the VRAM slots – between steps, never inside a graph.
+        Within an answer (`melden=False`) every LAGER_TAKT tokens: the slots follow the topic."""
+        lager = self._lager()
+        if not lager:
+            return
+        t0 = time.time()
+        with GPU_SPERRE:
+            bewegt = sum(l.umsortieren() for l in lager)
+        if bewegt and melden:
+            treffer = sum(l.treffer() for l in lager) / len(lager)
+            dbg.event(f"Experten-Lager: {bewegt} Experten getauscht in {time.time() - t0:.2f}s, "
+                      f"Treffer danach {treffer:.0%}")
+
+    def experten_zaehlung(self) -> Optional[List[List[float]]]:
+        """How often each expert was chosen, per MoE layer with a storeroom (None: no storeroom)
+        – to keep for the next start."""
+        lager = self._lager()
+        if not lager:
+            return None
+        with GPU_SPERRE:
+            return [[round(x, 3) for x in l.zaehler.tolist()] for l in lager]
+
+    def experten_zaehlung_setzen(self, zaehlung) -> bool:
+        """Counts from an earlier run: the storerooms start warm (the most used experts go to
+        VRAM right away).  False if they do not fit this model."""
+        lager = self._lager()
+        if not lager or not isinstance(zaehlung, list) or len(zaehlung) != len(lager):
+            return False
+        werte = []
+        for l, z in zip(lager, zaehlung):
+            if not isinstance(z, list) or len(z) != l.n_exp:
+                return False
+            t = torch.tensor([float(x) if isinstance(x, (int, float)) else -1.0 for x in z])
+            if not torch.isfinite(t).all() or (t < 0).any():
+                return False
+            werte.append(t)
+        with GPU_SPERRE:
+            for l, t in zip(lager, werte):
+                l.zaehler.copy_(t)
+        self._lager_umsortieren()
+        return True
+
+    def _objekte(self, typ) -> list:
+        """Objects of type `typ` reachable from the model, in a fixed order."""
         found, seen = [], set()
 
-        def walk(obj):
+        def walk(obj, wurzel=False):
             if id(obj) in seen:
                 return
             seen.add(id(obj))
-            if isinstance(obj, KVCache):
+            if isinstance(obj, typ):
                 found.append(obj)
                 return
             if isinstance(obj, (list, tuple)):
                 for x in obj:
                     walk(x)
-            elif type(obj).__module__.startswith(__package__):
+            elif wurzel or type(obj).__module__.startswith(__package__):
                 names = list(getattr(obj, "__dict__", {}))
                 for cls in type(obj).__mro__:
                     names += [n for n in getattr(cls, "__slots__", ()) if n not in names]
                 for n in names:
                     if hasattr(obj, n):
                         walk(getattr(obj, n))
-        walk(self.model)
+        walk(self.model, wurzel=True)
         return found
 
     def save_prefix(self, path: str, fingerprint: str) -> bool:
@@ -672,10 +982,11 @@ class Engine:
             return 0.0
         t0 = time.time()
         torch.cuda.synchronize()
-        graph = getattr(self.model, "graph", None)
-        if graph is not None:                       # captured graphs point at VRAM addresses
-            graph.graphs.clear()
-            graph.pool = None
+        from .models.common import GraphDecoder
+        for decoder in self._objekte(GraphDecoder):  # captured graphs point at VRAM addresses – all of
+            decoder.leeren()                         # them, also the MTP proposals (qwen35 _mtp_graph)
+        if (leser := getattr(self.model, "schnell", None)) is not None:
+            leser.parken()                          # TensorRT-Leser: Gewichte aus dem VRAM
 
         def to_ram(t):
             n = t.numel() * t.element_size()
@@ -685,8 +996,14 @@ class Engine:
                 host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
             host.copy_(t, non_blocking=True)
             return host
-        self._moved = _move_tensors(self.model, lambda t: t.device.type == "cuda", to_ram)
+        punkte = _Pruefpunkte(self)
+        self._moved = (_move_tensors(self.model, _im_vram, to_ram, ansichten=True)
+                       | _move_tensors(punkte, _im_vram, to_ram, ansichten=True))
+        punkte.zurueck(self)
         torch.cuda.synchronize()
+        # die alten VRAM-Tensoren hängen teils in Referenz-Kreisen: ohne Einsammeln blieben sie belegt
+        # (gemessen bis zur ganzen Modellgröße), während schon das Bildmodell lädt
+        gc.collect()
         torch.cuda.empty_cache()
         dbg.event(f"ausgelagert in {time.time() - t0:.2f}s, VRAM {torch.cuda.memory_allocated() / 2**30:.2f} GiB")
         return time.time() - t0
@@ -699,12 +1016,48 @@ class Engine:
         t0 = time.time()
         moved = self._moved
         self._moved = None
-        _move_tensors(self.model, lambda t: id(t) in moved,
-                      lambda t: t.to(self.device, non_blocking=True))
+        if (leser := getattr(self.model, "schnell", None)) is not None:
+            leser.aufwecken()
+        zurueck = lambda t: t.to(self.device, non_blocking=True)          # noqa: E731
+        punkte = _Pruefpunkte(self)
+        _move_tensors(self.model, lambda t: id(t) in moved, zurueck, ansichten=True)
+        _move_tensors(punkte, lambda t: id(t) in moved, zurueck, ansichten=True)
+        punkte.zurueck(self)
+        for lager in self._lager():                  # the slots got new addresses
+            lager.verankern()
         torch.cuda.synchronize()
         release_pinned_memory()                      # the RAM copies are no longer needed
         dbg.event(f"zurück auf der GPU in {time.time() - t0:.2f}s")
         return time.time() - t0
+
+    # -- unload ----------------------------------------------------------------
+    @property
+    def geleert(self) -> bool:
+        return bool(getattr(self, "_geleert", False))
+
+    def leeren(self) -> None:
+        """Frees all memory the engine holds (VRAM, pinned RAM, file views), even while other code still
+        references the engine object - the in-process counterpart of ending a runner process. Captured
+        graphs are dropped, the TensorRT reader is detached, and every tensor reachable from the engine is
+        replaced by an empty placeholder. The engine cannot be used afterwards."""
+        if self.geleert:
+            return
+        self._geleert = True
+        if self.device.type == "cuda":
+            torch.cuda.synchronize(self.device)
+        for name in ("graph", "_mtp_graph"):
+            if (decoder := getattr(self.model, name, None)) is not None:
+                decoder.leeren()
+        if getattr(self.model, "schnell", None) is not None:
+            self.model.schnell = None
+        leer = torch.empty(0, device="meta")
+        for wurzel in (self.model, getattr(self, "vision", None)):
+            if wurzel is not None:
+                _move_tensors(wurzel, lambda t: True, lambda t: leer)
+        for name, wert in list(vars(self).items()):  # checkpoints, proposals, last logits
+            if name not in ("model", "vision", "device") and _haelt_tensor(wert):
+                setattr(self, name, None)
+        self._moved = None
 
     # -- prefix cache ----------------------------------------------------------
     def _start_over(self) -> int:
@@ -781,15 +1134,18 @@ class Engine:
             raise
         else:
             dbg.code("".join(reply), "text", "Antwort")
+            self._lager_umsortieren()                       # the answer's choices count for the next one
         finally:   # also runs when the consumer stops iterating early
             total = time.time() - t0
             pre = self._prefill_seconds
             self.last_stats = dict(prompt_tokens=len(ids), generated=n, seconds=total,
                                    prefill_seconds=pre, decode_seconds=max(total - pre, 1e-9))
             st = self.last_stats
+            st["vorgeschlagen"], st["angenommen"] = getattr(self, "_spek_stat", (0, 0))
             dbg.kv({"Prompt-Tokens": st["prompt_tokens"],
                     "Prefill": f"{pre:.2f}s ({st['prompt_tokens'] / pre if pre > 0 else 0:.0f} tok/s)",
                     "generiert": f"{n} Tokens in {st['decode_seconds']:.2f}s ({n / st['decode_seconds']:.1f} tok/s)",
                     "Position danach": self._pos,
+                    "Vorschläge angenommen": f"{st['angenommen']} von {st['vorgeschlagen']}",
                     "VRAM": f"{torch.cuda.memory_allocated() / 2**30:.2f} GiB" if self.device.type == "cuda" else "-"},
                    "Antwort-Statistik")

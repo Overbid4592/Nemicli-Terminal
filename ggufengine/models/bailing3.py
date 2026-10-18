@@ -25,7 +25,9 @@ import torch
 import torch.nn.functional as F
 
 from ..gguf import GGUFError, GGUFFile
-from .common import GraphDecoder, KVCache, RoPE, WeightLoader, attention, rms_norm, swiglu_mlp
+from .common import (GraphDecoder, KVCache, RoPE, WeightLoader, attention, letzte_zeilen, logit_zeilen,
+                     rms_norm, swiglu_mlp, delta_nachholen, fenster_nachholen, mischer_nachholen,
+                     zeilen_merken)
 from .moe import Experten
 
 BLOCK_AB = 32           # from this many tokens: blockwise instead of token by token
@@ -127,6 +129,7 @@ class _KDALayer:
         dev = self.a.device
         self.conv_state = torch.zeros(self.K - 1, 3 * n, device=dev, dtype=torch.float32)
         self.S = torch.zeros(self.H, self.D, self.D, device=dev, dtype=torch.float32)
+        self._merk: dict = {}                                      # rows of the last check, by its length
         # sub-block size for kda_blockweise: sub * |lower_bound| <= EXP_GRENZE keeps its factors finite
         self.block = max(1, min(16, int(EXP_GRENZE // abs(self.lower))))
 
@@ -161,6 +164,8 @@ class _KDALayer:
             out = torch.empty(L, H, D, device=x.device, dtype=torch.float32)
             zerfall = g.exp().unsqueeze(-1)                                   # (L, H, D, 1)
             beta = beta.view(L, H, 1, 1)
+            if zeilen_merken():
+                self._merk[L] = (proj, zerfall, k, v, beta)
             for t in range(L):
                 S.mul_(zerfall[t])
                 kt = k[t].unsqueeze(1)                                        # (H, 1, D)
@@ -169,6 +174,11 @@ class _KDALayer:
                 out[t] = torch.bmm(q[t].unsqueeze(1), S)[:, 0]
         o = rms_norm(out, self.norm_w, self.eps) * torch.sigmoid(self.g(x).float().view(L, H, D))
         return self.out(o.reshape(L, n))
+
+    def nachholen(self, L: int, n: int) -> None:
+        proj, zerfall, k, v, beta = self._merk[L]
+        fenster_nachholen(self.conv_state, proj, n)
+        delta_nachholen(self.S, zerfall, k, v, beta, n)
 
 
 class _MLALayer:
@@ -301,6 +311,7 @@ def _zahl(gg: GGUFFile, key: str, default=None, lo=None, hi=None, ganz: bool = F
 
 
 class BailingMoe3Model:
+    alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
     arch_names = ("bailingmoe3",)
     prefill_chunk = 2048            # no sliding-window ring: long chunks read faster (qlinear)
 
@@ -379,6 +390,10 @@ class BailingMoe3Model:
             b.mixer.restore(s)
 
     # -- prefix cache ----------------------------------------------------------
+    def zeilen_nachholen(self, L: int, n: int) -> bool:
+        """State after row n of the last check with L rows, without reading the tokens again."""
+        return mischer_nachholen([b.mixer for b in self.blocks if isinstance(b.mixer, _KDALayer)], L, n)
+
     def resume_from(self, common: int, old_len: int) -> Optional[int]:
         """The recurrent state only exists for the end of the cached tokens: continue
         only when the new prompt extends them."""
@@ -395,8 +410,8 @@ class BailingMoe3Model:
         h = self.embed(tok)
         for blk in self.blocks:
             h = blk(h, pos_idx, kv_len)
-        h = rms_norm(h[-1:], self.out_norm, self.hp["eps"])
-        return self.lm_head(h)[0].float()
+        h = rms_norm(letzte_zeilen(self, h), self.out_norm, self.hp["eps"])
+        return logit_zeilen(self, self.lm_head(h)).float()
 
     @torch.inference_mode()
     def forward(self, tokens: List[int], pos: int, inject=None) -> torch.Tensor:

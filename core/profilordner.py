@@ -1,4 +1,4 @@
-"""profilordner.py – Eigener Ordner je Persönlichkeit: Profile/<Name>/{Chats,Bilder,Skills,Erinnerungen}.
+"""profilordner.py – Eigener Ordner je Persönlichkeit: Profile/<Name>/{Chats,Bilder,Videos,Skills,Erinnerungen,LoRA}.
 
 Der Ordnername kommt aus dem Namen der aktiven Persönlichkeit: nur A–Z, a–z, 0–9 und _
 (Umlaute → ae/oe/ue/ss). Gemeinsam für alle bleiben: „Über dich“, Fakten und Vorlieben
@@ -13,7 +13,7 @@ from pathlib import Path
 
 import paths
 
-UNTERORDNER = ("Chats", "Bilder", "Skills", "Erinnerungen")
+UNTERORDNER = ("Chats", "Bilder", "Videos", "Skills", "Erinnerungen", "LoRA")
 _UMLAUTE = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
 
 
@@ -60,6 +60,32 @@ def _eindeutig(ordner_: Path, endung: str) -> Path:
 def bild_pfad(endung: str = ".png") -> Path:
     """Neuer, eindeutiger Bildpfad: Profile/<Name>/Bilder/<Name>_JJJJ-MM-TT_HH-MM-SS.png."""
     return _eindeutig(ordner("Bilder"), endung)
+
+
+def video_pfad(endung: str = ".mp4") -> Path:
+    """Neuer, eindeutiger Videopfad: Profile/<Name>/Videos/<Name>_JJJJ-MM-TT_HH-MM-SS.mp4."""
+    return _eindeutig(ordner("Videos"), endung)
+
+
+def musik_pfad(endung: str = ".wav", titel: str = "") -> Path:
+    """Neuer, eindeutiger Musikpfad: Profile/<Name>/Musik/<Titel>_JJJJ-MM-TT_HH-MM.wav,
+    ohne Titel <Name>_JJJJ-MM-TT_HH-MM-SS.wav."""
+    kurz = "".join(c for c in str(titel or "") if ord(c) >= 32 and c not in '<>:"/\\|?*')
+    kurz = re.sub(r"\s+", " ", kurz).strip(" .")[:60].strip(" .")
+    if not kurz:
+        return _eindeutig(ordner("Musik"), endung)
+    o = ordner("Musik")
+    basis = f"{kurz}_{time.strftime('%Y-%m-%d_%H-%M')}"
+    pfad, n = o / f"{basis}{endung}", 2
+    while pfad.exists():
+        pfad = o / f"{basis}_{n}{endung}"
+        n += 1
+    return pfad
+
+
+def lora_pfad(ziel: str, name: str | None = None) -> Path:
+    """Charakter-LoRA einer Persönlichkeit für einen Motor: Profile/<Name>/LoRA/<ziel>.safetensors."""
+    return ordner("LoRA", name) / f"{ziel}.safetensors"
 
 
 def bild_ziel(alter_ordner, endung: str = ".png") -> Path:

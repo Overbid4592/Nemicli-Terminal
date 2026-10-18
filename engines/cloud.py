@@ -15,6 +15,7 @@ So funktioniert die Aktions-Schleife in main.py für jeden Anbieter gleich.
 from __future__ import annotations
 
 import re
+import time
 from typing import AsyncIterator
 
 import persona
@@ -27,6 +28,14 @@ from vision import user_content as _user_content
 # Hinweis: `openai` wird BEWUSST erst in __init__ importiert (nicht hier oben).
 # Das Paket braucht rund 0,9 Sekunden zum Laden – beim Start von NemiCLI weiß
 # aber noch niemand, ob überhaupt ein Cloud-Modell benutzt wird.
+
+
+def _zeiten_melden(zeiten: list[tuple[str, float]]) -> None:
+    try:
+        import debugbericht
+        debugbericht.ereignis("Anfrage: " + " · ".join(f"{n} {s:.1f} s" for n, s in zeiten), speicher=False)
+    except Exception:
+        pass
 
 
 def _usage_option_rejected(exc: Exception) -> bool:
@@ -186,29 +195,50 @@ class CloudChat:
 
     async def stream(self, user_text: str, images: list[str] | None = None) -> AsyncIterator[dict]:
         self.messages.append({"role": "user", "content": _user_content(user_text, images)})
+        zeiten = []                              # Vorarbeit bis zur Antwort des Anbieters (Debugbericht)
+        t = time.monotonic()
 
         # Verlauf auf das Kontextfenster dieses Modells kürzen
         pricing.kuerzen(self)
+        zeiten.append(("kürzen", time.monotonic() - t))
         if hinweis := pricing.aufraeum_hinweis(self):
             yield {"type": "note", "text": hinweis}
 
         use_model = self.model_id
         if self.auto_stark and self.auto_ziel and not images:
             # Auto-Stark: bei schweren Fragen für DIESE Antwort das große Modell nehmen.
-            if await self._ist_schwer(user_text):
+            t = time.monotonic()
+            schwer = await self._ist_schwer(user_text)
+            zeiten.append(("Einstufung", time.monotonic() - t))
+            if schwer:
                 use_model = self.auto_ziel
                 kurz = self.auto_ziel.split(":")[-1].split("-")[0]   # z.B. "12b"
                 yield {"type": "note",
                        "text": f"🧠 knifflige Frage – ich schalte auf {kurz} hoch"}
 
+        t = time.monotonic()
         sys_msg = {"role": "system",
                    "content": await persona.build_system_prompt_async(user_text)}
+        zeiten.append(("Systemprompt", time.monotonic() - t))
         full = ""
+        t = time.monotonic()
         try:
             stream = await self._open([sys_msg] + self.messages, model_id=use_model)
+            zeiten.append(("Anbieter antwortet", time.monotonic() - t))
+            _zeiten_melden(zeiten)
         except Exception as exc:
+            # Anfrage zu groß (HTTP 413): ältere Bilder raus, nur das neueste bleibt – ein Versuch.
+            if pricing.zu_gross(exc) and pricing.bilder_begrenzen(self.messages, 0):
+                yield {"type": "note", "text": "🖼 Anfrage war zu groß – ältere Bilder aus dem Verlauf "
+                                               "genommen, neuer Versuch."}
+                try:
+                    stream = await self._open([sys_msg] + self.messages, model_id=use_model)
+                except Exception:
+                    if self.messages and self.messages[-1]["role"] == "user":
+                        self.messages.pop()
+                    raise
             # Modell ohne Vision lehnt das Bild ab -> ohne Bild als reinen Text nachreichen.
-            if images and "image" in str(exc).lower():
+            elif images and "image" in str(exc).lower():
                 self.messages[-1] = {"role": "user", "content": user_text}
                 try:
                     stream = await self._open([sys_msg] + self.messages)

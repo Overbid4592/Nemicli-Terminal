@@ -2,17 +2,18 @@
 from __future__ import annotations
 
 import math
+import re
 import threading
 from typing import Dict, List, Optional
 
 import torch
 import torch.nn.functional as F
 
-from .. import cudakern
+from .. import cudakern, mmvq
 from .. import debuglog as dbg
-from .. import hostmem
+from .. import hostmem, schichten
 from ..gguf import GGML_TYPES, GGUFError, GGUFFile
-from ..qlinear import QuantLinear, build_quant_linear, kernel_available, quantizable
+from ..qlinear import build_quant_linear, kernel_available, quantizable
 from ..quant import dequantize, raw_to_tensor
 
 
@@ -22,6 +23,31 @@ def release_pinned_memory() -> None:
     hostmem.flush()
     if hasattr(torch._C, "_host_emptyCache"):
         torch._C._host_emptyCache()
+
+
+LAGER = True             # MoE experts beyond the VRAM budget: learning slots (False: whole tensors per layer)
+_EXPERTEN = re.compile(r"blk\.(\d+)\.ffn_\w+_exps\.weight$")
+
+
+def lager_plaetze(gg: GGUFFile, budget: Optional[int]) -> int:
+    """VRAM slots per MoE layer for an expert budget: the budget split evenly over the layers
+    (one slot holds one expert in every part: gate, up, down).  0: no storeroom (no budget, no
+    expert tensors, a format without kernel, or not even one slot)."""
+    if budget is None:
+        return 0
+    je_schicht: Dict[int, int] = {}
+    n_exp = 0
+    for name, ti in gg.tensors.items():
+        m = _EXPERTEN.match(name)
+        if m is None or len(ti.shape) != 3:
+            continue
+        if GGML_TYPES[ti.ggml_type][0] not in cudakern.FORMATE:
+            return 0
+        n_exp = max(n_exp, ti.shape[0])
+        je_schicht[int(m.group(1))] = je_schicht.get(int(m.group(1)), 0) + ti.n_bytes // ti.shape[0]
+    if not je_schicht:
+        return 0
+    return max(0, min(n_exp, budget // sum(je_schicht.values())))
 
 
 class WeightLoader:
@@ -40,7 +66,13 @@ class WeightLoader:
         self.loaded_bytes = 0
         self.quant = quant and kernel_available(device)
         self.experten_rest = experten_vram if device.type == "cuda" else None
+        # with a budget: every expert in pinned RAM, the budget becomes VRAM slots per layer for
+        # the most used experts (moe.ExpertenLager) – if the experts have kernels and LAGER is on
+        self.lager_plaetze = lager_plaetze(gg, experten_vram) if LAGER and self.experten_rest is not None else 0
         self.n_quant = 0            # matrices kept in quantised form
+        self.ram_namen = SCHICHTEN_RAM if device.type == "cuda" else frozenset()
+        self.ram_bytes = 0          # weights actually placed in pinned RAM
+        self.band = Fliessband(device) if self.ram_namen else None
         self._ring = None           # pinned read buffers [tensor, event of the last copy]
         self._ring_pos = 0
         self._strom = None          # copy stream: file reads overlap the conversions on the GPU
@@ -83,6 +115,21 @@ class WeightLoader:
         torch.cuda.current_stream(device).wait_stream(self._strom)
         return ziel
 
+    def _im_ram(self, ti) -> Optional[torch.Tensor]:
+        """Raw bytes of a planned RAM tensor as a CUDA view of pinned RAM (None: not planned,
+        or the driver cannot pin that much – then it goes to VRAM as usual)."""
+        if ti.name not in self.ram_namen:
+            return None
+        try:
+            host = hostmem.empty(ti.n_bytes, self.device)
+            self.gg.read_into(ti, host.numpy())
+            sicht = hostmem.abbilden(host, self.device)
+        except (RuntimeError, ValueError) as exc:
+            dbg.event(f"{ti.name}: RAM nicht festsetzbar ({exc}), bleibt im VRAM")
+            return None
+        self.ram_bytes += ti.n_bytes
+        return sicht
+
     def has(self, name: str) -> bool:
         return name in self.gg.tensors
 
@@ -120,6 +167,15 @@ class WeightLoader:
         ti = self._info2d(name)
         bias = self.norm(bias_name) if bias_name and self.has(bias_name) else None
         n_out, n_in = ti.shape
+        if (roh := self._im_ram(ti)) is not None:                # block format, copied over PCIe per use
+            pl = PackedLinear(roh, ti.ggml_type, n_out, n_in, bias, self.dtype)
+            pl.band, pl.nr = self.band, self.band.anmelden(roh)
+            self._count(ti)
+            return pl
+        if self.quant and mmvq_weg(ti.ggml_type, n_in, self.device):   # bleibt im Blockformat (mmvq)
+            pl = PackedLinear(self._roh(ti, self.device), ti.ggml_type, n_out, n_in, bias, self.dtype)
+            self._count(ti)
+            return pl
         if self.quant and quantizable(ti.ggml_type, n_out, n_in):
             raw = self._roh(ti, self.device)
             ql = build_quant_linear(raw, ti.ggml_type, n_out, n_in, bias)
@@ -146,7 +202,7 @@ class WeightLoader:
             raise GGUFError(f"tensor {name!r}: implausible expert count {n_exp}")
         per = ti.n_bytes // n_exp
         if self.experten_rest is not None and GGML_TYPES[ti.ggml_type][0] in cudakern.FORMATE \
-                and not self._passt_in_vram(ti, n_out, n_in):
+                and (self.lager_plaetze or not self._passt_in_vram(ti, n_out, n_in)):
             try:                                                             # pinned: readable by the GPU kernels
                 roh = hostmem.empty(ti.n_bytes, self.device)               # exact size, no rounding
                 self.gg.read_into(ti, roh.numpy())
@@ -198,6 +254,14 @@ class WeightLoader:
             raw = raw_to_tensor(self.gg.tensor_bytes(ti), "cpu")      # zero-copy view of the mmap
             self._count(ti)
             return Embedding(raw, ti.ggml_type, n_vocab, n_embd), None
+        if not tied_head and blockformat and (roh := self._im_ram(ti)) is not None:
+            self._count(ti)                                      # one row per token over PCIe
+            return Embedding(roh, ti.ggml_type, n_vocab, n_embd), None
+        if self.quant and mmvq_weg(ti.ggml_type, n_embd, self.device):   # der Kopf liest dieselben Bytes
+            raw = self._roh(ti, self.device)
+            head = PackedLinear(raw, ti.ggml_type, n_vocab, n_embd, None, self.dtype) if tied_head else None
+            self._count(ti)
+            return Embedding(raw, ti.ggml_type, n_vocab, n_embd), head
         if self.quant and quantizable(ti.ggml_type, n_vocab, n_embd):
             raw = self._roh(ti, self.device)
             emb = Embedding(raw, ti.ggml_type, n_vocab, n_embd)
@@ -218,12 +282,91 @@ def packed_type(ggml_type: int) -> bool:
     return GGML_TYPES[ggml_type][0] in cudakern.IMMER_GEPACKT
 
 
+# Formate, die im Blockformat bleiben und über die int8-Kerne (mmvq) rechnen statt über den int4-Weg:
+# kleiner (Q4_K 4,5 statt 5, Q6_K 6,56 statt 10 Bit je Gewicht), beim Schreiben schneller und genauer.
+MMVQ_STATT_INT4 = frozenset(("Q4_K", "Q6_K"))
+
+
+def mmvq_weg(ggml_type: int, n_in: int, device) -> bool:
+    name = GGML_TYPES[ggml_type][0]
+    return name in MMVQ_STATT_INT4 and torch.device(device).type == "cuda" and mmvq.verfuegbar(device, name, n_in)
+
+
+class Fliessband:
+    """Matrices in pinned RAM reach the GPU as whole copies on a copy stream, a few ahead of their
+    use, into a ring of VRAM slots – one large copy runs at full PCIe speed, kernels reading the
+    RAM directly only reach about half of it.  The copies wait for the slot's last use and the
+    computation waits for its copy (events), so it also works inside a CUDA graph capture.
+
+    Matrices are numbered in loading order, which is the order of use in a forward pass; a number
+    not above the previous one starts a new pass."""
+
+    PLAETZE = schichten.BAND_PLAETZE
+
+    def __init__(self, device: torch.device):
+        self.device = device
+        self.quellen: List[torch.Tensor] = []
+        self._ring: Optional[torch.Tensor] = None
+        self._strom = None
+        self._inhalt: List[int] = []             # matrix number per slot (-1: none)
+        self._fertig: list = []                  # event per slot: last computation that read it
+        self._gelesen: List[bool] = []           # that event belongs to this pass
+        self._bereit: list = []                  # event per slot: copy finished
+        self._zuletzt = 1 << 62
+
+    def anmelden(self, quelle: torch.Tensor) -> int:
+        self.quellen.append(quelle.reshape(-1))
+        return len(self.quellen) - 1
+
+    def _anlegen(self) -> None:
+        platz = max(q.numel() for q in self.quellen)
+        self._ring = torch.empty(self.PLAETZE, platz, dtype=torch.uint8, device=self.device)
+        self._strom = torch.cuda.Stream(self.device)
+        self._inhalt = [-1] * self.PLAETZE
+        self._gelesen = [False] * self.PLAETZE
+        self._fertig = [torch.cuda.Event() for _ in range(self.PLAETZE)]
+        self._bereit = [torch.cuda.Event() for _ in range(self.PLAETZE)]
+
+    def _laden(self, nr: int) -> None:
+        p = nr % self.PLAETZE
+        if self._inhalt[p] == nr:
+            return
+        q = self.quellen[nr]
+        if self._gelesen[p]:                     # earlier uses: covered by the wait at the start of the pass
+            self._strom.wait_event(self._fertig[p])
+        with torch.cuda.stream(self._strom):
+            self._ring[p, :q.numel()].copy_(q, non_blocking=True)
+            self._bereit[p].record(self._strom)
+        self._inhalt[p] = nr
+
+    def holen(self, nr: int) -> torch.Tensor:
+        """Bytes of matrix nr in VRAM; the following ones are already on their way."""
+        if self._ring is None:
+            self._anlegen()
+        rechnen = torch.cuda.current_stream(self.device)
+        if nr <= self._zuletzt:                  # new pass: slots from before may still be read
+            self._strom.wait_stream(rechnen)
+            self._inhalt = [-1] * self.PLAETZE
+            self._gelesen = [False] * self.PLAETZE
+        self._zuletzt = nr
+        for k in range(nr, min(nr + self.PLAETZE - 1, len(self.quellen) - 1) + 1):
+            self._laden(k)
+        p = nr % self.PLAETZE
+        rechnen.wait_event(self._bereit[p])
+        return self._ring[p, :self.quellen[nr].numel()]
+
+    def fertig(self, nr: int) -> None:
+        p = nr % self.PLAETZE
+        self._fertig[p].record(torch.cuda.current_stream(self.device))
+        self._gelesen[p] = True
+
+
 class PackedLinear:
     """y = x @ W^T (+ b), W (n_out, n_in) kept in a block format without int4 path: up to
-    KERNEL_BIS rows (tokens) per call through the own kernel, more rows unpack W piecewise
-    into the compute dtype."""
+    KERNEL_BIS rows (tokens) per call through the own kernels (one row: mv, more: mm, the
+    weights read once), more rows unpack W piecewise into the compute dtype."""
 
-    KERNEL_BIS = 8
+    KERNEL_BIS = cudakern.MM_ZEILEN
     ZEILEN_JE_STUECK = 32 * 1024 * 1024          # values unpacked at once
 
     def __init__(self, raw: torch.Tensor, ggml_type: int, n_out: int, n_in: int,
@@ -238,23 +381,49 @@ class PackedLinear:
         _, bs, ts = GGML_TYPES[ggml_type]
         self.zeilen_bytes = n_in // bs * ts
         self.kernel = raw.is_cuda and cudakern.verfuegbar(raw.device, self.name, n_in)
+        self.mmvq = raw.is_cuda and mmvq.verfuegbar(raw.device, self.name, n_in)
+        self.mm_bis = min(self.KERNEL_BIS, cudakern.mm_bis(raw.device)) if self.kernel else 1
+        self.im_ram = raw.is_cuda and hostmem.abgebildet(raw)   # pinned RAM, read over PCIe
+        self.band: Optional[Fliessband] = None   # with it: whole copies a few matrices ahead
+        self.nr = -1
         self._nullen: dict = {}
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.band is None:
+            return self._rechnen(x, self.raw)
+        roh = self.band.holen(self.nr).view(1, -1)
+        try:
+            return self._rechnen(x, roh)
+        finally:
+            self.band.fertig(self.nr)
+
+    def _rechnen(self, x: torch.Tensor, raw: torch.Tensor) -> torch.Tensor:
         x2 = x.reshape(-1, self.n_in)
         M = x2.shape[0]
-        if self.kernel and self.raw.is_cuda and M <= self.KERNEL_BIS:
-            if M not in self._nullen:            # every row uses "expert" 0, i.e. W itself
-                self._nullen[M] = torch.zeros(M, dtype=torch.long, device=self.raw.device)
-            y = cudakern.mv(self.name, self.raw, self._nullen[M], x2, self.n_out, self.n_in).to(self.dtype)
+        im_ram = self.im_ram and raw is self.raw
+        if self.mmvq and raw.is_cuda and M <= mmvq.MMVQ_BIS[self.name] and not im_ram:   # wenige Token: int8-Kerne
+            y = mmvq.mv(self.name, raw, x2, self.n_out, self.n_in).to(self.dtype)
+        elif self.mmvq and raw.is_cuda and M <= mmvq.MMQ_BIS[self.name] and not im_ram:  # mittel: Tensor-Kerne
+            y = mmvq.mm(self.name, raw, x2, self.n_out, self.n_in).to(self.dtype)
+        elif self.kernel and raw.is_cuda and M == 1:
+            if M not in self._nullen:            # the row uses "expert" 0, i.e. W itself
+                self._nullen[M] = torch.zeros(M, dtype=torch.long, device=raw.device)
+            y = cudakern.mv(self.name, raw, self._nullen[M], x2, self.n_out, self.n_in).to(self.dtype)
+        elif self.kernel and raw.is_cuda and M <= self.mm_bis:
+            y = cudakern.mm(self.name, raw, x2, self.n_out, self.n_in).to(self.dtype)
         else:
             xd = x2.to(self.dtype)
             y = torch.empty(M, self.n_out, dtype=self.dtype, device=x2.device)
             stueck = max(1, self.ZEILEN_JE_STUECK // self.n_in)
             for r0 in range(0, self.n_out, stueck):
                 r1 = min(r0 + stueck, self.n_out)
-                w = dequantize(self.raw[0, r0 * self.zeilen_bytes:r1 * self.zeilen_bytes], self.ggml_type,
-                               (r1 - r0) * self.n_in, self.dtype).view(r1 - r0, self.n_in)
+                roh = raw[0, r0 * self.zeilen_bytes:r1 * self.zeilen_bytes]
+                if im_ram:                       # one copy over PCIe, unpacking reads the bytes several times
+                    roh = roh.clone()
+                if self.mmvq:
+                    w = mmvq.entpacken(self.name, roh, r1 - r0, self.n_in).to(self.dtype)
+                else:
+                    w = dequantize(roh, self.ggml_type, (r1 - r0) * self.n_in, self.dtype).view(r1 - r0, self.n_in)
                 y[:, r0:r1] = xd @ w.t()
                 del w
         if self.b is not None:
@@ -278,6 +447,8 @@ class PackedExperts:
         self.name = GGML_TYPES[ggml_type][0]
         lesbar = raw.is_cuda or (self.geraet.type == "cuda" and raw.is_pinned())
         self.kernel = lesbar and cudakern.verfuegbar(self.geraet, self.name, n_in)
+        self.im_ram = not raw.is_cuda and self.geraet.type == "cuda" and raw.is_pinned()
+        self.adressen: Optional[torch.Tensor] = None   # set by moe.ExpertenLager: VRAM slot or RAM per expert
 
     def __len__(self) -> int:
         return self.n_exp
@@ -291,14 +462,15 @@ class PackedExperts:
     def matvec(self, ids: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
         """The experts `ids` (k,) applied to one shared input x (n_in,) -> (k, n_out) float32."""
         if self.kernel:
-            return cudakern.mv(self.name, self.raw, ids, x.reshape(-1), self.n_out, self.n_in)
+            return cudakern.mv(self.name, self.raw, ids, x.reshape(-1), self.n_out, self.n_in, self.adressen)
         w = self.weights(ids)
         return torch.matmul(w, x.to(w.dtype).reshape(-1, 1))[..., 0].float()
 
     def matvec_je(self, ids: torch.Tensor, a: torch.Tensor) -> torch.Tensor:
         """Expert ids[j] applied to its own input a[j]: (k, n_in) -> (k, n_out) float32."""
         if self.kernel:
-            return cudakern.mv(self.name, self.raw, ids, a.reshape(ids.numel(), -1), self.n_out, self.n_in)
+            return cudakern.mv(self.name, self.raw, ids, a.reshape(ids.numel(), -1), self.n_out, self.n_in,
+                               self.adressen)
         w = self.weights(ids)
         return torch.bmm(a.to(w.dtype).unsqueeze(1), w.transpose(1, 2))[:, 0].float()
 
@@ -353,6 +525,17 @@ class Linear:
 
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(x.to(self.w.dtype), self.w, self.b)
+
+
+def letzte_zeilen(model, h: torch.Tensor) -> torch.Tensor:
+    """Rows that get logits: the last one, or all while `model.alle_logits` is set
+    (several proposed tokens are checked in one pass)."""
+    return h if model.alle_logits else h[-1:]
+
+
+def logit_zeilen(model, logits: torch.Tensor) -> torch.Tensor:
+    """(V,) for the last row, (L, V) with `model.alle_logits`."""
+    return logits if model.alle_logits else logits[0]
 
 
 def rms_norm(x: torch.Tensor, w: torch.Tensor, eps: float) -> torch.Tensor:
@@ -446,27 +629,54 @@ KV_GROWTH = 4096         # full KV caches start this big and grow in these steps
 KV_GROUP = 32            # 8-bit KV cache: one scale per 32 values of a head vector (like q8_0)
 
 
+# Positions per full KV cache that live in VRAM (None: all).  Set by the Engine while it
+# builds the model; positions beyond it go to RAM blocks and travel to the GPU per layer.
+KV_GPU_SLOTS: Optional[int] = None
+
+# Weight matrices that stay in pinned RAM (schichten.planen).  Set by the Engine while it
+# builds the model; the GPU reads them over PCIe at every step.
+SCHICHTEN_RAM: frozenset = frozenset()
+
+
 class KVCache:
     """Full-context KV cache: slot i holds position i.  Allocated for KV_GROWTH positions
     and grown on demand up to `max_len` (`ensure`), so a short chat does not reserve the
     VRAM of the whole context.  With bits=8 keys and values are stored as int8 with one
     scale per KV_GROUP values (53 % of the bf16 size); `kv(n)` hands them to the attention
-    in the compute dtype, one layer at a time."""
+    in the compute dtype, one layer at a time.
+
+    With KV_GPU_SLOTS set (smaller than max_len) only the first `gpu_max` positions stay in
+    VRAM; later ones go to RAM blocks of KV_GROWTH positions (pinned when possible) and
+    `kv(n)` copies them to the GPU for each attention call – a context larger than the VRAM
+    allows, slower once it is longer than `gpu_max`."""
 
     def __init__(self, n_kv_heads: int, head_dim: int, max_len: int, device, dtype, bits: int = 16):
         self.max_len = max_len
         self.dtype = dtype
         self.int8 = bits == 8 and head_dim % KV_GROUP == 0
-        self.k, self.v, self.ks, self.vs = self._empty(n_kv_heads, min(max_len, KV_GROWTH), head_dim, device)
+        teilung = KV_GPU_SLOTS
+        self.gpu_max = max_len if not teilung or teilung >= max_len else max(1, int(teilung))
+        self.ram: List[tuple] = []        # RAM blocks for positions >= gpu_max
+        self.k, self.v, self.ks, self.vs = self._empty(n_kv_heads, min(self.gpu_max, KV_GROWTH), head_dim, device)
         self.pos = None           # slot i holds position i
 
-    def _empty(self, heads: int, n: int, dim: int, device):
+    @property
+    def geteilt(self) -> bool:
+        return self.gpu_max < self.max_len
+
+    def _empty(self, heads: int, n: int, dim: int, device, pin: bool = False):
+        def neu(shape, dt):
+            if pin:
+                try:
+                    return torch.zeros(shape, dtype=dt, pin_memory=True)
+                except RuntimeError:              # pinned RAM exhausted: pageable (slower copies)
+                    pass
+            return torch.zeros(shape, device=device, dtype=dt)
         if not self.int8:
-            k = torch.zeros(heads, n, dim, device=device, dtype=self.dtype)
-            return k, torch.zeros_like(k), None, None
-        k = torch.zeros(heads, n, dim, device=device, dtype=torch.int8)
-        s = torch.zeros(heads, n, dim // KV_GROUP, device=device, dtype=self.dtype)
-        return k, torch.zeros_like(k), s, torch.zeros_like(s)
+            return neu((heads, n, dim), self.dtype), neu((heads, n, dim), self.dtype), None, None
+        s = (heads, n, dim // KV_GROUP)
+        return (neu((heads, n, dim), torch.int8), neu((heads, n, dim), torch.int8),
+                neu(s, self.dtype), neu(s, self.dtype))
 
     @property
     def heads(self) -> int:
@@ -479,12 +689,15 @@ class KVCache:
     def ensure(self, n: int) -> bool:
         """Room for positions [0, n); returns True if the tensors were replaced (captured
         CUDA graphs that point at the old ones must be dropped)."""
-        cap = self.k.shape[1]
-        if n <= cap:
-            return False
         if n > self.max_len:
             raise RuntimeError(f"context window of {self.max_len} tokens exceeded")
-        neu = min(self.max_len, -(-n // KV_GROWTH) * KV_GROWTH)
+        while self.geteilt and self.gpu_max + len(self.ram) * KV_GROWTH < n:   # RAM blocks
+            self.ram.append(self._empty(self.heads, KV_GROWTH, self.head_dim, "cpu", pin=True))
+        cap = self.k.shape[1]
+        n = min(n, self.gpu_max)
+        if n <= cap:
+            return False
+        neu = min(self.gpu_max, -(-n // KV_GROWTH) * KV_GROWTH)
         with torch.inference_mode():
             parts = self._empty(self.heads, neu, self.head_dim, self.k.device)
             for old, new in zip((self.k, self.v, self.ks, self.vs), parts):
@@ -492,6 +705,30 @@ class KVCache:
                     new[:, :cap].copy_(old)
         self.k, self.v, self.ks, self.vs = parts
         return True
+
+    def _ram_schreiben(self, werte: tuple, pos: torch.Tensor):
+        """werte: tensors (H, L, ·) in storage format for positions `pos` (>= gpu_max, CPU)."""
+        rel = pos - self.gpu_max
+        block = torch.div(rel, KV_GROWTH, rounding_mode="floor")
+        for b in torch.unique(block).tolist():
+            wahl = block == b
+            idx = rel[wahl] - b * KV_GROWTH
+            for ziel, w in zip(self.ram[b], werte):
+                if ziel is not None:
+                    ziel.index_copy_(1, idx, w[:, wahl])
+
+    def _ram_lesen(self, n: int, device) -> List[Optional[torch.Tensor]]:
+        """Positions [gpu_max, n) of all four stores on `device`."""
+        rest = n - self.gpu_max
+        raus = []
+        for i in range(4):
+            if self.ram[0][i] is None:
+                raus.append(None)
+                continue
+            teile = [blk[i][:, :min(KV_GROWTH, rest - j * KV_GROWTH)]
+                     for j, blk in enumerate(self.ram) if j * KV_GROWTH < rest]
+            raus.append(torch.cat([t.to(device, non_blocking=True) for t in teile], dim=1))
+        return raus
 
     def _pack(self, x: torch.Tensor):
         """(H, L, D) -> int8 values and one scale per KV_GROUP (scale rounded first, so the
@@ -507,33 +744,52 @@ class KVCache:
     def write(self, k: torch.Tensor, v: torch.Tensor, pos_idx: torch.Tensor):
         """k, v: (L, n_kv_heads, head_dim); pos_idx: (L,) positions to write."""
         k, v = k.transpose(0, 1), v.transpose(0, 1)
-        if not self.int8:
-            self.k.index_copy_(1, pos_idx, k.to(self.k.dtype))
-            self.v.index_copy_(1, pos_idx, v.to(self.v.dtype))
-            return
-        for x, q_store, s_store in ((k, self.k, self.ks), (v, self.v, self.vs)):
-            q, s = self._pack(x)
-            q_store.index_copy_(1, pos_idx, q)
-            s_store.index_copy_(1, pos_idx, s)
+        if self.int8:
+            (kq, ks), (vq, vs) = self._pack(k), self._pack(v)
+            werte = (kq, vq, ks, vs)
+        else:
+            werte = (k.to(self.k.dtype), v.to(self.v.dtype), None, None)
+        if self.geteilt:
+            drin = pos_idx < self.gpu_max
+            if not bool(drin.all()):                   # some positions go to RAM
+                draussen = ~drin
+                self._ram_schreiben(tuple(w[:, draussen].cpu() if w is not None else None for w in werte),
+                                    pos_idx[draussen].cpu())
+                if not bool(drin.any()):
+                    return
+                werte = tuple(w[:, drin] if w is not None else None for w in werte)
+                pos_idx = pos_idx[drin]
+        for ziel, w in zip((self.k, self.v, self.ks, self.vs), werte):
+            if ziel is not None:
+                ziel.index_copy_(1, pos_idx, w)
 
     def kv(self, n: int):
         """Keys and values of positions [0, n) in the compute dtype, (H, n, D) each."""
+        teile = [self.k[:, :n], self.v[:, :n], None if self.ks is None else self.ks[:, :n],
+                 None if self.vs is None else self.vs[:, :n]]
+        if n > self.gpu_max:                           # the rest comes from RAM
+            ram = self._ram_lesen(n, self.k.device)
+            teile = [None if t is None else torch.cat([t, r], dim=1) for t, r in zip(teile, ram)]
         if not self.int8:
-            return self.k[:, :n], self.v[:, :n]
-        return self._unpack(self.k[:, :n], self.ks[:, :n]), self._unpack(self.v[:, :n], self.vs[:, :n])
+            return teile[0], teile[1]
+        return self._unpack(teile[0], teile[2]), self._unpack(teile[1], teile[3])
 
     def fill(self, k: torch.Tensor, v: torch.Tensor):
         """Positions [0, n) from keys/values as `kv(n)` returns them (prefix cache)."""
         n = k.shape[1]
         k, v = k.to(self.k.device), v.to(self.k.device)
-        if not self.int8:
-            self.k[:, :n].copy_(k)
-            self.v[:, :n].copy_(v)
-            return
-        for x, q_store, s_store in ((k, self.k, self.ks), (v, self.v, self.vs)):
-            q, s = self._pack(x)
-            q_store[:, :n].copy_(q)
-            s_store[:, :n].copy_(s)
+        if self.int8:
+            (kq, ks), (vq, vs) = self._pack(k), self._pack(v)
+            werte = (kq, vq, ks, vs)
+        else:
+            werte = (k.to(self.k.dtype), v.to(self.v.dtype), None, None)
+        g = min(n, self.gpu_max)
+        for ziel, w in zip((self.k, self.v, self.ks, self.vs), werte):
+            if ziel is not None:
+                ziel[:, :g].copy_(w[:, :g])
+        if n > g:
+            self._ram_schreiben(tuple(None if w is None else w[:, g:].cpu() for w in werte),
+                                torch.arange(g, n))
 
 
 class RingKVCache:
@@ -564,7 +820,7 @@ class RingKVCache:
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Tensor,
               kv_len: int, scale: float, window: int = 0,
               key_pos: Optional[torch.Tensor] = None, spans=None,
-              sinks: Optional[torch.Tensor] = None) -> torch.Tensor:
+              sinks: Optional[torch.Tensor] = None, chunk: int = 0) -> torch.Tensor:
     """
     q: (L, H, D) ; k, v: caches (Hkv, slots, D) ; q_pos: (L,) positions of the queries.
     Without `key_pos` slot i holds position i and slots [0, kv_len) are used.  With
@@ -572,9 +828,16 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Te
     `window` > 0 limits to the last `window` positions (sliding window, llama.cpp
     "standard" semantics).  `spans`: position ranges [lo, hi) read bidirectionally
     (an image's tokens; all of them must be written in this call).  `sinks` (H,): one extra
-    logit per head in the softmax denominator, without a value (gpt-oss).  Returns (L, H, D).
+    logit per head in the softmax denominator, without a value (gpt-oss).  `chunk` > 0: keys only
+    from the query's own block of `chunk` positions (Llama 4 chunked attention).  Returns (L, H, D).
     """
     L, H, D = q.shape
+    if (L > 1 and key_pos is None and window <= 0 and chunk <= 0 and not spans and sinks is None
+            and not mehrere_aufnahme()):
+        # Einlesen: die Token stehen auf den letzten L Plätzen des Caches – unten rechts kausal, ohne
+        # ausgeschriebene Maske (der Kern überspringt verdeckte Kacheln). Nicht in einer Graph-Aufnahme
+        # mehrerer Token: dort ist kv_len aufgerundet.
+        return _kausal_rechts(q, k[:, :kv_len].unsqueeze(0), v[:, :kv_len].unsqueeze(0), scale)
     if key_pos is None:
         kh = k[:, :kv_len].unsqueeze(0)
         vh = v[:, :kv_len].unsqueeze(0)
@@ -589,6 +852,9 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Te
         mask = mask & (key_pos >= 0).unsqueeze(0)      # empty slots
     if window > 0:
         mask = mask & (dist < window)
+    if chunk > 0:
+        mask = mask & (torch.div(q_pos, chunk, rounding_mode="floor").unsqueeze(1)
+                       == torch.div(key_pos, chunk, rounding_mode="floor").unsqueeze(0))
     for lo, hi in spans or ():                         # image tokens see each other both ways
         drin_q = (q_pos >= lo) & (q_pos < hi)
         drin_k = (key_pos >= lo) & (key_pos < hi)
@@ -599,6 +865,39 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Te
         return _attention_sinks(q, kh[0], vh[0], mask, scale, sinks)
     qh = q.transpose(0, 1).unsqueeze(0).to(k.dtype)   # (1,H,L,D)
     out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=mask, scale=scale, enable_gqa=(kh.shape[1] != H))
+    return out[0].transpose(0, 1)
+
+
+_CUDNN_ATTENTION = {"geht": None}      # None: noch nicht versucht, False: nicht verfügbar
+CUDNN_KOPF_BIS = 128                   # cuDNN-SDPA kann Köpfe bis zu dieser Größe (gemessen: 256 nicht)
+CUDNN_KOPIE_BIS = 256 * 2**20          # vervielfachte K/V höchstens so groß (langer Kontext, knapper VRAM)
+
+
+def _kausal_rechts(q: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor, scale: float) -> torch.Tensor:
+    """q (L, H, D), kh/vh (1, Hkv, S, D) mit den Abfragen auf den letzten L Plätzen. cuDNN-SDPA (auf Blackwell
+    gemessen 2–4× schneller als mit Maske; ohne GQA – KV-Köpfe werden vervielfacht), sonst der effiziente Kern
+    mit derselben Kausalität."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    from torch.nn.attention.bias import causal_lower_right
+    L, H, D = q.shape
+    Hkv, S = kh.shape[1], kh.shape[2]
+    qh = q.transpose(0, 1).unsqueeze(0).to(kh.dtype)                       # (1, H, L, D)
+    kausal = causal_lower_right(L, S)
+    kopie = 0 if Hkv == H else 2 * H * S * kh.shape[-1] * kh.element_size()
+    if (q.is_cuda and max(D, vh.shape[-1]) <= CUDNN_KOPF_BIS and kh.shape[-1] == vh.shape[-1]
+            and kopie <= CUDNN_KOPIE_BIS and _CUDNN_ATTENTION["geht"] is not False):
+        kk = kh if Hkv == H else kh.repeat_interleave(H // Hkv, dim=1)
+        vv = vh if Hkv == H else vh.repeat_interleave(H // Hkv, dim=1)
+        try:
+            with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+                out = F.scaled_dot_product_attention(qh, kk, vv, attn_mask=kausal, scale=scale)
+            _CUDNN_ATTENTION["geht"] = True
+            return out[0].transpose(0, 1)
+        except RuntimeError:
+            if _CUDNN_ATTENTION["geht"] is None:
+                dbg.event("cuDNN-Attention nicht verfügbar – Einlesen über den effizienten Kern")
+            _CUDNN_ATTENTION["geht"] = False
+    out = F.scaled_dot_product_attention(qh, kh, vh, attn_mask=kausal, scale=scale, enable_gqa=(Hkv != H))
     return out[0].transpose(0, 1)
 
 
@@ -672,51 +971,242 @@ def swiglu_mlp(x: torch.Tensor, gate: Linear, up: Linear, down: Linear) -> torch
 GPU_SPERRE = threading.RLock()
 
 
+MEHRERE_BUCKET = 2048                 # several tokens: fewer captures (each costs several passes)
+_MEHRERE = threading.local()          # set while several tokens are warmed up and captured
+
+
+def _host_lesen_finden():
+    """Dispatch mode that fails on reads from the GPU to the host (item/int, nonzero, copies to the CPU).
+    Unlike torch.cuda.set_sync_debug_mode it only applies to the calling thread – the global mode made
+    synchronizing calls in other threads fail too (seen: the TensorRT build next to the image describer).
+    It runs in the warm-up, not in the capture, so an op may finish before it is reported."""
+    from torch.utils._python_dispatch import TorchDispatchMode
+    from torch.utils._pytree import tree_leaves
+    aten = torch.ops.aten
+    immer = {aten.item.default, aten._local_scalar_dense.default, aten.nonzero.default,
+             aten.masked_select.default, aten.is_nonzero.default, aten.equal.default}
+
+    class HostLesen(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            if func in immer:
+                raise RuntimeError(f"called a synchronizing CUDA operation ({func})")
+            erg = func(*args, **(kwargs or {}))
+            rein = [t for t in tree_leaves((args, kwargs)) if isinstance(t, torch.Tensor)]
+            raus = [t for t in tree_leaves(erg) if isinstance(t, torch.Tensor)]
+            if any(t.is_cuda for t in rein) and any(t.device.type == "cpu" for t in raus):
+                raise RuntimeError(f"called a synchronizing CUDA operation ({func} to the CPU)")
+            return erg
+    return HostLesen()
+_ZEILEN = threading.local()           # set while proposed tokens are checked (see zeilen_merken)
+
+
+def zeilen_merken() -> bool:
+    """Proposed tokens are being checked: recurrent layers keep their per-token inputs, so the
+    state after any row can be rebuilt without reading the tokens again (`nachholen`)."""
+    return getattr(_ZEILEN, "an", False)
+
+
+class ZeilenMerken:
+    """Context: `zeilen_merken()` is true inside."""
+
+    def __enter__(self):
+        self._vorher = zeilen_merken()
+        _ZEILEN.an = True
+
+    def __exit__(self, *a):
+        _ZEILEN.an = self._vorher
+
+
+def fenster_nachholen(fenster: torch.Tensor, zeilen: torch.Tensor, n: int) -> None:
+    """Carried convolution window after the first n of `zeilen` (from the window before them)."""
+    voll = torch.cat([fenster, zeilen[:n]], dim=0)
+    fenster.copy_(voll[-fenster.shape[0]:])
+
+
+def delta_nachholen(S: torch.Tensor, zerfall: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+                    beta: torch.Tensor, n: int) -> None:
+    """Delta rule over the first n rows - the same steps as the token loops of DeltaNet / KDA."""
+    for t in range(n):
+        S.mul_(zerfall[t])
+        kt = k[t].unsqueeze(1)
+        delta = (v[t].unsqueeze(1) - torch.bmm(kt, S)) * beta[t]
+        S.baddbmm_(kt.transpose(1, 2), delta)
+
+
+def mischer_nachholen(mischer: list, L: int, n: int) -> bool:
+    """Rebuilds the state of every recurrent layer after row n of the last check with L rows
+    (state before the check already restored); False if a layer has no rows of that check."""
+    if not mischer or any(L not in m._merk for m in mischer):
+        return False
+    for m in mischer:
+        m.nachholen(L, n)
+    return True
+
+
+def mehrere_aufnahme() -> bool:
+    """Several tokens are being prepared for a CUDA graph: layers take their host-read-free way."""
+    return getattr(_MEHRERE, "an", False)
+_AUFNAHME_STROM: Dict = {}
+
+
+def aufnahme_strom(device) -> "torch.cuda.Stream":
+    """One side stream per device for all graph captures: cuBLAS keeps a workspace for every
+    stream it saw (about 32 MiB each, never freed) - a new stream per capture let that grow
+    with every KV bucket."""
+    idx = torch.device(device).index
+    idx = torch.cuda.current_device() if idx is None else idx
+    if idx not in _AUFNAHME_STROM:
+        _AUFNAHME_STROM[idx] = torch.cuda.Stream(device=idx)
+    return _AUFNAHME_STROM[idx]
+
+
 class GraphDecoder:
     """
     Runs single-token decode steps through captured CUDA graphs, one graph per
     KV-length bucket, eliminating per-kernel launch overhead.  The model must
     expose `_run(tok, pos_idx, kv_len)` using only static buffers / in-place
     state updates, plus `snapshot_state()` / `restore_state()`.
+    `mehrere` does the same for a few tokens with the logits of every row (checking
+    proposed tokens); one graph per (token count, bucket).  With `haupt` (another decoder)
+    the graphs and the memory pool are kept there under `name`, so dropping that decoder's
+    graphs drops these too.
     """
 
-    def __init__(self, model, n_ctx: int, bucket: int = 256):
+    def __init__(self, model, n_ctx: int, bucket: int = 256, haupt: Optional["GraphDecoder"] = None,
+                 name: str = ""):
         self.model = model
         self.n_ctx = n_ctx
         self.bucket = bucket
         dev = model.device
         self.tok = torch.zeros(1, dtype=torch.long, device=dev)
         self.pos = torch.zeros(1, dtype=torch.long, device=dev)
-        self.graphs: Dict[int, tuple] = {}
-        self.pool = None
+        self._haupt, self._name = haupt, name
+        self._graphs: Dict = {}           # kv_len -> graph; (L, kv_len) for several tokens
+        self._pool = None
+        self.pool_mehr = None             # own pool of the several-token graphs: dropped with them
+        self._puffer: Dict[int, tuple] = {}
+        self.mehrere_aus = False          # capturing several tokens failed for this model
+        self.aufnahmen = 0                # captures so far (a timed step that captured is not typical)
 
-    def _capture(self, kv_len: int):
+    @property
+    def graphs(self) -> Dict:
+        return self._haupt.graphs if self._haupt is not None else self._graphs
+
+    @property
+    def pool(self):
+        return self._haupt.pool if self._haupt is not None else self._pool
+
+    @pool.setter
+    def pool(self, wert):
+        if self._haupt is not None:
+            self._haupt.pool = wert
+        else:
+            self._pool = wert
+
+    def _schluessel(self, kv_len: int, L: int = 1):
+        if self._name:
+            return (self._name, L, kv_len)
+        return kv_len if L == 1 else (L, kv_len)
+
+    def _mehrfach(self, key) -> bool:
+        """Key of one of this decoder's several-token graphs."""
+        if not isinstance(key, tuple):
+            return False
+        if self._name:
+            return len(key) == 3 and key[0] == self._name and key[1] > 1
+        return len(key) == 2
+
+    def _capture(self, kv_len: int, L: int = 1):
         with GPU_SPERRE:
-            self._capture_exklusiv(kv_len)
+            self._capture_exklusiv(kv_len, L)
 
-    def _capture_exklusiv(self, kv_len: int):
+    def _capture_exklusiv(self, kv_len: int, L: int = 1):
+        tok, pos = (self.tok, self.pos) if L == 1 else self._puffer[L]
         snap = self.model.snapshot_state()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            for _ in range(2):                       # warm-up (cuBLAS workspaces etc.)
-                self.model._run(self.tok, self.pos, kv_len)
-        torch.cuda.current_stream().wait_stream(s)
-        g = torch.cuda.CUDAGraph()
-        # thread_local: other threads (e.g. embeddings) may use the GPU during capture
-        with torch.cuda.graph(g, pool=self.pool, capture_error_mode="thread_local"):
-            out = self.model._run(self.tok, self.pos, kv_len)
-        if self.pool is None:
+        self.model.alle_logits = L > 1
+        _MEHRERE.an = _ZEILEN.an = L > 1
+        try:
+            s = aufnahme_strom(self.model.device)
+            s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for i in range(2 if L == 1 else 1):      # warm-up (cuBLAS workspaces etc.)
+                    if L > 1:
+                        # a host read would break the capture and leave torch half inside it
+                        # (stream and pool not switched back): find it here, without capturing
+                        with _host_lesen_finden():
+                            self.model._run(tok, pos, kv_len)
+                    else:
+                        self.model._run(tok, pos, kv_len)
+            torch.cuda.current_stream().wait_stream(s)
+            g = torch.cuda.CUDAGraph()
+            # thread_local: other threads (e.g. embeddings) may use the GPU during capture
+            with torch.cuda.graph(g, pool=self.pool if L == 1 else self.pool_mehr, stream=s,
+                                  capture_error_mode="thread_local"):
+                out = self.model._run(tok, pos, kv_len)
+        finally:
+            self.model.alle_logits = False
+            _MEHRERE.an = _ZEILEN.an = False
+            self.model.restore_state(snap)
+        if L == 1 and self.pool is None:
             self.pool = g.pool()
-        self.model.restore_state(snap)
-        self.graphs[kv_len] = (g, out)
+        elif L > 1 and self.pool_mehr is None:
+            self.pool_mehr = g.pool()
+        self.graphs[self._schluessel(kv_len, L)] = (g, out)
+        self.aufnahmen += 1
+
+    def leeren(self) -> None:
+        """Drops all captured graphs and their memory (caches moved, model offloaded)."""
+        self.graphs.clear()
+        self.pool = None
+        self.pool_mehr = None
+
+    def _kv_len(self, ende: int, bucket: int = 0) -> int:
+        bucket = bucket or self.bucket
+        return min(-(-ende // bucket) * bucket, self.n_ctx)
 
     def __call__(self, token: int, pos: int) -> torch.Tensor:
-        kv_len = min(-(-(pos + 1) // self.bucket) * self.bucket, self.n_ctx)
+        kv_len = self._kv_len(pos + 1)
         self.tok.fill_(token)
         self.pos.fill_(pos)
-        if kv_len not in self.graphs:
+        key = self._schluessel(kv_len)
+        if key not in self.graphs:
             self._capture(kv_len)
-        g, out = self.graphs[kv_len]
+        g, out = self.graphs[key]
+        g.replay()
+        return out
+
+    def mehrere(self, tokens: List[int], pos: int) -> Optional[torch.Tensor]:
+        """Logits (L, V) of tokens at slots pos..; None if the model cannot be captured with
+        several tokens (the caller runs it without a graph then)."""
+        if self.mehrere_aus:
+            return None
+        L = len(tokens)
+        kv_len = self._kv_len(pos + L, MEHRERE_BUCKET)     # several sizes: fewer captures, longer buckets
+        dev = self.tok.device
+        if L not in self._puffer:
+            self._puffer[L] = (torch.zeros(L, dtype=torch.long, device=dev),
+                               torch.zeros(L, dtype=torch.long, device=dev))
+        tok, pidx = self._puffer[L]
+        tok.copy_(torch.tensor(tokens, dtype=torch.long))
+        pidx.copy_(torch.arange(pos, pos + L, dtype=torch.long))
+        vorher = getattr(self.model, "vor_graph", None)      # host-side inputs the model's forward() fills
+        if vorher is not None:
+            vorher(tokens)
+        key = self._schluessel(kv_len, L)
+        if key not in self.graphs:
+            # only the current bucket keeps several-token graphs, in a pool of their own that
+            # goes with them: each holds its (L, V) logits and activations (measured: 48 graphs
+            # over 12k positions in the shared pool = 1 GiB that never came back)
+            alte = [k for k in self.graphs if self._mehrfach(k) and k[-1] != kv_len]
+            for alt in alte:
+                del self.graphs[alt]
+            if alte and not any(self._mehrfach(k) for k in self.graphs):
+                self.pool_mehr = None
+            try:
+                self._capture(kv_len, L)
+            except Exception:
+                self.mehrere_aus = True
+                return None
+        g, out = self.graphs[key]
         g.replay()
         return out

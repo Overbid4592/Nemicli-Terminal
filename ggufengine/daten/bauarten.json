@@ -1,0 +1,206 @@
+{
+ "version": 1,
+ "beschreibung": "Bauarten (general.architecture der GGUF-Datei): welche Steine-Datei (klasse) sie baut und – für den Baukasten – ihre Bauanleitung. Fehlt ein Merkmal, gilt die Grundform (NeoX-RoPE, SiLU, kein Fenster, Top-k normiert).",
+ "felder": {
+  "klasse": "Steine-Datei: baukasten, qwen35, qwen3vl, gemma4, bailing3, deepseek2, hybrid, llama4",
+  "moe": "immer Mixture-of-Experts (bei anderen erkennt man es am Namen oder an den Tensoren)",
+  "rope_paare": "RoPE benachbarter Paare (llama.cpp 'normal'; Q/K vom Konverter umsortiert)",
+  "aktivierung": "gelu (tanh) statt SiLU",
+  "einbettung_wurzel": "Einbettung * sqrt(n_embd)",
+  "fenster_muster": "jede n-te Schicht global, der Rest mit Schiebefenster (wenn die Datei nichts sagt)",
+  "global_ohne_rope": "mit Fenster: globale Schichten ohne RoPE",
+  "ohne_rope_jede": "ohne Fenster: jede n-te Schicht ohne RoPE (NoPE)",
+  "fenster_rope_schlicht": "Fenster-Schichten: RoPE ohne Skalierung (YaRN nur global)",
+  "parallel": "Attention und FFN auf derselben Norm, beide aufs Residuum",
+  "logits_mal_skala": "logit_scale multipliziert (Granite: teilt)",
+  "fenster_basis": "RoPE-Basis der Fenster-Schichten",
+  "topk_normieren": "Gewichte der gewählten Experten normieren (Vorgabe ja)",
+  "softmax_nach_auswahl": "Top-k der Router-Logits, dann Softmax über diese",
+  "ffn_norm_heisst_post_attn": "llama.cpp: post_attention_norm ist die Norm vor dem FFN",
+  "yarn_ungerundet": "YaRN-Grenzen ohne Runden (transformers truncate=False)",
+  "yarn_log_mul_all_dim": "YaRN-Lautstärke mit yarn_log_multiplier als mscale_all_dim",
+  "glu_oai": "begrenzte SwiGLU-Variante von gpt-oss",
+  "temperatur_skala": "Q-Temperatur je Position ab dem Original-Kontext",
+  "gross_27b_bei_schichten": "so viele Schichten = 27B: Attention-Skala 1/sqrt(n_embd/n_head)"
+ },
+ "bauarten": {
+  "qwen35": {
+   "klasse": "qwen35"
+  },
+  "qwen35moe": {
+   "klasse": "qwen35",
+   "moe": true
+  },
+  "qwen3next": {
+   "klasse": "qwen35",
+   "moe": true
+  },
+  "qwen3vl": {
+   "klasse": "qwen3vl"
+  },
+  "gemma4": {
+   "klasse": "gemma4"
+  },
+  "bailingmoe3": {
+   "klasse": "bailing3",
+   "moe": true
+  },
+  "deepseek2": {
+   "klasse": "deepseek2",
+   "moe": true
+  },
+  "kimi-linear": {
+   "klasse": "deepseek2",
+   "moe": true
+  },
+  "granitehybrid": {
+   "klasse": "hybrid"
+  },
+  "nemotron_h": {
+   "klasse": "hybrid"
+  },
+  "nemotron_h_moe": {
+   "klasse": "hybrid",
+   "moe": true
+  },
+  "falcon-h1": {
+   "klasse": "hybrid"
+  },
+  "lfm2": {
+   "klasse": "hybrid"
+  },
+  "lfm2moe": {
+   "klasse": "hybrid",
+   "moe": true
+  },
+  "llama4": {
+   "klasse": "llama4",
+   "moe": true
+  },
+  "llama": {
+   "klasse": "baukasten",
+   "rope_paare": true
+  },
+  "mistral": {
+   "klasse": "baukasten",
+   "rope_paare": true
+  },
+  "mistral3": {
+   "klasse": "baukasten",
+   "rope_paare": true,
+   "yarn_log_mul_all_dim": true,
+   "temperatur_skala": true
+  },
+  "qwen2": {
+   "klasse": "baukasten"
+  },
+  "qwen3": {
+   "klasse": "baukasten"
+  },
+  "qwen2moe": {
+   "klasse": "baukasten",
+   "moe": true,
+   "topk_normieren": false
+  },
+  "qwen3moe": {
+   "klasse": "baukasten",
+   "moe": true
+  },
+  "k2-horizon": {
+   "klasse": "baukasten"
+  },
+  "gemma": {
+   "klasse": "baukasten",
+   "aktivierung": "gelu",
+   "einbettung_wurzel": true
+  },
+  "gemma2": {
+   "klasse": "baukasten",
+   "aktivierung": "gelu",
+   "einbettung_wurzel": true,
+   "fenster_muster": 2,
+   "gross_27b_bei_schichten": 46
+  },
+  "gemma3": {
+   "klasse": "baukasten",
+   "aktivierung": "gelu",
+   "einbettung_wurzel": true,
+   "fenster_muster": 6,
+   "fenster_basis": 10000.0,
+   "gross_27b_bei_schichten": 62
+  },
+  "phi3": {
+   "klasse": "baukasten"
+  },
+  "granite": {
+   "klasse": "baukasten",
+   "rope_paare": true
+  },
+  "granitemoe": {
+   "klasse": "baukasten",
+   "moe": true,
+   "rope_paare": true
+  },
+  "olmo2": {
+   "klasse": "baukasten"
+  },
+  "olmo3": {
+   "klasse": "baukasten",
+   "fenster_muster": 4,
+   "fenster_rope_schlicht": true
+  },
+  "gpt-oss": {
+   "klasse": "baukasten",
+   "moe": true,
+   "fenster_muster": 2,
+   "softmax_nach_auswahl": true,
+   "ffn_norm_heisst_post_attn": true,
+   "yarn_ungerundet": true,
+   "glu_oai": true
+  },
+  "ernie4_5": {
+   "klasse": "baukasten",
+   "rope_paare": true
+  },
+  "ernie4_5-moe": {
+   "klasse": "baukasten",
+   "moe": true,
+   "rope_paare": true
+  },
+  "seed_oss": {
+   "klasse": "baukasten"
+  },
+  "exaone4": {
+   "klasse": "baukasten",
+   "fenster_muster": 4,
+   "global_ohne_rope": true
+  },
+  "cohere2": {
+   "klasse": "baukasten",
+   "rope_paare": true,
+   "fenster_muster": 4,
+   "global_ohne_rope": true,
+   "parallel": true,
+   "logits_mal_skala": true
+  },
+  "command-r": {
+   "klasse": "baukasten",
+   "rope_paare": true,
+   "parallel": true,
+   "logits_mal_skala": true
+  },
+  "glm4": {
+   "klasse": "baukasten",
+   "rope_paare": true
+  },
+  "glm4moe": {
+   "klasse": "baukasten",
+   "moe": true
+  },
+  "smollm3": {
+   "klasse": "baukasten",
+   "rope_paare": true,
+   "ohne_rope_jede": 4
+  }
+ }
+}

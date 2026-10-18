@@ -8,6 +8,8 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import time
 from pathlib import Path
 
 import keyvault
@@ -20,30 +22,97 @@ _FILE = _ROOT / "nemicli.config.json"
 _ENV = _ROOT / ".env"
 
 
+_GEHEIM_NAME = ("API_KEY", "APIKEY", "TOKEN", "SECRET", "PASSWORD", "PASSWD", "CREDENTIAL")
+
+
+def umgebung_ohne_geheimnisse(**extra: str) -> dict:
+    """os.environ ohne Schlüssel, Tokens und Passwörter – für Programme, die die KI startet
+    (PowerShell, Projekt-Python, Browser). Die Schlüssel braucht nur NemiCLI selbst."""
+    env = {k: v for k, v in os.environ.items()
+           if not (any(g in k.upper() for g in _GEHEIM_NAME) or k.upper().endswith("_KEY")
+                   or k.upper().startswith(("NEMICLI_GUI_", "NEMICLI_KI_")))}
+    env.update(extra)
+    return env
+
+
 def _is_secret(name: str) -> bool:
     """Sensibler Wert, der verschlüsselt gehört (alle API-Keys)."""
     return name.endswith("API_KEY")
 
 
-def load() -> dict:
+letzter_fehler = ""          # warum das letzte Speichern scheiterte ("" = es ging)
+_gemeldet: set[str] = set()
+
+
+def _lesen(pfad: Path) -> dict | None:
     try:
-        return json.loads(_FILE.read_text(encoding="utf-8"))
+        d = json.loads(pfad.read_text(encoding="utf-8"))
     except Exception:
-        return {}
+        return None
+    return d if isinstance(d, dict) else None
 
 
-def save(data: dict) -> None:
+def load() -> dict:
+    """Einstellungen. Ist die Datei beschädigt (Absturz beim Schreiben), gilt die letzte gute
+    Fassung nemicli.config.json.bak – sonst schriebe das nächste Speichern eine Config mit nur
+    dem einen neuen Wert, und alle anderen Einstellungen wären weg."""
+    d = _lesen(_FILE)
+    if d is not None:
+        return d
+    if _FILE.exists():                   # beschädigt – gelöscht heißt dagegen: frisch anfangen
+        return _lesen(_FILE.with_name(_FILE.name + ".bak")) or {}
+    return {}
+
+
+def _melden(text: str) -> None:
+    """Einmal je Fehlerart sichtbar machen – nicht still schlucken."""
+    if text in _gemeldet:
+        return
+    _gemeldet.add(text)
     try:
-        _FILE.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        import ui
+        ui.warn(f"⚙ Einstellungen nicht gespeichert: {text} ({_FILE})")
     except Exception:
         pass
 
 
-def update(**kwargs) -> None:
-    """Einzelne Werte ändern und speichern, der Rest bleibt erhalten."""
+def save(data: dict) -> bool:
+    """Sicher speichern: Zwischendatei, dann tauschen; die bisherige Fassung bleibt als .bak.
+    Ist die Datei gerade von einem anderen Prozess offen (die Wache liest sie oft), wird der
+    Tausch kurz wiederholt und zuletzt direkt geschrieben. False + Hinweis, wenn nichts ging."""
+    global letzter_fehler
+    tmp = _FILE.with_name(_FILE.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
+        if _lesen(_FILE) is not None:
+            shutil.copyfile(_FILE, _FILE.with_name(_FILE.name + ".bak"))
+        for versuch in range(6):
+            try:
+                os.replace(tmp, _FILE)
+                break
+            except PermissionError:
+                if versuch == 5:
+                    _FILE.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")
+                    tmp.unlink(missing_ok=True)
+                    break
+                time.sleep(0.05)
+        letzter_fehler = ""
+        return True
+    except Exception as e:
+        letzter_fehler = f"{type(e).__name__}: {e}"
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        _melden(letzter_fehler)
+        return False
+
+
+def update(**kwargs) -> bool:
+    """Einzelne Werte ändern und speichern, der Rest bleibt erhalten. False = nicht gespeichert."""
     data = load()
     data.update(kwargs)
-    save(data)
+    return save(data)
 
 
 def set_env(name: str, value: str) -> bool:

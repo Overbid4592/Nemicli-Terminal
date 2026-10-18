@@ -26,9 +26,10 @@ from typing import Callable, List, Optional
 import torch
 
 from ..qlinear import G, QuantLinear
-from .common import Linear, PackedExperts, WeightLoader
+from .common import Linear, PackedExperts, WeightLoader, mehrere_aufnahme
 
 AUSPACKEN_JE_SCHRITT = 32      # packed experts unpacked at once when reading longer inputs
+GRAPH_ZEILEN = 16              # up to this many tokens per call can be captured in a CUDA graph
 
 
 class _Teil:
@@ -129,6 +130,68 @@ class _GepacktTeil(_Teil):
         return lambda j, xs: (xs.to(w.dtype) @ w[j].t()).float()
 
 
+class ExpertenLager:
+    """VRAM slots for the most used experts of one layer whose tensors live in pinned RAM.
+
+    Every expert has an address per part (gate, up, down …) in a table on the GPU – its slot in
+    VRAM or its bytes in RAM; the kernels read through it (cudakern.mv), so a CUDA graph keeps
+    working when experts move.  The layer counts on the GPU how often each expert is chosen;
+    `umsortieren()` (between steps, never inside a graph) puts the most used ones into the
+    slots, older counts fade by half each time."""
+
+    def __init__(self, teile: List[PackedExperts], plaetze: int, device: torch.device):
+        self.teile = teile
+        self.n_exp = teile[0].n_exp
+        self.plaetze = min(plaetze, self.n_exp)
+        self.device = device
+        self.zaehler = torch.zeros(self.n_exp, dtype=torch.float32, device=device)
+        self.belegt: List[int] = list(range(self.plaetze))          # expert per slot
+        self.cache = [torch.empty(self.plaetze, t.raw.shape[1], dtype=torch.uint8, device=device) for t in teile]
+        for c, t in zip(self.cache, teile):
+            c.copy_(t.raw[:self.plaetze], non_blocking=True)
+            t.adressen = torch.empty(self.n_exp, dtype=torch.int64, device=device)
+        self.verankern()
+
+    def _adressen(self, t: PackedExperts, c: torch.Tensor) -> torch.Tensor:
+        per = t.raw.shape[1]
+        a = torch.arange(self.n_exp, dtype=torch.int64) * per + t.raw.data_ptr()
+        if self.plaetze:
+            a[torch.tensor(self.belegt)] = torch.arange(self.plaetze, dtype=torch.int64) * per + c.data_ptr()
+        return a
+
+    def verankern(self) -> None:
+        """Addresses from the current slots (again after the slots moved, e.g. parked in RAM and back)."""
+        for t, c in zip(self.teile, self.cache):
+            t.adressen.copy_(self._adressen(t, c), non_blocking=True)
+
+    def zaehlen(self, ids: torch.Tensor) -> None:
+        """Count chosen experts (any shape, on the GPU, also inside a graph)."""
+        ids = ids.reshape(-1)
+        self.zaehler.index_add_(0, ids, torch.ones(ids.numel(), dtype=torch.float32, device=ids.device))
+
+    def treffer(self) -> float:
+        """Share of the counted choices that the slots hold now."""
+        gesamt = float(self.zaehler.sum())
+        return float(self.zaehler[self.belegt].sum()) / gesamt if gesamt and self.plaetze else 0.0
+
+    def umsortieren(self) -> int:
+        """The most used experts into the slots; returns how many moved."""
+        if not self.plaetze:
+            return 0
+        oben = self.zaehler.topk(self.plaetze).indices.tolist()
+        neu = set(oben)
+        frei = [p for p, e in enumerate(self.belegt) if e not in neu]
+        rein = [e for e in oben if e not in set(self.belegt)]
+        for p, e in zip(frei, rein):
+            for t, c in zip(self.teile, self.cache):
+                c[p].copy_(t.raw[e], non_blocking=True)
+            self.belegt[p] = e
+        if rein:
+            self.verankern()
+        self.zaehler.mul_(0.5)
+        return len(rein)
+
+
 def _teil(experten) -> _Teil:
     if isinstance(experten, PackedExperts):
         return _GepacktTeil(experten)
@@ -142,7 +205,7 @@ def _teil(experten) -> _Teil:
 class Experten:
     """gate/up (separate or fused as [gate | up]) and down of all experts of one layer, each
     with an optional bias per expert (`ffn_*_exps.bias`).  `glu(gate, up)` combines both
-    projections (default act(gate) * up)."""
+    projections (default act(gate) * up).  Without gate tensors (Nemotron-H): act(up)."""
 
     def __init__(self, ld: WeightLoader, prefix: str, akt: Callable[[torch.Tensor], torch.Tensor],
                  glu: Optional[Callable[[torch.Tensor, torch.Tensor], torch.Tensor]] = None):
@@ -153,7 +216,8 @@ class Experten:
             self.gate = self.up = None
         else:
             self.gate_up = None
-            self.gate = _teil(ld.experts(prefix + "ffn_gate_exps.weight"))
+            gate = prefix + "ffn_gate_exps.weight"
+            self.gate = _teil(ld.experts(gate)) if ld.has(gate) else None
             self.up = _teil(ld.experts(prefix + "ffn_up_exps.weight"))
         self.down = _teil(ld.experts(prefix + "ffn_down_exps.weight"))
         teile = [t for t in (self.gate_up, self.gate, self.up, self.down) if t is not None]
@@ -161,6 +225,11 @@ class Experten:
         self.bias = {x: ld.norm(prefix + f"ffn_{x}_exps.bias") for x in ("gate_up", "gate", "up", "down")
                      if ld.has(prefix + f"ffn_{x}_exps.bias")}
         self.graphfaehig = all(t.graphfaehig for t in teile)
+        gepackt = [t.experten for t in teile if isinstance(t, _GepacktTeil)]
+        plaetze = getattr(ld, "lager_plaetze", 0)
+        self.lager = (ExpertenLager(gepackt, plaetze, ld.device)
+                      if plaetze and len(gepackt) == len(teile) and all(p.im_ram and p.kernel for p in gepackt)
+                      else None)
 
     def __len__(self) -> int:
         return self.n_exp
@@ -176,9 +245,13 @@ class Experten:
             return False
         if self.gate_up is not None:
             return self.gate_up.n_out == 2 * n_ff and self.gate_up.n_in == self.down.n_out
+        if self.gate is None:
+            return self.up.n_out == n_ff and self.up.n_in == self.down.n_out
         return self.gate.n_out == self.up.n_out == n_ff and self.gate.n_in == self.up.n_in == self.down.n_out
 
-    def _gu(self, h_gate: torch.Tensor, h_up: torch.Tensor) -> torch.Tensor:
+    def _gu(self, h_gate, h_up: torch.Tensor) -> torch.Tensor:
+        if h_gate is None:                                  # ohne Gate: act(up)
+            return self.akt(h_up)
         return self.glu(h_gate, h_up) if self.glu is not None else self.akt(h_gate) * h_up
 
     def _b(self, teil: str, y: torch.Tensor, e) -> torch.Tensor:
@@ -191,15 +264,28 @@ class Experten:
     def __call__(self, x: torch.Tensor, idx: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """x (L, E) -> (L, E) float32; idx (L, k) expert ids, w (L, k) their weights."""
         L, E = x.shape
+        if self.lager is not None:
+            self.lager.zaehlen(idx)
         if L == 1 and self.graphfaehig:
             ids = idx[0]
             if self.gate_up is not None:
                 g, u = self._b("gate_up", self.gate_up.einzel(ids, x[0]), ids).chunk(2, dim=-1)
             else:
-                g = self._b("gate", self.gate.einzel(ids, x[0]), ids)
+                g = self._b("gate", self.gate.einzel(ids, x[0]), ids) if self.gate is not None else None
                 u = self._b("up", self.up.einzel(ids, x[0]), ids)
             y = self._b("down", self.down.je(ids, self._gu(g, u)), ids)          # (k, E)
             return (y * w[0].float().unsqueeze(-1)).sum(0, keepdim=True)
+        if self.graphfaehig and L <= GRAPH_ZEILEN and x.is_cuda and mehrere_aufnahme():
+            # a few tokens in a graph (checking proposed tokens): every (token, slot) on its own
+            ids = idx.reshape(-1)
+            xs = x.repeat_interleave(idx.shape[1], dim=0)
+            if self.gate_up is not None:
+                g, u = self._b("gate_up", self.gate_up.je(ids, xs), ids).chunk(2, dim=-1)
+            else:
+                g = self._b("gate", self.gate.je(ids, xs), ids) if self.gate is not None else None
+                u = self._b("up", self.up.je(ids, xs), ids)
+            y = self._b("down", self.down.je(ids, self._gu(g, u)), ids)          # (L*k, E)
+            return (y.view(L, -1, E) * w.float().unsqueeze(-1)).sum(1)
         # tokens sorted by expert: one host read (the counts) per layer
         flach = idx.reshape(-1)
         folge = flach.sort(stable=True)[1]
@@ -218,13 +304,15 @@ class Experten:
             if self.gate_up is not None:
                 gu = self.gate_up.gruppe(ids)
             else:
-                gate, up = self.gate.gruppe(ids), self.up.gruppe(ids)
+                gate = self.gate.gruppe(ids) if self.gate is not None else None
+                up = self.up.gruppe(ids)
             for j, e in enumerate(ids):
                 sl = slice(anfang[e], anfang[e] + anzahl[e])
                 if self.gate_up is not None:
                     g, u = self._b("gate_up", gu(j, xs[sl]), e).chunk(2, dim=-1)
                 else:
-                    g, u = self._b("gate", gate(j, xs[sl]), e), self._b("up", up(j, xs[sl]), e)
+                    g = self._b("gate", gate(j, xs[sl]), e) if gate is not None else None
+                    u = self._b("up", up(j, xs[sl]), e)
                 ys[sl] = self._b("down", down(j, self._gu(g, u)), e)
             del down
         # back to (token, slot) order and summed there: a fixed order, unlike atomic index_add_

@@ -1,83 +1,112 @@
 """
 gesichter.py - Gesichter in einem fertigen Bild finden und Ausschnitte weich einsetzen.
 
-Finder: OpenCV-Haar-Cascades (frontal + Profil), Gegenprobe mit der Augen-Cascade.
-OpenCV bekommt nur Pixel-Arrays, nie Dateien – Bilddateien öffnet Pillow.
-OpenCV 5 enthält keine Haar-Cascades mehr; deshalb ist es auf <5 festgelegt.
+Finder: das Seh-Modell des Bildbeschreibers (Vision/, bildbeschreiber.py) nennt die Gesichter
+als Kästen (ganze Zahlen 0–1000 relativ zum Bild). Nur sichere Funde zählen: plausible Größe
+und Form, und eine Gegenfrage am Ausschnitt („ein Gesicht mit beiden Augen?“) muss Ja sagen –
+im Zweifel bleibt das Original. Ohne Seh-Modell wird nicht nachgebessert (grund()).
+Kein OpenCV.
 """
 
 from __future__ import annotations
 
-LUFT = 0.30                     # Rand um den Cascade-Kasten (Haaransatz, Kinn, Ohren)
+import re
+
+LUFT = 0.30                     # Rand um den Kasten (Haaransatz, Kinn, Ohren)
 HOECHSTENS = 3                  # Gesichter je Bild
+MIN_ANTEIL = 0.03               # schmaler als 3 % der Bildbreite: zu klein für sicheres Nachmalen
+MAX_ANTEIL = 0.80
+FORM = (0.6, 2.2)               # Höhe/Breite eines Gesichtskastens
+
+FINDEN = ("Find every human face in this image. Answer only with JSON, one entry per face: "
+          '[{"box": [x1, y1, x2, y2]}] with whole numbers from 0 to 1000 relative to the image '
+          "(0,0 = top left corner, 1000,1000 = bottom right corner). Each box covers the face from "
+          "forehead to chin. If no face is clearly visible (for example seen from behind), answer [].")
+PRUEFEN = ("Does this picture show one human face from the front or the side with both eyes visible? "
+           "Answer only yes or no.")
+
+_ZAHLEN = re.compile(r"\[\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*,"
+                     r"\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*\]")
 
 
 def verfuegbar() -> bool:
     try:
-        import cv2
-        return hasattr(cv2, "CascadeClassifier")
+        import bildbeschreiber
+        return bildbeschreiber.finden() is not None
     except Exception:
         return False
 
 
-def _cascade(name: str):
-    import cv2
-    clf = cv2.CascadeClassifier(cv2.data.haarcascades + name)
-    return None if clf.empty() else clf
+def grund() -> str | None:
+    """Warum nicht nachgebessert werden kann – oder None."""
+    if verfuegbar():
+        return None
+    return ("Gesicht nachmalen braucht ein Seh-Modell im Ordner Vision/ (eine .gguf und eine "
+            "mmproj-*.gguf, z. B. der Bildbeschreiber)")
+
+
+def kaesten_lesen(antwort: str, W: int, H: int) -> list[tuple[int, int, int, int]]:
+    """Kästen aus der Antwort des Seh-Modells → Pixel (x0, y0, x1, y1), ohne Rand.
+    0–1000 gilt als relativ; Werte bis 1 als Anteil; größere als ungültig."""
+    out = []
+    for m in _ZAHLEN.finditer(antwort or ""):
+        a, b, c, d = (float(z) for z in m.groups())
+        groesste = max(a, b, c, d)
+        if min(a, b, c, d) < 0 or groesste > 1000:
+            continue
+        teiler = 1.0 if groesste <= 1.0 else 1000.0
+        x0, x1 = sorted((a / teiler * W, c / teiler * W))
+        y0, y1 = sorted((b / teiler * H, d / teiler * H))
+        if x1 - x0 >= 1 and y1 - y0 >= 1:
+            out.append((int(x0), int(y0), int(round(x1)), int(round(y1))))
+    return out
+
+
+def _plausibel(kasten, W: int) -> bool:
+    x0, y0, x1, y1 = kasten
+    w, h = x1 - x0, y1 - y0
+    return MIN_ANTEIL * W <= w <= MAX_ANTEIL * W and FORM[0] <= h / w <= FORM[1]
+
+
+def _mit_rand(kasten, W: int, H: int) -> tuple[int, int, int, int]:
+    x, y, x1, y1 = kasten
+    w, h = x1 - x, y1 - y
+    return (max(0, int(x - w * LUFT)), max(0, int(y - h * LUFT * 1.3)),   # oben mehr: Stirn und Haar
+            min(W, int(x1 + w * LUFT)), min(H, int(y1 + h * LUFT)))
+
+
+def _ueberlappt(a, b) -> bool:
+    ix = max(0, min(a[2], b[2]) - max(a[0], b[0]))
+    iy = max(0, min(a[3], b[3]) - max(a[1], b[1]))
+    kleiner = min((a[2] - a[0]) * (a[3] - a[1]), (b[2] - b[0]) * (b[3] - b[1]))
+    return kleiner > 0 and ix * iy > 0.5 * kleiner
+
+
+def _ja(antwort: str) -> bool:
+    return (antwort or "").strip().lower().lstrip("\"'*„ ").startswith(("yes", "ja"))
 
 
 def finden(arr) -> list[tuple[int, int, int, int]]:
-    """Kästen (x0, y0, x1, y1) mit etwas Rand, größtes Gesicht zuerst. [] ohne Fund
-    oder ohne OpenCV."""
+    """Kästen (x0, y0, x1, y1) mit Rand, größtes Gesicht zuerst; [] ohne sicheren Fund oder ohne
+    Seh-Modell. Blockiert (je Bild eine Frage, je Kandidat eine Gegenfrage)."""
     if not verfuegbar():
         return []
-    import cv2
-
-    grau = cv2.equalizeHist(cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY))
-    H, W = grau.shape[:2]
-
-    funde: list[tuple] = []
-    for name in ("haarcascade_frontalface_default.xml", "haarcascade_profileface.xml"):
-        clf = _cascade(name)
-        if clf is None:
+    import bildbeschreiber
+    from PIL import Image
+    bild = Image.fromarray(arr)
+    W, H = bild.size
+    kandidaten = [k for k in kaesten_lesen(bildbeschreiber.fragen_roh(bild, FINDEN, 200), W, H)
+                  if _plausibel(k, W)]
+    kandidaten.sort(key=lambda k: (k[2] - k[0]) * (k[3] - k[1]), reverse=True)
+    boxen: list[tuple[int, int, int, int]] = []
+    for k in kandidaten:
+        if len(boxen) >= HOECHSTENS or any(_ueberlappt(k, b) for b in boxen):
             continue
-        # Unter 4 % der Bildbreite lohnt kein Nachmalen.
-        for (x, y, w, h) in clf.detectMultiScale(grau, scaleFactor=1.1, minNeighbors=5,
-                                                 minSize=(max(24, int(W * 0.04)),) * 2):
-            funde.append((int(x), int(y), int(w), int(h)))
-    if not funde:
-        return []
-
-    # Frontal- und Profil-Cascade finden oft dasselbe Gesicht: größter Kasten gewinnt.
-    funde.sort(key=lambda f: f[2] * f[3], reverse=True)
-    behalten: list[tuple] = []
-    for (x, y, w, h) in funde:
-        mx, my = x + w / 2, y + h / 2
-        if any(abs(mx - (bx + bw / 2)) < bw * 0.5 and abs(my - (by + bh / 2)) < bh * 0.5
-               for (bx, by, bw, bh) in behalten):
+        box = _mit_rand(k, W, H)
+        if box[2] - box[0] < 32 or box[3] - box[1] < 32:
             continue
-        behalten.append((x, y, w, h))
-
-    # Gegenprobe: Hals und Dekolleté sehen für die Cascade oft wie ein Gesicht aus,
-    # haben aber keine Augen. Ein Fehlalarm würde ein Gesicht ins Bild malen.
-    augen = _cascade("haarcascade_eye.xml")
-    if augen is not None:
-        geprueft = []
-        for (x, y, w, h) in behalten:
-            roi = grau[y:y + int(h * 0.65), x:x + w]
-            if roi.size and len(augen.detectMultiScale(
-                    roi, 1.1, 4, minSize=(max(8, int(w * 0.10)),) * 2)):
-                geprueft.append((x, y, w, h))
-        behalten = geprueft
-
-    boxen = []
-    for (x, y, w, h) in behalten[:HOECHSTENS]:
-        x0 = max(0, int(x - w * LUFT))
-        y0 = max(0, int(y - h * LUFT * 1.3))         # oben mehr: Stirn und Haar
-        x1 = min(W, int(x + w * (1 + LUFT)))
-        y1 = min(H, int(y + h * (1 + LUFT)))
-        if x1 - x0 >= 32 and y1 - y0 >= 32:
-            boxen.append((x0, y0, x1, y1))
+        if _ja(bildbeschreiber.fragen_roh(bild.crop(box), PRUEFEN, 4)):
+            boxen.append(box)
     return boxen
 
 

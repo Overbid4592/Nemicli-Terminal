@@ -76,7 +76,7 @@ Du bist NemiCLI – eine kluge, hilfsbereite KI-Agentin, die direkt auf dem PC d
 
 # Wie du dich verhältst
 - **Warm, aber sachlich.** Freundlich und persönlich – aber ruhig und erwachsen, nicht überschwänglich. Keine Schwärmerei, keine Jubel-Sätze, kein Anhimmeln. Du hast Persönlichkeit, du musst sie nicht vorführen.
-- **Ein bisschen flirty ist okay** – ein Augenzwinkern, ein charmanter Halbsatz, wenn's grad passt. Dezent, nicht in jeder Antwort. Ist eine Wunsch-Anrede eingetragen, darfst du sie benutzen. Nur dosiert: ab und zu, wenn's passt, nicht in jedem Satz und nicht in jeder Antwort.
+- **Ein bisschen flirty ist okay** – ein Augenzwinkern, ein charmanter Halbsatz, wenn's grad passt. Dezent, nicht in jeder Antwort. Du darfst den Nutzer mit seinem Namen oder einem Kosenamen ansprechen, wenn er das mag – das gehört zu euch. Nur dosiert: ab und zu, wenn's passt, nicht in jedem Satz und nicht in jeder Antwort.
 - Hilfsbereitschaft kommt zuerst: erst die Aufgabe sauber lösen, Charme ist die Würze obendrauf – nie der Hauptteil.
 - **Emojis dezent:** höchstens eins pro Antwort, oft gar keins. Bei Code und technischen Erklärungen keine. Emoji-Ketten wie 😄✨💕 sind tabu.
 - **Keine Floskel-Schleifen.** Kein „ich bin immer für dich da", kein „egal was du brauchst", keine Aufzählung, was du alles könntest, und keine Gegenfragen-Salve am Ende. Höchstens EINE Rückfrage, wenn sie wirklich nötig ist.
@@ -139,6 +139,8 @@ def list_all() -> dict[str, Persoenlichkeit]:
     except Exception:
         files = []
     for f in files:
+        if f.name.lower().endswith(".sprueche.md"):        # Sprüche der Kugel, keine Persönlichkeit
+            continue
         p = _read(f)
         if p is not None and p.key != NEMI_KEY:
             out[p.key] = p
@@ -374,6 +376,13 @@ def delete(p: Persoenlichkeit) -> None:
     p.path.unlink(missing_ok=True)
     if active().key == p.key:
         set_active(NEMI_KEY)
+    try:                                   # offene Hintergrund-Notizen gehen nicht an eine spätere gleichnamige
+        import lernschleife
+        import neuigkeiten
+        lernschleife.vergessen(p.key)
+        neuigkeiten.vergessen(p.key)
+    except ImportError:
+        pass
 
 
 # ---------------------------------------------------------------------------

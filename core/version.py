@@ -6,6 +6,7 @@ Aufbau wie bei Windows („Version 24H2, Build 26100"):
     VERSION   Hauptnummer, von Hand vergeben (5.1 Alpha, 5.2 …)
     Build     <Haupt>.<Neben>.<Anzahl Commits>, zählt mit jedem Commit selbst hoch
     STAND     Datum des Codes (Jahr.Monat.Tag)
+    GEBURTSTAG  Projektbeginn; daraus das Alter in /version und im Systemprompt
 
 Im Git-Repo kommt die Build-Nummer aus `git rev-list --count HEAD`, dazu der
 kurze Commit-Hash. Die gepackte exe hat kein Git; dort liest sie `build.txt`,
@@ -14,13 +15,15 @@ das NemiCLI.spec beim Bauen mit in die exe packt.
 
 from __future__ import annotations
 
+import datetime as _dt
 import platform
 import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "6.6 Alpha"
-STAND = "2026.10.06"
+VERSION = "8.9 Alpha"
+STAND = "2026.10.18"
+GEBURTSTAG = _dt.date(2026, 6, 19)
 AUTHOR = "D. Hoffmann (Vibecoder)"
 BUILT_WITH = "Claude Opus 5 · Anthropic"
 
@@ -84,6 +87,17 @@ def build_nummer() -> str:
     return _BUILD_CACHE
 
 
+def alter_tage(heute: _dt.date | None = None) -> int:
+    """Tage seit GEBURTSTAG."""
+    return ((heute or _dt.date.today()) - GEBURTSTAG).days
+
+
+def alter_text(heute: _dt.date | None = None) -> str:
+    """'19.06.2026 · heute 111 Tage alt'."""
+    n = alter_tage(heute)
+    return f"{GEBURTSTAG:%d.%m.%Y} · heute {n} {'Tag' if n == 1 else 'Tage'} alt"
+
+
 def build_label() -> str:
     """Kurzform für Banner/Statuszeile: '5.1 Alpha · Build 5.1.63 (a4f25d1)' bzw. '… (exe)'."""
     g = git_info()
@@ -96,6 +110,7 @@ def report(model: str | None = None, persona: str | None = None) -> list[tuple[s
     """Zeilen für /version: (Bezeichnung, Wert)."""
     g = git_info()
     rows = [("Version", VERSION), ("Build", build_nummer()), ("Stand", STAND),
+            ("Geburtstag", alter_text()),
             ("Entwickelt von", AUTHOR),
             ("Gebaut mit", BUILT_WITH)]
     if g["hash"]:

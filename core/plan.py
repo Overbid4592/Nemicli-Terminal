@@ -1,8 +1,10 @@
 """
-plan.py - Gelbe Todo-Liste: vor jeder Aktion steht fest, was die KI vorhat.
+plan.py - Gelbe Todo-Liste: bei Aufgaben mit mehreren Schritten steht vorher fest, was die KI vorhat.
 
-Bevor die KI in einer Nutzer-Runde eine Aktion ausführt, schreibt sie mit dem
-Werkzeug `plan` die Schritte auf. Ohne Liste führt das Programm keine Aktion aus.
+Hat eine Nutzer-Runde mehr als einen Arbeitsschritt, schreibt die KI mit dem
+Werkzeug `plan` vorher die Schritte auf. Ohne Liste läuft je Runde nur EIN Arbeitsschritt;
+Nachsehen (Lese-Werkzeuge) und Begleiten (Gedächtnis, Kugel, Stimme) zählen nicht mit –
+Plaudern soll keine Liste erzeugen.
 Ausnahme: der Coding-Assistent, der seine eigene Todo-Liste führt (coding.py).
 
 Die Liste gilt, bis alle Punkte erledigt oder gestrichen sind – auch über mehrere Nutzer-Runden
@@ -28,22 +30,28 @@ MAX_TEXT = 160
 # Werkzeuge, die keine Liste brauchen: die Liste selbst und der Coding-Assistent.
 # Ohne Liste frei: die Liste selbst und Bedienhilfe (Anleitung lesen, Menü für den Nutzer öffnen).
 FREI = {"plan", "coding_start", "todo", "anleitung_lesen", "menue_oeffnen"}
+# Begleiten im Gespräch: kein Arbeitsschritt, also auch ohne Liste frei.
+BEGLEITEN = {"merken", "kugel", "erinnern", "vorlesen", "stimme_schalter", "modell_schalter", "aufgaben", "lora", "coding_lora",
+             "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen"}
+EINZELN = 1                   # so viele Arbeitsschritte je Runde laufen ohne Liste
 
 SPERR_TEXT = (
-    "Nicht ausgeführt: {tools}. Vor jeder Aktion steht die Todo-Liste. Schreib zuerst auf, "
-    "was du vorhast, z. B. {{\"tool\": \"plan\", \"punkte\": [\"Ordner ansehen\", \"Datei anlegen\"]}} – "
+    "Nicht ausgeführt: {tools}. Das ist mehr als ein Arbeitsschritt – dafür steht vorher die "
+    "Todo-Liste. Schreib zuerst auf, was du vorhast, z. B. {{\"tool\": \"plan\", \"punkte\": [\"Ordner ansehen\", \"Datei anlegen\"]}} – "
     "im selben Zug darfst du direkt danach die Aktion schicken. Hake Punkte mit "
     "{{\"tool\": \"plan\", \"erledigt\": 1}} ab.")
 
 _liste: dict | None = None
 _gezeigt: tuple | None = None
+_ohne_liste = 0               # Arbeitsschritte dieser Runde ohne Liste
 
 
 def runde_neu() -> bool:
     """Neue Nutzer-Runde. Eine Liste mit offenen Punkten bleibt (lange Arbeit über mehrere Runden),
     eine fertige weicht. True = eine offene Liste läuft weiter."""
-    global _liste, _gezeigt
+    global _liste, _gezeigt, _ohne_liste
     _gezeigt = None
+    _ohne_liste = 0
     if _liste is not None and aktuell() is not None:
         return True
     _liste = None
@@ -52,7 +60,8 @@ def runde_neu() -> bool:
 
 def verwerfen() -> None:
     """Neuer Chat: keine Liste mitnehmen."""
-    global _liste, _gezeigt
+    global _liste, _gezeigt, _ohne_liste
+    _ohne_liste = 0
     _liste = None
     _gezeigt = None
 
@@ -214,17 +223,23 @@ def kurzstand() -> str:
 
 def zurueckweisen(acts: list[dict], frei: bool = False) -> tuple[list[dict], list[dict]]:
     """Teilt die Aktionen eines Zuges in (laufen, gesperrt). Eine Aktion läuft, wenn
-    schon eine Liste besteht oder im selben Zug vorher eine angelegt wird.
+    schon eine Liste besteht oder im selben Zug vorher eine angelegt wird, wenn sie nur
+    nachsieht oder begleitet – oder wenn sie der erste Arbeitsschritt der Runde ist.
     frei=True (Coding-Assistent an): alles läuft."""
+    global _ohne_liste
     if frei:
         return list(acts), []
+    import modes
     liste_da = _liste is not None
     laufen, gesperrt = [], []
     for act in acts:
         tool = act.get("tool")
         if tool == "plan" and _texte(act.get("punkte")):
             liste_da = True
-        if tool in FREI or liste_da:
+        if tool in FREI or tool in BEGLEITEN or tool in modes.READ_TOOLS or liste_da:
+            laufen.append(act)
+        elif _ohne_liste < EINZELN:
+            _ohne_liste += 1
             laufen.append(act)
         else:
             gesperrt.append(act)

@@ -20,12 +20,33 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import re
 import threading
 import time
 import weakref
 from pathlib import Path
-from typing import AsyncIterator
+
+try:
+    import debugbericht as _DBG
+except Exception:                                    # Selbsttest ohne core/ im Pfad
+    class _DBG:                                      # type: ignore[no-redef]
+        @staticmethod
+        def ereignis(*a, **k): pass
+
+        @staticmethod
+        def fehler(*a, **k): pass
+
+        @staticmethod
+        def motor_log(): pass
+
+        class messen:
+            def __init__(self, *a): pass
+
+            def __enter__(self): return self
+
+            def __exit__(self, *a): return False
+from typing import AsyncIterator, NamedTuple
 
 try:
     from paths import INSTALL as _INSTALL
@@ -34,18 +55,55 @@ except Exception:                                    # Selbsttest ohne Bootstrap
 
 ORDNER = _INSTALL / "ModelGGUF"
 PROVIDER = "gguf"
-VORGABE_KONTEXT = 131072
+VORGABE_KONTEXT = 25600                # 25k: schnelles Vorlesen des Verlaufs, wenig VRAM; mehr über /kontext
 VORGABE_TOK_S = 30
 MAX_ANTWORT = 8192
 ANLEITUNG_MARKE = "📘 Anleitung „{}“ (von NemiCLI nachgereicht, gilt ab jetzt):"
 # Stehen Treffer oder Anleitungen vor der Nachricht, markiert das, worauf geantwortet wird.
 NACHRICHT_MARKE = "# Die Nachricht deines Gegenübers – darauf antwortest du (alles darüber ist Hintergrund):\n"
 KURZ_OHNE_SUCHE = 4                 # weniger Wörter und kein „?“: keine Gedächtnissuche
+# Werkzeug-Ergebnisse vor der letzten echten Nachricht: nur der Anfang bleibt im Kontext
+ERGEBNIS_LANG = 1200                # ab so vielen Zeichen wird gekürzt
+ERGEBNIS_ANFANG = 400               # so viel bleibt stehen
+# Stand des Gesprächs: Zusammenfassung des ausgelagerten Teils, vor der ersten Nachricht
+STAND_MARKE = "# Stand des Gesprächs bis hierher (deine Zusammenfassung des ausgelagerten Teils):\n"
+STAND_MAX = 2500                    # Zeichen
+# Doppelpuffer: Platz für Nachrichten = Kontext ohne Anleitung (Systemprompt, Werkzeuge) und ohne
+# Antwort-Reserve. Belegen die Nachrichten nach einer Antwort mehr als PUFFER_AB davon, räumt NemiCLI im
+# Hintergrund auf – Älteres in den Stand des Gesprächs, die neuesten (bis PUFFER_BEHALTEN des Platzes)
+# bleiben – und liest den neuen Kontext schon vor. Der Abstand dazwischen ist Puffer für die nächsten
+# Runden; die nächste Nachricht liest nur sich.
+PUFFER_AB = 0.75
+PUFFER_BEHALTEN = 0.35
+STAND_SYSTEM = (
+    "Du schreibst den „Stand des Gesprächs“ für dich selbst: Der ältere Teil des Chats fällt gleich aus "
+    "deinem Kontext, danach arbeitest du nur mit dieser Zusammenfassung weiter. Deutsch, Stichpunkte, "
+    "höchstens 15 Zeilen: Ziel und Wünsche des Gegenübers, Entscheidungen, Erledigtes, Offenes, wichtige "
+    "Fakten (Namen, Pfade, Zahlen, Befehle). Schreib den bisherigen Stand fort, nichts erfinden, nur die "
+    "Stichpunkte.")
+
+
+def _ergebnis_kurz(text: str) -> str:
+    """Langes Werkzeug-Ergebnis → Anfang + Vermerk. Nachgereichte Anleitungen und Gedächtnis-
+    Treffer davor (bis NACHRICHT_MARKE) bleiben ganz."""
+    vor, marke, nach = text.rpartition(NACHRICHT_MARKE)
+    if not marke:
+        vor, nach = "", text
+    teile = []
+    for block in re.split(r"(?m)^(?=Ergebnis von ')", nach):
+        if len(block) > ERGEBNIS_LANG:
+            block = (block[:ERGEBNIS_ANFANG].rstrip() + f"\n… [{len(block) - ERGEBNIS_ANFANG:,} Zeichen gekürzt – das "
+                     "ganze Ergebnis steht im Chat-Verlauf (gedaechtnis_suchen) oder erneut über das "
+                     "Werkzeug]\n").replace(",", ".")
+        teile.append(block)
+    return vor + marke + "".join(teile)
 
 # Ein fertiger Werkzeug-Block: Zaun, JSON mit "tool", schließender Zaun
 _BLOCK_FERTIG = re.compile(r'```(?:aktion|json)?[ \t]*\n\s*\{.*?"tool".*?\}\s*```', re.DOTALL)
 
 _lock = threading.Lock()                             # ein Modell, eine Rechnung zur Zeit
+_lade_lock = threading.Lock()                        # ein Ladevorgang zur Zeit
+_stopp = threading.Event()                           # entladen() läuft an: Hintergrund-Arbeit hört auf
 _motor = None                                        # (Pfad, Kontext, Engine)
 
 
@@ -61,7 +119,7 @@ def _config() -> dict:
         return {}
 
 
-KONTEXT_STUFEN = (8192, 16384, 32768, 65536, 131072)
+KONTEXT_STUFEN = (8192, 16384, 25600, 32768, 65536, 131072)
 
 
 def kontext(name: str | None = None) -> int:
@@ -113,23 +171,61 @@ def kontext_max(name: str) -> int | None:
     return _kopf_werte(name)[0]
 
 
-def kv_bytes_pro_token(name: str) -> int | None:
+def kv_bytes_pro_token(name: str, bits: int = 16) -> int | None:
     """Wie viel der Gesprächsspeicher (KV) pro Token Kontext belegt – nur die Schichten,
     die mit dem Kontext wachsen (Gemma 4: Voll-Schichten mit eigenem KV, Qwen3.5: jede
     `full_attention_interval`-te Schicht); mit 8 Bit int8 plus eine bf16-Skala je 32 Werte."""
     bf16 = _kopf_werte(name)[1]
-    return bf16 * 17 // 32 if bf16 and kv_bits() == 8 else bf16
+    return bf16 * 17 // 32 if bf16 and bits == 8 else bf16
 
 
-def kv_bits() -> int:
-    """Gesprächsspeicher in 16 Bit (Standard, schneller) oder 8 Bit (`gguf_kv_8bit`, etwa
-    halber VRAM je Token, in langen Chats langsamer)."""
-    return 8 if _config().get("gguf_kv_8bit") else 16
+def werkzeug_nativ() -> bool:
+    """Werkzeuge in der Muttersprache des Modells (`gguf_werkzeug_nativ`, Vorgabe an): Modelle mit
+    eigenem Werkzeug-Format in der Vorlage rufen Werkzeuge darin auf (engines/werkzeugsprache.py).
+    Gemessen mit Qwen3.5-9B, 12 Aufgaben: 12/12 statt 8/12 im ```aktion-Format."""
+    return bool(_config().get("gguf_werkzeug_nativ", True))
 
 
-def setze_kv_bits(bits: int) -> None:
-    import config
-    config.update(gguf_kv_8bit=bits == 8)
+def sprache(engine):
+    """Der Werkzeug-Dialekt des geladenen Modells (None: ```aktion wie bisher)."""
+    if not werkzeug_nativ():
+        return None
+    if not hasattr(engine, "_nemicli_sprache"):
+        try:
+            import werkzeugsprache
+            engine._nemicli_sprache = werkzeugsprache.erkennen(engine.gg.get("tokenizer.chat_template"))
+        except Exception:
+            engine._nemicli_sprache = None
+    return engine._nemicli_sprache
+
+
+def system_nachricht(system: str, dialekt=None):
+    """Die System-Nachricht für die Engine; mit Dialekt samt Werkzeugliste und Beispielen in der
+    Muttersprache des Modells (als Teile: die Marken des Formats werden Sonder-Token)."""
+    from ggufengine import Message
+    if dialekt is None:
+        return Message("system", system)
+    import werkzeugsprache
+    liste = werkzeugsprache.werkzeug_liste()
+    teile = dialekt.system_teile(system, liste)
+    return Message("system", werkzeugsprache.als_text(teile), teile=teile, danach=dialekt.system_danach(liste))
+
+
+def doppelpuffer() -> bool:
+    """Hintergrund-Aufräumen ab PUFFER_AB (`gguf_doppelpuffer`, Preview, Vorgabe an)."""
+    return bool(_config().get("gguf_doppelpuffer", True))
+
+
+def kv_gpu_token(name: str, ctx: int, frei: int | None = None, budget: int | None = None,
+                 schichten: int | None = None, bits: int = 16) -> int | None:
+    """Wie viele Positionen des Gesprächsspeichers in den freien VRAM passen (None: alle `ctx`)."""
+    datei = modelle().get(name)
+    pro_token = kv_bytes_pro_token(name, bits)
+    frei = _frei_vram() if frei is None else frei
+    if frei is None or datei is None or not pro_token:
+        return None
+    passt = max(1024, (frei - _gewichte_im_vram(name, datei, budget, schichten) - RESERVE) // pro_token)
+    return None if passt >= ctx else int(passt)
 
 
 def experten_vram(name: str) -> int | None:
@@ -142,45 +238,12 @@ def gewichte_vram(name: str) -> int | None:
     return _kopf_werte(name)[2]
 
 
-_VIER_BIT = {"Q4_0", "Q4_1", "Q4_K"}
-_ACHT_BIT = {"Q8_0", "Q5_0", "Q5_1", "Q5_K", "Q6_K"}
-
-
 def _gewichte_bytes(gg, nur_experten: bool = False) -> int | None:
-    """Gewichte, wie `ggufengine.qlinear` sie ablegt: 4-Bit-Blöcke als int4 mit bf16-Skala und
-    -Nullpunkt je 32 Werte (5 Bit/Wert), 5- bis 8-Bit-Blöcke als zwei solche Matrizen
-    (10 Bit/Wert, Q6_K also mehr als in der Datei), Einbettungstabellen und alle Formate ohne int4-Weg
-    (cudakern.IMMER_GEPACKT) unverändert im Blockformat (die Tabelle je Schicht von Gemma 4 im RAM),
-    der Rest bf16. `nur_experten`: nur die MoE-Experten (`*_exps`)."""
+    """Gewichte, wie die Engine sie im VRAM ablegt (ggufengine.schichten.vram_bytes).
+    `nur_experten`: nur die MoE-Experten (`*_exps`)."""
     try:
-        from ggufengine.cudakern import IMMER_GEPACKT
-        from ggufengine.gguf import GGML_TYPES
-        gebunden = "output.weight" not in gg.tensors
-        summe = 0
-        for name, ti in gg.tensors.items():
-            if nur_experten and not (len(ti.shape) == 3 and "_exps." in name):
-                continue
-            art, block, _ = GGML_TYPES.get(ti.ggml_type, ("", 1, 0))
-            n_aus, n_ein = (ti.shape[-2], ti.shape[-1]) if len(ti.shape) >= 2 else (1, ti.n_elements)
-            experten = len(ti.shape) == 3 and "_exps." in name           # gepackt ohne Mindestgröße
-            packbar = (art in _VIER_BIT | _ACHT_BIT and n_aus % 8 == 0 and n_ein % 128 == 0
-                       and (experten or n_aus * n_ein >= 1 << 20))       # wie qlinear.quantizable
-            gepackt = ti.n_elements * (5 if art in _VIER_BIT else 10) // 8
-            if name == "per_layer_token_embd.weight" and block > 1:
-                continue
-            if name.endswith(("attn_k_b.weight", "attn_v_b.weight", "attn_kv_b.weight")):   # MLA: float32
-                summe += ti.n_elements * 4
-                continue
-            if art in IMMER_GEPACKT:                                     # bleiben im Dateiformat
-                summe += ti.n_bytes
-                continue
-            if name == "token_embd.weight" and block > 1 and packbar:
-                summe += ti.n_bytes + (gepackt if gebunden else 0)
-            elif packbar:
-                summe += gepackt
-            else:
-                summe += ti.n_elements * (4 if len(ti.shape) < 2 else 2)
-        return summe
+        from ggufengine import schichten
+        return schichten.gewichte_bytes(gg, nur_experten)
     except Exception:
         return None
 
@@ -202,7 +265,7 @@ def _kv_bytes(gg) -> int | None:
             fenster = gg.require(f"{a}.attention.sliding_window_pattern")
             eigene = n - int(gg.get(f"{a}.attention.shared_kv_layers", 0))
             schichten = [i for i in range(eigene) if not fenster[i]]
-        elif a == "qwen35":
+        elif a in ("qwen35", "qwen35moe", "qwen3next"):          # nur jede n-te Schicht mit Attention
             schritt = int(gg.get(f"{a}.full_attention_interval", 4))
             schichten = [i for i in range(n) if (i + 1) % schritt == 0]
         else:
@@ -243,9 +306,16 @@ def _ist_mmproj(p: Path) -> bool:
     return "mmproj" in p.name.lower()
 
 
+def _ist_beiwerk(p: Path) -> bool:
+    """Keine Sprachmodell-Datei: Bild-Teil, Wichtigkeits-Matrix der Quantisierung (imatrix…gguf),
+    eigener MTP-Kopf (mtp-….gguf, der Motor nimmt den aus der Modelldatei)."""
+    name = p.name.lower()
+    return _ist_mmproj(p) or "imatrix" in name or name.startswith("mtp-")
+
+
 def _gguf_in(ordner: Path) -> Path | None:
-    """Die Sprachmodell-Datei eines Modell-Ordners (mmproj-Dateien ausgenommen)."""
-    dateien = sorted(p for p in ordner.glob("*.gguf") if not _ist_mmproj(p))
+    """Die Sprachmodell-Datei eines Modell-Ordners (Beiwerk wie mmproj ausgenommen)."""
+    dateien = sorted(p for p in ordner.glob("*.gguf") if not _ist_beiwerk(p))
     return dateien[0] if dateien else None
 
 
@@ -318,7 +388,6 @@ def _torch_bereit() -> None:
 
 
 RESERVE = int(1.5 * 2**30)
-KONTEXT_NEBEN_RAM_EXPERTEN = 16384        # so viel Kontext bleibt frei, bevor Experten den VRAM füllen
 
 
 def _frei_vram() -> int | None:
@@ -332,10 +401,10 @@ def _frei_vram() -> int | None:
         return None
 
 
-def experten_budget(name: str, ctx: int, frei: int | None = None) -> int | None:
+def experten_budget(name: str, ctx: int, frei: int | None = None, bits: int = 16) -> int | None:
     """VRAM für MoE-Experten (None: alle im VRAM, 0: alle im RAM). `gguf_experten` in der Config:
     "vram", "ram" oder "auto" – passt das Modell samt Kontext nicht, bleiben so viele Experten im
-    VRAM, wie neben den übrigen Gewichten, dem Kontext und der Reserve Platz haben."""
+    VRAM, wie neben den übrigen Gewichten, dem Kontext, dem Bild-Teil und der Reserve Platz haben."""
     modus = str(_config().get("gguf_experten", "auto")).lower()
     if modus == "vram":
         return None
@@ -347,29 +416,142 @@ def experten_budget(name: str, ctx: int, frei: int | None = None) -> int | None:
     frei = _frei_vram() if frei is None else frei
     if frei is None:
         return None
-    kv = (kv_bytes_pro_token(name) or 0) * min(ctx, KONTEXT_NEBEN_RAM_EXPERTEN)
+    kv = (kv_bytes_pro_token(name, bits) or 0) * ctx + _sehen_bytes(name)
     if gesamt + kv + RESERVE <= frei:
         return None
     return max(0, frei - (gesamt - experten) - kv - RESERVE)
 
 
-def passender_kontext(name: str, ctx: int, frei: int | None = None, budget: int | None = None) -> int:
-    """Größte Stufe bis `ctx`, deren Gesprächsspeicher neben dem Modell in den freien
-    VRAM passt (Gewichte wie die Engine sie ablegt, Experten nur bis `budget`, 1,5 GB Reserve).
-    Ohne GPU-Angaben: `ctx`."""
-    datei = modelle().get(name)
-    pro_token = kv_bytes_pro_token(name)
+SCHICHTEN_MODI = ("auto", "vram", "ram")
+
+
+def schichten_modus() -> str:
+    """Wo die Schichten dichter Modelle liegen. Vorgabe "auto" (kein Menüpunkt): erst der
+    eingestellte Kontext, was vom Modell daneben nicht in den Grafikspeicher passt, bleibt im RAM
+    (die GPU holt es über PCIe, langsamer). Nur über die Config (`gguf_schichten`): "vram" – alles
+    in der Grafikkarte, der Kontext wird kleiner; "ram" – alles Auslagerbare im RAM."""
+    modus = str(_config().get("gguf_schichten", "auto")).lower()
+    return modus if modus in SCHICHTEN_MODI else "auto"
+
+
+def modell_ort(name: str) -> str:
+    """Wo das geladene Modell liegt, in Worten (für /kontext)."""
+    if _motor is None or _motor[0] != modelle().get(name):
+        return "wird beim Laden automatisch verteilt"
+    engine = _motor[2]
+    plan = getattr(engine, "schichten_plan", None)
+    lager = engine._lager() if hasattr(engine, "_lager") else []
+    if lager:
+        ort = (f"Experten-Lager – je Schicht {lager[0].plaetze} von {lager[0].n_exp} Experten in der Grafikkarte "
+               "(die meistgebrauchten, lernt mit), der Rest im RAM")
+    elif plan is None or not plan.ram:
+        ort = "ganz in der Grafikkarte – schnell"
+    else:
+        ort = (f"Hybrid – {plan.ram_bytes / 2**30:.1f} GB im RAM, die Grafikkarte holt sie über PCIe "
+               "(langsamer, dafür passt der ganze Kontext)")
+    ort += f"  ·  Gesprächsspeicher {getattr(engine, 'kv_bits_wahl', 16)} Bit"
+    if (kv := getattr(engine, "kv_im_vram", None)):
+        ort += f", davon {kv // 1024}k in der Grafikkarte, der Rest im RAM"
+    return ort
+
+
+def _sehen_bytes(name: str) -> int:
+    """Grafikspeicher des Bild-Übersetzers (mmproj), wenn das Modell sieht."""
+    try:
+        mm = _mmproj(name) if sieht(name) else None
+        return mm.stat().st_size if mm is not None else 0
+    except Exception:
+        return 0
+
+
+def schichten_budget(name: str, ctx: int, frei: int | None = None, bits: int = 16) -> int | None:
+    """VRAM für die Gewichte eines dichten Modells (None: alle im VRAM, 0: alles Auslagerbare im
+    RAM), siehe `schichten_modus`. MoE-Modelle haben das Experten-Budget."""
+    modus = schichten_modus()
+    if modus == "vram" or experten_vram(name) or modelle().get(name) is None:
+        return None
+    if modus == "ram":
+        return 0
+    gesamt = gewichte_vram(name)
     frei = _frei_vram() if frei is None else frei
-    if frei is None or datei is None or not pro_token:
-        return ctx
+    if gesamt is None or frei is None:
+        return None
+    kv = (kv_bytes_pro_token(name, bits) or 0) * ctx
+    platz = frei - kv - RESERVE - _sehen_bytes(name)
+    return None if gesamt <= platz else max(0, platz)
+
+
+def schichten_plan(name: str, budget: int | None):
+    """Plan der Engine für `budget` (ggufengine.schichten.Plan) oder None."""
+    datei = modelle().get(name)
+    if budget is None or datei is None:
+        return None
+    try:
+        from ggufengine import schichten
+        from ggufengine.gguf import GGUFFile
+        gg = GGUFFile(str(datei))
+        try:
+            return schichten.planen(gg, budget)
+        finally:
+            gg.close()
+    except Exception:
+        return None
+
+
+def _gewichte_im_vram(name: str, datei, budget: int | None, schichten: int | None) -> int:
+    """Gewichte im VRAM samt Bild-Teil (mmproj), nach Experten- und Schichten-Budget."""
     gewichte = gewichte_vram(name) or datei.stat().st_size
     if budget is not None and (experten := experten_vram(name)):
         gewichte = gewichte - experten + min(experten, budget)
-    platz = frei - gewichte - RESERVE
+    if (plan := schichten_plan(name, schichten)) is not None:
+        gewichte = min(gewichte, plan.vram_bytes)
+    return gewichte + _sehen_bytes(name)
+
+
+def passender_kontext(name: str, ctx: int, frei: int | None = None, budget: int | None = None,
+                      schichten: int | None = None, bits: int = 16) -> int:
+    """Größte Stufe bis `ctx`, deren Gesprächsspeicher neben dem Modell in den freien
+    VRAM passt (Gewichte wie die Engine sie ablegt, Experten nur bis `budget`, Schichten nach
+    `schichten_budget`, 1,5 GB Reserve). Ohne GPU-Angaben: `ctx`."""
+    datei = modelle().get(name)
+    pro_token = kv_bytes_pro_token(name, bits)
+    frei = _frei_vram() if frei is None else frei
+    if frei is None or datei is None or not pro_token:
+        return ctx
+    platz = frei - _gewichte_im_vram(name, datei, budget, schichten) - RESERVE
     if pro_token * ctx <= platz:
         return ctx
     stufen = [s for s in KONTEXT_STUFEN if s < ctx and pro_token * s <= platz]
     return stufen[-1] if stufen else min(ctx, 4096)
+
+
+class Verteilung(NamedTuple):
+    bits: int                    # Gesprächsspeicher 16 oder 8 Bit
+    experten: int | None         # VRAM-Budget der MoE-Experten (None: alle im VRAM)
+    schichten: int | None        # VRAM-Budget der Gewichte dichter Modelle (None: alle im VRAM)
+    n_ctx: int
+    kv_vram: int | None          # Positionen des Gesprächsspeichers im VRAM (None: alle)
+
+
+def verteilen(name: str, ctx: int, frei: int | None = None) -> Verteilung:
+    """Der Erkenner: die schnellste Verteilung, mit der der eingestellte Kontext ganz gilt.
+    1. alles in der Grafikkarte, Gesprächsspeicher 16 Bit
+    2. alles in der Grafikkarte, Gesprächsspeicher 8 Bit (halber Platz, kaum langsamer)
+    3. 8 Bit, Experten oder Schichten so weit nötig im RAM (über PCIe, langsamer)
+    4. reicht auch das nicht: ein Teil des Gesprächsspeichers im RAM (ohne CUDA-Graphen)"""
+    frei = _frei_vram() if frei is None else frei
+    for bits in (16, 8):
+        if passender_kontext(name, ctx, frei, bits=bits) >= ctx:
+            return Verteilung(bits, None, None, ctx, None)
+    budget, schicht = experten_budget(name, ctx, frei, 8), schichten_budget(name, ctx, frei, 8)
+    if passender_kontext(name, ctx, frei, budget, schicht, 8) >= ctx:
+        return Verteilung(8, budget, schicht, ctx, None)
+    return Verteilung(8, budget, schicht, ctx, kv_gpu_token(name, ctx, frei, budget, schicht, 8))
+
+
+def antwort_reserve(n_ctx: int) -> int:
+    """So viel Kontext bleibt für die Antwort frei (bei 25k gut 4k)."""
+    return min(MAX_ANTWORT, max(2048, n_ctx // 6))
 
 
 def wirksamer_kontext(name: str) -> int:
@@ -381,11 +563,17 @@ def wirksamer_kontext(name: str) -> int:
 
 def _schluessel(name: str) -> tuple:
     """Einstellungen, mit denen eine geladene Engine weiterverwendet werden kann."""
-    return kontext(name), kv_bits(), str(_config().get("gguf_experten", "auto")).lower()
+    return kontext(name), str(_config().get("gguf_experten", "auto")).lower(), schichten_modus()
 
 
 def motor(name: str):
-    """Die geladene Engine für Modell `name` (lädt beim ersten Mal, ~10 s)."""
+    """Die geladene Engine für Modell `name` (lädt beim ersten Mal, ~10 s). Ein Ladevorgang zur Zeit:
+    eine Antwort und das Vorbereiten im Hintergrund laden nie zwei Modelle nebeneinander."""
+    with _lade_lock:
+        return _motor_laden(name)
+
+
+def _motor_laden(name: str):
     global _motor
     datei = modelle().get(name)
     if datei is None:
@@ -397,25 +585,147 @@ def motor(name: str):
     _torch_bereit()
     from ggufengine import Engine
     frei = _frei_vram()
-    budget = experten_budget(name, ctx, frei)
-    engine = Engine(str(datei), n_ctx=passender_kontext(name, ctx, frei, budget), verbose=False, max_tok_s=tok_s(),
-                    kv_bits=kv_bits(), experts_vram=budget)
+    v = verteilen(name, ctx, frei)
+    if frei is not None and v != Verteilung(16, None, None, ctx, None):
+        frei = _stimme_platz_machen() or frei     # die Stimme räumt, dann neu verteilen
+        v = verteilen(name, ctx, frei)
+    _DBG.motor_log()
+    _DBG.ereignis(f"Modell laden: {name} (Kontext {v.n_ctx}, Gesprächsspeicher {v.bits} Bit, KV im VRAM "
+                  f"{v.kv_vram}, frei {frei}, Experten-Budget {v.experten}, Schichten-Budget {v.schichten})")
+    engine = Engine(str(datei), n_ctx=v.n_ctx, verbose=False, max_tok_s=tok_s(), kv_bits=v.bits,
+                    experts_vram=v.experten, kv_gpu_tokens=v.kv_vram, weights_vram=v.schichten)
+    engine.kv_im_vram = v.kv_vram
+    engine.kv_bits_wahl = v.bits
+    _DBG.ereignis(f"Modell geladen: {name}")
     if sieht(name) and (mm := _mmproj(name)) is not None:
         try:
             engine.enable_vision(str(mm))
         except Exception:
             engine.vision = None                  # Modell ohne Bildeingang: nur Text
+    if experten_laden(name, engine):
+        _DBG.ereignis("Experten-Lager: Zählung vom letzten Mal übernommen")
+    _trt_anbinden(engine, datei)
     _motor = (datei, _schluessel(name), engine)
+    _leerlauf_starten()
+    _lora_abgleich(engine, datei)
     return engine
+
+
+def _trt_anbinden(engine, datei) -> None:
+    """TensorRT-RTX abgelegt (Models/TensorRT-RTX): lange Prompts liest ein TensorRT-Netz, die Antwort
+    schreibt der GGUF-Motor (trtmotor.chat). Abschalten: Config trt_chat = false."""
+    if not _config().get("trt_chat", True):
+        return
+    try:
+        from trtmotor import chat as TC
+        grund = TC.anbinden(engine, datei)
+        if grund:
+            _DBG.ereignis(f"TensorRT-Leser: {grund}")
+    except Exception as exc:
+        _DBG.ereignis(f"TensorRT-Leser nicht angebunden: {exc}")
+
+
+def _lora_abgleich(engine, datei) -> None:
+    """Coding-Assistent an: der LoRA-Motor klinkt das Coding-LoRA dieses Modells an, aus: wieder ab."""
+    try:
+        from loramotor import adapter
+        if adapter.abgleich(engine, datei):
+            _DBG.ereignis(f"Coding-LoRA: {getattr(engine, '_nemicli_lora_soll', '') or 'abgeklinkt'}")
+    except Exception as exc:
+        _DBG.ereignis(f"Coding-LoRA-Abgleich fehlgeschlagen: {exc}")
+
+
+def _stimme_platz_machen() -> int | None:
+    """Passt das Modell mit dem eingestellten Kontext nicht neben die geladene Stimme, räumt sie
+    die GPU (sie lädt beim nächsten Satz neu). Gibt den neuen freien VRAM zurück."""
+    import sys
+    st = sys.modules.get("stimme")
+    if st is None or getattr(st, "_modell", None) is None:
+        return None
+    try:
+        st.gpu_freigeben()
+    except Exception:
+        return None
+    return _frei_vram()
 
 
 def geladen() -> bool:
     return _motor is not None
 
 
-def entladen() -> None:
-    """Gibt VRAM und RAM des Sprachmodells frei (Modellwechsel), samt Bildbeschreiber."""
-    global _motor
+class MotorWeg(RuntimeError):
+    """Das Modell wurde inzwischen entladen (oder wird es gerade) – die Arbeit hört still auf."""
+
+
+# Leihe (wie Ollamas refCount): wer mit dem Modell rechnet, leiht es sich; entladen() nimmt keine neuen Leihen
+# mehr an, gibt das Stopp-Signal und wartet, bis alle zurück sind.
+_leih = threading.Condition()
+_leihen = 0
+_entladen_laeuft = False
+_zuletzt = time.monotonic()                          # letzte Leihe (fürs Entladen im Leerlauf)
+_runden = 0                                          # laufende Runden: zwischen zwei Leihen kein Leerlauf
+LEIHE_WARTEN_S = 5.0                                 # so lange wartet entladen() auf laufende Arbeit
+LEERLAUF_PRUEFEN_S = 30.0
+
+
+@contextlib.contextmanager
+def geliehen(engine):
+    """`with geliehen(engine):` – rechnen mit dem geladenen Modell. MotorWeg, wenn es nicht mehr das geladene
+    ist oder gerade entladen wird."""
+    global _leihen, _zuletzt
+    with _leih:
+        if _entladen_laeuft or _motor is None or _motor[2] is not engine:
+            raise MotorWeg("Modell inzwischen entladen")
+        _leihen += 1
+        _zuletzt = time.monotonic()
+    try:
+        yield engine
+    finally:
+        with _leih:
+            _leihen -= 1
+            _zuletzt = time.monotonic()
+            _leih.notify_all()
+
+
+@contextlib.contextmanager
+def versucht_geliehen(engine):
+    """Wie geliehen(), ohne Ausnahme: liefert False, wenn das Modell nicht mehr das geladene ist."""
+    try:
+        leihe = geliehen(engine)
+        leihe.__enter__()
+    except MotorWeg:
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        leihe.__exit__(None, None, None)
+
+
+@contextlib.contextmanager
+def runde():
+    """Eine Runde (Antwort mit Werkzeugen) läuft: das Modell wird in der Zeit nicht wegen Leerlaufs entladen."""
+    global _runden
+    _runden += 1
+    try:
+        yield
+    finally:
+        _runden -= 1
+
+
+def _belegt() -> int:
+    try:
+        import torch
+        return torch.cuda.memory_allocated() if torch.cuda.is_available() else 0
+    except Exception:
+        return 0
+
+
+def entladen(grund: str = "") -> None:
+    """Gibt VRAM und RAM des Sprachmodells frei (Modellwechsel, Leerlauf), samt Bildbeschreiber – wie Ollama:
+    keine neuen Leihen, laufende Arbeit hört auf (Stopp-Signal) und wird abgewartet (höchstens LEIHE_WARTEN_S),
+    dann wird die Engine geleert. Ihr Speicher ist damit frei, auch wenn noch irgendwo jemand sie hält."""
+    global _motor, _entladen_laeuft
     try:
         import bildbeschreiber
         bildbeschreiber.entladen()
@@ -423,23 +733,104 @@ def entladen() -> None:
         pass
     if _motor is None:
         return
-    with _lock:
-        engine = _motor[2]
-        _motor = None
-        try:
-            engine.gg.close()
-        except Exception:
-            pass
-        del engine
+    t0, vorher = time.monotonic(), _belegt()
+    with _leih:
+        _entladen_laeuft = True
+    _stopp.set()                                     # Doppelpuffer und Hintergrund-Arbeit hören auf
+    try:
+        with _leih:
+            _leih.wait_for(lambda: _leihen == 0, timeout=LEIHE_WARTEN_S)
+            offen = _leihen
+        with _lock:
+            if _motor is None:
+                return
+            datei, _, engine = _motor
+            _motor = None
+            try:
+                from trtmotor import chat as TC
+                TC.abbinden(engine)
+            except Exception:
+                pass
+            try:
+                experten_speichern(Path(datei).parent.name, engine)
+            except Exception:                        # nur ein Vorteil fürs nächste Laden
+                pass
+            try:
+                engine.leeren()
+            except Exception as exc:
+                _DBG.fehler("Entladen: leeren", exc)
+            gg = getattr(engine, "gg", None)
+            del engine
+            import gc
+            gc.collect()                             # erst ohne die Tensoren lässt sich die Datei schließen
+            try:
+                if gg is not None:
+                    gg.close()
+            except Exception as exc:                 # noch eine Sicht auf die Datei: sie bleibt offen
+                _DBG.fehler("Entladen: Modelldatei schließen", exc)
+    finally:
+        _stopp.clear()
+        with _leih:
+            _entladen_laeuft = False
     try:
         import gc
         import torch
         gc.collect()
         torch.cuda.empty_cache()
         from ggufengine.models.common import release_pinned_memory
-        release_pinned_memory()                  # Experten im RAM, ausgelagerte Gewichte
+        release_pinned_memory()                      # Experten im RAM, ausgelagerte Gewichte
     except Exception:
         pass
+    frei = max(0, vorher - _belegt())
+    text = f"Modell entladen{' (' + grund + ')' if grund else ''}: {frei / 2**30:.1f} GB zurück in " \
+           f"{time.monotonic() - t0:.1f} s"
+    if offen:
+        text += f" – {offen} Arbeit(en) hörten nach {LEIHE_WARTEN_S:.0f} s nicht auf, trotzdem geleert"
+        try:
+            import fehlerwaechter
+            fehlerwaechter.befund("entladen", f"{offen} Arbeit(en) hörten beim Entladen nicht auf das Stopp-Signal")
+        except Exception:
+            pass
+    _DBG.ereignis(text)
+
+
+def leerlauf_minuten() -> int:
+    """Config `gguf_leerlauf_min`: so viele Minuten ohne Arbeit, dann wird das Modell entladen (0 = nie)."""
+    try:
+        return max(0, min(1440, int(_config().get("gguf_leerlauf_min", 0) or 0)))
+    except (TypeError, ValueError):
+        return 0
+
+
+def leerlauf_pruefen() -> bool:
+    """Einmal nachsehen: Modell geladen, niemand rechnet, keine Runde, kein Bild, lange genug still? Dann
+    entladen. True, wenn entladen wurde."""
+    minuten = leerlauf_minuten()
+    if not minuten or _motor is None or _leihen or _runden or _bild_tiefe:
+        return False
+    if time.monotonic() - _zuletzt < minuten * 60:
+        return False
+    entladen(f"{minuten} Min. ohne Arbeit")
+    return True
+
+
+_leerlauf_faden: threading.Thread | None = None
+
+
+def _leerlauf_starten() -> None:
+    global _leerlauf_faden
+    if _leerlauf_faden is not None and _leerlauf_faden.is_alive():
+        return
+
+    def lauf():
+        while True:
+            time.sleep(LEERLAUF_PRUEFEN_S)
+            try:
+                leerlauf_pruefen()
+            except Exception as exc:
+                _DBG.fehler("Leerlauf-Entladen", exc)
+    _leerlauf_faden = threading.Thread(target=lauf, daemon=True, name="gguf-leerlauf")
+    _leerlauf_faden.start()
 
 
 _bild_tiefe = 0
@@ -463,15 +854,21 @@ def gpu_fuer_bild():
         return
     _bild_tiefe += 1
     if _bild_tiefe == 1:
-        with _lock:
-            engine.offload()
+        with versucht_geliehen(engine) as da, _lock:
+            if da:
+                engine.offload()
+        if da:
+            _DBG.ereignis("Sprachmodell für das Bild in den RAM")
     try:
         yield
     finally:
         _bild_tiefe -= 1
         if _bild_tiefe == 0:
-            with _lock:
-                engine.restore()
+            with versucht_geliehen(engine) as da, _lock:
+                if da:                               # inzwischen entladen: nichts zurückzuholen
+                    engine.restore()
+            if da:
+                _DBG.ereignis("Sprachmodell zurück auf die GPU")
 
 
 # ---------------------------------------------------------------------------
@@ -495,6 +892,8 @@ class _Denktrenner:
             self.AUF, self.ZU, self.KANAL = "<|channel|>analysis<|message|>", HARMONY_FINAL, ""
         elif format.startswith("mistral"):                  # Magistral / Ministral 3 Reasoning
             self.AUF, self.ZU, self.KANAL = "[THINK]", "[/THINK]", ""
+        elif format == "seed_oss":
+            self.AUF, self.ZU, self.KANAL = "<seed:think>", "</seed:think>", ""
         elif format != "gemma4":
             self.AUF, self.ZU, self.KANAL = "<think>", "</think>", ""
         self.denkt = offen
@@ -611,10 +1010,34 @@ class GgufChat:
         self.messages: list[dict] = []
         self.strength = None
         self._zusatz = _Zusatz()                     # je Nachricht: ids, gesendet, bilder
+        self.stand = ""                              # Zusammenfassung des ausgelagerten Teils
+        self._puffer: asyncio.Task | None = None    # laufendes Hintergrund-Aufräumen / Vorlesen
+        self._puffer_hinweis = ""
+        self._puffer_system = ""                     # Anleitung der letzten Antwort (fürs Vorlesen)
+        self._platz_cache: tuple = (None, (0, 0))
+
+    async def schliessen(self, warten_s: float = 5.0) -> None:
+        """Modellwechsel: die Hintergrund-Arbeit (Doppelpuffer: Vorlesen, Zusammenfassen) anhalten – sie hält das
+        Modell sonst fest, und entladen() gäbe den Grafikspeicher nicht frei. Erst das Stopp-Signal (ihr Faden
+        hört nur darauf), dann abbrechen; höchstens `warten_s` warten, danach geht der Wechsel trotzdem weiter
+        (entladen() räumt nach). Das Signal gilt nur fürs Warten: scheitert der Wechsel, arbeitet der Puffer weiter."""
+        puffer, self._puffer = self._puffer, None
+        if puffer is None or puffer.done():
+            return
+        _stopp.set()
+        try:
+            puffer.cancel()
+            await asyncio.wait({puffer}, timeout=warten_s)
+        finally:
+            _stopp.clear()
 
     def reset(self) -> None:
         self.messages = []
         self._zusatz.clear()
+        self.stand = ""
+        if self._puffer is not None and not self._puffer.done():
+            self._puffer.cancel()
+        self._puffer, self._puffer_hinweis, self._puffer_system = None, "", ""
 
     # -- intern ---------------------------------------------------------------
     def _anleitungen_fuer(self, user_text: str) -> str:
@@ -636,16 +1059,27 @@ class GgufChat:
                 teile.append(ANLEITUNG_MARKE.format(t) + "\n" + persona.anleitung(t))
         return "\n\n".join(teile)
 
-    def _nachrichten(self, system: str, verlauf: list[dict], denk_weg: bool = False):
+    @staticmethod
+    def _letzte_echte(verlauf: list[dict]) -> int:
+        return max((i for i, m in enumerate(verlauf) if m.get("role") == "user"
+                    and not _ist_ergebnis(m.get("content"))), default=-1)
+
+    def _nachrichten(self, system: str, verlauf: list[dict], denk_weg: bool = False, stand: bool = False,
+                     dialekt=None):
         """Verlauf für die Engine. Antworten tragen ihre erzeugten Token (samt Denktext).
         `denk_weg` (Vorlage verwirft alten Denktext): bei Antworten vor der letzten echten
         Nutzernachricht fällt er weg; innerhalb der laufenden Werkzeug-Kette (nur
         Werkzeug-Ergebnisse seither) bleibt er – das Modell kennt so noch den Grund für
-        jeden Schritt (interleaved thinking, wie in den Vorlagen von Qwen3, GLM-4.5, gpt-oss)."""
+        jeden Schritt (interleaved thinking, wie in den Vorlagen von Qwen3, GLM-4.5, gpt-oss).
+        Werkzeug-Ergebnisse vor der letzten echten Nachricht sind gekürzt (`_ergebnis_kurz`);
+        mit `stand` steht der Stand des Gesprächs vor der ersten Nachricht. Mit `dialekt` (Muttersprache
+        des Modells): Antworten als Text und Werkzeug-Ergebnisse in seinem Werkzeug-Format."""
         from ggufengine import Message
-        raus = [Message("system", system)] if system else []
-        letzte_echte = max((i for i, m in enumerate(verlauf) if m.get("role") == "user"
-                            and not _ist_ergebnis(m.get("content"))), default=-1)
+        if dialekt is not None:
+            import werkzeugsprache
+        raus = [system_nachricht(system, dialekt)] if system else []
+        letzte_echte = self._letzte_echte(verlauf)
+        erste = next((i for i, m in enumerate(verlauf) if m.get("role") == "user"), -1) if stand and self.stand else -1
         for i, m in enumerate(verlauf):
             rolle, inhalt = m.get("role"), m.get("content")
             if not isinstance(inhalt, str):                  # Bilder o. Ä.: nur der Text
@@ -654,11 +1088,242 @@ class GgufChat:
                 ids = self._zusatz.get(m, "ids")
                 if denk_weg and i < letzte_echte and self._zusatz.get(m, "gedacht"):
                     ids = None                               # als Text, ohne Denktext
+                if dialekt is not None and ids is None:
+                    teile = werkzeugsprache.aktion_teile(dialekt, inhalt)
+                    raus.append(Message("assistant", werkzeugsprache.als_text(teile), teile=teile))
+                    continue
                 raus.append(Message("assistant", inhalt, ids=ids))
             elif rolle == "user":
-                raus.append(Message("user", self._zusatz.get(m, "gesendet", inhalt),
-                                    images=self._zusatz.get(m, "bilder")))
+                text = self._zusatz.get(m, "gesendet", inhalt)
+                if i < letzte_echte and _ist_ergebnis(inhalt):
+                    text = _ergebnis_kurz(text)
+                if i == erste:
+                    text = STAND_MARKE + self.stand + "\n\n" + text
+                if dialekt is not None and _ist_ergebnis(inhalt):
+                    teile = dialekt.ergebnisse_teile(text)
+                    raus.append(Message("user", werkzeugsprache.als_text(teile), images=self._zusatz.get(m, "bilder"),
+                                        teile=teile, werkzeug_antwort=True))
+                    continue
+                raus.append(Message("user", text, images=self._zusatz.get(m, "bilder")))
         return raus
+
+    def sichtbar(self) -> list[dict]:
+        """Der Verlauf, wie das Modell ihn sieht: ältere Werkzeug-Ergebnisse gekürzt."""
+        letzte = self._letzte_echte(self.messages)
+        return [dict(m, content=_ergebnis_kurz(m["content"])) if i < letzte and _ist_ergebnis(m.get("content"))
+                else m for i, m in enumerate(self.messages)]
+
+    def _kontext_melden(self) -> None:
+        """Für die Suche „vorhin in diesem Chat“: was wirklich im Kontext steht (gekürzte
+        Ergebnisse nur mit ihrem Anfang – der Rest ist so wieder auffindbar)."""
+        try:
+            import chatstore
+            chatstore.im_kontext_setzen(self.sichtbar())
+        except Exception:
+            pass
+
+    async def _stand_fortschreiben(self, weg: list[dict], n_ctx: int, hintergrund: bool = False) -> bool:
+        """Stand des Gesprächs um die ausgelagerten Nachrichten `weg` ergänzen (eigener Modell-
+        Aufruf ohne Denken). Schlägt er fehl, bleibt der alte Stand. True = fortgeschrieben."""
+        grenze = max(4000, int((n_ctx - antwort_reserve(n_ctx) - 1000) * 2.5))   # Zeichen Eingabe
+        teile, summe = [], 0
+        for m in weg:
+            inhalt = m.get("content")
+            if not isinstance(inhalt, str):
+                inhalt = " ".join(b.get("text", "") for b in inhalt or [] if isinstance(b, dict))
+            if _ist_ergebnis(inhalt):
+                inhalt = _ergebnis_kurz(inhalt)
+            stueck = ("Gegenüber" if m.get("role") == "user" else "Du") + ": " + inhalt.strip()[:1500]
+            if summe + len(stueck) > grenze:
+                teile.append("… (weitere Nachrichten gekürzt)")
+                break
+            teile.append(stueck)
+            summe += len(stueck)
+        if not teile:
+            return False
+        text = ((f"Bisheriger Stand:\n{self.stand}\n\n" if self.stand else "")
+                + "Diese Nachrichten fallen jetzt aus dem Kontext:\n\n" + "\n\n".join(teile))
+        try:
+            neu = await self._einmal(STAND_SYSTEM, [{"role": "user", "content": text}], max_tokens=900,
+                                     denken_aus=True, hintergrund=hintergrund)
+        except Exception:
+            return False
+        if not neu.strip():
+            return False
+        self.stand = neu.strip()[:STAND_MAX]
+        return True
+
+    def _behalten_ab(self, budget: int) -> int:
+        """Index der ersten Nachricht, die stehen bleibt: die neuesten, zusammen höchstens `budget`
+        Token (so wie sie gesendet werden), mindestens die letzten zwei."""
+        import pricing
+        summe, n = 0, 0
+        for m in reversed(self.messages):
+            k = pricing.est_tokens(self._zusatz.get(m, "gesendet", m.get("content")))
+            if n >= 2 and summe + k > budget:
+                break
+            summe, n = summe + k, n + 1
+        return len(self.messages) - n
+
+    def _naechster_anfang(self, system: str, engine) -> list:
+        """Der Anfang des nächsten Prompts – so dargestellt, wie ihn die nächste echte Nachricht
+        sieht (ältere Ergebnisse gekürzt, alter Denktext weg)."""
+        platzhalter = {"role": "user", "content": ""}
+        return self._nachrichten(system, self.messages + [platzhalter], engine.chat_format.drops_old_thinking,
+                                 stand=True, dialekt=sprache(engine))[:-1]
+
+    async def _vorlesen(self, engine, system: str) -> int:
+        anfang = self._naechster_anfang(system, engine)
+
+        def lesen():
+            with versucht_geliehen(engine) as da, _lock:
+                if (not da or _stopp.is_set()                                      # entladen / Wechsel
+                        or _bild_tiefe or engine.offloaded):                       # ein Bild entsteht gerade
+                    return 0
+                engine.chat_format.thinking = denken()
+                with _DBG.messen("Doppelpuffer: vorlesen"):
+                    return engine.vorlesen(anfang, abbruch=_stopp.is_set)
+        return await asyncio.to_thread(lesen)
+
+    async def _aufraeumen(self, engine, system: str) -> None:
+        """Doppelpuffer: Älteres in den Stand des Gesprächs (und über `weggefallen` ins Gedächtnis),
+        die neuesten Nachrichten bleiben, der neue Kontext wird schon vorgelesen."""
+        import pricing
+        t0, vorher = time.time(), engine._pos
+        alt = self.messages
+        n = pricing.schnitt(alt, self._behalten_ab(int(PUFFER_BEHALTEN * self._platz(engine, system)[1])))
+        if n <= 0:
+            return
+        _DBG.ereignis(f"Doppelpuffer: {n} Nachrichten in den Stand, {len(alt) - n} bleiben")
+        # erst der Stand, dann der Schnitt: bricht die Zusammenfassung ab (Entladen, Bild), fehlt nichts
+        if not await self._stand_fortschreiben(alt[:n], engine.n_ctx, hintergrund=True) or self.messages is not alt:
+            return
+        gezaehlt = getattr(self, "aufgeraeumt", 0)
+        pricing.abschneiden(self, n)
+        self.aufgeraeumt = gezaehlt                  # eigener Hinweis statt „Kontext voll“
+        self._zusatz.aufraeumen(self.messages)
+        gelesen = await self._vorlesen(engine, system)
+        self._kontext_melden()
+        self._puffer_hinweis = (f"📌 Kontext im Hintergrund aufgeräumt: {n} ältere Nachrichten stehen jetzt im Stand "
+                                f"des Gesprächs (und im Gedächtnis), {len(self.messages)} bleiben – "
+                                f"{vorher:,} → {engine._pos:,} Token, {gelesen:,} vorgelesen in "
+                                f"{time.time() - t0:.1f} s.").replace(",", ".")
+
+    def _hintergrund(self, engine, system: str, aufraeumen: bool) -> None:
+        """Aufräumen (ab PUFFER_AB) oder nur den Gesprächsanfang wieder vorlesen – im Hintergrund,
+        hinter einer schon laufenden Arbeit; die nächste Nachricht wartet darauf (`_puffer_abwarten`)."""
+        if not doppelpuffer() or not system or not self.messages:
+            return
+        if aufraeumen:
+            anleitung, platz = self._platz(engine, system)
+            aufraeumen = engine._pos - anleitung > PUFFER_AB * platz
+        vorher = self._puffer
+
+        async def laufen():
+            if vorher is not None:
+                with contextlib.suppress(Exception):
+                    await vorher
+            if _motor is None or _motor[2] is not engine or _bild_tiefe:   # entladen, gewechselt, Bild: nichts tun
+                return
+            try:
+                if aufraeumen:
+                    await self._aufraeumen(engine, system)
+                else:
+                    await self._vorlesen(engine, system)
+            except (asyncio.CancelledError, MotorWeg):
+                return
+            except Exception as exc:                   # ein Bonus: nie das Gespräch stören
+                _DBG.fehler("Doppelpuffer", exc)
+                self._puffer_hinweis = f"⚠ Kontext im Hintergrund vorbereiten ging nicht: {exc}"
+        self._puffer = asyncio.get_running_loop().create_task(laufen())
+
+    def _platz(self, engine, system: str) -> tuple[int, int]:
+        """(Anleitung, Platz für Nachrichten) in Token: der Kontext ohne die Anleitung und ohne die
+        Antwort-Reserve, gezählt mit dem Tokenizer des Modells."""
+        schluessel = (id(engine), engine.n_ctx, system)
+        if self._platz_cache[0] != schluessel:
+            fmt = engine.chat_format
+            anleitung = len(fmt.encode([system_nachricht(system, sprache(engine))], add_generation_prompt=False))
+            platz = max(1024, engine.n_ctx - anleitung - antwort_reserve(engine.n_ctx))
+            self._platz_cache = (schluessel, (anleitung, platz))
+        return self._platz_cache[1]
+
+    def vorbereiten(self, fertig=None) -> bool:
+        """Passt der Verlauf nicht in den Kontext (nach einem Modellwechsel, kleinerem Kontext, einem
+        fortgesetzten Gespräch): Modell im Hintergrund laden und gleich aufräumen wie der Doppelpuffer,
+        statt bis zur nächsten Nachricht zu warten. Die nächste Nachricht wartet darauf. `fertig` wird
+        danach aufgerufen. True = gestartet."""
+        if not doppelpuffer() or not self.messages or (self._puffer is not None and not self._puffer.done()):
+            return False
+        try:
+            import hintergrund
+            if hintergrund.gpu_belegt():               # Video/Bild-Serie rechnet: nicht dazwischen laden
+                return False
+        except ImportError:
+            pass
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return False
+
+        async def laufen():
+            import persona
+            try:
+                engine = await self._laden()
+                system = await persona.build_system_prompt_async("", kompakt_fuer_lokal=True)
+                await self._aufraeumen(engine, system)
+                self._puffer_system = system
+            except (asyncio.CancelledError, MotorWeg):
+                return
+            except Exception as exc:                   # die nächste Nachricht räumt dann selbst auf
+                _DBG.fehler("Kontext vorbereiten", exc)
+            if fertig is not None:
+                with contextlib.suppress(Exception):
+                    fertig()
+        self._puffer = loop.create_task(laufen())
+        return True
+
+    def _nach_nebenfrage(self) -> None:
+        """Eine Einzelfrage (Reflexion, Recherche, Spiele …) hat den Zwischenspeicher mit ihrem
+        eigenen Prompt belegt: den Gesprächsanfang im Hintergrund wieder vorlesen."""
+        if _motor is not None and _motor[0] == modelle().get(self.name) and self._puffer_system:
+            self._hintergrund(_motor[2], self._puffer_system, aufraeumen=False)
+
+    async def _puffer_abwarten(self) -> AsyncIterator[dict]:
+        """Vor einer neuen Nachricht: ein laufendes Aufräumen erst fertig werden lassen."""
+        if self._puffer is not None:
+            if not self._puffer.done():
+                yield {"type": "note", "text": "📌 einen Moment – der Kontext wird gerade vorbereitet …"}
+            with contextlib.suppress(Exception, asyncio.CancelledError):
+                await self._puffer
+            self._puffer = None
+        if self._puffer_hinweis:
+            yield {"type": "note", "text": self._puffer_hinweis}
+            self._puffer_hinweis = ""
+
+    def _einpassen(self, engine, system: str) -> None:
+        """Anleitung + Verlauf + Platz für die Antwort müssen in den Kontext passen – gezählt mit
+        dem Tokenizer des Modells. Sonst fallen die ältesten Nachrichten heraus (ins Gedächtnis,
+        wie beim normalen Aufräumen). Passt nicht einmal die Anleitung: klare Meldung statt Absturz."""
+        import pricing
+        n_ctx, reserve = engine.n_ctx, antwort_reserve(engine.n_ctx)
+        fmt = engine.chat_format
+        anleitung = len(fmt.encode([system_nachricht(system, sprache(engine))], add_generation_prompt=False))
+        if anleitung + reserve + 512 > n_ctx:
+            raise RuntimeError(
+                f"Der Kontext ({n_ctx // 1024}k) ist zu klein: die Anleitung allein braucht ~{anleitung:,} Token "
+                f"und für die Antwort bleiben {reserve:,} frei. /kontext höher stellen oder Grafikspeicher "
+                "freimachen.".replace(",", "."))
+
+        def laenge() -> int:
+            return len(fmt.encode(self._nachrichten(system, self.messages, fmt.drops_old_thinking, stand=True,
+                                                    dialekt=sprache(engine))))
+        while laenge() + reserve > n_ctx and len(self.messages) > 1:
+            if not pricing.abschneiden(self, max(1, len(self.messages) // 4)):
+                break
+        if laenge() + reserve > n_ctx:
+            raise RuntimeError(f"Die Nachricht ist zu lang für den Kontext ({n_ctx // 1024}k) – kürzer fassen "
+                               "oder /kontext höher stellen.")
 
     @staticmethod
     def _sampler(engine):
@@ -672,37 +1337,62 @@ class GgufChat:
             return SamplerConfig(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, **dry)
         return SamplerConfig(temperature=1.0, top_p=0.95, top_k=64, min_p=0.0, **dry)
 
-    async def _laden(self):
+    def _geladen(self):
+        """Der Motor, wenn er schon mit diesem Modell (und diesen Einstellungen) läuft – lädt nie nach."""
         if _motor is not None and _motor[0] == modelle().get(self.name) and _motor[1] == _schluessel(self.name):
             return _motor[2]
+        return None
+
+    async def _laden(self):
+        if (engine := self._geladen()) is not None:
+            return engine
         return await asyncio.to_thread(motor, self.name)
 
-    async def _erzeugen(self, engine, nachrichten, max_tokens, abbruch: threading.Event):
-        """Lässt die Engine in einem Thread laufen und reicht die Textstücke weiter."""
+    async def _erzeugen(self, engine, nachrichten, max_tokens, abbruch: threading.Event, denken_aus: bool = False,
+                        hintergrund: bool = False, sprache=None):
+        """Lässt die Engine in einem Thread laufen und reicht die Textstücke weiter. Im Hintergrund
+        (Doppelpuffer) endet sie, sobald entladen() anläuft, und wartet nicht auf ein Bild.
+        Mit `sprache` (Werkzeug-Dialekt) gehen Aufrufe in der Muttersprache als ```aktion-Block weiter."""
         loop = asyncio.get_running_loop()
         schlange: asyncio.Queue = asyncio.Queue()
         ENDE = object()
 
         def arbeiten():
             try:
-                with _lock:
-                    engine.chat_format.thinking = denken()
+                while _bild_tiefe and not abbruch.is_set():   # das Bildmodell hat die GPU allein
+                    if hintergrund:
+                        raise RuntimeError("Ein Bild entsteht gerade")
+                    time.sleep(0.2)
+                with geliehen(engine), _lock:
+                    if hintergrund and _stopp.is_set():
+                        raise MotorWeg("Modell wird entladen")
+                    if not hintergrund and _motor is not None and _motor[2] is engine:
+                        _lora_abgleich(engine, _motor[0])
+                    engine.chat_format.thinking = False if denken_aus else denken()
                     engine.denk_budget = denk_budget()
                     gen = engine.chat(nachrichten, max_tokens=max_tokens, sampler=self._sampler(engine))
                     bisher = ""
+                    import werkzeugsprache
+                    strom = werkzeugsprache.Strom(sprache) if sprache is not None else None
                     try:
                         for stueck in gen:
-                            if abbruch.is_set():
+                            if abbruch.is_set() or (hintergrund and _stopp.is_set()):
                                 break
-                            loop.call_soon_threadsafe(schlange.put_nowait, stueck)
+                            if strom is not None:
+                                stueck = strom(stueck)
+                            if stueck:
+                                loop.call_soon_threadsafe(schlange.put_nowait, stueck)
                             # Nach einem fertigen Werkzeug-Block ist Schluss: was danach käme,
                             # wären vorweggenommene oder erfundene Ergebnisse.
                             bisher += stueck
-                            if "```" in stueck and werkzeug_block_fertig(bisher):
+                            if (strom is not None and strom.aufrufe) or ("```" in stueck and werkzeug_block_fertig(bisher)):
                                 break
                     finally:
                         gen.close()
+                        if strom is not None and (rest := strom.ende()):
+                            loop.call_soon_threadsafe(schlange.put_nowait, rest)
             except BaseException as exc:                     # an den Aufrufer weiterreichen
+                _DBG.fehler("Erzeugen", exc)
                 loop.call_soon_threadsafe(schlange.put_nowait, exc)
             loop.call_soon_threadsafe(schlange.put_nowait, ENDE)
 
@@ -720,27 +1410,51 @@ class GgufChat:
             abbruch.set()
             await asyncio.to_thread(faden.join)
 
-    async def _einmal(self, system: str, verlauf: list[dict], max_tokens: int = 2048) -> str:
-        engine = await self._laden()
+    async def _einmal(self, system: str, verlauf: list[dict], max_tokens: int = 2048,
+                      denken_aus: bool = False, hintergrund: bool = False) -> str:
+        """Ein Aufruf ohne Verlauf. `hintergrund` (Doppelpuffer): nur mit dem schon geladenen Motor,
+        nie nachladen; wird er währenddessen entladen, ist das Ergebnis ungültig (Fehler)."""
+        if hintergrund:
+            engine = self._geladen()
+            if engine is None:
+                raise RuntimeError("Modell nicht geladen")
+        else:
+            engine = await self._laden()
         teile, trenner = [], _trenner(engine)
         async for stueck in self._erzeugen(engine, self._nachrichten(system, verlauf, engine.chat_format.drops_old_thinking),
-                                           max_tokens, threading.Event()):
+                                           max_tokens, threading.Event(), denken_aus, hintergrund):
             teile += [t for art, t in trenner(stueck) if art == "text"]
         teile += [t for art, t in trenner.ende() if art == "text"]
+        if hintergrund and (_stopp.is_set() or self._geladen() is not engine):
+            raise MotorWeg("Modell inzwischen entladen")
         return "".join(teile).strip()
 
     # -- Schnittstelle ----------------------------------------------------------
     async def ask_once(self, prompt: str, system: str) -> str:
-        return await self._einmal(system, [{"role": "user", "content": prompt}])
+        try:
+            return await self._einmal(system, [{"role": "user", "content": prompt}])
+        finally:
+            self._nach_nebenfrage()
 
     async def ask_messages(self, system: str, messages: list[dict]) -> str:
-        return await self._einmal(system, messages, max_tokens=4096)
+        try:
+            return await self._einmal(system, messages, max_tokens=4096)
+        finally:
+            self._nach_nebenfrage()
 
     async def stream(self, user_text: str, images: list[str] | None = None) -> AsyncIterator[dict]:
+        with runde():
+            async for teil in self._stream(user_text, images):
+                yield teil
+
+    async def _stream(self, user_text: str, images: list[str] | None = None) -> AsyncIterator[dict]:
         import persona
         import pricing
+        async for hinweis in self._puffer_abwarten():
+            yield hinweis
         frage = {"role": "user", "content": user_text}
         self.messages.append(frage)
+        bisher = list(self.messages)                 # was ausgelagert wird, kommt in den Stand
         pricing.kuerzen(self)
         self._zusatz.aufraeumen(self.messages)
         if hinweis := pricing.aufraeum_hinweis(self):
@@ -754,6 +1468,9 @@ class GgufChat:
             engine = await self._laden()
             zeiten["laden"] = time.time() - t
             frisch = vorher is None or vorher() is not engine   # auch nach geänderten Einstellungen
+            if frisch and getattr(engine, "kv_im_vram", None):
+                yield {"type": "note", "text": f"🧠 Gesprächsspeicher: {engine.kv_im_vram // 1024}k im Grafikspeicher, "
+                                               f"bis {engine.n_ctx // 1024}k im RAM – ab da langsamer."}
             if engine.n_ctx < kontext(self.name):
                 yield {"type": "note", "text": f"⚠ Kontext auf {engine.n_ctx // 1024}k begrenzt – mehr passt "
                                                "neben dem Modell nicht in den Grafikspeicher (/kontext)."}
@@ -773,6 +1490,19 @@ class GgufChat:
             vorsatz = [t.strip() for t in (treffer, self._anleitungen_fuer(user_text)) if t and t.strip()]
             if vorsatz:
                 self._zusatz.von(frage)["gesendet"] = "\n\n".join(vorsatz + [NACHRICHT_MARKE + user_text])
+            zusammengefasst: set[int] = set()
+            for _ in range(3):                           # der neue Stand braucht selbst etwas Platz
+                await asyncio.to_thread(self._einpassen, engine, system)
+                drin = {id(m) for m in self.messages}
+                weg = [m for m in bisher if id(m) not in drin and id(m) not in zusammengefasst]
+                if not weg:
+                    break
+                yield {"type": "note", "text": "📌 Kontext voll – ich schreibe den Stand des Gesprächs fort …"}
+                await self._stand_fortschreiben(weg, engine.n_ctx)
+                zusammengefasst |= {id(m) for m in weg}
+            self._kontext_melden()
+            if hinweis := pricing.aufraeum_hinweis(self):
+                yield {"type": "note", "text": hinweis}
         except BaseException:
             self.messages.pop()
             raise
@@ -786,8 +1516,9 @@ class GgufChat:
         try:
             t = time.time()
             async for stueck in self._erzeugen(engine, self._nachrichten(system, self.messages,
-                                                                         engine.chat_format.drops_old_thinking),
-                                               MAX_ANTWORT, abbruch):
+                                                                         engine.chat_format.drops_old_thinking,
+                                                                         stand=True, dialekt=sprache(engine)),
+                                               MAX_ANTWORT, abbruch, sprache=sprache(engine)):
                 zeiten.setdefault("erstes_token", time.time() - t)
                 for art, text in trenner(stueck):
                     if art == "text":
@@ -818,6 +1549,10 @@ class GgufChat:
         self.messages.append(erwiderung)
         if engine.checkpoint_new:
             await asyncio.to_thread(prefix_speichern, self.name, engine)
+        if _hat_lager(engine):
+            await asyncio.to_thread(experten_speichern, self.name, engine)
+        self._puffer_system = system
+        self._hintergrund(engine, system, aufraeumen=True)
 
 
 LADE_PHASEN = {"file": "Datei", "tokenizer": "Tokenizer", "weights": "Gewichte", "warmup": "Aufwärmen",
@@ -857,7 +1592,57 @@ def _prefix_kennung(name: str, engine) -> str:
     """Modelldatei (Name, Größe, Zeitstempel) + Rechenweise – passt sie nicht, wird neu gelesen."""
     datei = modelle().get(name)
     st = datei.stat()
-    return f"{datei.name}|{st.st_size}|{st.st_mtime_ns}|{engine.dtype}|{engine.device.type}"
+    return (f"{datei.name}|{st.st_size}|{st.st_mtime_ns}|{engine.dtype}|{engine.device.type}"
+            f"|{getattr(engine, '_nemicli_lora_soll', '')}")
+
+
+def _experten_datei(name: str) -> Path | None:
+    pfad = _prefix_datei(name)
+    return pfad.with_name(f"{name}.experten.json") if pfad is not None else None
+
+
+def _modell_kennung(name: str) -> str:
+    datei = modelle().get(name)
+    st = datei.stat()
+    return f"{datei.name}|{st.st_size}|{st.st_mtime_ns}"
+
+
+def _hat_lager(engine) -> bool:
+    lager = getattr(engine, "_lager", None)
+    return bool(lager()) if callable(lager) else False
+
+
+def experten_laden(name: str, engine) -> bool:
+    """Zählung des Experten-Lagers vom letzten Mal: die meistgebrauchten Experten liegen gleich
+    in der Grafikkarte (erste Antwort so schnell wie spätere). Nur für dieselbe Modelldatei."""
+    pfad = _experten_datei(name)
+    if pfad is None or not pfad.is_file() or not _hat_lager(engine):
+        return False
+    try:
+        if pfad.stat().st_size > 16 * 2**20:
+            return False
+        daten = json.loads(pfad.read_text(encoding="utf-8"))
+        if not isinstance(daten, dict) or daten.get("kennung") != _modell_kennung(name):
+            return False
+        return engine.experten_zaehlung_setzen(daten.get("zaehlung"))
+    except (OSError, ValueError):
+        return False
+
+
+def experten_speichern(name: str, engine) -> bool:
+    """Zählung des Experten-Lagers für den nächsten Start sichern (klein: Zahlen je Schicht)."""
+    pfad = _experten_datei(name)
+    zaehlung = engine.experten_zaehlung() if pfad is not None and _hat_lager(engine) else None
+    if zaehlung is None:
+        return False
+    try:
+        pfad.parent.mkdir(parents=True, exist_ok=True)
+        neu = pfad.with_suffix(".tmp")
+        neu.write_text(json.dumps({"kennung": _modell_kennung(name), "zaehlung": zaehlung}), encoding="utf-8")
+        neu.replace(pfad)
+        return True
+    except OSError:
+        return False
 
 
 def prefix_laden(name: str, engine, system: str) -> bool:
@@ -866,8 +1651,7 @@ def prefix_laden(name: str, engine, system: str) -> bool:
     pfad = _prefix_datei(name)
     if engine._pos != 0 or pfad is None or not pfad.is_file() or not system:
         return False
-    from ggufengine import Message
-    ids = engine.chat_format.encode([Message("system", system)], add_generation_prompt=False)
+    ids = engine.chat_format.encode([system_nachricht(system, sprache(engine))], add_generation_prompt=False)
     return engine.load_prefix(str(pfad), _prefix_kennung(name, engine), ids)
 
 
@@ -901,7 +1685,7 @@ def _bild_aus_uri(uri: str):
 
 def _kodieren(engine, uris: list[str]) -> list:
     """Bilder -> Embeddings; der Bild-Encoder ist nur dafür auf der GPU."""
-    with _lock:
+    with geliehen(engine), _lock:
         return [engine.encode_image(_bild_aus_uri(u)) for u in uris]
 
 

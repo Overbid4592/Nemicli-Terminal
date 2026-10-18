@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import List, Optional, Tuple
 
 from .tokenizer import Tokenizer
 
@@ -24,6 +24,15 @@ class Message:
     # user turns: image embeddings (one (n_tokens, n_embd) tensor per image, from
     # Engine.encode_image); rendered as begin mark + n placeholders + end mark
     images: Optional[list] = None
+    # content as pieces (text, special): a special piece becomes its special token, every other
+    # piece plain text – for the marks of the model's own tool format, which only the caller sets
+    # (tool results, web pages and files stay plain text and can never turn into a mark)
+    teile: Optional[List[Tuple[str, bool]]] = None
+    # a tool result in the model's own format: Gemma 4 answers it inside its open turn, Ling reads it
+    # as OBSERVATION, Mistral without [INST]
+    werkzeug_antwort: bool = False
+    # pieces right after the turn's closing mark (Mistral: [AVAILABLE_TOOLS] after the system prompt)
+    danach: Optional[List[Tuple[str, bool]]] = None
 
 
 IMAGE_MARKS = {                                   # begin, placeholder, end
@@ -44,81 +53,20 @@ def detect_image_marks(tok: Tokenizer) -> Optional[tuple]:
 
 
 def detect_format(template: Optional[str], arch: str) -> str:
-    """Chat format from substrings of the template (never executed) and the architecture."""
-    t = template or ""
-    if "<|ifm|im_start|>" in t or arch == "k2-horizon":
-        return "k2"
-    if "<|turn>" in t or arch == "gemma4":
-        return "gemma4"
-    if ("<|start|>" in t and "<|channel|>" in t) or arch == "gpt-oss":
-        return "harmony"
-    if "[gMASK]" in t or arch in ("glm4", "glm4moe"):            # GLM-4 / GLM-4.5
-        return "glm4"
-    if "<|begin_of_sentence|>" in t and "Assistant: " in t:     # ERNIE 4.5
-        return "ernie4_5"
-    if "<｜User｜>" in t:                        # DeepSeek-R1 (and its distills)
-        return "deepseek"
-    if "Reasoning Mode: " in t or arch == "smollm3":
-        return "smollm3"
-    if "<|im_start|>" in t:
-        if "<|im_sep|>" in t:
-            return "phi4"
-        return "granite4" if "truncate_history_thinking" in t else "chatml"
-    if "<role>HUMAN</role>" in t or arch == "bailingmoe3":
-        return "bailing"
-    if "[INST]" in t:
-        if "[SYSTEM_PROMPT]" in t:                 # Tekken-Vorlagen: [INST] ohne Leerzeichen
-            return "mistral-v7-tekken" if ("'[INST]' +" in t or '"[INST]" +' in t) else "mistral-v7"
-        if "' [INST] ' + system_message" in t or "[AVAILABLE_TOOLS]" in t:
-            if " [INST]" in t:
-                return "mistral-v1"
-            return "mistral-v3-tekken" if '"[INST]"' in t else "mistral-v3"
-        return "llama2" if "<<SYS>>" in t else "mistral-v1"
-    if "<|start_header_id|>" in t:
-        return "llama3"
-    if "<|header_start|>" in t and "<|header_end|>" in t:
-        return "llama4"
-    if "<|START_OF_TURN_TOKEN|>" in t and "<|USER_TOKEN|>" in t:
-        return "command-r"
-    if "<|start_of_role|>" in t:
-        return "granite"
-    if "[|system|]" in t and "[|assistant|]" in t and "[|endofturn|]" in t:
-        return "exaone3"
-    if "<|assistant|>" in t and "<|end|>" in t:
-        return "phi3"
-    if "<|assistant|>" in t and "<|user|>" in t and "</s>" in t:
-        return "falcon3"
-    if "<|user|>" in t and "<|endoftext|>" in t:
-        return "zephyr"
-    if "<start_of_turn>" in t:
-        return "gemma"
-    by_arch = {"phi3": "phi3", "granite": "granite", "granitemoe": "granite", "llama": "llama3",
-               "gemma": "gemma", "gemma2": "gemma", "gemma3": "gemma"}
-    if arch.startswith("qwen"):
-        return "chatml"
-    return by_arch.get(arch, "chatml")
+    """Chat format from substrings of the template (never executed) and the architecture; the rules
+    live in the model database (daten/chatformate.json)."""
+    from . import ausfuellen
+    return ausfuellen.chatformat(template or "", arch)
 
 
 # Formats that are only "role header + content + end mark" (llama.cpp llm_chat_apply_template).
 # Pieces: a string that is a special token of the model is inserted as that token, everything
 # else is encoded as text; "{role}" is the role name.  strip = content is trimmed.
-_ROLLEN_FORMATE = {
-    "phi3": dict(pre=("<|{role}|>", "\n"), post=("<|end|>", "\n"), gen=("<|assistant|>", "\n")),
-    "phi4": dict(pre=("<|im_start|>", "{role}", "<|im_sep|>"), post=("<|im_end|>",),
-                 gen=("<|im_start|>", "assistant", "<|im_sep|>")),
-    "falcon3": dict(pre=("<|{role}|>", "\n"), post=("\n",), gen=("<|assistant|>", "\n")),
-    "zephyr": dict(pre=("<|{role}|>", "\n"), post=("<|endoftext|>", "\n"), gen=("<|assistant|>", "\n")),
-    "granite": dict(pre=("<|start_of_role|>", "{role}", "<|end_of_role|>"), post=("<|end_of_text|>", "\n"),
-                    gen=("<|start_of_role|>", "assistant", "<|end_of_role|>")),
-    "llama4": dict(pre=("<|header_start|>", "{role}", "<|header_end|>", "\n\n"), post=("<|eot|>",),
-                   gen=("<|header_start|>", "assistant", "<|header_end|>", "\n\n"), strip=True),
-    "command-r": dict(pre=("<|START_OF_TURN_TOKEN|>", "<|{ROLE}_TOKEN|>"), post=("<|END_OF_TURN_TOKEN|>",),
-                      gen=("<|START_OF_TURN_TOKEN|>", "<|CHATBOT_TOKEN|>"), strip=True,
-                      namen={"assistant": "CHATBOT"}),
-    "exaone3": dict(pre=("[|{role}|]",), post={"system": ("[|endofturn|]", "\n"), "user": ("\n",),
-                                              "assistant": ("[|endofturn|]", "\n")},
-                    gen=("[|assistant|]",), strip=True),
-}
+def _rollen_formate() -> dict:
+    """Pieces per format (daten/chatformate.json, 'rollen_formate'): pre/post/gen, optional strip,
+    namen (role names), post per role."""
+    from . import ausfuellen
+    return ausfuellen.rollen_formate()
 
 
 # gpt-oss: identity line of the model's own template; end of the thinking and start of the
@@ -131,11 +79,14 @@ _MONATE_EN = ("January", "February", "March", "April", "May", "June", "July", "A
 
 
 class ChatFormatter:
-    def __init__(self, tok: Tokenizer, fmt: str, thinking: bool = False):
+    def __init__(self, tok: Tokenizer, fmt: str, thinking: bool = False, template: Optional[str] = None):
         self.tok = tok
         self.fmt = fmt
         self.thinking = thinking
         self.image_marks = detect_image_marks(tok)
+        # ChatML with a think block only when the model's template uses one: Qwen3-VL Instruct
+        # shares the Qwen3 vocabulary (<think> included) but was never trained on the block
+        self.chatml_denkt = "<think>" in tok.special and (template is None or "<think>" in template)
 
     def _image_ids(self, images) -> List[int]:
         if not self.image_marks:
@@ -158,7 +109,7 @@ class ChatFormatter:
         """Does the generation prompt open a thinking block (the reply starts inside it)?"""
         if not self.thinking:
             return False
-        return self.fmt in ("k2", "bailing", "granite4", "harmony") or             (self.fmt == "chatml" and "<think>" in self.tok.special)
+        return self.fmt in ("k2", "bailing", "granite4", "harmony") or             (self.fmt == "chatml" and self.chatml_denkt)
 
     @property
     def drops_old_thinking(self) -> bool:
@@ -180,6 +131,8 @@ class ChatFormatter:
             return self._stuecke(("<ifm|think>",)), self._stuecke(("</ifm|think>", "\n"))
         if self.fmt.startswith("mistral") and "[THINK]" in self.tok.special and "[/THINK]" in self.tok.special:
             return self._stuecke(("[THINK]",)), self._stuecke(("[/THINK]",))      # Magistral / Ministral 3 Reasoning
+        if self.fmt == "seed_oss" and "<seed:think>" in self.tok.special:
+            return self._stuecke(("<seed:think>",)), self._stuecke(("</seed:think>",))
         if "<think>" in self.tok.special and "</think>" in self.tok.special:
             return self._stuecke(("<think>",)), self._stuecke(("</think>", "\n\n"))
         return None
@@ -187,7 +140,7 @@ class ChatFormatter:
     # Each formatter returns token ids; special tokens are inserted by id and
     # user-supplied text goes through the plain encoder (no special parsing).
     def encode(self, messages: List[Message], add_generation_prompt: bool = True) -> List[int]:
-        if self.fmt in _ROLLEN_FORMATE:
+        if self.fmt in _rollen_formate():
             return self._rollen(messages, add_generation_prompt)
         if self.fmt.startswith("mistral") or self.fmt == "llama2":
             return self._mistral_art(messages, add_generation_prompt)
@@ -212,12 +165,32 @@ class ChatFormatter:
             ids += tok.encode(text)
         return ids
 
+    def _inhalt(self, m: Message, text: Optional[str] = None, strip: bool = True) -> List[int]:
+        """Content ids: from `m.teile` (special pieces as special tokens, the rest plain), otherwise
+        `text` (default: the content) through the plain encoder."""
+        if not m.teile:
+            t = m.content if text is None else text
+            return self.tok.encode(t.strip() if strip else t)
+        teile = list(m.teile)
+        if strip:                         # only the ends of the message; text next to a marker stays
+            if not teile[0][1]:
+                teile[0] = (teile[0][0].lstrip(), False)
+            if not teile[-1][1]:
+                teile[-1] = (teile[-1][0].rstrip(), False)
+        ids: List[int] = []
+        for t, besonders in teile:
+            if besonders and t in self.tok.special:
+                ids.append(self.tok.special[t])
+            elif t:
+                ids += self.tok.encode(t)
+        return ids
+
     def _bos(self) -> List[int]:
         tok = self.tok
         return [tok.bos_id] if getattr(tok, "add_bos", False) and tok.bos_id is not None else []
 
     def _rollen(self, messages, gen):
-        f = _ROLLEN_FORMATE[self.fmt]
+        f = _rollen_formate()[self.fmt]
         ids = self._bos()
         for m in messages:
             if m.role not in ("system", "user", "assistant"):
@@ -229,8 +202,9 @@ class ChatFormatter:
                 ids += list(m.ids)
             else:
                 content = m.content
-                if m.role == "assistant" and "</think>" in content:
-                    content = content.split("</think>")[-1].lstrip("\n")
+                for ende in ("</think>", "</seed:think>"):
+                    if m.role == "assistant" and ende in content:
+                        content = content.split(ende)[-1].lstrip("\n")
                 ids += self.tok.encode(content.strip() if f.get("strip") else content)
             ids += self._stuecke(post, role)
         if gen:
@@ -248,12 +222,16 @@ class ChatFormatter:
             if m.role == "assistant" and m.ids is not None:
                 return list(m.ids)
             bilder = self._image_ids(m.images) if (m.role == "user" and m.images) else []
-            return bilder + tok.encode(m.content.strip())                 # Bilder vor dem Text
+            return bilder + self._inhalt(m)                               # Bilder vor dem Text
         if fmt.startswith("mistral-v7"):
             sp = " " if fmt == "mistral-v7" else ""
             for m in messages:
                 if m.role == "system":
                     ids += self._stuecke(("[SYSTEM_PROMPT]", sp)) + inhalt(m) + self._stuecke(("[/SYSTEM_PROMPT]",))
+                    if m.danach:
+                        ids += self._inhalt(Message("system", "", teile=m.danach), strip=False)
+                elif m.role == "user" and m.werkzeug_antwort:              # [TOOL_RESULTS] ohne [INST]
+                    ids += inhalt(m)
                 elif m.role == "user":
                     ids += self._stuecke(("[INST]", sp)) + inhalt(m) + self._stuecke(("[/INST]",))
                 else:
@@ -299,7 +277,11 @@ class ChatFormatter:
         ids: List[int] = []
         rest = list(messages)
         if rest and rest[0].role == "system":
-            ids += self._stuecke(("<role>", "SYSTEM", "</role>")) + self.tok.encode(rest[0].content + "\n" + denken)
+            if rest[0].teile:
+                ids += self._stuecke(("<role>", "SYSTEM", "</role>")) + self._inhalt(rest[0], strip=False)
+                ids += self.tok.encode("\n" + denken)
+            else:
+                ids += self._stuecke(("<role>", "SYSTEM", "</role>")) + self.tok.encode(rest[0].content + "\n" + denken)
             ids += ende
             rest = rest[1:]
         else:
@@ -308,15 +290,16 @@ class ChatFormatter:
         for m in rest:
             if m.role not in namen:
                 raise ValueError(f"unsupported role {m.role!r}")
-            ids += self._stuecke(("<role>", namen[m.role], "</role>"))
+            rolle = "OBSERVATION" if m.werkzeug_antwort else namen[m.role]
+            ids += self._stuecke(("<role>", rolle, "</role>"))
             if m.role == "assistant":
                 if m.ids is not None:
                     ids += self._stuecke(oeffnen) + list(m.ids)
                 else:
                     inhalt = m.content.split("</think>")[-1].lstrip("\n") if "</think>" in m.content else m.content
-                    ids += self._stuecke(("\n", "<think>", "</think>")) + self.tok.encode(inhalt)
+                    ids += self._stuecke(("\n", "<think>", "</think>")) + self._inhalt(m, inhalt, strip=False)
             else:
-                ids += self.tok.encode(m.content)
+                ids += self._inhalt(m, strip=False)
             ids += ende
         if gen:
             ids += self._stuecke(("<role>", "ASSISTANT", "</role>") + oeffnen)
@@ -324,18 +307,21 @@ class ChatFormatter:
 
     def _glm4(self, messages, gen):
         """GLM-4 / GLM-4.5 as llama.cpp's chatglm4: [gMASK]<sop>, then "<|role|>" + newline +
-        content per message, the reply after "<|assistant|>" + newline."""
-        tok = self.tok
+        content per message, the reply after "<|assistant|>" + newline. Tool results as in the
+        GLM-4.5 template: "<|observation|>", the pieces start with their own newline."""
         ids = self._stuecke(("[gMASK]", "<sop>"))
         for m in messages:
             if m.role not in ("system", "user", "assistant"):
                 raise ValueError(f"unsupported role {m.role!r}")
-            ids += self._stuecke((f"<|{m.role}|>", "\n"))
+            if m.werkzeug_antwort:
+                ids += self._stuecke(("<|observation|>",))
+            else:
+                ids += self._stuecke((f"<|{m.role}|>", "\n"))
             if m.role == "assistant" and m.ids is not None:
                 ids += list(m.ids)
             else:
                 inhalt = m.content.split("</think>")[-1].lstrip("\n") if "</think>" in m.content else m.content
-                ids += tok.encode(inhalt)
+                ids += self._inhalt(m, inhalt, strip=False)
         if gen:
             ids += self._stuecke(("<|assistant|>", "\n"))
         return ids
@@ -413,9 +399,9 @@ class ChatFormatter:
                     ids += oeffnen + list(m.ids) + [e] + nl
                     continue
                 content = m.content.split("</think>")[-1] if "</think>" in m.content else m.content
-                ids += leer + tok.encode(content.strip()) + [e] + nl
+                ids += leer + self._inhalt(m, content) + [e] + nl
                 continue
-            ids += tok.encode(m.content) + [e] + nl
+            ids += self._inhalt(m, strip=False) + [e] + nl
         if gen:
             ids += [s] + tok.encode("assistant\n") + oeffnen
         return ids
@@ -437,14 +423,15 @@ class ChatFormatter:
                 content = content.split("</think>")[-1].lstrip("\n")
             if m.role == "user" and m.images:
                 ids += self._image_ids(m.images)
-            ids += tok.encode(content) + [e] + nl
+            # text after </think> keeps leading spaces (as before); pieces: only the message ends
+            ids += self._inhalt(m, content, strip=bool(m.teile)) + [e] + nl
         if gen:
             ids += [s] + tok.encode("assistant\n") + self._chatml_think(nl)
         return ids
 
     def _chatml_think(self, nl):
         tok = self.tok
-        if "<think>" not in tok.special:
+        if not self.chatml_denkt:
             return []
         if self.thinking:
             return [tok.special_id("<think>")] + nl
@@ -566,6 +553,8 @@ class ChatFormatter:
 
     def _gemma4(self, messages, gen):
         # <bos>[<|turn>system\n[<|think|>\n]{system}<turn|>\n]<|turn>user\n{..}<turn|>\n<|turn>model\n
+        # Tool results in Gemma's own format (Message.werkzeug_antwort) stay inside the open model
+        # turn right after its call, and the model goes on in that turn (as in its template).
         tok = self.tok
         sot, eot = tok.special_id("<|turn>"), tok.special_id("<turn|>")
         nl = tok.encode("\n")
@@ -576,24 +565,44 @@ class ChatFormatter:
             if self.thinking and "<|think|>" in tok.special:
                 ids += [tok.special_id("<|think|>")] + nl
             if system:
-                ids += tok.encode(system[0].content.strip())
+                ids += self._inhalt(system[0])
             ids += [eot] + nl
-        for m in messages:
-            if m.role == "system":
+        rest = [m for m in messages if m.role != "system"]
+        offen = False                                    # model turn still open (call, result, …)
+        for i, m in enumerate(rest):
+            danach_antwort = i + 1 < len(rest) and rest[i + 1].werkzeug_antwort
+            if offen and m.werkzeug_antwort:
+                ids += (self._image_ids(m.images) if m.images else []) + self._inhalt(m)
                 continue
             role = "model" if m.role == "assistant" else "user"
-            if role == "model" and m.ids is not None:
-                ids += [sot] + tok.encode("model\n") + list(m.ids) + [eot] + nl
+            if offen and role == "user":
+                ids += [eot] + nl
+                offen = False
+            if role == "model":
+                kopf = [] if offen else [sot] + tok.encode("model\n")
+                if m.ids is not None:
+                    ids += kopf + list(m.ids)
+                else:
+                    content = m.content.strip()
+                    if "<channel|>" in content:                      # drop previous thinking
+                        content = content.split("<channel|>")[-1].strip()
+                    if m.teile or offen:
+                        ids += kopf + self._inhalt(m, content)
+                    else:                                            # one piece, as before
+                        ids += [sot] + tok.encode("model\n" + content)
+                offen = danach_antwort
+                if not offen:
+                    ids += [eot] + nl
                 continue
-            if role == "user" and m.images:
+            if m.images:
                 ids += [sot] + tok.encode("user\n") + self._image_ids(m.images)
-                ids += tok.encode(m.content.strip()) + [eot] + nl
+                ids += self._inhalt(m) + [eot] + nl
                 continue
-            content = m.content.strip()
-            if role == "model" and "<channel|>" in content:          # drop previous thinking
-                content = content.split("<channel|>")[-1].strip()
-            ids += [sot] + tok.encode(role + "\n" + content) + [eot] + nl
-        if gen:
+            if m.teile:
+                ids += [sot] + tok.encode("user\n") + self._inhalt(m) + [eot] + nl
+            else:
+                ids += [sot] + tok.encode("user\n" + m.content.strip()) + [eot] + nl
+        if gen and not offen:
             ids += [sot] + tok.encode("model\n")
         return ids
 

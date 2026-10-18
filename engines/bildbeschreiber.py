@@ -20,6 +20,26 @@ from pathlib import Path
 import gguflokal
 
 try:
+    import debugbericht as _DBG
+except Exception:                                    # Selbsttest ohne core/ im Pfad
+    class _DBG:                                      # type: ignore[no-redef]
+        @staticmethod
+        def ereignis(*a, **k): pass
+
+        @staticmethod
+        def fehler(*a, **k): pass
+
+        @staticmethod
+        def motor_log(): pass
+
+        class messen:
+            def __init__(self, *a): pass
+
+            def __enter__(self): return self
+
+            def __exit__(self, *a): return False
+
+try:
     from paths import INSTALL as _INSTALL
 except Exception:                                    # Selbsttest ohne Bootstrap
     _INSTALL = Path(__file__).resolve().parent.parent
@@ -43,11 +63,12 @@ Regeln:
 - Bist du unsicher, schreib „vermutlich“.
 - Sachlich, ohne Einleitung und ohne Bewertung."""
 
-FRAGE = """Beantworte nur diese Frage zum Bild: {frage}
-Antworte kurz. Nur was wirklich zu sehen ist. Ist es im Bild nicht zu erkennen, antworte: „Im Bild nicht zu erkennen.“"""
+# Kein fester Ausweich-Satz: Qwen3-VL schreibt ihn sonst auch bei sichtbaren Dingen ab.
+FRAGE = """{frage}
+Antworte in einem Satz. Halte dich nur an das Bild; fehlt etwas im Bild, sag, dass es fehlt."""
 
 HINWEIS = ("Du siehst das Bild nicht selbst – das ist die Beschreibung eines kleinen Bildmodells. "
-           "Anzahlen ab 3 und links/rechts können ungenau sein. Genauer nachfragen: "
+           "Anzahlen und links/rechts können ungenau sein. Genauer nachfragen: "
            "Werkzeug bild_fragen (Felder: pfad, frage).")
 
 _lock = threading.Lock()
@@ -74,40 +95,50 @@ def zustaendig(model: str | None) -> bool:
 
 
 def _engine():
+    """Den Beschreiber laden oder den geladenen zurückgeben. Nur mit gehaltener `_lock` aufrufen."""
     global _helfer
     teile = finden()
     if teile is None:
         raise RuntimeError(f"Kein Bildbeschreiber in {ORDNER} (Ordner mit .gguf und mmproj-*.gguf).")
     if _helfer is not None and _helfer[0] == teile[0]:
         return _helfer[1]
-    entladen()
+    _entladen()                     # die Sperre hält der Aufrufer schon – `entladen()` wartete ewig auf sie
     gguflokal._torch_bereit()
     from ggufengine import Engine
     engine = Engine(str(teile[0]), n_ctx=KONTEXT, verbose=False)
     engine.enable_vision(str(teile[1]))
     _helfer = (teile[0], engine)
+    _DBG.ereignis("Bildbeschreiber geladen")
     return engine
 
 
 def beschreiben(pfad, frage: str | None = None) -> str:
     """Beschreibt das Bild – oder beantwortet `frage` dazu. Blockiert (1–6 s)."""
     from PIL import Image
+    text = FRAGE.format(frage=frage.strip()) if frage else BESCHREIBEN
+    with Image.open(pfad) as bild:
+        antwort = fragen_roh(bild, text, MAX_ANTWORT if frage else MAX_BESCHREIBUNG)
+    return antwort or "(keine Beschreibung)"
+
+
+def fragen_roh(bild, text: str, max_tokens: int = MAX_ANTWORT) -> str:
+    """`text` wörtlich zu einem PIL-Bild fragen (ohne Vorlage), temperatur 0. Blockiert.
+    Auch für Aufgaben ohne Chat-Modell, z. B. Gesichter finden (gesichter.py)."""
     from ggufengine import Message, SamplerConfig
     with gguflokal.gpu_fuer_bild(), _lock:
         engine = _engine()
         engine.restore()
+        _DBG.ereignis("Bildbeschreiber auf der GPU")
         try:
-            with Image.open(pfad) as bild:
-                emb = engine.encode_image(bild, BILD_TOKEN)
-            text = FRAGE.format(frage=frage.strip()) if frage else BESCHREIBEN
+            emb = engine.encode_image(bild, BILD_TOKEN)
             engine.reset()
             antwort = "".join(engine.chat(
                 [Message("user", text, images=[emb])], checkpoint_system=False,
-                max_tokens=MAX_ANTWORT if frage else MAX_BESCHREIBUNG,
-                sampler=SamplerConfig(temperature=0.0)))
+                max_tokens=max_tokens, sampler=SamplerConfig(temperature=0.0)))
         finally:
             engine.offload()
-    return antwort.strip() or "(keine Beschreibung)"
+            _DBG.ereignis("Bildbeschreiber in den RAM")
+    return antwort.strip()
 
 
 def block(pfad, text: str, frage: str | None = None) -> str:
@@ -120,19 +151,26 @@ def block(pfad, text: str, frage: str | None = None) -> str:
 
 def entladen() -> None:
     """Gibt den Speicher des Beschreibers frei."""
-    global _helfer
     if _helfer is None:
         return
     with _lock:
-        engine = _helfer[1]
-        _helfer = None
-        try:
-            engine.gg.close()
-            if engine.vision is not None:
-                engine.vision.gg.close()
-        except Exception:
-            pass
-        del engine
+        _entladen()
+
+
+def _entladen() -> None:
+    """Wie entladen(), aber ohne die Sperre zu nehmen – der Aufrufer hält sie."""
+    global _helfer
+    if _helfer is None:
+        return
+    engine = _helfer[1]
+    _helfer = None
+    try:
+        engine.gg.close()
+        if engine.vision is not None:
+            engine.vision.gg.close()
+    except Exception:
+        pass
+    del engine
     try:
         import gc
         gc.collect()
@@ -140,3 +178,4 @@ def entladen() -> None:
         release_pinned_memory()                  # ausgelagerte Gewichte im festgesetzten RAM
     except Exception:
         pass
+    _DBG.ereignis("Bildbeschreiber entladen")

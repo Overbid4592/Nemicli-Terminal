@@ -11,7 +11,7 @@ that is still queued.
 from __future__ import annotations
 
 import ctypes
-from typing import List
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -22,6 +22,7 @@ _PORTABLE = 0x01        # CU_MEMHOSTALLOC_PORTABLE: pinned for every context
 _DEVICEMAP = 0x02       # CU_MEMHOSTALLOC_DEVICEMAP: kernels read it over PCIe
 
 _ausstehend: List[int] = []     # pointers of dead blocks, freed in flush()
+_bereiche: Dict[int, int] = {}  # start -> end of the live blocks (same addresses on the GPU)
 
 
 class _Block:
@@ -57,7 +58,35 @@ def empty(n_bytes: int, device) -> torch.Tensor:
                                                  ctypes.c_uint(_PORTABLE | _DEVICEMAP))
     if fehler or not ptr.value:
         raise RuntimeError(f"cuMemHostAlloc({n_bytes}): CUDA-Fehler {fehler}")
+    _bereiche[ptr.value] = ptr.value + max(1, n_bytes)
     return torch.from_numpy(np.asarray(_Block(ptr.value, n_bytes)))
+
+
+class _GpuSicht:
+    """__cuda_array_interface__ of a host block; torch keeps this object (and through it the
+    block) alive as long as the CUDA tensor lives."""
+
+    def __init__(self, host: torch.Tensor):
+        self.host = host
+        self.__cuda_array_interface__ = {"shape": (host.numel(),), "typestr": "|u1", "strides": None,
+                                         "data": (host.data_ptr(), False), "version": 3}
+
+
+def abbilden(host: torch.Tensor, device) -> torch.Tensor:
+    """A block from `empty()` as a CUDA tensor at the same address: kernels, copies and CUDA
+    graphs read it straight over PCIe, nothing is held in VRAM."""
+    if not abgebildet(host):
+        raise ValueError("only blocks from hostmem.empty() can be mapped")
+    sicht = torch.as_tensor(_GpuSicht(host.view(-1)), device=torch.device(device))
+    if sicht.data_ptr() != host.data_ptr():
+        raise RuntimeError("no unified addressing: the GPU sees the block at another address")
+    return sicht
+
+
+def abgebildet(t: torch.Tensor) -> bool:
+    """t lives in a block from `empty()` (also as a CUDA tensor from `abbilden`)."""
+    p = t.data_ptr()
+    return any(a <= p < e for a, e in _bereiche.items())
 
 
 def flush() -> None:
@@ -73,6 +102,7 @@ def flush() -> None:
                 ptr = _ausstehend.pop()
             except IndexError:                  # emptied by another thread
                 break
+            _bereiche.pop(ptr, None)
             cu.cuMemFreeHost(ctypes.c_void_p(ptr))
 
 

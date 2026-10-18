@@ -270,9 +270,16 @@ def deq_iq4_nl(raw, dtype=torch.float32):
     return (pairs.transpose(1, 2) * d.unsqueeze(-1)).reshape(-1)   # low nibbles first, then high
 
 
+_U8: dict = {}
+
+
 def _u8(t: torch.Tensor, *shifts) -> torch.Tensor:
-    """Shift amounts as a uint8 tensor on the device of t."""
-    return torch.tensor(shifts, dtype=torch.uint8, device=t.device)
+    """Shift amounts as a uint8 tensor on the device of t – made once, so that unpacking (e.g. an
+    embedding row in a CUDA graph) copies nothing from the CPU during a graph capture."""
+    schluessel = (shifts, t.device)
+    if (wert := _U8.get(schluessel)) is None:
+        wert = _U8[schluessel] = torch.tensor(shifts, dtype=torch.uint8, device=t.device)
+    return wert
 
 
 def deq_q2_k(raw, dtype=torch.float32):

@@ -1,0 +1,554 @@
+{
+ "version": 1,
+ "beschreibung": "Chat-Formate: Erkennung aus der Vorlage (nur Teilstücke, nie ausgeführt) und der Bauart – der erste passende Eintrag gilt; eine Regel passt bei passender Bauart ODER wenn alle Teilstücke aus 'alle', eines aus 'eins' und keines aus 'keins' in der Vorlage stehen. 'rollen_formate': Formate aus Rollen-Kopf + Inhalt + Ende-Marke (Stücke: Sonder-Token, sonst Text; {role} = Rolle).",
+ "erkennung": [
+  {
+   "format": "k2",
+   "wenn": [
+    {
+     "alle": [
+      "<|ifm|im_start|>"
+     ]
+    },
+    {
+     "bauart": [
+      "k2-horizon"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "gemma4",
+   "wenn": [
+    {
+     "alle": [
+      "<|turn>"
+     ]
+    },
+    {
+     "bauart": [
+      "gemma4"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "harmony",
+   "wenn": [
+    {
+     "alle": [
+      "<|start|>",
+      "<|channel|>"
+     ]
+    },
+    {
+     "bauart": [
+      "gpt-oss"
+     ]
+    }
+   ],
+   "hinweis": "gpt-oss"
+  },
+  {
+   "format": "glm4",
+   "wenn": [
+    {
+     "alle": [
+      "[gMASK]"
+     ]
+    },
+    {
+     "bauart": [
+      "glm4",
+      "glm4moe"
+     ]
+    }
+   ],
+   "hinweis": "GLM-4 / GLM-4.5"
+  },
+  {
+   "format": "ernie4_5",
+   "wenn": [
+    {
+     "alle": [
+      "<|begin_of_sentence|>",
+      "Assistant: "
+     ]
+    }
+   ],
+   "hinweis": "ERNIE 4.5"
+  },
+  {
+   "format": "deepseek",
+   "wenn": [
+    {
+     "alle": [
+      "<｜User｜>"
+     ]
+    }
+   ],
+   "hinweis": "DeepSeek-R1 und seine Destillate"
+  },
+  {
+   "format": "kimi_k2",
+   "wenn": [
+    {
+     "alle": [
+      "<|im_middle|>"
+     ]
+    },
+    {
+     "bauart": [
+      "kimi-linear"
+     ]
+    }
+   ],
+   "hinweis": "Kimi K2 / Kimi Linear"
+  },
+  {
+   "format": "seed_oss",
+   "wenn": [
+    {
+     "alle": [
+      "<seed:bos>"
+     ]
+    },
+    {
+     "bauart": [
+      "seed_oss"
+     ]
+    }
+   ],
+   "hinweis": "Seed-OSS (ByteDance)"
+  },
+  {
+   "format": "smollm3",
+   "wenn": [
+    {
+     "alle": [
+      "Reasoning Mode: "
+     ]
+    },
+    {
+     "bauart": [
+      "smollm3"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "phi4",
+   "wenn": [
+    {
+     "alle": [
+      "<|im_start|>",
+      "<|im_sep|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "granite4",
+   "wenn": [
+    {
+     "alle": [
+      "<|im_start|>",
+      "truncate_history_thinking"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "chatml",
+   "wenn": [
+    {
+     "alle": [
+      "<|im_start|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "bailing",
+   "wenn": [
+    {
+     "alle": [
+      "<role>HUMAN</role>"
+     ]
+    },
+    {
+     "bauart": [
+      "bailingmoe3"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "mistral-v7-tekken",
+   "wenn": [
+    {
+     "alle": [
+      "[INST]",
+      "[SYSTEM_PROMPT]"
+     ],
+     "eins": [
+      "'[INST]' +",
+      "\"[INST]\" +"
+     ]
+    }
+   ],
+   "hinweis": "Tekken-Vorlagen: [INST] ohne Leerzeichen"
+  },
+  {
+   "format": "mistral-v7",
+   "wenn": [
+    {
+     "alle": [
+      "[INST]",
+      "[SYSTEM_PROMPT]"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "mistral-v1",
+   "wenn": [
+    {
+     "alle": [
+      "[INST]",
+      " [INST]"
+     ],
+     "eins": [
+      "' [INST] ' + system_message",
+      "[AVAILABLE_TOOLS]"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "mistral-v3-tekken",
+   "wenn": [
+    {
+     "alle": [
+      "[INST]",
+      "\"[INST]\""
+     ],
+     "eins": [
+      "' [INST] ' + system_message",
+      "[AVAILABLE_TOOLS]"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "mistral-v3",
+   "wenn": [
+    {
+     "alle": [
+      "[INST]"
+     ],
+     "eins": [
+      "' [INST] ' + system_message",
+      "[AVAILABLE_TOOLS]"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "llama2",
+   "wenn": [
+    {
+     "alle": [
+      "[INST]",
+      "<<SYS>>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "mistral-v1",
+   "wenn": [
+    {
+     "alle": [
+      "[INST]"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "llama3",
+   "wenn": [
+    {
+     "alle": [
+      "<|start_header_id|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "llama4",
+   "wenn": [
+    {
+     "alle": [
+      "<|header_start|>",
+      "<|header_end|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "command-r",
+   "wenn": [
+    {
+     "alle": [
+      "<|START_OF_TURN_TOKEN|>",
+      "<|USER_TOKEN|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "granite",
+   "wenn": [
+    {
+     "alle": [
+      "<|start_of_role|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "exaone3",
+   "wenn": [
+    {
+     "alle": [
+      "[|system|]",
+      "[|assistant|]",
+      "[|endofturn|]"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "phi3",
+   "wenn": [
+    {
+     "alle": [
+      "<|assistant|>",
+      "<|end|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "falcon3",
+   "wenn": [
+    {
+     "alle": [
+      "<|assistant|>",
+      "<|user|>",
+      "</s>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "zephyr",
+   "wenn": [
+    {
+     "alle": [
+      "<|user|>",
+      "<|endoftext|>"
+     ]
+    }
+   ]
+  },
+  {
+   "format": "gemma",
+   "wenn": [
+    {
+     "alle": [
+      "<start_of_turn>"
+     ]
+    }
+   ]
+  }
+ ],
+ "nach_bauart": {
+  "phi3": "phi3",
+  "granite": "granite",
+  "granitemoe": "granite",
+  "llama": "llama3",
+  "gemma": "gemma",
+  "gemma2": "gemma",
+  "gemma3": "gemma"
+ },
+ "bauart_praefix": {
+  "qwen": "chatml"
+ },
+ "standard": "chatml",
+ "rollen_formate": {
+  "phi3": {
+   "pre": [
+    "<|{role}|>",
+    "\n"
+   ],
+   "post": [
+    "<|end|>",
+    "\n"
+   ],
+   "gen": [
+    "<|assistant|>",
+    "\n"
+   ]
+  },
+  "phi4": {
+   "pre": [
+    "<|im_start|>",
+    "{role}",
+    "<|im_sep|>"
+   ],
+   "post": [
+    "<|im_end|>"
+   ],
+   "gen": [
+    "<|im_start|>",
+    "assistant",
+    "<|im_sep|>"
+   ]
+  },
+  "falcon3": {
+   "pre": [
+    "<|{role}|>",
+    "\n"
+   ],
+   "post": [
+    "\n"
+   ],
+   "gen": [
+    "<|assistant|>",
+    "\n"
+   ]
+  },
+  "zephyr": {
+   "pre": [
+    "<|{role}|>",
+    "\n"
+   ],
+   "post": [
+    "<|endoftext|>",
+    "\n"
+   ],
+   "gen": [
+    "<|assistant|>",
+    "\n"
+   ]
+  },
+  "granite": {
+   "pre": [
+    "<|start_of_role|>",
+    "{role}",
+    "<|end_of_role|>"
+   ],
+   "post": [
+    "<|end_of_text|>",
+    "\n"
+   ],
+   "gen": [
+    "<|start_of_role|>",
+    "assistant",
+    "<|end_of_role|>"
+   ]
+  },
+  "llama4": {
+   "pre": [
+    "<|header_start|>",
+    "{role}",
+    "<|header_end|>",
+    "\n\n"
+   ],
+   "post": [
+    "<|eot|>"
+   ],
+   "gen": [
+    "<|header_start|>",
+    "assistant",
+    "<|header_end|>",
+    "\n\n"
+   ],
+   "strip": true
+  },
+  "command-r": {
+   "pre": [
+    "<|START_OF_TURN_TOKEN|>",
+    "<|{ROLE}_TOKEN|>"
+   ],
+   "post": [
+    "<|END_OF_TURN_TOKEN|>"
+   ],
+   "gen": [
+    "<|START_OF_TURN_TOKEN|>",
+    "<|CHATBOT_TOKEN|>"
+   ],
+   "strip": true,
+   "namen": {
+    "assistant": "CHATBOT"
+   }
+  },
+  "kimi_k2": {
+   "pre": [
+    "<|im_{role}|>",
+    "{role}",
+    "<|im_middle|>"
+   ],
+   "post": [
+    "<|im_end|>"
+   ],
+   "gen": [
+    "<|im_assistant|>",
+    "assistant",
+    "<|im_middle|>"
+   ],
+   "hinweis": "Kimi K2 / Kimi Linear: <|im_user|>user<|im_middle|>…<|im_end|> (llama.cpp KIMI_K2)"
+  },
+  "seed_oss": {
+   "pre": [
+    "<seed:bos>",
+    "{role}",
+    "\n"
+   ],
+   "post": [
+    "<seed:eos>"
+   ],
+   "gen": [
+    "<seed:bos>",
+    "assistant",
+    "\n"
+   ],
+   "hinweis": "Seed-OSS: <seed:bos>rolle\\n…<seed:eos> (llama.cpp SEED_OSS)"
+  },
+  "exaone3": {
+   "pre": [
+    "[|{role}|]"
+   ],
+   "post": {
+    "system": [
+     "[|endofturn|]",
+     "\n"
+    ],
+    "user": [
+     "\n"
+    ],
+    "assistant": [
+     "[|endofturn|]",
+     "\n"
+    ]
+   },
+   "gen": [
+    "[|assistant|]"
+   ],
+   "strip": true,
+   "hinweis": "auch EXAONE 4 (seine Vorlage hat zusätzlich [|tool|]; llama.cpp schreibt die Rollen gleich)"
+  }
+ }
+}

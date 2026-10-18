@@ -23,6 +23,7 @@ download.pytorch.org – dieselben Quellen wie ein normales `pip`.
 from __future__ import annotations
 
 import atexit
+import hashlib
 import os
 import re
 import shutil
@@ -43,6 +44,8 @@ except Exception:
 UV_VERSION = "0.12.13"
 UV_ASSET = "uv-x86_64-pc-windows-msvc.zip"
 UV_URL = f"https://github.com/astral-sh/uv/releases/download/{UV_VERSION}/{UV_ASSET}"
+# Aus der offiziellen Release-Seite (<asset>.sha256 und sha256.sum stimmen überein).
+UV_SHA256 = "a86c9dc7bad9b03f388583b7187c05fe9951c2e0d392217e8fd43d97787f6ec2"
 # GitHub leitet Release-Downloads auf einen Asset-Host um. Beide Schreibweisen
 # sind je nach GitHub-Stand möglich – wir erlauben genau diese.
 _ALLOWED_HOSTS = ("github.com", "release-assets.githubusercontent.com",
@@ -293,18 +296,23 @@ def ensure_uv(on_status=None) -> Path:
             raise RuntimeError("uv-Umleitung auf fremde Adresse – abgebrochen.")
         gesamt = int(r.headers.get("content-length", 0))
         geladen = 0
+        summe = hashlib.sha256()
         with open(zip_pfad, "wb") as f:
             for chunk in r.iter_bytes(1 << 16):
                 f.write(chunk)
+                summe.update(chunk)
                 geladen += len(chunk)
                 if on_status and gesamt:
                     on_status(f"lade uv … {geladen * 100 // gesamt} %")
+    if summe.hexdigest() != UV_SHA256:
+        zip_pfad.unlink(missing_ok=True)
+        raise RuntimeError("uv-Download hat eine falsche SHA-256 – verworfen.")
     if on_status:
         on_status("entpacke uv …")
+    basis = UV_DIR.resolve()
     with zipfile.ZipFile(zip_pfad) as z:
-        for name in z.namelist():                 # kein Zip-Slip
-            ziel = (UV_DIR / name).resolve()
-            if not str(ziel).startswith(str(UV_DIR.resolve())):
+        for name in z.namelist():                 # kein Zip-Slip (auch nicht nach uv2\…)
+            if not (UV_DIR / name).resolve().is_relative_to(basis):
                 raise RuntimeError("Unsicherer Pfad im uv-Archiv – abgebrochen.")
             z.extract(name, UV_DIR)
     try:
@@ -341,22 +349,66 @@ def ensure_python(on_status=None) -> str:
     return f"Isoliertes Python {PYVER} bereit."
 
 
+def venv_version(ordner: Path | None = None) -> str | None:
+    """Python-Version (Major.Minor) eines venv laut pyvenv.cfg – `version` (venv) oder `version_info` (uv)."""
+    try:
+        text = ((ordner or VENV_DIR) / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    for zeile in text.splitlines():
+        schluessel, _, wert = zeile.partition("=")
+        if schluessel.strip() in ("version", "version_info") and wert.strip():
+            return ".".join(wert.strip().split(".")[:2])
+    return None
+
+
+def venv_passt(ordner: Path | None = None) -> bool:
+    """Passt das venv zum Python dieser NemiCLI? Pakete wie torch sind je Python-Version gebaut (cp312, cp314 …);
+    ohne lesbare Angabe gilt es als passend."""
+    ver = venv_version(ordner)
+    return ver is None or ver == PYVER
+
+
 def venv_python() -> Path | None:
+    """python.exe des eigenen venv – nur, wenn es zum Python dieser NemiCLI passt."""
     exe = VENV_DIR / "Scripts" / "python.exe"
-    return exe if exe.exists() else None
+    return exe if exe.exists() and venv_passt() else None
+
+
+def _altes_venv_beiseite() -> str:
+    """Ein venv für ein anderes Python wird umbenannt (venv_alt_py3.12), nicht gelöscht."""
+    if not VENV_DIR.exists() or venv_passt():
+        return ""
+    ziel = VENV_DIR.with_name(f"venv_alt_py{venv_version()}")
+    n = 2
+    while ziel.exists():
+        ziel = VENV_DIR.with_name(f"venv_alt_py{venv_version()}_{n}")
+        n += 1
+    try:
+        VENV_DIR.rename(ziel)
+    except OSError as e:
+        raise RuntimeError(f"Die alte Arbeits-Umgebung (Python {venv_version()}) lässt sich nicht umbenennen "
+                           f"({e}) – NemiCLI ganz schließen und nochmal versuchen.") from None
+    return f"Alte Arbeits-Umgebung (Python {ziel.name.split('py', 1)[1]}) liegt als {ziel.name} daneben – " \
+           "löschen, wenn alles läuft. "
 
 
 def ensure_venv(on_status=None) -> str:
-    """Legt das venv neben NemiCLI an (mit dem isolierten Python)."""
+    """Legt das venv neben NemiCLI an (mit dem isolierten Python). Eins für ein anderes Python wird vorher
+    beiseitegelegt."""
     if venv_python():
         return "Arbeits-Umgebung war schon da."
+    beiseite = _altes_venv_beiseite()
+    if beiseite and on_status:
+        on_status(beiseite)
     ensure_python(on_status)
     if on_status:
         on_status("lege isolierte Arbeits-Umgebung an …")
-    code, aus = _run([str(UV_EXE), "venv", "--python", PYVER, str(VENV_DIR)], on_status)
+    # --seed: pip gleich mit hinein – torch installiert der Nutzer selbst im venv-Fenster (pip3 …)
+    code, aus = _run([str(UV_EXE), "venv", "--seed", "--python", PYVER, str(VENV_DIR)], on_status)
     if code != 0 or not venv_python():
         raise RuntimeError(f"venv konnte nicht angelegt werden: {aus[-300:]}")
-    return f"Arbeits-Umgebung angelegt: {VENV_DIR}"
+    return f"{beiseite}Arbeits-Umgebung angelegt: {VENV_DIR}"
 
 
 def pip_install(pakete: list[str], on_status=None, extra: list[str] | None = None,

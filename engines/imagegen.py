@@ -22,6 +22,9 @@ def _gpu_fuer_bild(fn):
 
     @functools.wraps(fn)
     def huelle(*args, **kw):
+        st = sys.modules.get("stimme")
+        if st is not None:
+            st.gpu_freigeben()                     # die Stimme lädt beim nächsten Satz neu
         lokal = sys.modules.get("gguflokal")
         if lokal is None:
             return fn(*args, **kw)
@@ -137,9 +140,12 @@ def modell_aufloesen(wunsch: str | None) -> tuple[str | None, str]:
 def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
           steps: int | None = None, cfg: float | None = None,
           size: tuple[int, int] | None = None, seed: int | None = None,
-          sampler: str | None = None, on_status=None) -> str:
+          sampler: str | None = None, on_status=None, vorlage: str | None = None,
+          staerke: float | None = None, figur: bool = False) -> str:
     """Malt EIN Bild mit dem aktiven Motor und gibt den Pfad zurück. Krea 2 nimmt
-    keinen Negativ-Prompt und keine CFG; die externen Stellen schon.
+    keinen Negativ-Prompt und keine CFG; die externen Stellen schon. `vorlage`/`staerke`
+    (Bild umzeichnen) nur mit Krea 2. `figur`: die Persönlichkeit selbst ist im Bild – Krea nimmt dann
+    ihre Charakter-LoRA dazu, falls es eine gibt.
     Ein geladenes lokales Sprachmodell wartet solange im RAM (gguflokal)."""
     art = backend()
     if art in _EXTERN:
@@ -147,9 +153,13 @@ def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
             prompt, model=model, neg=neg, steps=steps, cfg=cfg,
             size=size, seed=seed, sampler=sampler, on_status=on_status)
     import krea
+    extra = {"vorlage": vorlage, "staerke": staerke} if vorlage and staerke is not None else (
+        {"vorlage": vorlage} if vorlage else {})
+    if figur and (lora := krea.lora_fuer_figur()):
+        extra["lora"] = lora
     return krea.generate(prompt, model=model, steps=steps, size=size, seed=seed,
                          sampler=sampler if sampler in ("euler", "euler_ancestral") else None,
-                         on_status=on_status)
+                         on_status=on_status, **extra)
 
 
 @_gpu_fuer_bild

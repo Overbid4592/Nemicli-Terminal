@@ -111,11 +111,13 @@ def check_all() -> list[dict]:
     plan = syscheck.torch_plan(gpu, cap)
     schritte.append({
         "id": "torch", "titel": f"Rechen-Motor torch ({plan['kanal']})",
-        # Ein CPU-torch zählt bei einer NVIDIA-Karte nicht als erledigt.
+        # Ein CPU-torch zählt bei einer NVIDIA-Karte nicht als erledigt. Installiert wird er vom Nutzer selbst
+        # im venv-Fenster (/venv) – über uv im Hintergrund blieb die große CUDA-Installation hängen.
         "ok": _hat_paket("torch") and (not plan["kanal"].startswith("cu")
                                        or _torch_bau() not in ("", "cpu")),
-        "machbar": True, "pflicht": False,
-        "info": plan["grund"],
+        "machbar": False, "pflicht": False,
+        "info": f"{plan['grund']} – im venv-Fenster (/venv): {plan['cmd']}",
+        "befehl": plan["cmd"],
     })
     fehlend = _fehlende_pakete()
     schritte.append({
@@ -180,38 +182,28 @@ def install_venv(on_status=None) -> str:
     return uvsetup.ensure_venv(on_status)
 
 
-def install_torch(on_status=None) -> str:
-    """Installiert torch – in der Fassung, die zu dieser Grafikkarte passt."""
-    if not _venv_python():
-        install_venv(on_status)
+def torch_befehl() -> str:
+    """pip-Befehl für torch auf DIESER Grafikkarte (NVIDIA: CUDA-Bau, AMD: DirectML)."""
     gpu = S.gpu_info()
     cap = syscheck.compute_cap() if gpu.get("vendor") == "nvidia" else ""
-    plan = syscheck.torch_plan(gpu, cap)
-    kanal = plan["kanal"]
-    if on_status:
-        on_status(f"installiere torch ({kanal}) – das sind ~2,5 GB, dauert …")
-    if kanal == "directml":
-        uvsetup.pip_install(["torch-directml"], on_status)
-    else:
-        # --reinstall-package: ein schon vorhandenes torch (z. B. der CPU-Bau, den
-        # andere Pakete als Abhängigkeit mitziehen) wird ersetzt, statt als
-        # „schon erfüllt“ liegen zu bleiben.
-        uvsetup.pip_install(["torch"], on_status,
-                            extra=["--index-url", f"https://download.pytorch.org/whl/{kanal}",
-                                   "--reinstall-package", "torch"],
-                            namen={"torch": torch_anzeigename(kanal)})
-        bau = _torch_bau()
-        if kanal.startswith("cu") and bau in ("cpu", ""):
-            raise RuntimeError(f"torch im venv ist der Bau „{bau or '?'}“, erwartet {kanal}.")
-    return f"torch ({kanal}) installiert."
+    return syscheck.torch_plan(gpu, cap)["cmd"]
 
 
-def torch_anzeigename(kanal: str) -> str:
-    """cu132 → „PyTorch CUDA 13.2“, cpu → „PyTorch (CPU)“."""
-    if kanal.startswith("cu") and kanal[2:].isdigit() and len(kanal) > 3:
-        z = kanal[2:]
-        return f"PyTorch CUDA {z[:-1]}.{z[-1]}"
-    return f"PyTorch ({kanal.upper()})"
+def venv_fenster() -> str:
+    """Öffnet ein Konsolenfenster mit aktiviertem venv und dem torch-Befehl als Hinweis. pip im venv ist
+    sichergestellt – sonst landete `pip3 install` im Python des Systems."""
+    py = _venv_python()
+    if not py:
+        raise RuntimeError("Noch kein passendes venv – /einrichten legt es an.")
+    import subprocess
+    befehl = torch_befehl()
+    skript = (f'call "{py.parent / "activate.bat"}" && '
+              f'(python -m pip --version >nul 2>&1 || python -m ensurepip --upgrade >nul) && '
+              f'echo. && echo NemiCLI-venv ist aktiv: {VENV_DIR} && echo. && '
+              f'echo torch fuer diese Grafikkarte: && echo   {befehl} && echo.')
+    subprocess.Popen(["cmd.exe", "/k", skript], cwd=str(VENV_DIR.parent),
+                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+    return befehl
 
 
 def _torch_bau() -> str:
@@ -230,7 +222,7 @@ def _torch_bau() -> str:
     return m.group(1) if m else "cpu"
 
 
-# torch kommt ausschließlich über install_torch vom PyTorch-Index (CUDA-Bau).
+# torch installiert der Nutzer selbst im venv-Fenster (/venv) vom PyTorch-Index (CUDA-Bau).
 # Aus requirements.txt heraus würde uv es von PyPI holen – dort gibt es für
 # Windows nur den CPU-Bau.
 _TORCH_PAKETE = {"torch", "torchvision", "torchaudio", "torch-directml"}
@@ -275,13 +267,6 @@ def _fehlende_pakete() -> list[str]:
     return [n for n in map(_paketname, requirements_ohne_torch()) if n not in da]
 
 
-def _torch_zuerst(on_status=None) -> None:
-    """Bei NVIDIA den CUDA-torch vor allem anderen: Pakete, die torch als
-    Abhängigkeit haben, zögen sonst den CPU-Bau von PyPI."""
-    if S.gpu_info().get("vendor") == "nvidia" and _torch_bau() in ("", "cpu"):
-        install_torch(on_status)
-
-
 def install_pakete(on_status=None) -> str:
     """requirements.txt ins venv – getrennt von torch, das vorher schon steht."""
     if not _venv_python():
@@ -289,7 +274,6 @@ def install_pakete(on_status=None) -> str:
     pakete = requirements_ohne_torch()
     if not pakete:
         raise RuntimeError("requirements.txt nicht gefunden.")
-    _torch_zuerst(on_status)
     if on_status:
         on_status(f"installiere {len(pakete)} Pakete aus requirements.txt …")
     uvsetup.pip_install(pakete, on_status)
@@ -299,7 +283,6 @@ def install_pakete(on_status=None) -> str:
 ERLEDIGER = {
     "python": install_python,
     "venv": install_venv,
-    "torch": install_torch,
     "pakete": install_pakete,
 }
 

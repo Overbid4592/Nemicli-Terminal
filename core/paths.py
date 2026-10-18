@@ -204,6 +204,7 @@ _DIRS = ("Models", "Models/Krea2", "Bilder", "chats",
 # Was hier NICHT steht, bleibt bewusst beim Programm, weil es zur Installation
 # gehört und nicht zum Nutzer: .env, nemicli.config.json, .git, .runtime,
 # requirements.txt, nemicli.cmd, chrome-erweiterung, venv.
+# Backup/ zieht ebenfalls nicht mit um: Sicherungen können sehr groß sein.
 DATEN_INHALT = ("chats", "Gespraeche", "learned", "Bilder", "Models",
                 "NemiSandbox", "Persoenlichkeiten", "Agenten", "Skills", "Profile", "Befehle",
                 "Vorschläge", "Zeitplan", "Berichte", "Wissen", "Papierkorb", ".cli_history")
@@ -262,12 +263,12 @@ kleines sehendes Modell aus diesem Ordner das Bild als Text. Das Sprachmodell
 bekommt die Beschreibung und kann mit dem Werkzeug bild_fragen nachfragen.
 
 Ein Unterordner je Beschreiber. Darin:
-  - eine .gguf mit dem Modell (z. B. Gemma-4-E2B)
+  - eine .gguf mit dem Modell (z. B. Qwen3-VL-4B-Instruct, kleiner: Gemma-4-E2B)
   - eine mmproj-*.gguf mit dem Bild-Teil
 
 Beispiel:
-  Vision/GemmaE2B/gemma-4-E2B-it-Q4_K_M.gguf
-  Vision/GemmaE2B/mmproj-gemma-4-E2B-it-BF16.gguf
+  Vision/Qwen3VL4B/Qwen3VL-4B-Instruct-Q4_K_M.gguf
+  Vision/Qwen3VL4B/mmproj-Qwen3VL-4B-Instruct-F16.gguf
 
 Genommen wird der erste Ordner mit bekanntem Bild-Encoder.
 Gilt nur fuer lokale Modelle im eigenen Motor, nie fuer Cloud-Modelle.

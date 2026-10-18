@@ -40,6 +40,18 @@ def _candidates() -> list[Path]:
     return [eigenes_venv()]
 
 
+def _venv_version(ordner: Path) -> str | None:
+    """Python-Version (Major.Minor) laut pyvenv.cfg (venv: `version`, uv: `version_info`)."""
+    try:
+        for zeile in (ordner / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace").splitlines():
+            schluessel, _, wert = zeile.partition("=")
+            if schluessel.strip() in ("version", "version_info") and wert.strip():
+                return ".".join(wert.strip().split(".")[:2])
+    except OSError:
+        pass
+    return None
+
+
 def find_torch_dir() -> Path | None:
     """Das eigene venv, wenn dort torch WIRKLICH liegt."""
     p = eigenes_venv()
@@ -73,6 +85,13 @@ def enable() -> dict:
         _state.update(aktiv=False, pfad="", grund=(
             f"Kein eigenes venv neben NemiCLI ({site.parent.parent}). "
             "/einrichten legt es an und installiert torch & Co. dort hinein."))
+        return _state
+
+    ver = _venv_version(site.parent.parent)
+    if ver and ver != PYVER:                        # cp312-Pakete laden nicht in Python 3.14 (und umgekehrt)
+        _state.update(aktiv=False, pfad="", grund=(
+            f"Das eigene venv ist für Python {ver}, NemiCLI läuft mit {PYVER} – /einrichten legt es neu an "
+            "(das alte bleibt umbenannt liegen)."))
         return _state
 
     if str(site) not in sys.path:
