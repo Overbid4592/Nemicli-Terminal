@@ -5,11 +5,15 @@ auf einmal liefern. Für jeden einzeln ein Gespräch zu starten wäre teuer
 (Tokens) und nutzlos (zwanzig halbe Bilder statt eines ganzen). Deshalb:
 
   1. Alarm kommt an → passt er zur Weck-Stufe (trigger_ab / trigger_ml)?
-  2. Ja → in den Korb. Der Korb wartet `trigger_buendel_s` Sekunden auf Nachzügler.
-  3. Dann EIN Auftrag mit allen Alarmen im Korb an die aktive Persönlichkeit.
-  4. Danach `trigger_pause_s` Ruhe; höchstens `trigger_max_pro_tag` Wecks am Tag.
-     Was in der Pause ankommt, wird gesammelt und beim nächsten Weck mitgegeben –
-     nichts geht verloren, es steht ohnehin in der Datenbank.
+     Ja → in den Korb. Der Korb wartet `trigger_buendel_s` Sekunden auf Nachzügler.
+  2. Zähl-Trigger: Liegen `pruefen_ab` ungeprüfte Alarme vor (jede Stufe), kommen
+     sie alle sofort in den Korb – sonst blieben niedrige Alarme ungesehen liegen.
+  3. EIN Auftrag mit dem Korb an die aktive Persönlichkeit, schwerste zuerst,
+     höchstens PRO_WECKRUF Alarme; der Rest folgt direkt danach. Keine Pause,
+     keine Tagesgrenze.
+  4. Bleibt danach ein übergebener Alarm ohne Urteil, wird einmal nachgefragt.
+     Übergebene Alarme zählen nicht erneut (keine Endlosschleife); nach einem
+     Neustart zählen liegengebliebene wieder mit.
 
 Was die Persönlichkeit mit den Alarmen tun soll, steht in
 DATEN/Agenten/wache_alarm.md (der Nutzer kann es ändern). Fehlt die Datei,
@@ -26,7 +30,11 @@ from typing import Awaitable, Callable
 
 from . import ANLEITUNG
 from .ereignisse import Alarm
-from .justierung import einstellungen, trigger_stufe
+from .justierung import einstellungen, pruefen_ab, trigger_stufe
+
+PRO_WECKRUF = 20     # höchstens so viele Alarme in einem Auftrag; der Rest folgt direkt danach
+SOFORT_S = 2.0       # Zähl-Trigger: kurz auf gleichzeitig eintreffende Alarme warten
+NACHLEGEN_S = 30.0   # läuft gerade ein Gespräch: dann erneut versuchen
 
 VORGABE_ANLEITUNG = """\
 # Wache: ein Alarm – was du tust
@@ -114,12 +122,19 @@ def anleitung_text() -> str:
         return VORGABE_ANLEITUNG
 
 
-def auftrag_text(alarme: list[Alarm], speicher, name: str) -> str:
+def auftrag_text(alarme: list[Alarm], speicher, name: str, nachhaken: bool = False) -> str:
     """Die Nachricht, mit der die Persönlichkeit geweckt wird."""
-    zeilen = [f"[Weckruf deiner Systemwache – {time.strftime('%d.%m.%Y %H:%M')}. "
-              f"{len(alarme)} Alarm(e). Es ist niemand da, der antwortet oder etwas freigibt: "
-              "du kannst lesen, abfragen, bewerten und in Grenzen justieren. Deine LETZTE "
-              "Antwort wird als Bericht gespeichert.]", "",
+    if nachhaken:
+        kopf = (f"[Nachfrage deiner Systemwache – {time.strftime('%d.%m.%Y %H:%M')}. "
+                f"{len(alarme)} Alarm(e) aus dem letzten Weckruf haben noch KEIN Urteil.")
+    else:
+        kopf = (f"[Weckruf deiner Systemwache – {time.strftime('%d.%m.%Y %H:%M')}. "
+                f"{len(alarme)} Alarm(e), schwerste zuerst.")
+    zeilen = [kopf + " Es ist niemand da, der antwortet oder etwas freigibt: "
+              "du kannst lesen, abfragen, bewerten und in Grenzen justieren. Jeder Alarm unten "
+              "braucht ein Urteil mit wache_bewerten – vorher bist du nicht fertig; ist einer "
+              "unklar, urteile `gesehen` mit Begründung. Deine LETZTE Antwort wird als Bericht "
+              "gespeichert.]", "",
               anleitung_text().strip(), "", "## Die Alarme", ""]
     for a in alarme:
         zeilen.append(f"### Alarm {a.id} · {a.schwere.label} · {a.regel}"
@@ -148,9 +163,9 @@ def auftrag_text(alarme: list[Alarm], speicher, name: str) -> str:
 
 
 class Wecker:
-    """Sammelt Alarme und ruft `wecken(alarme)` – eine Coroutine, die main.py stellt."""
+    """Sammelt Alarme und ruft `wecken(alarme, nachhaken=…)` – eine Coroutine, die main.py stellt."""
 
-    def __init__(self, speicher, wecken: Callable[[list[Alarm]], Awaitable[str]],
+    def __init__(self, speicher, wecken: Callable[..., Awaitable[str]],
                  schleife: asyncio.AbstractEventLoop):
         self.speicher = speicher
         self._wecken = wecken
@@ -158,13 +173,13 @@ class Wecker:
         self._lock = threading.Lock()
         self._korb: list[Alarm] = []
         self._timer: threading.Timer | None = None
-        self._zuletzt = 0.0
-        self._heute = time.strftime("%Y-%m-%d")
-        self._heute_n = 0
+        self._faellig = 0.0
+        # Schon übergebene Alarme zählen nicht erneut – sonst weckte derselbe
+        # unbeurteilte Alarm die Persönlichkeit endlos.
+        self._uebergeben: set[str] = set()
         self.laeuft = False
         self.geweckt = 0
         self.letzter_bericht = ""
-        self.ausgelassen = 0
 
     def passt(self, a: Alarm, e: dict) -> bool:
         if a.quelle == "ml":
@@ -174,53 +189,104 @@ class Wecker:
     def alarm(self, alarme: list[Alarm]) -> None:
         """Vom Motor aus einem Thread gerufen."""
         e = einstellungen()
+        if trigger_stufe(e["trigger_ab"]) > 4:                 # „nie“
+            return
         passende = [a for a in alarme if self.passt(a, e)]
-        if not passende:
+        if passende:
+            with self._lock:
+                self._aufnehmen(passende)
+            self._planen(float(e.get("trigger_buendel_s", 45)))
+        self.pruefen(e)
+
+    def ungeprueft(self) -> list[Alarm]:
+        """Offene Alarme, die noch nicht übergeben wurden (auch die im Korb)."""
+        try:
+            offen = self.speicher.alarme(limit=500, status="offen")
+        except Exception:
+            return []
+        with self._lock:
+            return [a for a in offen if a.id not in self._uebergeben]
+
+    def pruefen(self, e: dict | None = None) -> None:
+        """Zähl-Trigger: ab `pruefen_ab` ungeprüften Alarmen jeder Stufe sofort wecken."""
+        e = e or einstellungen()
+        if trigger_stufe(e["trigger_ab"]) > 4:
+            return
+        liste = self.ungeprueft()
+        if len(liste) < pruefen_ab(e):
             return
         with self._lock:
-            self._korb.extend(passende)
-            if self._timer is None:
-                warten = float(e.get("trigger_buendel_s", 45))
-                rest_pause = self._zuletzt + float(e.get("trigger_pause_s", 600)) - time.time()
-                if rest_pause > 0:
-                    warten = max(warten, rest_pause)
-                self._timer = threading.Timer(warten, self._feuern)
-                self._timer.daemon = True
-                self._timer.start()
+            self._aufnehmen(liste)
+        self._planen(SOFORT_S)
+
+    def _aufnehmen(self, liste: list[Alarm]) -> None:
+        """In den Korb, ohne Doppelte (Aufrufer hält das Lock)."""
+        drin = {a.id for a in self._korb} | self._uebergeben
+        for a in liste:
+            if a.id not in drin:
+                self._korb.append(a)
+                drin.add(a.id)
+
+    def _planen(self, warten: float) -> None:
+        """Feuern in `warten` Sekunden – ein früherer Termin bleibt bestehen."""
+        with self._lock:
+            ziel = time.time() + warten
+            if self._timer is not None:
+                if self._faellig <= ziel:
+                    return
+                self._timer.cancel()
+            self._faellig = ziel
+            self._timer = threading.Timer(max(0.0, warten), self._feuern)
+            self._timer.daemon = True
+            self._timer.start()
 
     def _feuern(self) -> None:
         with self._lock:
             self._timer = None
-            alarme, self._korb = self._korb, []
-        if not alarme:
+            if not self._korb:
+                return
+            beschaeftigt = self.laeuft
+            if not beschaeftigt:
+                self._korb.sort(key=lambda a: (-int(a.schwere), -a.zeit))
+                alarme, self._korb = self._korb[:PRO_WECKRUF], self._korb[PRO_WECKRUF:]
+                self._uebergeben.update(a.id for a in alarme)
+                self.laeuft = True
+        if beschaeftigt:                         # gerade schon ein Gespräch – gleich noch einmal
+            self._planen(NACHLEGEN_S)
             return
-        tag = time.strftime("%Y-%m-%d")
-        if tag != self._heute:
-            self._heute, self._heute_n = tag, 0
-        e = einstellungen()
-        if self._heute_n >= int(e.get("trigger_max_pro_tag", 24)):
-            self.ausgelassen += len(alarme)
-            return
-        if self.laeuft:                          # gerade schon ein Gespräch – nachlegen
-            with self._lock:
-                self._korb = alarme + self._korb
-                self._timer = threading.Timer(30, self._feuern)
-                self._timer.daemon = True
-                self._timer.start()
-            return
-        self._heute_n += 1
-        self._zuletzt = time.time()
-        self.laeuft = True
         fut = asyncio.run_coroutine_threadsafe(self._ausfuehren(alarme), self._loop)
-        fut.add_done_callback(lambda _f: setattr(self, "laeuft", False))
+        fut.add_done_callback(self._fertig)
+
+    def _fertig(self, _fut) -> None:
+        self.laeuft = False
+        with self._lock:
+            rest = bool(self._korb)
+        if rest:
+            self._planen(SOFORT_S)
+        else:
+            self.pruefen()
+
+    def _ohne_urteil(self, alarme: list[Alarm]) -> list[Alarm]:
+        out = []
+        for a in alarme:
+            try:
+                jetzt = self.speicher.alarm(a.id)
+            except Exception:
+                jetzt = None
+            if jetzt is not None and jetzt.status == "offen":
+                out.append(jetzt)
+        return out
 
     async def _ausfuehren(self, alarme: list[Alarm]) -> None:
         try:
-            for a in alarme:
-                if a.status == "offen":
-                    self.speicher.alarm_urteil(a.id, "gesehen", "Wache", "an die Persönlichkeit übergeben")
             self.letzter_bericht = await self._wecken(alarme) or ""
             self.geweckt += 1
+            if self.letzter_bericht.startswith("❌"):     # niemand erreichbar – nachfragen hilft nicht
+                return
+            liegen = self._ohne_urteil(alarme)
+            if liegen:
+                # Einmal nachfragen; was danach offen bleibt, sieht der Nutzer im Tray.
+                self.letzter_bericht = await self._wecken(liegen, nachhaken=True) or self.letzter_bericht
         except Exception as exc:
             self.letzter_bericht = f"Weckruf fehlgeschlagen: {exc}"
 

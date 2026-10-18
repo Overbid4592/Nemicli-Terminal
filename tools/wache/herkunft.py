@@ -52,6 +52,13 @@ KEINE_SYSTEM_ORTE = tuple(os.path.normcase(p) for p in (
     os.path.join(_WINDOWS, "Debug"),
 ))
 
+# Systemprogramme, die direkt im Windows-Ordner liegen statt in System32. Erlaubt
+# ist nur genau diese Datei – nicht der Windows-Ordner als Ganzes, in dem auch
+# Installer auspacken.
+SYSTEM_EINZELDATEIEN = frozenset(os.path.normcase(os.path.join(_WINDOWS, n)) for n in (
+    "explorer.exe",
+))
+
 # Namen, die nur aus einem Systemordner kommen dürfen. `updater.exe`,
 # `python.exe` & Co. gehören NICHT hierher – die liegen legitim überall.
 SYSTEM_BINAERE = frozenset((
@@ -87,6 +94,9 @@ def maskerade(prozess: str, exe: str) -> str:
     if not name or not exe or name not in SYSTEM_BINAERE:
         return ""
     if ist_systemort(exe):
+        return ""
+    pfad = os.path.normcase(os.path.abspath(exe))
+    if pfad in SYSTEM_EINZELDATEIEN and os.path.basename(pfad) == name:
         return ""
     return (f"{prozess} ist ein Windows-Systemprogramm, läuft hier aber aus {exe}. "
             "Systemprogramme kommen ausschließlich aus System32, SysWOW64, SystemApps "

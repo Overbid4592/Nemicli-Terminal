@@ -64,6 +64,7 @@ class ProzessSensor:
 
     def schnappschuss(self) -> dict[int, dict]:
         procs: dict[int, dict] = {}
+        jetzt = time.time()
         for p in psutil.process_iter(_ATTRS, ad_value=None):
             try:
                 i = p.info
@@ -72,8 +73,15 @@ class ProzessSensor:
                     continue
                 mem = i.get("memory_info")
                 cmd = i.get("cmdline") or []
+                name = i.get("name") or f"pid-{pid}"
+                start = i.get("create_time") or 0.0
+                if not start:
+                    # Startzeit nicht lesbar: der erste Blick auf den Prozess ersetzt sie,
+                    # damit PID + Startzeit über alle Durchläufe derselbe Schlüssel bleiben.
+                    vorher = self._bekannt.get(pid)
+                    start = vorher["start"] if vorher and vorher["name"] == name else jetzt
                 procs[pid] = {
-                    "pid": pid, "ppid": i.get("ppid") or 0, "name": i.get("name") or f"pid-{pid}",
+                    "pid": pid, "ppid": i.get("ppid") or 0, "name": name, "start": float(start),
                     "nutzer": i.get("username") or "", "exe": i.get("exe") or "",
                     "cmdline": " ".join(cmd) if isinstance(cmd, list) else "",
                     "cpu": i.get("cpu_percent") or 0.0,
@@ -101,14 +109,15 @@ class ProzessSensor:
                 PROZESS, "process_start", f"Prozess gestartet: {p['name']} (PID {pid})",
                 prozess=p["name"], pid=pid, ppid=p["ppid"],
                 eltern=self._elternname(p["ppid"], aktuell), nutzer=p["nutzer"],
-                exe=p["exe"], cmdline=p["cmdline"],
+                exe=p["exe"], cmdline=p["cmdline"], start=p["start"],
+                eltern_start=self._elternstart(p, aktuell),
                 extra={"cpu": round(p["cpu"], 2), "mem_mb": round(p["mem"], 2),
                        "threads": p["threads"]}))
         for pid in alt - neu:
             p = self._bekannt[pid]
             out.append(Ereignis(PROZESS, "process_stop", f"Prozess beendet: {p['name']} (PID {pid})",
                                 prozess=p["name"], pid=pid, ppid=p["ppid"], nutzer=p["nutzer"],
-                                exe=p["exe"]))
+                                exe=p["exe"], start=p.get("start", 0.0)))
         for pid in neu & alt:
             if pid == 0:                          # "System Idle Process" zählt Leerlauf aller Kerne
                 continue
@@ -116,16 +125,25 @@ class ProzessSensor:
             if 70 < n["cpu"] <= 100 * 64 and n["cpu"] - a["cpu"] > 40:
                 out.append(Ereignis(PROZESS, "cpu_spike", f"CPU-Sprung: {n['name']} bei {n['cpu']:.0f}%",
                                     schwere=Schwere.NIEDRIG, prozess=n["name"], pid=pid,
-                                    nutzer=n["nutzer"], exe=n["exe"],
+                                    nutzer=n["nutzer"], exe=n["exe"], start=n["start"],
                                     extra={"cpu": round(n["cpu"], 2)}))
             if n["mem"] - a["mem"] > 500:
                 out.append(Ereignis(PROZESS, "memory_spike",
                                     f"Speicher-Sprung: {n['name']} +{n['mem'] - a['mem']:.0f} MB",
                                     schwere=Schwere.NIEDRIG, prozess=n["name"], pid=pid,
-                                    nutzer=n["nutzer"], exe=n["exe"],
+                                    nutzer=n["nutzer"], exe=n["exe"], start=n["start"],
                                     extra={"mem_mb": round(n["mem"], 2)}))
         self._bekannt = aktuell
         return out
+
+    @staticmethod
+    def _elternstart(kind: dict, tabelle: dict[int, dict]) -> float:
+        """Startzeit des Elternprozesses – 0, wenn er fehlt oder jünger ist als das Kind:
+        dann trägt ein anderer Prozess inzwischen dieselbe PID."""
+        e = tabelle.get(kind["ppid"])
+        if not e or not e.get("start") or e["start"] > kind["start"] + 1.0:
+            return 0.0
+        return e["start"]
 
     @staticmethod
     def _elternname(ppid: int, tabelle: dict[int, dict]) -> str:
@@ -149,22 +167,43 @@ class NetzSensor:
         self.intervall = intervall
         self._bekannt: set[tuple] = set()
         self._erster = True
-        self._namen: dict[int, tuple[str, str]] = {}
+        self._namen: dict[int, tuple[str, str, float]] = {}
 
-    def _prozessinfo(self, pid: int | None) -> tuple[str, str]:
-        """(Name, Pfad) zur PID – gecacht, weil dieselbe PID viele Sockets hat.
+    def _prozessinfo(self, pid: int | None, runde: dict | None = None) -> tuple[str, str, float]:
+        """(Name, Pfad, Startzeit) zur PID – gecacht, weil dieselbe PID viele Sockets hat.
 
         Der Pfad muss mit: Ein Alarm „Prozess X verbindet sich nach draußen“ ist
-        ohne ihn nicht prüfbar, denn der Name allein ist frei wählbar. `.exe()`
-        hängt am selben psutil-Objekt wie `.name()` und kostet nichts extra.
+        ohne ihn nicht prüfbar, denn der Name allein ist frei wählbar. Die Startzeit
+        wird einmal je Durchlauf (`runde`) gelesen und mit dem Cache verglichen:
+        Windows vergibt PIDs neu, derselbe Eintrag mit anderer Startzeit ist ein
+        anderer Prozess.
         """
         if not pid:
-            return "", ""
-        if pid in self._namen:
-            return self._namen[pid]
-        n, exe = "", ""
+            return "", "", 0.0
+        if runde is not None and pid in runde:
+            return runde[pid]
+        info = self._prozessinfo_lesen(pid)
+        if runde is not None:
+            runde[pid] = info
+        return info
+
+    def _prozessinfo_lesen(self, pid: int) -> tuple[str, str, float]:
         try:
             p = psutil.Process(pid)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
+            # Prozess schon weg: Name und Pfad aus dem Cache sind ein Hinweis, die
+            # Startzeit nicht – ohne sie hängt das Ereignis an keiner Kette.
+            n, exe, _ = self._namen.get(pid, ("", "", 0.0))
+            return n, exe, 0.0
+        try:
+            start = float(p.create_time() or 0.0)
+        except (psutil.NoSuchProcess, psutil.AccessDenied, OSError):
+            start = 0.0
+        vorher = self._namen.get(pid)
+        if vorher and start and vorher[2] == start:
+            return vorher
+        n, exe = "", ""
+        try:
             n = p.name()
             try:
                 exe = p.exe() or ""
@@ -172,8 +211,8 @@ class NetzSensor:
                 exe = ""              # ohne Adminrechte bei fremden Prozessen normal
         except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
             pass
-        self._namen[pid] = (n, exe)
-        return n, exe
+        self._namen[pid] = (n, exe, start)
+        return n, exe, start
 
     def sammeln(self) -> list[Ereignis]:
         out: list[Ereignis] = []
@@ -199,14 +238,15 @@ class NetzSensor:
             self._erster = False
             return [Ereignis(NETZ, "baseline", f"Netz-Baseline: {len(aktuell)} aktive Sockets",
                              extra={"anzahl": len(aktuell)})]
+        runde: dict = {}
         for key in aktuell - self._bekannt:
             d = details[key]
-            name, exe = self._prozessinfo(d["pid"])
+            name, exe, start = self._prozessinfo(d["pid"], runde)
             if d["status"] == "LISTEN":
                 out.append(Ereignis(NETZ, "listen_open",
                                     f"Neuer Listener: {name or 'unbekannt'} auf {d['lokal']}",
                                     schwere=Schwere.NIEDRIG, prozess=name, pid=d["pid"],
-                                    exe=exe, lokal=d["lokal"], protokoll=d["proto"]))
+                                    exe=exe, lokal=d["lokal"], protokoll=d["proto"], start=start))
                 continue
             ist_extern = extern(d["ip"])
             schwere, hinweis = Schwere.INFO, PORTS_AUFFAELLIG.get(d["port"], "")
@@ -217,7 +257,7 @@ class NetzSensor:
             text = f"Verbindung: {name or 'unbekannt'} → {d['ziel']}" + (f" ({hinweis})" if hinweis else "")
             out.append(Ereignis(NETZ, "conn_open", text, schwere=schwere, prozess=name,
                                 pid=d["pid"], exe=exe, lokal=d["lokal"], ziel=d["ip"],
-                                zielport=d["port"], protokoll=d["proto"],
+                                zielport=d["port"], protokoll=d["proto"], start=start,
                                 extra={"extern": ist_extern}))
         self._bekannt = aktuell
         if len(self._namen) > 2000:

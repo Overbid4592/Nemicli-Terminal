@@ -132,7 +132,7 @@ def finde_dateien(text: str) -> list[Path]:
 # node_modules/ den Kontext sprengen - für Tiefe gibt es dateien_suchen.
 MAX_EINTRAEGE = 200
 # Wo ein Listing nichts bringt und nur Lärm macht.
-_LEISE_ORDNER = {"node_modules", ".git", "__pycache__", "venv", ".venv", ".workspace",
+_LEISE_ORDNER = {"node_modules", ".git", "__pycache__", "venv", ".venv", ".nemicli",
                  "dist", "build", ".idea", ".vscode"}
 
 

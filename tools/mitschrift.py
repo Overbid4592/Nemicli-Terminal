@@ -67,7 +67,7 @@ def _jetzt() -> str:
 
 
 def leeren() -> None:
-    """Neuer Chat (/reset, /resume): Mitschnitt von vorn."""
+    """Neuer Chat oder Gespräch geladen: Mitschnitt von vorn."""
     _eintraege.clear()
 
 
@@ -150,7 +150,7 @@ def als_markdown(kopf: dict | None = None) -> str:
     if k.get("ordner"):
         a(f"- **Arbeitsordner:** `{k['ordner']}`")
     if nummer:
-        a(f"- **Fortsetzen mit:** `/resume {nummer}`")
+        a("- **Fortsetzen:** geht beim nächsten Start von selbst weiter")
     a(f"- **Einträge:** {len(_eintraege)}")
     a("")
     a("> Vollständiger Mitschnitt dieser Sitzung: jede Frage, jeder Denktext,")

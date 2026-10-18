@@ -22,6 +22,12 @@ _LOKAL = {"localhost", "127.0.0.1", "::1", "[::1]"}
 _KONSOLE = re.compile(r':CONSOLE[^\]]*\]\s*"(.*)", source: (\S+) \((\d+)\)')
 
 
+def _ohne_geheimnisse() -> dict:
+    """Umgebung ohne Schlüssel und Tokens: der gestartete Code braucht sie nicht."""
+    import config
+    return config.umgebung_ohne_geheimnisse()
+
+
 def browser() -> Path | None:
     """Erster gefundener Chromium-Browser."""
     pf, pf86, lad = os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", ""), os.environ.get("LOCALAPPDATA", "")
@@ -88,7 +94,7 @@ def ansehen(ziel: str, breite: int = BREITE, hoehe: int = HOEHE) -> tuple[Path |
               f"--screenshot={bild}", "--enable-logging=stderr", "--v=0", "--virtual-time-budget=3000", url]
     try:
         r = subprocess.run(befehl, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=ZEIT,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                           env=_ohne_geheimnisse(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         ausgabe = (r.stderr or "") + (r.stdout or "")
     except subprocess.TimeoutExpired:
         return None, f"Der Browser hat nach {ZEIT} s nicht geantwortet."

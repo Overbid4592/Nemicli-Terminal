@@ -32,6 +32,12 @@ _FREMD = {"venv", ".venv", "env", ".nemicli", "__pycache__", "site-packages", "n
 _cache: dict[str, tuple[float, dict]] = {}
 
 
+def _ohne_geheimnisse() -> dict:
+    """Umgebung ohne Schlüssel und Tokens: der gestartete Code braucht sie nicht."""
+    import config
+    return config.umgebung_ohne_geheimnisse()
+
+
 # --- Welches Python ----------------------------------------------------------
 
 def python_fuer(ordner: Path | None) -> tuple[Path | None, str]:
@@ -60,7 +66,7 @@ def _lauf(python: Path, skript: str, eingabe: str, cwd: Path | None) -> tuple[bo
         r = subprocess.run([str(python), "-I", "-X", "utf8", "-c", skript], input=eingabe, capture_output=True,
                            text=True, encoding="utf-8", errors="replace", timeout=ZEIT,
                            cwd=str(cwd) if cwd else None,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                           env=_ohne_geheimnisse(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except subprocess.TimeoutExpired:
         return False, f"Zeitgrenze ({ZEIT} s) überschritten."
     except OSError as e:
@@ -331,7 +337,7 @@ def ruff_pruefen(ziele: list[Path], cwd: Path | None = None, regeln: str = REGEL
     try:
         r = subprocess.run(befehl, input=inhalt, capture_output=True, text=True, encoding="utf-8",
                            errors="replace", timeout=ZEIT, cwd=str(cwd) if cwd else None,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                           env=_ohne_geheimnisse(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (subprocess.TimeoutExpired, OSError) as e:
         return f"ruff lief nicht: {e}", 0
     funde = [z for z in r.stdout.splitlines() if re.search(r":\d+:\d+: [A-Z]+\d+", z)]

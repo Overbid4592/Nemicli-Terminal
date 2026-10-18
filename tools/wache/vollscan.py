@@ -1,7 +1,12 @@
 """Vollscan: alle lokalen Laufwerke als Ausgangsstand (Baseline) der Wache.
 
-Stufe 1  jede Datei aller lokalen Volumes (auch ohne Laufwerksbuchstaben):
-         Pfad, Größe, Änderungszeit – nur Verzeichniseinträge.
+Stufe 0  Datenträger: jede Festplatte mit Partitionen und Volumes (datentraeger.py).
+Stufe 1  jede Datei aller lokalen Volumes (Festplatten, Wechseldatenträger,
+         RAM-Disks, eingebundene Abbilder – auch ohne Laufwerksbuchstaben, auch
+         Pfade über 260 Zeichen): Pfad, Größe, Änderungszeit, Attribute. Auf
+         NTFS dazu zusätzliche Datenströme (ADS) und bei Programmen die
+         Download-Herkunft (Zone.Identifier). Nicht lesbare Ordner und nicht
+         betretene Verweise werden mit Grund bzw. Ziel festgehalten.
 Stufe 2  ausführbarer Code und Skripte zusätzlich: SHA-256, Signaturstatus,
          Signierer (wintrust.dll im eigenen Prozess). Der vorige Hash bleibt
          erhalten; der Bericht listet Code, dessen Inhalt sich geändert hat.
@@ -10,6 +15,8 @@ Stufe 3  Systemstand (systemstand.py): Autostart, Dienste, Aufgaben, Treiber,
 
 Läuft als eigener Prozess (`--vollscan`) im Hintergrundmodus von Windows
 (niedrige CPU-, Datenträger- und Speicherpriorität), nur lesend, fortsetzbar.
+Von Windows gesperrte Systembereiche sind Revier des Virenschutzes: Sie werden
+nicht aufgebrochen und stehen im Bericht als gesperrt.
 Ein weiterer Lauf prüft in Stufe 2 Dateien, deren Größe oder Änderungszeit
 sich geändert hat, und hasht nicht gültig signierten Code immer neu – dort
 fiele eine Änderung ohne neues Datum sonst nicht auf. Jeder Lauf trägt den Windows-Stand (Build,
@@ -37,6 +44,9 @@ from . import BERICHTE, ORDNER, ordner_anlegen
 DB = ORDNER / "vollscan.db"
 STAND = ORDNER / "vollscan.json"
 STOPP = ORDNER / "vollscan_stopp"
+STARTS = ORDNER / "vollscan_starts.json"   # Startzeiten neuer Vollscans der letzten 7 Tage
+PRO_WOCHE = 3                              # höchstens so viele neue Vollscans in 7 Tagen
+WOCHE = 7 * 86400
 
 # Stufe 2: alles, was Code ausführen kann.
 CODE_ENDUNGEN = {
@@ -77,11 +87,69 @@ CREATE TABLE IF NOT EXISTS system (
     signierer TEXT, ampel TEXT, grund TEXT, neu INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_s_lauf ON system(lauf, art);
+CREATE TABLE IF NOT EXISTS luecken (
+    lauf INTEGER, pfad TEXT COLLATE NOCASE, grund TEXT, PRIMARY KEY (lauf, pfad)
+);
+CREATE TABLE IF NOT EXISTS verweise (
+    lauf INTEGER, pfad TEXT COLLATE NOCASE, art TEXT, ziel TEXT, PRIMARY KEY (lauf, pfad)
+);
+CREATE TABLE IF NOT EXISTS stroeme (
+    lauf INTEGER, pfad TEXT COLLATE NOCASE, name TEXT, groesse INTEGER, inhalt TEXT,
+    PRIMARY KEY (lauf, pfad, name)
+);
+CREATE TABLE IF NOT EXISTS volumen (
+    lauf INTEGER, wurzel TEXT, daten TEXT, PRIMARY KEY (lauf, wurzel)
+);
 """
 
 # Spalten, die nach dem ersten Lauf dazukamen – an bestehende Datenbanken anbauen.
 _NACHRUESTEN = [("code", "sha_vorher", "TEXT DEFAULT ''"), ("code", "veraendert_lauf", "INTEGER DEFAULT 0"),
-                ("laeufe", "unzugaenglich", "TEXT DEFAULT '[]'")]
+                ("laeufe", "unzugaenglich", "TEXT DEFAULT '[]'"), ("dateien", "attribute", "INTEGER DEFAULT 0"),
+                ("laeufe", "datentraeger", "TEXT DEFAULT '{}'")]
+
+# Dateiattribute (st_file_attributes)
+_VERSTECKT, _SYSTEM, _KOMPRIMIERT, _VERSCHLUESSELT = 0x2, 0x4, 0x800, 0x4000
+
+# Gründe für nicht lesbare Ordner und Dateien (winerror)
+_GRUENDE = {5: "Zugriff verweigert", 32: "von einem Programm gesperrt", 2: "während des Scans verschwunden",
+            3: "während des Scans verschwunden", 21: "Gerät nicht bereit", 1920: "vom System gesperrt",
+            1392: "beschädigt", 206: "Name zu lang", 123: "ungültiger Name", 1005: "Dateisystem nicht erkannt"}
+
+# Zusätzliche Datenströme, die Windows und gängige Programme selbst anlegen.
+_STROM_UEBLICH = {"zone.identifier", "smartscreen", "com.dropbox.attributes", "com.dropbox.attrs",
+                  "oecustomproperty", "encryptable", "ms-properties", "afp_afpinfo", "afp_resource",
+                  "{4c8cc155-6c1e-11d1-8e41-00c04fb9386d}", "$kernel.purge.esbcache",
+                  "$kernel.purge.apprxcache", "$kernel.purge.cipcache", "$kernel.smartlocker.originclaim",
+                  "favicon"}
+
+# Windows legt in jedem Profil Verweise unter alten Ordnernamen an (Kompatibilität).
+_ALTE_ORDNERNAMEN = {
+    "application data", "cookies", "local settings", "my documents", "nethood", "printhood", "recent",
+    "sendto", "start menu", "templates", "documents and settings", "all users", "default user",
+    "my music", "my pictures", "my videos", "history", "temporary internet files", "anwendungsdaten",
+    "druckumgebung", "netzwerkumgebung", "lokale einstellungen", "startmenü", "vorlagen", "eigene dateien",
+    "eigene bilder", "eigene musik", "eigene videos", "verlauf", "programme", "desktop", "favoriten",
+    "dokumente", "programs", "common files", "gemeinsame dateien", "dokumente und einstellungen"}
+
+_ARTEN = [
+    ("Programme und Bibliotheken", {".exe", ".dll", ".pyd", ".sys", ".scr", ".ocx", ".cpl", ".drv", ".efi",
+                                    ".ax", ".com", ".mui"}),
+    ("Skripte", {".ps1", ".psm1", ".psd1", ".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".hta",
+                 ".py", ".pyw", ".jar", ".sh"}),
+    ("Installationspakete", {".msi", ".msp", ".msix", ".appx", ".msixbundle", ".appxbundle", ".cab"}),
+    ("Dokumente", {".txt", ".md", ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx", ".odt",
+                   ".ods", ".rtf", ".csv", ".epub", ".json", ".xml", ".html", ".htm"}),
+    ("Bilder", {".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp", ".tif", ".tiff", ".ico", ".svg",
+                ".heic", ".psd", ".raw"}),
+    ("Videos", {".mp4", ".mkv", ".avi", ".mov", ".wmv", ".webm", ".m4v", ".flv"}),
+    ("Audio", {".mp3", ".wav", ".flac", ".ogg", ".m4a", ".aac", ".wma", ".opus"}),
+    ("Archive und Abbilder", {".zip", ".7z", ".rar", ".tar", ".gz", ".xz", ".bz2", ".zst", ".iso", ".img",
+                              ".vhd", ".vhdx", ".vmdk", ".wim", ".esd"}),
+    ("KI-Modelle", {".gguf", ".safetensors", ".ckpt", ".pt", ".pth", ".onnx"}),
+    ("Datenbanken", {".db", ".sqlite", ".sqlite3", ".mdb", ".accdb", ".edb"}),
+    ("Verknüpfungen", {".lnk", ".url"}),
+]
+_ART_JE_ENDUNG = {e: name for name, endungen in _ARTEN for e in endungen}
 
 # Nicht gültig signierter Code wird in jedem Lauf neu gehasht.
 _NEU_HASHEN = ("NotSigned", "HashMismatch", "NotTrusted")
@@ -92,43 +160,26 @@ _NEU_HASHEN = ("NotSigned", "HashMismatch", "NotTrusted")
 # ---------------------------------------------------------------------------
 
 def volumes() -> tuple[list[str], list[str]]:
-    """Alle lokalen Volumes (Festplatten, Wechseldatenträger – keine Netz- und
-    CD-Laufwerke), auch ohne Laufwerksbuchstaben oder in einen Ordner
-    eingehängt. Rückgabe: (lesbare Wurzeln, nicht zugängliche)."""
+    """Alle lokalen Volumes (Festplatten, Wechseldatenträger, RAM-Disks, optische
+    Laufwerke und eingebundene Abbilder mit Medium – keine Netzlaufwerke), auch
+    ohne Laufwerksbuchstaben oder in einen Ordner eingehängt.
+    Rückgabe: (lesbare Wurzeln, nicht zugängliche)."""
     if os.name != "nt":
         return ["/"], []
-    import ctypes
-    from ctypes import wintypes as w
-    k = ctypes.WinDLL("kernel32", use_last_error=True)
-    k.FindFirstVolumeW.restype = ctypes.c_void_p
-    k.FindFirstVolumeW.argtypes = [w.LPWSTR, w.DWORD]
-    k.FindNextVolumeW.argtypes = [ctypes.c_void_p, w.LPWSTR, w.DWORD]
-    k.FindVolumeClose.argtypes = [ctypes.c_void_p]
-    k.GetVolumePathNamesForVolumeNameW.argtypes = [w.LPCWSTR, w.LPWSTR, w.DWORD, ctypes.POINTER(w.DWORD)]
-    lesbar, gesperrt = [], []
-    puffer = ctypes.create_unicode_buffer(260)
-    h = k.FindFirstVolumeW(puffer, 260)
-    if not h or h == ctypes.c_void_p(-1).value:
+    from .datentraeger import LOKAL, volume_liste
+    liste = volume_liste()
+    if not liste:
         return _laufwerksbuchstaben(), []
-    try:
-        while True:
-            guid = puffer.value
-            namen = ctypes.create_unicode_buffer(2048)
-            laenge = w.DWORD()
-            pfade = []
-            if k.GetVolumePathNamesForVolumeNameW(guid, namen, 2048, ctypes.byref(laenge)):
-                pfade = [x for x in namen[:laenge.value].split("\0") if x]
-            wurzel = sorted(pfade, key=len)[0] if pfade else guid
-            if k.GetDriveTypeW(guid) in (2, 3):             # REMOVABLE, FIXED
-                try:
-                    os.listdir(wurzel)
-                    lesbar.append(wurzel)
-                except OSError:
-                    gesperrt.append(wurzel)
-            if not k.FindNextVolumeW(h, puffer, 260):
-                break
-    finally:
-        k.FindVolumeClose(h)
+    lesbar, gesperrt = [], []
+    for v in liste:
+        if v["art"] not in LOKAL:
+            continue
+        try:
+            os.listdir(v["wurzel"])
+            lesbar.append(v["wurzel"])
+        except OSError as exc:
+            if getattr(exc, "winerror", 0) != 21:          # 21 = kein Medium eingelegt
+                gesperrt.append(v["wurzel"])
     lesbar.sort(key=lambda x: (x.startswith("\\\\"), x))
     return lesbar, gesperrt
 
@@ -138,7 +189,7 @@ def _laufwerksbuchstaben() -> list[str]:
     k = ctypes.windll.kernel32
     maske = k.GetLogicalDrives()
     return [f"{chr(65 + i)}:\\" for i in range(26)
-            if maske & (1 << i) and k.GetDriveTypeW(f"{chr(65 + i)}:\\") in (2, 3)]
+            if maske & (1 << i) and k.GetDriveTypeW(f"{chr(65 + i)}:\\") in (2, 3, 5, 6)]
 
 
 def laufwerke() -> list[str]:
@@ -154,6 +205,22 @@ def volume_name(wurzel: str) -> str:
     fs = ctypes.create_unicode_buffer(261)
     if ctypes.windll.kernel32.GetVolumeInformationW(wurzel, puffer, 261, None, None, None, fs, 261):
         return f"{puffer.value or '(ohne Namen)'}, {fs.value}"
+    return ""
+
+
+def _dateisystem(wurzel: str) -> str:
+    """NTFS, FAT32, exFAT … des Volumes, auf dem `wurzel` liegt."""
+    if os.name != "nt":
+        return ""
+    import ctypes
+    k = ctypes.windll.kernel32
+    fs = ctypes.create_unicode_buffer(261)
+    volume = ctypes.create_unicode_buffer(1024)
+    pfad = wurzel if wurzel.endswith("\\") else wurzel + "\\"
+    if not k.GetVolumePathNameW(pfad, volume, 1024):
+        volume.value = pfad
+    if k.GetVolumeInformationW(volume.value, None, 0, None, None, None, fs, 261):
+        return fs.value
     return ""
 
 
@@ -265,6 +332,106 @@ def gruppe(pfad: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Lesen: lange Pfade, Datenströme, Download-Herkunft
+# ---------------------------------------------------------------------------
+
+_LANG = "\\\\?\\"
+
+
+def _lang(pfad: str) -> str:
+    """Lange Windows-Form (Präfix _LANG): auch Pfade über 260 Zeichen sind lesbar."""
+    if os.name != "nt" or pfad.startswith("\\\\"):
+        return pfad
+    return _LANG + os.path.abspath(pfad)
+
+
+def _kurz(pfad: str) -> str:
+    if pfad.startswith(_LANG) and pfad[5:6] == ":":
+        return pfad[4:]
+    return pfad
+
+
+def grund(exc: OSError) -> str:
+    n = getattr(exc, "winerror", None) or 0
+    return _GRUENDE.get(n, f"Fehler {n or exc.errno}")
+
+
+def dateiart(endung: str) -> str:
+    return _ART_JE_ENDUNG.get(endung, "Andere")
+
+
+_STROM_API = None
+
+
+def _strom_api():
+    global _STROM_API
+    if _STROM_API is None:
+        import ctypes
+        from ctypes import wintypes as w
+
+        class Daten(ctypes.Structure):
+            _fields_ = [("groesse", ctypes.c_longlong), ("name", ctypes.c_wchar * 296)]
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.FindFirstStreamW.restype = ctypes.c_void_p
+        k.FindFirstStreamW.argtypes = [w.LPCWSTR, ctypes.c_int, ctypes.c_void_p, w.DWORD]
+        k.FindNextStreamW.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+        k.FindClose.argtypes = [ctypes.c_void_p]
+        _STROM_API = (k, Daten, ctypes.c_void_p(-1).value)
+    return _STROM_API
+
+
+def stroeme(pfad: str) -> list[tuple[str, int]]:
+    """Zusätzliche Datenströme (ADS) einer Datei oder eines Ordners: [(name, groesse)],
+    ohne den Hauptinhalt. Leer, wenn es keine gibt oder das Dateisystem keine kennt."""
+    if os.name != "nt":
+        return []
+    import ctypes
+    k, Daten, ungueltig = _strom_api()
+    d = Daten()
+    h = k.FindFirstStreamW(_lang(pfad), 0, ctypes.byref(d), 0)
+    if not h or h == ungueltig:
+        return []
+    raus = []
+    try:
+        while True:
+            teile = d.name.split(":")                       # ":name:$DATA"
+            if len(teile) == 3 and teile[1] and teile[2] == "$DATA":
+                raus.append((teile[1], int(d.groesse)))
+            if not k.FindNextStreamW(h, ctypes.byref(d)):
+                break
+    finally:
+        k.FindClose(h)
+    return raus
+
+
+def _strom_kopf(pfad: str, name: str) -> bytes:
+    try:
+        with open(_lang(pfad) + ":" + name, "rb") as f:
+            return f.read(2)
+    except OSError:
+        return b""
+
+
+def download_herkunft(pfad: str) -> str:
+    """Zone.Identifier einer Datei in Kurzform: „Internet · <Adresse> · über <Seite>“."""
+    try:
+        with open(_lang(pfad) + ":Zone.Identifier", "r", encoding="utf-8", errors="replace") as f:
+            text = f.read(4096)
+    except OSError:
+        return ""
+    werte = {k.strip().lower(): v.strip() for k, v in
+             (z.split("=", 1) for z in text.splitlines() if "=" in z)}
+    zone = werte.get("zoneid", "")
+    teile = [{"0": "dieser Rechner", "1": "Intranet", "2": "vertrauenswürdige Seite", "3": "Internet",
+              "4": "gesperrte Seite"}.get(zone, f"Zone {zone or '?'}")]
+    if werte.get("hosturl"):
+        teile.append(werte["hosturl"][:300])
+    if werte.get("referrerurl"):
+        teile.append("über " + werte["referrerurl"][:300])
+    return " · ".join(teile)
+
+
+# ---------------------------------------------------------------------------
 # Zustand für die Anzeige (vollscan.json)
 # ---------------------------------------------------------------------------
 
@@ -308,7 +475,7 @@ def anzeige(z: dict) -> str:
     if phase == "liste":
         gb = z.get("bytes", 0) / 1e9
         gesamt = max(z.get("belegt", 0) / 1e9, 1)
-        return (f"{vorn}Stufe 1 (alle Dateien) · {z.get('laufwerk', '')} · "
+        return (f"{vorn}Stufe 1 (alle Dateien) · {_wo(z)} · "
                 f"{min(gb, gesamt * 0.99):.0f}/{gesamt:.0f} GB · "
                 f"{_zahl(z.get('dateien', 0))} Dateien · {uhr}")
     if phase == "code":
@@ -321,12 +488,22 @@ def anzeige(z: dict) -> str:
     return phase or "unbekannt"
 
 
+def _wo(z: dict) -> str:
+    """Aktuelles Laufwerk samt Position, z. B. „C: (Laufwerk 1 von 4)“ – die Laufwerke kommen nacheinander."""
+    w = z.get("laufwerk", "")
+    if w.startswith(_LANG + "Volume{"):
+        w = "Volume " + w[len(_LANG + "Volume{"):][:8]
+    if z.get("anzahl", 0) > 1:
+        w += f" (Laufwerk {z.get('nr', 1)} von {z['anzahl']})"
+    return w
+
+
 def kurzanzeige(z: dict) -> str:
     """Für die Statuszeile: kurz, mit genau einem „i/n“ für den Mini-Balken."""
     if z.get("phase") == "liste":
         gesamt = max(z.get("belegt", 0) / 1e9, 1)
         gb = min(z.get("bytes", 0) / 1e9, gesamt * 0.99)
-        return f"Vollscan {z.get('laufwerk', '')} {gb:.0f}/{gesamt:.0f} GB"
+        return f"Vollscan {_wo(z)} {gb:.0f}/{gesamt:.0f} GB"
     if z.get("phase") == "code":
         return f"Vollscan Fingerabdruck {z.get('code_fertig', 0)}/{z.get('code_gesamt', 0)}"
     if z.get("phase") == "system":
@@ -404,13 +581,19 @@ class Lauf:
             erledigt = json.loads(offen[1] or "[]")
         else:
             stand = windows_stand()
+            try:
+                from .datentraeger import uebersicht
+                platten = uebersicht()
+            except Exception as exc:
+                platten = {"fehler": repr(exc)[:200]}
             lid = self.c.execute(
-                "INSERT INTO laeufe(start, windows, updates, laufwerke, ausgelassen, unzugaenglich) "
-                "VALUES (?,?,?,?,?,?)",
+                "INSERT INTO laeufe(start, windows, updates, laufwerke, ausgelassen, unzugaenglich, "
+                "datentraeger) VALUES (?,?,?,?,?,?,?)",
                 (time.time(), json.dumps(stand, ensure_ascii=False), "\n".join(stand["updates"]),
-                 "[]", json.dumps(self.ausgelassen_pfade), json.dumps(self.unzugaenglich))).lastrowid
-            self.c.commit()
+                 "[]", json.dumps(self.ausgelassen_pfade), json.dumps(self.unzugaenglich),
+                 json.dumps(platten, ensure_ascii=False))).lastrowid
             erledigt = []
+            self.c.commit()
         self.lid = lid
         self.z = {"pid": os.getpid(), "lauf": lid, "start": time.time(), "phase": "liste",
                   "laufwerk": "", "dateien": 0, "bytes": 0, "belegt": 0, "fehler": 0,
@@ -423,9 +606,10 @@ class Lauf:
                 self.z["phase"] = "code"
         self._melden(sofort=True)
 
-        for w in self.wurzeln:
+        for nr, w in enumerate(self.wurzeln, 1):
             if w in erledigt:
                 continue
+            self.z.update(nr=nr, anzahl=len(self.wurzeln))
             if not self._laufwerk(w):
                 self._melden(sofort=True, phase="abgebrochen")
                 return 2
@@ -453,8 +637,16 @@ class Lauf:
         except OSError:
             belegt = 0
         self._melden(sofort=True, laufwerk=wurzel, belegt=belegt, bytes=0)
-        stapel = [wurzel]
+        fs = _dateisystem(wurzel)
+        mit_stroemen = fs in ("NTFS", "ReFS")
+        s = {"dateisystem": fs, "ordner": 0, "dateien": 0, "bytes": 0, "versteckt": 0, "system": 0,
+             "komprimiert": 0, "verschluesselt": 0, "cloud": 0, "code": 0, "verweise": 0,
+             "stroeme": 0, "stroeme_ueblich": 0, "luecken": 0, "arten": {}, "ebene1": {}, "ebene2": {}}
+        stapel = [_lang(wurzel)]
         puffer: list[tuple] = []
+        self._luecken: list[tuple] = []
+        self._verweise: list[tuple] = []
+        self._stroeme: list[tuple] = []
         gesehen = 0
         while stapel:
             if gesehen % 200 == 0:
@@ -466,26 +658,36 @@ class Lauf:
             try:
                 with os.scandir(verz) as it:
                     eintraege = list(it)
-            except OSError:
-                self.z["fehler"] += 1
+            except OSError as exc:
+                self._luecke(verz, exc, s)
                 continue
+            s["ordner"] += 1
+            if mit_stroemen:
+                self._ads(verz, False, s)
             for e in eintraege:
                 try:
+                    if e.is_symlink() or e.is_junction():
+                        self._verweis(e, s)
+                        continue
                     if e.is_dir(follow_symlinks=False):
-                        if e.is_symlink() or e.is_junction() or self._ausgelassen(e.path):
-                            continue
-                        stapel.append(e.path)
+                        if not self._ausgelassen(_kurz(e.path)):
+                            stapel.append(e.path)
                         continue
                     if not e.is_file(follow_symlinks=False):
                         continue
                     st = e.stat(follow_symlinks=False)
-                except OSError:
-                    self.z["fehler"] += 1
+                except OSError as exc:
+                    self._luecke(e.path, exc, s)
                     continue
+                pfad = _kurz(e.path)
                 endung = os.path.splitext(e.name)[1].lower()
-                lokal = not (getattr(st, "st_file_attributes", 0) & _NICHT_LOKAL)
+                attr = getattr(st, "st_file_attributes", 0)
+                lokal = not (attr & _NICHT_LOKAL)
                 code = 1 if endung in CODE_ENDUNGEN and lokal else 0
-                puffer.append((e.path, wurzel, st.st_size, st.st_mtime, code, self.lid, self.lid))
+                puffer.append((pfad, wurzel, st.st_size, st.st_mtime, code, self.lid, self.lid, attr))
+                self._zaehlen(s, pfad, wurzel, endung, st.st_size, attr, lokal, code)
+                if mit_stroemen and lokal:
+                    self._ads(e.path, bool(code), s)
                 self.z["dateien"] += 1
                 self.z["bytes"] += st.st_size
             if len(puffer) >= 5000:
@@ -493,19 +695,86 @@ class Lauf:
                 puffer = []
             gesehen += 1
         self._schreiben(puffer)
+        for name in ("ebene1", "ebene2"):
+            s[name] = dict(sorted(s[name].items(), key=lambda p: -p[1])[:15])
+        self.c.execute("INSERT OR REPLACE INTO volumen VALUES (?,?,?)",
+                       (self.lid, wurzel, json.dumps(s, ensure_ascii=False)))
+        self.c.commit()
         return True
 
+    def _zaehlen(self, s: dict, pfad: str, wurzel: str, endung: str, groesse: int, attr: int,
+                 lokal: bool, code: int) -> None:
+        s["dateien"] += 1
+        s["bytes"] += groesse
+        s["versteckt"] += bool(attr & _VERSTECKT)
+        s["system"] += bool(attr & _SYSTEM)
+        s["komprimiert"] += bool(attr & _KOMPRIMIERT)
+        s["verschluesselt"] += bool(attr & _VERSCHLUESSELT)
+        s["cloud"] += not lokal
+        s["code"] += code
+        art = s["arten"].setdefault(dateiart(endung), [0, 0])
+        art[0] += 1
+        art[1] += groesse
+        teile = pfad[len(wurzel):].strip("\\/").replace("/", "\\").split("\\")
+        e1 = teile[0] if len(teile) > 1 else "(Dateien direkt im Wurzelordner)"
+        s["ebene1"][e1] = s["ebene1"].get(e1, 0) + groesse
+        if len(teile) > 2:
+            e2 = teile[0] + "\\" + teile[1]
+            s["ebene2"][e2] = s["ebene2"].get(e2, 0) + groesse
+
+    def _luecke(self, pfad: str, exc: OSError, s: dict) -> None:
+        self.z["fehler"] += 1
+        s["luecken"] += 1
+        self._luecken.append((self.lid, _kurz(pfad), grund(exc)))
+        if len(self._luecken) >= 2000:
+            self._nebentabellen()
+
+    def _verweis(self, e, s: dict) -> None:
+        s["verweise"] += 1
+        try:
+            ziel = _kurz(os.readlink(e.path))
+        except OSError:
+            ziel = ""
+        art = "Abzweigung (Junction)" if e.is_junction() else "symbolischer Link"
+        self._verweise.append((self.lid, _kurz(e.path), art, ziel))
+        if len(self._verweise) >= 2000:
+            self._nebentabellen()
+
+    def _ads(self, pfad: str, code: bool, s: dict) -> None:
+        for name, groesse in stroeme(pfad):
+            klein = name.lower()
+            if klein in _STROM_UEBLICH:
+                s["stroeme_ueblich"] += 1
+                if klein == "zone.identifier" and code:
+                    self._stroeme.append((self.lid, _kurz(pfad), name, groesse, download_herkunft(pfad)))
+                continue
+            s["stroeme"] += 1
+            kopf = _strom_kopf(pfad, name)
+            self._stroeme.append((self.lid, _kurz(pfad), name, groesse,
+                                  "Programmcode (MZ)" if kopf == b"MZ" else ""))
+        if len(self._stroeme) >= 2000:
+            self._nebentabellen()
+
+    def _nebentabellen(self) -> None:
+        if self._luecken:
+            self.c.executemany("INSERT OR REPLACE INTO luecken VALUES (?,?,?)", self._luecken)
+        if self._verweise:
+            self.c.executemany("INSERT OR REPLACE INTO verweise VALUES (?,?,?,?)", self._verweise)
+        if self._stroeme:
+            self.c.executemany("INSERT OR REPLACE INTO stroeme VALUES (?,?,?,?,?)", self._stroeme)
+        self._luecken, self._verweise, self._stroeme = [], [], []
+
     def _schreiben(self, puffer: list[tuple]) -> None:
-        if not puffer:
-            return
-        self.c.executemany(
-            "INSERT INTO dateien(pfad, laufwerk, groesse, mtime, code, lauf, erstmals) "
-            "VALUES (?,?,?,?,?,?,?) ON CONFLICT(pfad) DO UPDATE SET "
-            # Zweiter Besuch im selben Lauf (Fortsetzen): Merkmal behalten.
-            "geaendert = CASE WHEN lauf = excluded.lauf THEN geaendert "
-            "ELSE (groesse != excluded.groesse OR mtime != excluded.mtime) END, "
-            "groesse = excluded.groesse, mtime = excluded.mtime, code = excluded.code, "
-            "laufwerk = excluded.laufwerk, lauf = excluded.lauf", puffer)
+        self._nebentabellen()
+        if puffer:
+            self.c.executemany(
+                "INSERT INTO dateien(pfad, laufwerk, groesse, mtime, code, lauf, erstmals, attribute) "
+                "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(pfad) DO UPDATE SET "
+                # Zweiter Besuch im selben Lauf (Fortsetzen): Merkmal behalten.
+                "geaendert = CASE WHEN lauf = excluded.lauf THEN geaendert "
+                "ELSE (groesse != excluded.groesse OR mtime != excluded.mtime) END, "
+                "groesse = excluded.groesse, mtime = excluded.mtime, code = excluded.code, "
+                "laufwerk = excluded.laufwerk, lauf = excluded.lauf, attribute = excluded.attribute", puffer)
         self.c.commit()
 
     def _offene_code(self) -> list[tuple]:
@@ -593,7 +862,8 @@ class Lauf:
         entfernt = c.execute(f"DELETE FROM dateien WHERE lauf<? AND laufwerk IN ({platz})",
                              (lid, *self.wurzeln)).rowcount
         c.execute("DELETE FROM code WHERE pfad NOT IN (SELECT pfad FROM dateien)")
-        c.execute("DELETE FROM system WHERE lauf < ?", (lid - 5,))          # die letzten Läufe genügen
+        for tabelle in ("system", "luecken", "verweise", "stroeme", "volumen"):
+            c.execute(f"DELETE FROM {tabelle} WHERE lauf < ?", (lid - 5,))   # die letzten Läufe genügen
         dateien = c.execute("SELECT COUNT(*) FROM dateien WHERE lauf=?", (lid,)).fetchone()[0]
         code = c.execute("SELECT COUNT(*) FROM dateien WHERE lauf=? AND code=1", (lid,)).fetchone()[0]
         c.execute("UPDATE laeufe SET ende=?, dateien=?, code=?, neu=?, geaendert=?, entfernt=?, fertig=1 "
@@ -606,14 +876,18 @@ def _fingerabdruck(pfad: str, herkunft) -> tuple[str, str, str]:
     """(sha256, status, signierer)."""
     sha = hashlib.sha256()
     try:
-        with open(pfad, "rb", buffering=0) as f:
+        f = open(_lang(pfad), "rb", buffering=0)
+    except PermissionError:
+        return "", "kein Zugriff", ""
+    except OSError:
+        return "", "nicht lesbar", ""
+    try:
+        with f:
             while True:
                 block = f.read(1 << 20)
                 if not block:
                     break
                 sha.update(block)
-    except PermissionError:
-        return "", "kein Zugriff", ""
     except OSError:
         return "", "nicht lesbar", ""
     endung = os.path.splitext(pfad)[1].lower()
@@ -665,11 +939,176 @@ def _systemteil(c: sqlite3.Connection, lid: int) -> list[str]:
     return z
 
 
+_NAMEN_OHNE_AUSSAGE = {"basic data partition", "microsoft reserved partition", "efi system partition",
+                       "eps", "msr"}
+
+
+def _gr(n: float) -> str:
+    from .datentraeger import groesse_text
+    return groesse_text(n)
+
+
+def _datentraegerteil(d: dict, gescannt: set, gesperrt: set, ausgelassen: set) -> list[str]:
+    """Festplatte → Partition → Volume, mit Scan-Stand je Volume."""
+    if not d:
+        return []
+    if d.get("fehler") or not d.get("platten"):
+        return ["", "## Datenträger", "", f"- nicht ermittelt: {d.get('fehler') or 'keine Angaben'}"]
+    from .datentraeger import ART_TEXT
+    vols = {v["wurzel"]: v for v in d.get("volumes", [])}
+
+    def volume(w: str) -> str:
+        v = vols.get(w) or {}
+        teile = [f"„{v.get('name') or 'ohne Namen'}“", v.get("dateisystem") or "kein Dateisystem"]
+        if v.get("groesse"):
+            teile.append(f"{_gr(v['groesse'])}, frei {_gr(v.get('frei', 0))}")
+        weitere = [p for p in v.get("pfade", []) if p != w]
+        if weitere:
+            teile.append("auch unter " + ", ".join(weitere))
+        if w in gescannt:
+            stand = "gescannt"
+        elif w in gesperrt:
+            stand = "von Windows gesperrt (Systembereich, Revier des Virenschutzes)"
+        elif w in ausgelassen:
+            stand = "bewusst nicht betreten (Produkt im Windows-Sicherheitscenter)"
+        else:
+            stand = "nicht gescannt" + (f" ({v['grund']})" if v.get("grund") else "")
+        return f"{w} ({', '.join(teile)}) – {stand}"
+
+    z = ["", "## Datenträger", "", "Jede Festplatte mit ihren Partitionen; „→“ zeigt das Volume darauf.", ""]
+    zugeordnet = set()
+    for p in d["platten"]:
+        art = {True: "SSD", False: "HDD"}.get(p.get("ssd"), "")
+        kopf = [p.get("modell") or "unbekanntes Modell", p.get("anschluss", ""), art,
+                _gr(p["groesse"]) if p.get("groesse") else "", p.get("stil", ""),
+                "wechselbar" if p.get("wechselbar") else ""]
+        z += [f"### Datenträger {p['nummer']} · {' · '.join(x for x in kopf if x)}", ""]
+        if not p.get("partitionen"):
+            z.append("- keine Partitionen")
+        for t in p.get("partitionen", []):
+            name = f" „{t['name']}“" if t.get("name") and t["name"].lower() not in _NAMEN_OHNE_AUSSAGE else ""
+            ziel = f" → {volume(t['volume'])}" if t.get("volume") else " – kein Volume (nicht einhängbar)"
+            z.append(f"- Partition {t['nummer']} · {t['art']}{name} · {_gr(t['groesse'])}{ziel}")
+            zugeordnet.add(t.get("volume"))
+        z.append("")
+    rest = [w for w in vols if w not in zugeordnet]
+    if rest:
+        z += ["### Volumes ohne zugeordnete Partition", ""]
+        z += [f"- {volume(w)} · {ART_TEXT.get(vols[w].get('art'), 'andere Art')}" for w in rest]
+    return z
+
+
+def _laufwerkteil(w: str, n: int, s: dict | None) -> list[str]:
+    name = volume_name(w)
+    if not s:
+        return [f"- {w}{' (' + name + ')' if name else ''}: {_zahl(n)} Dateien"]
+    z = [f"### {w}{' (' + name + ')' if name else ''}", "",
+         f"- {_zahl(s['dateien'])} Dateien in {_zahl(s['ordner'])} Ordnern · {_gr(s['bytes'])}",
+         f"- Code und Skripte: {_zahl(s['code'])} · versteckt: {_zahl(s['versteckt'])} · "
+         f"Systemdateien: {_zahl(s['system'])} · komprimiert: {_zahl(s['komprimiert'])} · "
+         f"verschlüsselt (EFS): {_zahl(s['verschluesselt'])} · nur in der Cloud: {_zahl(s['cloud'])}",
+         f"- Verweise (nicht betreten): {_zahl(s['verweise'])} · zusätzliche Datenströme: "
+         + (f"{_zahl(s['stroeme'])} ungewöhnlich, {_zahl(s['stroeme_ueblich'])} üblich"
+            if s.get("dateisystem") in ("NTFS", "ReFS") else f"– ({s.get('dateisystem') or '?'} kennt keine)")
+         + f" · nicht lesbar: {_zahl(s['luecken'])}"]
+    arten = sorted(s.get("arten", {}).items(), key=lambda p: -p[1][1])
+    if arten:
+        z.append("- Dateiarten: " + " · ".join(f"{a} {_zahl(x[0])} ({_gr(x[1])})" for a, x in arten))
+    if s.get("ebene1"):
+        z.append("- Größte Ordner: " + " · ".join(f"{o} {_gr(b)}" for o, b in list(s["ebene1"].items())[:10]))
+    if s.get("ebene2"):
+        z.append("- Größte Unterordner: " + " · ".join(f"{o} {_gr(b)}" for o, b in list(s["ebene2"].items())[:10]))
+    return z + [""]
+
+
+def _versteckt_teil(c: sqlite3.Connection, lid: int) -> list[str]:
+    windows = os.path.normcase(os.environ.get("SystemRoot", r"C:\Windows")) + os.sep
+    zeilen = [(p, s) for p, s in c.execute(
+        "SELECT d.pfad, c.status FROM dateien d LEFT JOIN code c ON c.pfad = d.pfad "
+        "WHERE d.lauf=? AND d.code=1 AND (d.attribute & ?) != 0 ORDER BY d.pfad",
+        (lid, _VERSTECKT)) if not os.path.normcase(p).startswith(windows)]
+    z = ["", f"## Versteckte Programme und Skripte außerhalb des Windows-Ordners ({len(zeilen)})", ""]
+    z += [f"- {'🟢' if s == 'Valid' else '🟡'} {p} ({s or 'ohne Prüfung'})" for p, s in
+          sorted(zeilen, key=lambda r: (r[1] == "Valid", r[0]))[:150]] or ["- keine"]
+    if len(zeilen) > 150:
+        z.append(f"- … {len(zeilen) - 150} weitere")
+    return z
+
+
+def _download_teil(c: sqlite3.Connection, lid: int) -> list[str]:
+    zeilen = c.execute(
+        "SELECT s.pfad, s.inhalt, c.status, c.signierer FROM stroeme s LEFT JOIN code c ON c.pfad = s.pfad "
+        "WHERE s.lauf=? AND lower(s.name)='zone.identifier' ORDER BY (c.status = 'Valid'), s.pfad",
+        (lid,)).fetchall()
+    z = ["", f"## Heruntergeladene Programme und Skripte ({len(zeilen)})", "",
+         "Herkunft laut Download-Vermerk von Windows (Zone.Identifier); nicht gültig signierte zuerst.", ""]
+    for pfad, inhalt, status, signierer in zeilen[:200]:
+        sig = "gültig signiert" + (f": {signierer}" if signierer else "") if status == "Valid" else (status or "?")
+        z.append(f"- {'🟢' if status == 'Valid' else '🟡'} {pfad} – {inhalt or 'ohne Angaben'} ({sig})")
+    if not zeilen:
+        z.append("- keine")
+    elif len(zeilen) > 200:
+        z.append(f"- … {len(zeilen) - 200} weitere")
+    return z
+
+
+def _stroeme_teil(c: sqlite3.Connection, lid: int) -> list[str]:
+    zeilen = c.execute(
+        "SELECT pfad, name, groesse, inhalt FROM stroeme WHERE lauf=? AND lower(name) != 'zone.identifier' "
+        "ORDER BY (inhalt = ''), groesse DESC", (lid,)).fetchall()
+    z = ["", f"## Ungewöhnliche zusätzliche Datenströme (ADS) ({len(zeilen)})", "",
+         "Versteckter Inhalt hinter einer Datei oder einem Ordner, den der Explorer nicht zeigt. "
+         "Übliche Ströme (Download-Vermerk, Cloud-Merkmale) sind nur gezählt.", ""]
+    for pfad, name, groesse, inhalt in zeilen[:150]:
+        z.append(f"- {'🔴' if inhalt else '🟡'} {pfad}:{name} · {_gr(groesse)}" + (f" · {inhalt}" if inhalt else ""))
+    if not zeilen:
+        z.append("- keine")
+    elif len(zeilen) > 150:
+        z.append(f"- … {len(zeilen) - 150} weitere")
+    return z
+
+
+def _verweise_teil(c: sqlite3.Connection, lid: int) -> list[str]:
+    zeilen = c.execute("SELECT pfad, art, ziel FROM verweise WHERE lauf=? ORDER BY pfad", (lid,)).fetchall()
+    alt = [r for r in zeilen if os.path.basename(r[0]).lower() in _ALTE_ORDNERNAMEN]
+    andere = [r for r in zeilen if r not in alt]
+    z = ["", f"## Verweise – nicht betreten ({len(zeilen)})", "",
+         "Abzweigungen und symbolische Links zeigen auf andere Orte; ihr Ziel wird dort erfasst, wo es "
+         f"liegt. {len(alt)} davon sind Kompatibilitätsverweise von Windows unter alten Ordnernamen.", ""]
+    z += [f"- {p} → {ziel or '?'} ({art})" for p, art, ziel in andere[:150]] or ["- keine weiteren"]
+    if len(andere) > 150:
+        z.append(f"- … {len(andere) - 150} weitere")
+    return z
+
+
+def _luecken_teil(c: sqlite3.Connection, lid: int) -> list[str]:
+    gruende = c.execute("SELECT grund, COUNT(*) n FROM luecken WHERE lauf=? GROUP BY grund ORDER BY n DESC",
+                        (lid,)).fetchall()
+    gesamt = sum(n for _, n in gruende)
+    z = ["", f"## Nicht lesbar ({gesamt})", ""]
+    if not gesamt:
+        return z + ["- nichts – alles wurde gelesen"]
+    z.append("- " + " · ".join(f"{g}: {_zahl(n)}" for g, n in gruende))
+    if any(g == "Zugriff verweigert" for g, _ in gruende):
+        z.append("- „Zugriff verweigert“: von Windows gesperrte Systembereiche – Revier des Virenschutzes, "
+                 "der Vollscan bricht sie bewusst nicht auf.")
+    z.append("")
+    zeilen = c.execute("SELECT pfad, grund FROM luecken WHERE lauf=? ORDER BY pfad LIMIT 200", (lid,)).fetchall()
+    z += [f"- {p} ({g})" for p, g in zeilen]
+    if gesamt > 200:
+        z.append(f"- … {gesamt - 200} weitere")
+    return z
+
+
 def _bericht(c: sqlite3.Connection, lid: int, erster: bool, fehler: list[str] | None = None) -> Path:
-    lauf = c.execute("SELECT start, ende, windows, updates, ausgelassen, dateien, code, neu, "
-                     "geaendert, entfernt, laufwerke, unzugaenglich FROM laeufe WHERE id=?", (lid,)).fetchone()
+    lauf = c.execute("SELECT start, ende, windows, updates, ausgelassen, dateien, code, neu, geaendert, "
+                     "entfernt, laufwerke, unzugaenglich, datentraeger FROM laeufe WHERE id=?",
+                     (lid,)).fetchone()
     (start, ende, windows, updates, ausgelassen, dateien, code, neu, geaendert, entfernt,
-     laufwerke_json, unzugaenglich_json) = lauf
+     laufwerke_json, unzugaenglich_json, datentraeger_json) = lauf
+    volumen = {w: json.loads(d) for w, d in c.execute("SELECT wurzel, daten FROM volumen WHERE lauf=?", (lid,))}
+    gescannt = json.loads(laufwerke_json or "[]")
+    gesperrt = json.loads(unzugaenglich_json or "[]")
     stand = json.loads(windows or "{}")
     status = dict(c.execute("SELECT status, COUNT(*) FROM code GROUP BY status").fetchall())
     pe = tuple(_PE)
@@ -684,7 +1123,7 @@ def _bericht(c: sqlite3.Connection, lid: int, erster: bool, fehler: list[str] | 
     mit_hash = c.execute("SELECT COUNT(*) FROM code WHERE sha256 != ''").fetchone()[0]
     verteilt = dict(c.execute("SELECT laufwerk, COUNT(*) FROM dateien WHERE lauf=? GROUP BY laufwerk",
                               (lid,)).fetchall())
-    pro_laufwerk = [(w, verteilt.get(w, 0)) for w in json.loads(laufwerke_json or "[]")]
+    pro_laufwerk = [(w, verteilt.get(w, 0)) for w in gescannt]
     veraendert = c.execute(
         "SELECT pfad, status, signierer FROM code WHERE veraendert_lauf=? "
         "ORDER BY (status = 'Valid'), pfad", (lid,)).fetchall()
@@ -692,18 +1131,22 @@ def _bericht(c: sqlite3.Connection, lid: int, erster: bool, fehler: list[str] | 
     z = [f"# Vollscan {time.strftime('%d.%m.%Y %H:%M', time.localtime(start))}", "",
          f"- Stand: {windows_text(stand)}",
          f"- Dauer: {dauer // 3600}:{dauer % 3600 // 60:02d} h",
-         f"- Dateien: {_zahl(dateien)}, davon Code/Skripte: {_zahl(code)}",
+         f"- Dateien: {_zahl(dateien)} in {_zahl(sum(s.get('ordner', 0) for s in volumen.values()))} "
+         f"Ordnern, davon Code/Skripte: {_zahl(code)}",
          ("- Erster Lauf: alles ist Ausgangsstand." if erster else
           f"- Seit dem letzten Lauf: {neu} neu · {geaendert} geändert · {entfernt} entfernt"),
          f"- SHA-256 gespeichert für {_zahl(mit_hash)} Code-Dateien"
          + (" – verglichen wird ab dem nächsten Lauf." if erster else "."),
-         "", "## Laufwerke", ""]
+         f"- Nicht lesbar: {_zahl(sum(s.get('luecken', 0) for s in volumen.values()))} Ordner/Dateien "
+         "(Liste unten)"]
+    z += _datentraegerteil(json.loads(datentraeger_json or "{}"), set(gescannt), set(gesperrt),
+                           set(json.loads(ausgelassen or "[]")))
+    z += ["", "## Laufwerke", ""]
     for w, n in pro_laufwerk:
+        z += _laufwerkteil(w, n, volumen.get(w))
+    for w in gesperrt:
         name = volume_name(w)
-        z.append(f"- {w}{' (' + name + ')' if name else ''}: {_zahl(n)} Dateien")
-    for w in json.loads(unzugaenglich_json or "[]"):
-        name = volume_name(w)
-        z.append(f"- {w}{' (' + name + ')' if name else ''}: nicht zugänglich (ohne Adminrechte gesperrt)")
+        z.append(f"- {w}{' (' + name + ')' if name else ''}: von Windows gesperrt (Systembereich, Revier des Virenschutzes)")
     z += ["", "## Signaturen", ""]
     for k, n in sorted(status.items(), key=lambda p: -p[1]):
         z.append(f"- {k}: {_zahl(n)}")
@@ -713,6 +1156,11 @@ def _bericht(c: sqlite3.Connection, lid: int, erster: bool, fehler: list[str] | 
     z += [f"- {g}: {n}" for g, n in unsigniert] or ["- keine"]
     z += ["", "## Signatur ungültig oder nicht vertrauenswürdig", ""]
     z += [f"- {p} ({s})" for p, s in auffaellig] or ["- keine"]
+    z += _versteckt_teil(c, lid)
+    z += _download_teil(c, lid)
+    z += _stroeme_teil(c, lid)
+    z += _verweise_teil(c, lid)
+    z += _luecken_teil(c, lid)
     if not erster:
         skripte = [v for v in veraendert if v[1] == "Skript"]
         nicht_gueltig = [v for v in veraendert if v[1] not in ("Valid", "Skript")]
@@ -890,9 +1338,43 @@ def befehl(install_ordner: Path) -> list[str]:
     return [str(pythonw if pythonw.exists() else python), str(install_ordner / "main.py"), "--vollscan"]
 
 
+def starts_lesen() -> list[float]:
+    try:
+        return [float(t) for t in json.loads(STARTS.read_text(encoding="utf-8"))]
+    except (OSError, ValueError, TypeError):
+        return []
+
+
+def woche_frei(jetzt: float | None = None) -> tuple[bool, float]:
+    """(darf ein neuer Vollscan starten, ab wann wieder frei). Fortsetzen zählt nicht."""
+    jetzt = jetzt if jetzt is not None else time.time()
+    letzte = sorted(t for t in starts_lesen() if jetzt - t < WOCHE)
+    if len(letzte) < PRO_WOCHE:
+        return True, jetzt
+    return False, letzte[-PRO_WOCHE] + WOCHE
+
+
+def sperre_text(jetzt: float | None = None) -> str:
+    _frei, ab = woche_frei(jetzt)
+    return (f"Höchstens {PRO_WOCHE} Vollscans in 7 Tagen – der nächste geht ab "
+            f"{time.strftime('%d.%m. %H:%M', time.localtime(ab))}. Einen angehaltenen Scan "
+            "fortsetzen geht jederzeit.")
+
+
+def _start_merken(jetzt: float | None = None) -> None:
+    jetzt = jetzt if jetzt is not None else time.time()
+    letzte = [t for t in starts_lesen() if jetzt - t < WOCHE] + [jetzt]
+    tmp = STARTS.with_suffix(".tmp")
+    tmp.write_text(json.dumps(letzte), encoding="utf-8")
+    os.replace(tmp, STARTS)
+
+
 def starten(install_ordner: Path) -> str:
     if laeuft():
         return "Der Vollscan läuft schon."
+    neu = stand_lesen().get("phase") != "abgebrochen"       # Fortsetzen zählt nicht als neue Prüfung
+    if neu and not woche_frei()[0]:
+        return sperre_text()
     ordner_anlegen()
     STOPP.unlink(missing_ok=True)
     b = befehl(install_ordner)
@@ -903,6 +1385,11 @@ def starten(install_ordner: Path) -> str:
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
         return f"Start fehlgeschlagen: {exc}"
+    if neu:
+        try:
+            _start_merken()
+        except OSError:
+            pass
     for _ in range(50):
         time.sleep(0.2)
         if laeuft():

@@ -25,6 +25,7 @@ import json
 import math
 import os
 import time
+from itertools import islice
 from pathlib import Path
 
 # learned/ liegt in der Projekt-Wurzel (Modul ist eine Ebene tief unter tools/)
@@ -89,14 +90,17 @@ def features(path: str | os.PathLike) -> list[str]:
     """Macht aus dem Inhalt eines Ordners eine Liste von Merkmal-Tokens."""
     tokens: list[str] = []
     try:
-        entries = list(os.scandir(path))
-    except (OSError, PermissionError):
+        # Nur MAX_ENTRIES lesen – riesige Ordner (oder Netzlaufwerke) nicht ganz einlesen.
+        with os.scandir(path) as it:
+            entries = list(islice(it, MAX_ENTRIES))
+    except OSError:
         return tokens
 
-    for entry in entries[:MAX_ENTRIES]:
+    for entry in entries:
         name = entry.name.lower()
         try:
-            is_dir = entry.is_dir()
+            # Verknüpfungen nicht verfolgen: kein Zugriff aufs Ziel (Netz, Schleifen).
+            is_dir = entry.is_dir(follow_symlinks=False)
         except OSError:
             continue
 
@@ -297,6 +301,8 @@ def _get_model() -> dict:
         if MODEL_PATH.exists():
             try:
                 _MODEL_CACHE = json.loads(MODEL_PATH.read_text(encoding="utf-8"))
+                if not all(k in _MODEL_CACHE for k in ("labels", "vocab", "ndocs")):
+                    _MODEL_CACHE = None              # unvollständig → aus den Beispielen neu bauen
             except Exception:
                 _MODEL_CACHE = None
         if _MODEL_CACHE is None:
@@ -309,7 +315,7 @@ def _rebuild() -> dict:
     global _MODEL_CACHE
     examples = [(label, toks) for label, toks in _seed_examples()]
     for ex in _load_examples():
-        examples.append((ex["label"], ex["tokens"]))
+        examples.append((ex["label"], ex["tokens"]))      # _load_examples liefert nur gültige
     model = _train(examples)
     LEARN_DIR.mkdir(parents=True, exist_ok=True)
     _save_json(MODEL_PATH, model)
@@ -317,18 +323,33 @@ def _rebuild() -> dict:
     return model
 
 
+def _gueltig(ex) -> bool:
+    return (isinstance(ex, dict) and ex.get("label") in LABEL_DE
+            and isinstance(ex.get("tokens"), list) and all(isinstance(t, str) for t in ex["tokens"]))
+
+
 def _load_examples() -> list[dict]:
-    if EXAMPLES_PATH.exists():
+    """Selbst gelernte Beispiele – nur gültige Einträge. Ist die Datei unlesbar, wird sie als
+    .kaputt beiseitegelegt, damit das nächste learn_folder sie nicht überschreibt."""
+    if not EXAMPLES_PATH.exists():
+        return []
+    try:
+        daten = json.loads(EXAMPLES_PATH.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
         try:
-            return json.loads(EXAMPLES_PATH.read_text(encoding="utf-8"))
-        except Exception:
-            return []
-    return []
+            os.replace(EXAMPLES_PATH, EXAMPLES_PATH.with_suffix(".kaputt"))
+        except OSError:
+            pass
+        return []
+    return [ex for ex in daten if _gueltig(ex)] if isinstance(daten, list) else []
 
 
 def _save_json(path: Path, data) -> None:
+    """Atomar: erst Zwischendatei, dann tauschen – ein Absturz hinterlässt keine halbe Datei."""
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    os.replace(tmp, path)
 
 
 # ---------------------------------------------------------------------------

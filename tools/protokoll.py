@@ -76,6 +76,14 @@ def _ergebnis_kurz(ergebnis: str | None, grenze: int = 120) -> str:
     return warn.rstrip(" ·")
 
 
+def _nach_netz_inhalt() -> bool:
+    try:
+        import actions
+        return actions.web_tainted()
+    except Exception:
+        return False
+
+
 def schreibe(tool: str, beschreibung: str, status: str, *, veraendernd: bool,
              wer: str = "", pfad: Path | None = None, ergebnis: str | None = None,
              stufe: str = "") -> None:
@@ -92,6 +100,8 @@ def schreibe(tool: str, beschreibung: str, status: str, *, veraendernd: bool,
         if stufe == "riskant":
             art = "⚠RISIKO"
         text = " ".join(str(beschreibung or "").split())[:300]
+        if veraendernd and _nach_netz_inhalt():
+            text = "🌐 nach Netz-Inhalt · " + text
         kurz = _ergebnis_kurz(ergebnis)
         if kurz:
             text += f" → Ergebnis: {kurz}"

@@ -28,6 +28,7 @@ SKILLS_DIR = LEARN_DIR / "skills"
 SNIPPETS_DIR = LEARN_DIR / "snippets"
 
 MAX_INDEX = 20  # so viele Einträge je Kategorie kommen in den Prompt
+MAX_SNIPPETS = 300   # darüber werden keine neuen Snippets mehr gesammelt
 
 _PY_BLOCK = re.compile(r"```(?:python|py)\s*\n(.*?)```", re.DOTALL)
 
@@ -77,13 +78,45 @@ def extract_python(text: str) -> list[str]:
     return [c.strip() for c in _PY_BLOCK.findall(text) if c.strip()]
 
 
+def _text(m: dict) -> str:
+    c = m.get("content")
+    if isinstance(c, str):
+        return c
+    if isinstance(c, list):
+        return " ".join(str(t.get("text", "")) for t in c if isinstance(t, dict))
+    return ""
+
+
+def fremdes_in_runde(user_prompt: str, messages: list) -> bool:
+    """Kam in dieser Runde Fremd-Inhalt herein (Webseite, Datei, Bild, Werkzeug-Ergebnis mit dem
+    Fremddaten-Rahmen)? Gesucht wird rückwärts bis zur Nachricht des Nutzers."""
+    try:
+        from fremddaten import _HINWEIS as marke
+    except Exception:
+        marke = "stammt NICHT vom Nutzer"
+    anfang = (user_prompt or "").strip()[:200]
+    for m in reversed(messages[-80:]):
+        t = _text(m)
+        if marke in t:
+            return True
+        if m.get("role") == "user" and anfang and t.strip().startswith(anfang):
+            return False
+    return False
+
+
 def capture_from_answer(user_prompt: str, messages: list, chat_id: int | None = None) -> int:
-    """Sucht im letzten Assistenten-Text nach Python-Code und speichert ihn."""
+    """Sucht im letzten Assistenten-Text nach Python-Code und speichert ihn – nicht, wenn in
+    dieser Runde Fremd-Inhalt im Spiel war: Code, den die KI von einer Webseite oder aus einer
+    Datei wiedergibt, soll nicht dauerhaft als „gelernt“ im Prompt stehen."""
     answer = ""
     for m in reversed(messages):
         if m.get("role") == "assistant" and isinstance(m.get("content"), str):
             answer = m["content"]
             break
+    if not extract_python(answer) or fremdes_in_runde(user_prompt, messages):
+        return 0
+    if SNIPPETS_DIR.is_dir() and sum(1 for _ in SNIPPETS_DIR.glob("*.py")) >= MAX_SNIPPETS:
+        return 0
     saved = 0
     for code in extract_python(answer):
         if len(code) < 20:        # winzige Schnipsel ignorieren

@@ -127,16 +127,22 @@ def befehl_harmlos(cmd: str) -> bool:
         return False
     try:
         import actions
+        if actions.ausdruck_in_text(roh):          # "$(…)" führt einen Befehl aus
+            return False
         if actions._nur_lesend(roh) is None and actions._guard_command(roh, lesend=True) is None:
             return True
     except Exception:
-        pass
+        return False
     if _UMLEITUNG.search(_STRINGS.sub("''", roh)):
         return False
     liste = whitelist()
     if not liste:
         return False
     ohne_strings = _STRINGS.sub("''", roh)
+    # Eine Klammer in den Argumenten ( (…), $(…), @(…) ) führt einen Befehl aus –
+    # „mkdir $(…)“ ist kein harmloses mkdir mehr.
+    if "(" in ohne_strings:
+        return False
     return all(_segment_passt(seg, liste) for seg in _TRENNER.split(ohne_strings))
 
 
@@ -147,7 +153,8 @@ def befehl_harmlos(cmd: str) -> bool:
 LESEN, HARMLOS, AENDERT, RISKANT = "lesen", "harmlos", "aendert", "riskant"
 
 _HARMLOS = {"ordner_erstellen", "bildschirm_ansehen", "merken", "skill_merken",
-            "ordner_lernen", "bild_malen", "bild_serie", "wache_bewerten", "wache_justieren", "kugel"}
+            "ordner_lernen", "bild_malen", "bild_serie", "comic_malen", "tagesrueckblick", "musik_machen", "musik_cover", "wache_bewerten", "wache_justieren", "kugel",
+            "kugel_anziehen", "erinnern"}
 _MIT_VORSCHAU = {"datei_schreiben", "datei_bearbeiten", "pdf_erstellen", "skill_schreiben", "skill_ausbessern"}
 
 
@@ -205,8 +212,8 @@ def stufe(act: dict) -> str:
 # ---------------------------------------------------------------------------
 # Arbeitsbereich der Persönlichkeit: dauerhaft bearbeiten ohne Rückfrage
 # ---------------------------------------------------------------------------
-# Die Persönlichkeit pflegt ihr eigenes Gedächtnis selbst. Gilt für jede
-# Persönlichkeit, nicht für einen Namen. Bedingungen, alle zugleich:
+# Ohne dieses Recht hätte die Persönlichkeit ein Gedächtnis ohne Stift. Gilt für
+# jede Persönlichkeit, nicht für einen Namen. Bedingungen, alle zugleich:
 #   • schreibendes Datei-Werkzeug, Stufe harmlos/ändert (loeschen und Ordner-
 #     Verschieben bleiben riskant → fragen weiter)
 #   • JEDER Pfad der Aktion liegt im Daten-Ordner (paths.DATEN), und der ist
@@ -247,9 +254,78 @@ def arbeitsbereich(act: dict) -> bool:
             if profile in p.parents and len(p.relative_to(profile).parts) >= 2 \
                     and p.relative_to(profile).parts[1] == "Skills":
                 return False
+        if steuerdatei_grund(act):
+            return False
         return actions._guard(*pfade) is None
     except Exception:
         return False
+
+
+# ---------------------------------------------------------------------------
+# Wächter für steuernde Dateien im Daten-Ordner
+# ---------------------------------------------------------------------------
+# Manche Dateien steuern die KI selbst oder laufen später ohne den Nutzer:
+#   Persoenlichkeiten/*.md (ohne .sprueche.md), Agenten/*.md – der Wächter liest die Änderung
+#     mit den Regeln des Skill-Wächters; harmlos → Stift, sonst Rückfrage mit Grund.
+#   Zeitplan/, Befehle/ – immer Rückfrage (läuft von allein bzw. ist ein Programm).
+# Gilt in jedem Modus (modes.decide), „Immer“ gibt es dafür nicht.
+_STEUERND_IMMER = ("zeitplan", "befehle")
+_STEUERND_TEXT = ("persoenlichkeiten", "agenten")
+_MIN_REST = 0.4
+
+
+def _neuer_text(act: dict, p: Path) -> str | None:
+    """Inhalt nach der Änderung – None, wenn er sich nicht vorher bestimmen lässt."""
+    tool = act.get("tool")
+    if tool == "datei_schreiben":
+        return str(act.get("inhalt") or "")
+    if tool == "datei_bearbeiten":
+        try:
+            alt = p.read_text(encoding="utf-8")
+        except OSError:
+            alt = ""
+        return alt.replace(str(act.get("alt") or ""), str(act.get("neu") or ""), 1)
+    return None
+
+
+def _waechter_text(text: str, p: Path) -> str | None:
+    import skillwaechter
+    if (grund := skillwaechter._inhalt(text) or skillwaechter.riskante_aktion(text)):
+        return grund
+    try:
+        alt = p.read_text(encoding="utf-8") if p.is_file() else ""
+    except OSError:
+        alt = ""
+    if len(alt) >= 200 and len(text.strip()) < len(alt) * _MIN_REST:
+        return "würde die Datei fast leeren"
+    return None
+
+
+def steuerdatei_grund(act: dict) -> str | None:
+    """Warum eine Änderung im Daten-Ordner trotz Stift fragen muss – oder None."""
+    if act.get("tool") not in _ARBEITSBEREICH_TOOLS:
+        return None
+    try:
+        import paths
+        import actions
+        daten = Path(paths.DATEN).resolve()
+        pfade = [str(act.get(f)) for f in _PFAD_FELDER if isinstance(act.get(f), str) and act.get(f).strip()]
+        for roh in pfade:
+            for p in actions._kandidaten(roh) or []:
+                if not p.is_relative_to(daten) or p == daten:
+                    continue
+                erster = p.relative_to(daten).parts[0].lower()
+                if erster in _STEUERND_IMMER:
+                    return f"{p.relative_to(daten).parts[0]}/ läuft später von allein – das entscheidest du"
+                if erster in _STEUERND_TEXT and p.suffix.lower() == ".md" \
+                        and not p.name.lower().endswith(".sprueche.md"):
+                    if (text := _neuer_text(act, p)) is None:
+                        return "eine Anleitung wird hierher kopiert oder verschoben – den Inhalt prüft der Wächter so nicht"
+                    if (grund := _waechter_text(text, p)):
+                        return f"die Änderung an {p.name} {grund}"
+    except Exception:
+        return "die Änderung ließ sich nicht prüfen"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -319,7 +395,49 @@ def frage(act: dict) -> str:
         if tool == "zeitplan":
             return "⚠ RISIKO – läuft künftig OHNE dich im Hintergrund. Wie weiter?"
         return "⚠ RISIKO – ganzer Ordner. Wie weiter?"
+    if (grund := _netz_grund(act)):
+        return f"🛡 Netz-Sperre: {grund}. Trotzdem ausführen?"
+    if act.get("tool") == "web_lesen" and _verdaechtig(act):
+        return "⚠ Diese Seite hat schon einmal versucht, die KI zu steuern. Trotzdem laden?"
+    if act.get("tool") == "web_lesen" and not _fremd_frei(act):
+        return ("Unbekannte Seite, die aus keinem Suchtreffer stammt – über die Adresse könnten Daten "
+                "nach draußen gehen. Prüf die Adresse. Laden?" if not _fremd_fragen()
+                else "Unbekannte Seite außerhalb der Allowlist (Fremdseiten: fragen). Laden?")
+    if (grund := steuerdatei_grund(act)):
+        return f"🛡 Wächter: {grund}. Trotzdem ausführen?"
     return "Wie möchtest du fortfahren?"
+
+
+def _fremd_frei(act: dict) -> bool:
+    try:
+        import webfetch
+        return webfetch.fremd_ohne_nachfrage(str(act.get("url") or ""))
+    except Exception:
+        return False
+
+
+def _fremd_fragen() -> bool:
+    try:
+        import webfetch
+        return webfetch.fremdseiten_modus() == "fragen"
+    except Exception:
+        return False
+
+
+def _verdaechtig(act: dict) -> bool:
+    try:
+        import webfetch
+        return webfetch.verdaechtig(str(act.get("url") or ""))
+    except Exception:
+        return False
+
+
+def _netz_grund(act: dict) -> str | None:
+    try:
+        import actions
+        return actions.fremd_grund(act)
+    except Exception:
+        return None
 
 
 def optionen(act: dict) -> list[tuple[str, str]]:
@@ -331,7 +449,8 @@ def optionen(act: dict) -> list[tuple[str, str]]:
         import coding
         return coding.frage_und_optionen(act)[1]
     s = stufe(act)
-    if s == RISKANT or act.get("tool") == "befehl":
+    if (s == RISKANT or act.get("tool") in ("befehl", "web_lesen") or steuerdatei_grund(act)
+            or _netz_grund(act)):
         return [("yes", "Ja, ausführen"), ("no", "Nein, abbrechen")]
     return [("yes", "Ja, ausführen"),
             ("always", "Ja – und solche Aktionen diese Sitzung nicht mehr fragen"),

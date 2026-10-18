@@ -14,11 +14,34 @@ nach der Runde warm – erst nach IDLE_UNLOAD_S Ruhe fliegt er aus dem RAM.
 
 from __future__ import annotations
 
+import functools
 import json
 import math
+import os
 import re
+import shutil
 import threading
 import time
+
+try:
+    import debugbericht as _DBG
+except Exception:                                    # Selbsttest ohne core/ im Pfad
+    class _DBG:                                      # type: ignore[no-redef]
+        @staticmethod
+        def ereignis(*a, **k): pass
+
+        @staticmethod
+        def fehler(*a, **k): pass
+
+        @staticmethod
+        def motor_log(): pass
+
+        class messen:
+            def __init__(self, *a): pass
+
+            def __enter__(self): return self
+
+            def __exit__(self, *a): return False
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -54,23 +77,131 @@ letzter_grund = ""        # warum die letzte Notiz abgelehnt wurde (für das Wer
 # Datei laden / speichern
 # ---------------------------------------------------------------------------
 
-def _load(datei: Path | None = None) -> dict:
+# Gelesene Dateien bleiben gemerkt, solange Änderungszeit und Größe gleich sind: mit den Vektoren ist eine
+# Datei schnell einige MB groß, und eine neue Notiz las sie sonst mehrmals ganz ein (Sekunden).
+_gelesen: dict[Path, tuple[tuple[int, int], dict]] = {}
+_gelesen_lock = threading.Lock()
+# Lesen-ändern-schreiben nie aus zwei Fäden gleichzeitig (Reflexion im Hintergrund, Bibliothekar, Werkzeuge).
+_schreib_lock = threading.RLock()
+
+
+def _schreibend(f):
+    @functools.wraps(f)
+    def huelle(*a, **k):
+        with _schreib_lock:
+            return f(*a, **k)
+    return huelle
+
+
+def _stand(pfad: Path) -> tuple[int, int] | None:
     try:
-        data = json.loads((datei or _FILE).read_text(encoding="utf-8"))
-        if isinstance(data, dict) and isinstance(data.get("entries"), list):
-            return data
+        st = pfad.stat()
+    except OSError:
+        return None
+    return st.st_mtime_ns, st.st_size
+
+
+def _kopie(data: dict) -> dict:
+    """Eigene Hülle je Aufrufer (Einträge und Listen kopiert, die ändern sie); Vektoren werden nur ersetzt,
+    nie verändert – die bleiben geteilt."""
+    neu = {}
+    for k, v in data.items():
+        if isinstance(v, list):
+            v = [dict(x) if isinstance(x, dict) else x for x in v]
+        elif isinstance(v, dict):
+            v = dict(v)
+        neu[k] = v
+    return neu
+
+
+def _lesen(pfad: Path) -> dict | None:
+    stand = _stand(pfad)
+    if stand is None:
+        return None
+    with _gelesen_lock:
+        treffer = _gelesen.get(pfad)
+    if treffer is not None and treffer[0] == stand:
+        return _kopie(treffer[1])
+    try:
+        data = json.loads(pfad.read_text(encoding="utf-8"))
     except Exception:
-        pass
+        return None
+    if isinstance(data, dict) and isinstance(data.get("entries"), list):
+        with _gelesen_lock:
+            _gelesen[pfad] = (stand, data)
+        return _kopie(data)
+    return None
+
+
+def _load(datei: Path | None = None) -> dict:
+    """Notizen laden. Ist die Datei beschädigt (Absturz beim Schreiben), gilt die letzte gute
+    Fassung `memory.json.bak` – sonst würde das nächste Speichern alles durch eine leere ersetzen."""
+    ziel = datei or _FILE
+    data = _lesen(ziel)
+    if data is not None:
+        return data
+    bak = ziel.with_name(ziel.name + ".bak")
+    if ziel.exists() or bak.exists():
+        sicher = _lesen(bak)
+        _DBG.fehler(f"Gedächtnis {ziel.name} unlesbar – " + ("letzte gute Fassung (.bak) geladen"
+                                                             if sicher is not None else "keine .bak vorhanden"))
+        if sicher is not None:
+            return sicher
     return {"next_id": 1, "entries": []}
 
 
+# Text der Vektoren: ein Vektor wird nur ersetzt, nie verändert – sein Text bleibt gültig, solange es dasselbe
+# Objekt ist (das Objekt bleibt hier festgehalten, seine id also eindeutig). Sonst wandelte jede neue Notiz alle
+# Vektoren neu in Text (bei 2000 Notizen ~0,8 s, in der Zeit hält json das GIL).
+_vec_text: dict[int, tuple[list, str]] = {}
+
+
+def _eintrag_json(e) -> str:
+    vec = e.get("vec") if isinstance(e, dict) else None
+    if not isinstance(vec, list) or len(vec) < 64:
+        return json.dumps(e, ensure_ascii=False)
+    treffer = _vec_text.get(id(vec))
+    if treffer is not None and treffer[0] is vec:
+        text = treffer[1]
+    else:
+        text = json.dumps(vec)
+        _vec_text[id(vec)] = (vec, text)
+    rest = json.dumps({k: v for k, v in e.items() if k != "vec"}, ensure_ascii=False)
+    return rest[:-1] + (", " if len(rest) > 2 else "") + '"vec": ' + text + "}"
+
+
+def _als_text(data: dict) -> str:
+    """JSON mit einer Notiz je Zeile (Listen von Einträgen), Vektoren aus `_vec_text`."""
+    teile = []
+    for k, v in data.items():
+        if isinstance(v, list) and all(isinstance(x, dict) for x in v):
+            inhalt = "[\n" + ",\n".join(_eintrag_json(x) for x in v) + "\n]" if v else "[]"
+        else:
+            inhalt = json.dumps(v, ensure_ascii=False)
+        teile.append(json.dumps(k, ensure_ascii=False) + ": " + inhalt)
+    aktuell = {id(x["vec"]) for v in data.values() if isinstance(v, list)
+               for x in v if isinstance(x, dict) and isinstance(x.get("vec"), list)}
+    for schluessel in [s for s in _vec_text if s not in aktuell]:     # nur Vektoren, die es noch gibt
+        del _vec_text[schluessel]
+    return "{\n" + ",\n".join(teile) + "\n}\n"
+
+
 def _save(data: dict, datei: Path | None = None) -> None:
+    """Sicher schreiben: erst eine Zwischendatei, dann tauschen. Die bisherige Fassung bleibt als
+    .bak, wenn sie lesbar ist – eine beschädigte überschreibt nie die letzte gute Sicherung."""
     ziel = datei or _FILE
     try:
         ziel.parent.mkdir(parents=True, exist_ok=True)
-        ziel.write_text(json.dumps(data, ensure_ascii=False, indent=1), encoding="utf-8")
-    except Exception:
-        pass
+        tmp = ziel.with_name(ziel.name + ".tmp")
+        tmp.write_text(_als_text(data), encoding="utf-8")
+        if _lesen(ziel) is not None:
+            shutil.copyfile(ziel, ziel.with_name(ziel.name + ".bak"))    # kopieren: ziel bleibt bis zum Tausch da
+        os.replace(tmp, ziel)
+        if (stand := _stand(ziel)) is not None:                          # der neue Stand ist schon bekannt
+            with _gelesen_lock:
+                _gelesen[ziel] = (stand, _kopie(data))
+    except Exception as exc:
+        _DBG.fehler(f"Gedächtnis {ziel.name} nicht gespeichert: {exc}")
 
 
 def _profil_datei() -> Path | None:
@@ -155,6 +286,8 @@ _last_use = 0.0
 _idle_thread = None
 _warm_thread = None
 _geraet_aktiv = ""       # "cuda" | "cpu" – worauf der geladene Encoder rechnet
+_gpu_pause_bis = 0.0     # monotonic: bis dahin gehört die GPU dem Bildmotor (gpu_freigeben)
+GPU_RUHE_S = 180.0       # so lange nach dem letzten Bild lädt der Encoder nicht neu
 
 
 GPU_AB_STANDARD = 32     # ab so vielen Texten in einem Auftrag rechnet „auto“ auf der GPU
@@ -230,7 +363,7 @@ def auftrag(anzahl: int):
     global _geraet_aktiv
     enc = None
     gewechselt = False
-    if geraet_gewuenscht() == "auto" and anzahl >= gpu_ab():
+    if geraet_gewuenscht() == "auto" and anzahl >= gpu_ab() and not gpu_pause():
         enc = _get_encoder()
         if enc is not None and str(getattr(enc, "device", "cpu")) == "cpu" and _gpu_frei_genug():
             try:
@@ -238,6 +371,7 @@ def auftrag(anzahl: int):
                     enc.to("cuda")
                     _geraet_aktiv = "cuda"
                 gewechselt = True
+                _DBG.ereignis(f"Embedding-Modell für {anzahl} Texte auf die GPU")
             except Exception:
                 try:
                     with enc._lock:
@@ -256,6 +390,7 @@ def auftrag(anzahl: int):
                 import embedder
                 with embedder.gpu_sperre():
                     torch.cuda.empty_cache()
+                _DBG.ereignis("Embedding-Modell zurück in den RAM")
             except Exception:
                 pass
 
@@ -441,6 +576,7 @@ def _get_encoder():
                         raise
             global _geraet_aktiv
             _geraet_aktiv = enc.device
+            _DBG.ereignis(f"Embedding-Modell geladen ({enc.device})")
             if enc.device == "cuda":
                 # Der allererste CUDA-Aufruf kostet ~16 s (Kernel-Start), danach 16 Brocken
                 # in 0,3 s. Das hier beim Laden abfangen – dann steht es unter „lade …“
@@ -462,8 +598,11 @@ def _get_encoder():
 
 
 def warm_encoder() -> None:
-    """Lädt den Encoder im Hintergrund vor – der Aufrufer wartet nicht."""
+    """Lädt den Encoder im Hintergrund vor – der Aufrufer wartet nicht. Nicht während eine
+    Bilderserie läuft: sonst lädt jede Suche ihn zwischen zwei Bildern wieder auf die GPU."""
     global _warm_thread
+    if gpu_pause():
+        return
     with _enc_lock:
         if _encoder is not None:            # geladen oder dauerhaft nicht da
             return
@@ -515,11 +654,25 @@ def _unload_locked() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+    _DBG.ereignis("Embedding-Modell entladen")
+
+
+def gpu_pause() -> bool:
+    """Gehört die GPU gerade dem Bildmotor? Dann lädt der Encoder nicht nach."""
+    return time.monotonic() < _gpu_pause_bis
 
 
 def gpu_freigeben() -> None:
     """Beim Bildermalen hat das Bildmodell die GPU allein: ein Encoder auf der GPU
-    wird entladen (wartet auf einen laufenden Auftrag) und lädt später neu."""
+    wird entladen (wartet auf einen laufenden Auftrag) und lädt erst GPU_RUHE_S nach
+    dem letzten Bild wieder; ein laufender Bibliothekar hört nach seinem Stapel auf."""
+    global _gpu_pause_bis
+    _gpu_pause_bis = time.monotonic() + GPU_RUHE_S
+    try:
+        import indexdb
+        indexdb.unterbrechen()
+    except Exception:
+        pass
     with _enc_lock:
         if encoder_loaded() and _geraet_aktiv == "cuda":
             with _encoder._lock:
@@ -551,6 +704,8 @@ def _embed_texts(texts: list[str], *, query: bool = False) -> list[list[float]] 
     Chat-Pfad nur aufrufen, wenn encoder_loaded() True ist."""
     if not texts:
         return None
+    if gpu_pause() and not encoder_loaded():
+        return None                          # Bilderserie läuft: nur Stichworte, Vektoren später
     enc = _get_encoder()
     if enc is None:
         return None
@@ -564,6 +719,31 @@ def _embed_texts(texts: list[str], *, query: bool = False) -> list[list[float]] 
     except Exception:
         return None
     return [v.tolist() for v in vecs]
+
+
+def frage_einbetten(text: str) -> list[list[float]] | None:
+    """Suchanfrage für den Chat einbetten, ohne zu warten: Rechnet der Bibliothekar gerade
+    oder wird der Encoder umgezogen, None – die Runde sucht dann nur nach Stichworten."""
+    global _last_use
+    if not _enc_lock.acquire(blocking=False):
+        return None
+    try:
+        enc = _encoder if encoder_loaded() else None
+    finally:
+        _enc_lock.release()
+    if enc is None or not enc._lock.acquire(blocking=False):
+        return None
+    try:
+        try:
+            vecs = enc.encode([text], normalize_embeddings=True, prompt_name="query")
+        except TypeError:
+            vecs = enc.encode([text], normalize_embeddings=True)
+        _last_use = time.time()
+        return [v.tolist() for v in vecs]
+    except Exception:
+        return None
+    finally:
+        enc._lock.release()
 
 
 # ---------------------------------------------------------------------------
@@ -599,6 +779,7 @@ def verdaechtig(text: str) -> str | None:
     return None
 
 
+@_schreibend
 def remember(text: str, kind: str = "fakt") -> dict | None:
     """Schreibt eine Notiz nach learned/memory.json. Kein Embedding hier –
     das macht der Bibliothekar nach der Runde (indexdb.after_turn).
@@ -663,9 +844,10 @@ def recall(query: str, k: int = RECALL_K) -> list[dict]:
     if qe:
         entries = []
         for datei in _dateien():
-            data = _load(datei)
-            if _backfill_vectors(data):
-                _save(data, datei)
+            with _schreib_lock:
+                data = _load(datei)
+                if _backfill_vectors(data):
+                    _save(data, datei)
             entries += data["entries"]
         qv = qe[0]
         kennung = modell_kennung()
@@ -703,6 +885,7 @@ def _archivieren(data: dict, eintrag: dict, grund: str) -> None:
     data["archiv"] = (data.get("archiv") or [])[-(MAX_ARCHIV - 1):] + [alt]
 
 
+@_schreibend
 def ersetzen(entry_id: int, text: str, kind: str | None = None) -> dict | None:
     """Eintrag `entry_id` bekommt einen neuen Text (alte Fassung ins Archiv) –
     statt einen widersprüchlichen zweiten anzuhängen. None = nicht gefunden/abgelehnt."""
@@ -735,6 +918,7 @@ def ersetzen(entry_id: int, text: str, kind: str | None = None) -> dict | None:
     return e
 
 
+@_schreibend
 def vergessen(entry_id: int, grund: str = "vergessen") -> bool:
     """Eintrag entfernen, aber im Archiv aufheben (nachvollziehbar, nicht mehr im Prompt)."""
     datei = _datei_von(entry_id)
@@ -775,6 +959,7 @@ def kern_block() -> str:
             + "\n".join(teile) + "\n" + fuss + "\n")
 
 
+@_schreibend
 def forget(entry_id: int) -> bool:
     datei = _datei_von(entry_id)
     if datei is None:
@@ -793,6 +978,7 @@ def forget(entry_id: int) -> bool:
     return False
 
 
+@_schreibend
 def clear() -> int:
     ids = []
     for datei in _dateien():
@@ -825,6 +1011,7 @@ def consolidate(threshold: float = 0.90) -> dict:
     return gesamt
 
 
+@_schreibend
 def _verdichten(datei: Path, threshold: float) -> dict:
     data = _load(datei)
     entries = data["entries"]

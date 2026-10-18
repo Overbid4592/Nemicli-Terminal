@@ -11,7 +11,7 @@ Oberfläche will, geht über `oberflaeche.im_gui`. Beendet wird über das
 Tray-Menü, /wache stop (Stopp-Datei) oder Strg+C. Ohne Qt (fehlt PySide6)
 läuft die Wache kopflos weiter – ohne Schild und Kugel.
 
-main.py stellt: `wecken(alarme) -> str` (Weckruf, Bericht zurück),
+main.py stellt: `wecken(alarme, nachhaken=False) -> str` (Weckruf, Bericht zurück),
 `chat(text, bilder) -> (antwort, neue_bilder, todo_text)` (Gespräch über die Kugel),
 `chat_neu()` (Kugel-Gespräch leeren),
 den Programm-Ordner und den Namen der aktiven Persönlichkeit.
@@ -20,8 +20,6 @@ den Programm-Ordner und den Namen der aktiven Persönlichkeit.
 from __future__ import annotations
 
 import asyncio
-import subprocess
-import sys
 import threading
 import time
 from pathlib import Path
@@ -31,14 +29,17 @@ from .justierung import einstellungen
 from .motor import Motor
 from .wecker import Wecker
 
+UNKLAR_TAGE = 7          # so lange hält ein „unklar“-Urteil die Kugel gelb
+
 
 class Dienst:
     def __init__(self, wecken, install_ordner: Path, *, chat=None, chat_neu=None, name: str = "Persönlichkeit",
-                 nutzer: str = "du", mit_tray: bool = True, mit_kugel: bool = True):
+                 nutzer: str = "du", mit_tray: bool = True, mit_kugel: bool = True, name_von=None):
         ordner_anlegen()
         self.install = install_ordner
         self.name = name
         self.nutzer = nutzer
+        self._name_von = name_von
         self.motor = Motor(DB_PFAD)
         zugang.motor = self.motor
         self.loop = asyncio.new_event_loop()
@@ -50,6 +51,7 @@ class Dienst:
         self._kugel_schalter = mit_kugel      # --ohne-kugel gilt, bis der Nutzer sie selbst zeigt
         self._ende = threading.Event()
         self._einstellungs_stand = ""
+        self._stoerung_gemeldet = ""
         self._chat = chat
         self._chat_neu = chat_neu
         self.tray = None
@@ -63,7 +65,7 @@ class Dienst:
         if mit_tray and self.gui is not None:
             from .tray import Tray
             self.tray = Tray(stand=self.stand, aktion=self.aktion, install_ordner=install_ordner,
-                             berichte=BERICHTE, extra_menue=self._extra_menue)
+                             berichte=BERICHTE, extra_menue=self._extra_menue, oeffnen=self.nemicli_oeffnen)
 
     # ------------------------------------------------------------- Zustand
 
@@ -79,19 +81,54 @@ class Dienst:
             return {"farbe": "grau", "zahl": 0, "text": "🛡 NemiCLI-Wache · beendet",
                     "pausiert": True, "kugel": False}
         offen, echt = st.get("offen", 0), st.get("echt", 0)
+        try:
+            unklar = self.motor.speicher.unklar(time.time() - UNKLAR_TAGE * 86400)
+        except Exception:
+            unklar = 0
+        gestoert = self.motor.gestoert or ("" if self.motor.laeuft else "Motor steht")
         if self.pausiert:
             farbe, text = "grau", "🛡 NemiCLI-Wache · pausiert"
         elif echt:
             farbe, text = "rot", f"🛡 NemiCLI-Wache · {echt} ECHTE Auffälligkeit(en)!"
+            if gestoert:
+                text += " · Wache gestört"
+        elif gestoert:
+            farbe, text = "grau", f"🛡 NemiCLI-Wache · GESTÖRT: {gestoert}"
         elif offen:
             farbe, text = "gelb", f"🛡 NemiCLI-Wache · {offen} offene Alarme"
+        elif unklar:
+            farbe, text = "gelb", f"🛡 NemiCLI-Wache · {unklar} unklare(r) Alarm(e) – wird beobachtet"
         else:
             m = self.motor.stand()
+            dl = m.get("dl") or {}
+            folgen = ("" if not dl.get("an") else
+                      " · Folgen-Netz " + ("lernt noch" if not dl.get("trainiert") else
+                                           "warnt" if dl.get("alarm") else "im Schatten"))
             text = (f"🛡 NemiCLI-Wache · ruhig · {m['gespeichert']} Ereignisse · "
-                    f"Modell {'trainiert' if m['ml']['trainiert'] else 'lernt noch'}")
+                    f"Modell {'trainiert' if m['ml']['trainiert'] else 'lernt noch'}{folgen}")
             farbe = "gruen"
-        return {"farbe": farbe, "zahl": offen + echt, "text": text, "pausiert": self.pausiert,
+        return {"farbe": farbe, "zahl": offen + echt + unklar, "text": text, "pausiert": self.pausiert,
                 "kugel": self.kugel_erlaubt}
+
+    def _melden(self, titel: str, text: str) -> None:
+        """Hinweis neben der Uhr – wenn die Kugel gerade nicht zu sehen ist."""
+        if self.tray is not None:
+            self.tray.melden(titel, text)
+
+    def _aufgabe_fertig(self, e: dict) -> None:
+        """Hintergrund-Aufgabe im Wache-Prozess fertig (Thread der asyncio-Schleife)."""
+        if self.kugel is not None:
+            self.kugel.im_gui(lambda: self.kugel.aufgabe_fertig(e))
+        else:
+            self._melden("NemiCLI", f"{'Fertig' if e.get('ok') else 'Gescheitert'}: {e.get('titel', '')}")
+
+    def _erinnerungen_ohne_kugel(self) -> None:
+        """Ohne Kugel (kein Qt, kein Chat) holt der Wächter fällige Erinnerungen ab."""
+        if self.kugel is not None:
+            return
+        from . import erinnerungen
+        for d in erinnerungen.abholen():
+            self._melden("Erinnerung", erinnerungen.meldung(d))
 
     def _tray_hinweis(self, alarme) -> None:
         if self.tray is None:
@@ -120,7 +157,8 @@ class Dienst:
     def _extra_menue(self) -> list[tuple]:
         return [
             (lambda: "Kugel verstecken" if self.kugel_erlaubt else "Kugel zeigen", lambda: self.aktion("kugel")),
-            ("Mit ihr reden (Kugel-Fenster)", lambda: self.aktion("chat")),
+            (lambda: f"Mit {self.kugel.name if self.kugel is not None else self.name} reden (Kugel-Fenster)",
+             lambda: self.aktion("chat")),
         ]
 
     def aktion(self, name: str) -> None:
@@ -145,6 +183,15 @@ class Dienst:
                 speichern({"kugel": self.kugel_erlaubt})
             except Exception:
                 pass
+            if self.kugel_erlaubt:               # „Kugel zeigen“ holt sie auch zurück, wenn sie sich versteckt hat
+                try:
+                    from . import steuerung
+                    z = steuerung.lesen()
+                    if z.get("versteckt"):
+                        z["versteckt"] = False
+                        steuerung.schreiben(z)
+                except Exception:
+                    pass
         elif name == "chat":
             if self.kugel is not None:
                 self.kugel_erlaubt = self._kugel_schalter = True
@@ -153,24 +200,10 @@ class Dienst:
             self.beenden()
 
     def nemicli_oeffnen(self) -> None:
-        cmd = self.install / "nemicli.cmd"
         try:
-            if getattr(sys, "frozen", False):
-                # NemiCLI im eigenen Terminal-Fenster (NemiCLI.exe ohne Auftrag öffnet es);
-                # fehlt die fensterlose exe, die Terminal-exe in einer neuen Konsole.
-                from paths import exe_mit_fenster, exe_ohne_fenster
-                w = exe_ohne_fenster()
-                if w.name.lower() == "nemicli.exe":
-                    subprocess.Popen([str(w)], cwd=str(Path.home()))
-                else:
-                    subprocess.Popen([str(exe_mit_fenster())], cwd=str(Path.home()),
-                                     creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
-            elif cmd.exists():
-                subprocess.Popen(["cmd", "/c", "start", "", str(cmd)], cwd=str(Path.home()))
-            else:
-                subprocess.Popen(["cmd", "/c", "start", "", "python", str(self.install / "main.py")],
-                                 cwd=str(Path.home()))
-        except OSError:
+            import kontextmenue
+            kontextmenue.fenster_starten()
+        except Exception:
             pass
 
     def screenshot(self) -> Path | None:
@@ -209,21 +242,47 @@ class Dienst:
     # ------------------------------------------------------------- Laufen
 
     def _waechter(self) -> None:
-        """Stopp-Datei jede Sekunde, Einstellungen und Lebenszeichen alle 10 s."""
+        """Stopp-Datei jede Sekunde, Einstellungen und Lebenszeichen alle 10 s.
+        Jeder Schritt ist einzeln abgesichert: ein Fehler (Datei kurz gesperrt) darf
+        den Wächter nicht beenden, sonst wirkt /wache stop nicht mehr."""
         takt = 0
         while not self._ende.wait(1):
-            if zugang.stopp_gewuenscht():
-                try:
-                    zugang.STOPP.unlink(missing_ok=True)
-                except OSError:
-                    pass
-                self.beenden()
-                return
+            try:
+                if zugang.stopp_gewuenscht():
+                    try:
+                        zugang.STOPP.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+                    self.beenden()
+                    return
+            except Exception:
+                pass
             takt += 1
             if takt % 10:
                 continue
-            self._einstellungen_pruefen()
-            zugang.lock_schreiben()          # Lebenszeichen
+            for schritt in (self._einstellungen_pruefen, zugang.lock_schreiben, self._stoerung_pruefen,
+                            self.motor.folgen.zeiger_pruefen, self._erinnerungen_ohne_kugel):
+                try:
+                    schritt()
+                except Exception:
+                    pass
+            if not self.pausiert:
+                try:
+                    self.wecker.pruefen()        # Zähl-Trigger, auch für Liegengebliebenes nach dem Start
+                except Exception:
+                    pass
+
+    def _stoerung_pruefen(self) -> None:
+        """Wechsel nach „gestört“ einmal als Hinweis neben der Uhr melden."""
+        if self.pausiert:
+            return
+        jetzt = self.motor.gestoert or ("" if self.motor.laeuft else "Motor steht")
+        if jetzt and not self._stoerung_gemeldet and self.tray is not None:
+            self.tray.melden("Wache gestört", jetzt)
+            self.tray.aktualisieren()
+        elif not jetzt and self._stoerung_gemeldet and self.tray is not None:
+            self.tray.aktualisieren()
+        self._stoerung_gemeldet = jetzt
 
     def _einstellungen_pruefen(self) -> None:
         try:
@@ -245,6 +304,16 @@ class Dienst:
 
     def laufen(self) -> int:
         zugang.lock_schreiben()
+        try:
+            import hintergrund
+            hintergrund.BEI_FERTIG.append(self._aufgabe_fertig)
+        except Exception:
+            pass
+        try:
+            import autobackup                    # tägliche Sicherung, auch wenn NemiCLI selbst nicht läuft
+            autobackup.starten()
+        except Exception:
+            pass
         self.kugel_erlaubt = bool(einstellungen().get("kugel", True)) and self.kugel_erlaubt
         threading.Thread(target=self._asyncio_thread, daemon=True, name="wache-asyncio").start()
         self.motor.start()
@@ -258,7 +327,8 @@ class Dienst:
                     self.kugel = Kugel(stand=self.stand, chat=self._chat, schleife=self.loop,
                                        sichtbar=self.kugel_sichtbar, name=self.name, nutzer=self.nutzer,
                                        nemicli_oeffnen=self.nemicli_oeffnen, screenshot=self.screenshot,
-                                       chat_neu=self._chat_neu)
+                                       chat_neu=self._chat_neu, name_von=self._name_von,
+                                       erinnerungen=True, leben=True, musik=True, melden=self._melden)
                 except Exception as exc:
                     print(f"Kugel nicht verfügbar: {exc}")
                     self.kugel = None

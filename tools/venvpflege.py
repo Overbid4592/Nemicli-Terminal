@@ -2,8 +2,8 @@
 venvpflege.py - Das venv neben NemiCLI aktuell halten (/update).
 
 Geprüft wird gegen requirements.txt (ohne torch): fehlt ein Paket, passt eine Version nicht zur Angabe, gibt es eine neuere
-erlaubte Version? torch wird nur repariert (falscher Bau für die Grafikkarte), nie einfach
-hochgezogen – der CUDA-Bau muss zur Karte passen; ein fehlendes torch holt /einrichten.
+erlaubte Version? torch & Co. installiert der Nutzer selbst im venv-Fenster (/venv) – hier wird ein falscher
+Bau für die Grafikkarte nur gemeldet, samt Befehl.
 
 Dazu bekannte Sicherheitslücken und Schadpakete aller installierten Pakete (luecken.py, OSV.dev):
 behoben wird mit der ersten Version, die die Lücke schließt – bei Paketen von NemiCLI nur
@@ -29,8 +29,10 @@ from typing import Callable, Optional
 import uvsetup
 
 AUSSTEHEND = uvsetup.RUNTIME / "update_ausstehend.txt"
-# Früher von NemiCLI installiert, heute nicht mehr gebraucht (SD-Pipeline, transformers).
-ALTLASTEN = ("transformers", "diffusers", "accelerate")
+# Früher von NemiCLI installiert, heute nicht mehr gebraucht (SD-Pipeline, transformers,
+# OpenCV – Gesichter findet jetzt das Seh-Modell; WebEngine/Addons – ausgebauter Browser, NemiCLI braucht
+# nur PySide6-Essentials). Bleiben, solange ein anderes Paket sie verlangt.
+ALTLASTEN = ("transformers", "diffusers", "accelerate", "opencv-python", "pyside6-webengine", "pyside6-addons")
 _TORCH_FAMILIE = {"torch", "torchvision", "torchaudio", "torch-directml"}
 
 
@@ -57,8 +59,9 @@ class Eintrag:
 
     @property
     def machbar(self) -> bool:
-        """luecke-offen: keine Behebung, die NemiCLI einspielen darf – nur Meldung."""
-        return self.grund != "luecke-offen"
+        """luecke-offen: keine Behebung, die NemiCLI einspielen darf – nur Meldung. torch & Co. installiert der
+        Nutzer selbst im venv-Fenster (/venv)."""
+        return self.grund != "luecke-offen" and self.name not in _TORCH_FAMILIE
 
     @property
     def installieren_als(self) -> str:
@@ -182,8 +185,16 @@ def _torch_eintrag(inst: dict[str, str]) -> Optional[Eintrag]:
     if "torch" not in inst:
         return None
     if S.gpu_info().get("vendor") == "nvidia" and wizard._torch_bau() in ("", "cpu"):
-        return Eintrag("torch", inst["torch"], "", "torch", "torch-bau")
+        return Eintrag("torch", inst["torch"], "", "torch", "torch-bau",
+                       hinweis=f"CPU-Bau statt CUDA – im venv-Fenster (/venv): {wizard.torch_befehl()}")
     return None
+
+
+def _pip_eintrag(inst: dict[str, str]) -> Optional[Eintrag]:
+    """uv legt venvs ohne pip an; ein `pip` in der Konsole griffe dann zum System-Python."""
+    if "pip" in inst:
+        return None
+    return Eintrag("pip", "", "", "pip", "fehlt", hinweis="damit pip im venv-Fenster (/venv) das venv trifft")
 
 
 STAND = {"luecken": ""}          # nach pruefen(): "" geprüft, sonst der Grund, warum nicht
@@ -265,6 +276,8 @@ def pruefen(veraltet: Optional[Callable[[], list[dict]]] = None,
     raus: list[Eintrag] = []
     if (t := _torch_eintrag(inst)) is not None:
         raus.append(t)
+    if (p := _pip_eintrag(inst)) is not None:
+        raus.append(p)
     for n, r in wuensche.items():
         spez = f"{r.name}{r.specifier}"
         if n not in inst:
@@ -401,7 +414,6 @@ def einspielen(auswahl: list[Eintrag], on_status=None) -> dict:
     holt bei Bruch die alte Version zurück; Gesperrtes wandert (geprüft) nach AUSSTEHEND.
     Rückgabe: {"jetzt", "spaeter", "neustart", "entfernt": [Namen],
                "abgelehnt", "zurueck": [(Name, Grund)]}."""
-    import wizard
     site = site_packages()
     jetzt, spaeter, neustart = [], [], []
     for e in auswahl:
@@ -422,8 +434,6 @@ def einspielen(auswahl: list[Eintrag], on_status=None) -> dict:
         r = _ausfuehren(_pip("uninstall") + ([] if uvsetup.UV_EXE.is_file() else ["-y"]) + [e.name], 600)
         (entfernt.append(e) if r.returncode == 0 else abgelehnt.append((e, _kurz(r.stderr or r.stdout))))
     vorher = {e.name: _laedt(e.name, site) for e in torch + rest if e.installiert} if site else {}
-    if torch:
-        wizard.install_torch(on_status)
     if rest:
         if on_status:
             on_status(f"installiere {len(rest)} Paket(e) – prüfe, ob alles zusammenpasst …")

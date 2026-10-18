@@ -9,6 +9,7 @@ Profile/<Name>/<name>.json:
     outfits        {Schlüssel: Text}
     posen          {Schlüssel: Text}
     regeln         [Text] – feste Vorgaben für Bilder der Figur
+    voice          {beschreibung, seed, sprache} – die Stimme (engines/stimme.py)
 
 Krea 2 kennt die Datei nicht: bild_malen/bild_serie setzen daraus den Prompt zusammen
 (Kern · Outfit · Pose · Szene · Stil) und nehmen den Referenz-Seed, außer es ist
@@ -46,6 +47,22 @@ def _bausteine(wert) -> dict[str, str]:
     return raus
 
 
+def stimme_sauber(v) -> dict | None:
+    """Der Eintrag `voice` – None, wenn er fehlt oder unbrauchbar ist."""
+    if not isinstance(v, dict) or not _text(v.get("beschreibung")):
+        return None
+    try:
+        seed = int(v.get("seed") or 0) & 0x7FFFFFFF
+    except (TypeError, ValueError):
+        seed = 0
+    raus = {"beschreibung": _text(v.get("beschreibung"))[:600], "seed": seed,
+            "sprache": _text(v.get("sprache"))[:20] or "german"}
+    for k in ("geschlecht", "stimmhoehe_hz"):
+        if v.get(k) not in (None, ""):
+            raus[k] = v[k] if isinstance(v[k], (int, float)) else _text(v[k])[:20]
+    return raus
+
+
 def _sauber(d: dict) -> dict:
     seed = d.get("seed_referenz")
     try:
@@ -55,10 +72,44 @@ def _sauber(d: dict) -> dict:
     regeln = d.get("regeln") or []
     if isinstance(regeln, str):
         regeln = [regeln]
-    return {"name": _text(d.get("name"))[:60], "kern": _text(d.get("kern")), "seed_referenz": seed,
+    raus = {"name": _text(d.get("name"))[:60], "kern": _text(d.get("kern")), "seed_referenz": seed,
             "stil": _text(d.get("stil")), "outfits": _bausteine(d.get("outfits")),
             "posen": _bausteine(d.get("posen")),
             "regeln": [r for r in (_text(x) for x in regeln) if r][:MAX_REGELN]}
+    if (stimme := stimme_sauber(d.get("voice"))):
+        raus["voice"] = stimme                          # Stimme bleibt beim Speichern erhalten
+    return raus
+
+
+def roh(name: str | None = None) -> dict:
+    """Die Datei, wie sie ist (auch ohne Kern) – {} ohne Datei."""
+    try:
+        d = json.loads(datei(name).read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return d if isinstance(d, dict) else {}
+
+
+def stimme_setzen(voice: dict, name: str | None = None) -> Path:
+    """`voice` in die Charakter-Datei schreiben, alles andere bleibt, wie es ist."""
+    v = stimme_sauber(voice)
+    if v is None:
+        raise ValueError("Die Beschreibung der Stimme fehlt.")
+    d = roh(name)
+    if not d.get("name"):
+        try:
+            import persoenlichkeiten
+            d["name"] = name or persoenlichkeiten.active().name
+        except Exception:
+            d["name"] = name or ""
+    d["voice"] = v
+    p = datei(name)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    if p.is_file():
+        import snapshot
+        snapshot.sichern(p, "stimme_festlegen")
+    p.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+    return p
 
 
 def laden(name: str | None = None) -> dict | None:
@@ -135,6 +186,8 @@ def zeigen(d: dict | None, name: str | None = None) -> str:
     for feld in ("outfits", "posen"):
         zeilen.append(f"{feld}: " + ("; ".join(f"{k} = {v}" for k, v in d[feld].items()) or "–"))
     zeilen.append("regeln: " + (" · ".join(d["regeln"]) or "–"))
+    if d.get("voice"):
+        zeilen.append(f"voice: {d['voice']['beschreibung']} (Seed {d['voice']['seed']})")
     return "\n".join(zeilen)
 
 
@@ -152,6 +205,8 @@ def aendern(a: dict) -> tuple[str, bool]:
     neu = _neu(alt, a)
     if (fehler := _pruefen(neu)):
         return fehler, False
+    if "voice" not in neu and (stimme := stimme_sauber(roh().get("voice"))):
+        neu["voice"] = stimme                           # Datei ohne Kern, aber mit Stimme
     p = datei()
     p.parent.mkdir(parents=True, exist_ok=True)
     if p.is_file():

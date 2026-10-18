@@ -61,6 +61,10 @@ class Ereignis:
     nutzer: str = ""
     exe: str = ""
     cmdline: str = ""
+    # Startzeit des Prozesses (psutil create_time) und seines Elternprozesses. Windows
+    # vergibt PIDs neu – erst PID + Startzeit bezeichnen genau einen Prozess. 0 = unbekannt.
+    start: float = 0.0
+    eltern_start: float = 0.0
 
     # Netz-Kontext
     lokal: str = ""
@@ -79,24 +83,28 @@ class Ereignis:
 
     SPALTEN = ("id", "zeit", "kategorie", "aktion", "schwere", "text", "prozess", "pid",
                "ppid", "eltern", "nutzer", "exe", "cmdline", "lokal", "ziel", "zielport",
-               "protokoll", "datei", "score", "anomalie", "extra")
+               "protokoll", "datei", "score", "anomalie", "extra", "start", "eltern_start")
 
     def zeile(self) -> tuple:
         return (self.id, self.zeit, self.kategorie, self.aktion, int(self.schwere), self.text,
                 self.prozess, self.pid, self.ppid, self.eltern, self.nutzer, self.exe,
                 self.cmdline, self.lokal, self.ziel, self.zielport, self.protokoll, self.datei,
                 self.score, int(self.anomalie),
-                json.dumps(self.extra, ensure_ascii=False) if self.extra else "")
+                json.dumps(self.extra, ensure_ascii=False) if self.extra else "",
+                self.start, self.eltern_start)
 
     @staticmethod
     def aus_zeile(r) -> "Ereignis":
+        k = r.keys()
         return Ereignis(
             id=r["id"], zeit=r["zeit"], kategorie=r["kategorie"], aktion=r["aktion"],
             schwere=Schwere(r["schwere"]), text=r["text"], prozess=r["prozess"], pid=r["pid"],
             ppid=r["ppid"], eltern=r["eltern"], nutzer=r["nutzer"], exe=r["exe"],
             cmdline=r["cmdline"], lokal=r["lokal"], ziel=r["ziel"], zielport=r["zielport"],
             protokoll=r["protokoll"], datei=r["datei"], score=r["score"],
-            anomalie=bool(r["anomalie"]), extra=json.loads(r["extra"]) if r["extra"] else {})
+            anomalie=bool(r["anomalie"]), extra=json.loads(r["extra"]) if r["extra"] else {},
+            start=float(r["start"] or 0.0) if "start" in k else 0.0,
+            eltern_start=float(r["eltern_start"] or 0.0) if "eltern_start" in k else 0.0)
 
     def kurz(self) -> str:
         """Eine Zeile für Berichte und die Persönlichkeit."""
@@ -109,18 +117,18 @@ class Alarm:
     titel: str
     text: str
     schwere: Schwere
-    regel: str                           # R001…R014 oder ML-001
+    regel: str                           # R001…R014, ML-001 oder DL-001
     ereignis_id: str = ""
     zeit: float = field(default_factory=time.time)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
-    quelle: str = "regel"                # "regel" oder "ml"
+    quelle: str = "regel"                # "regel", "ml" oder "dl" (Folgen-Netz)
     score: float = 0.0
     status: str = "offen"                # offen · gesehen · harmlos · echt
     urteil_von: str = ""                 # wer den Status gesetzt hat (Persönlichkeit, Nutzer)
     begruendung: str = ""
     # Worum es geht – der Prozess, bei R004 der Elternprozess, bei Dateien der Pfad, bei
-    # Netz „prozess → ziel“. Regel + Subjekt ist der Schlüssel fürs Verdichten (derselbe
-    # Vorgang soll nicht 100 Einzelalarme geben) und fürs Dämpfen.
+    # Netz „prozess → ziel“. Regel + Subjekt ist der Schlüssel fürs Verdichten
+    # (derselbe Vorgang gab sonst 100 Einzelalarme) und fürs Dämpfen.
     subjekt: str = ""
     anzahl: int = 1                      # wie oft dasselbe innerhalb des Cooldowns wiederkam
     zuletzt: float = 0.0                 # Zeit des letzten Wiederkommens (0 = nur einmal)

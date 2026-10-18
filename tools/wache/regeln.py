@@ -89,7 +89,10 @@ BESCHREIBUNG = {
 # neuer Dienst …): da ist JEDER Treffer eine eigene Frage, auch beim bekannten Prozess. Beispiel:
 # R001·powershell.exe 23× harmlos (Abfragen der KI selbst) darf ein echtes `powershell -enc`
 # nicht stumm schalten.
-MENGENREGELN = {"R004", "R007", "R008", "R009", "ML-001"}
+MENGENREGELN = {"R004", "R007", "R008", "R009", "ML-001", "DL-001"}
+# Wird verdichtet, aber nie gedämpft: R009 hat ein festes Subjekt („überwachte Ordner“) –
+# eine Dämpfung schaltete die Erkennung massenhafter Änderungen für alle Ordner ab.
+NIE_GEDAEMPFT = {"R009"}
 
 
 @dataclass

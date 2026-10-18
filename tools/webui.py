@@ -170,12 +170,6 @@ def _make_handler(bridge: WebBridge, handlers: dict):
                     self._send(403); return
                 self._json(handlers["state"]())
                 return
-            if path == "/chats":
-                if not token_ok(parsed, self.headers):
-                    self._send(403); return
-                fn = handlers.get("chats")
-                self._json(fn() if fn else {"current": 0, "chats": []})
-                return
             self._send(404)
 
         # --- SSE: offene Verbindung, schreibt Ereignis-Zeilen ---
@@ -230,11 +224,6 @@ def _make_handler(bridge: WebBridge, handlers: dict):
             if path == "/switch":
                 handlers["switch"](data.get("ref", ""))
                 self._send(204); return
-            if path == "/resume":
-                fn = handlers.get("resume")
-                if fn:
-                    fn(data.get("id"))
-                self._send(204); return
             if path == "/newchat":
                 fn = handlers.get("newchat")
                 if fn:
@@ -282,6 +271,7 @@ PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.cdnfonts.com; font-src 'self' https://fonts.gstatic.com https://fonts.cdnfonts.com; img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; form-action 'self'">
 <title>NemiCLI · WebUI</title>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
@@ -467,12 +457,11 @@ body.t-hc{--bg:#000;--panel:#0a0a0a;--panel2:#111;--text:#ffe600;--muted:#cccc00
     <div class="mark">✦</div>
     <div>
       <div class="logo">NemiCLI</div>
-      <div class="tag">dein Coding-Agent</div>
+      <div class="tag">deine eigene KI</div>
     </div>
   </div>
   <button id="newChatBtn" class="primary" type="button">＋ Neuer Chat</button>
-  <div class="section-title">Chats</div>
-  <div id="chatList" class="chatlist"></div>
+  <div class="chatlist"></div>
   <div class="side-foot">
     <span class="dot"></span>
     <span id="hintSide">Verbinde …</span>
@@ -508,7 +497,6 @@ body.t-hc{--bg:#000;--panel:#0a0a0a;--panel2:#111;--text:#ffe600;--muted:#cccc00
   <div class="section-title">Sitzung</div>
   <div class="card">
     <div class="kv"><span>Modell</span><b id="sModel">—</b></div>
-    <div class="kv"><span>Chat</span><b id="sChat">—</b></div>
     <div class="kv"><span>Kontext</span><b id="sCtx">—</b></div>
     <div class="ctx"><i id="sCtxBar"></i></div>
     <div class="kv"><span>Tokens</span><b id="sTok">—</b></div>
@@ -565,7 +553,8 @@ function atBottom(){ return log.scrollHeight - log.scrollTop - log.clientHeight 
 function toBottom(){ log.scrollTop = log.scrollHeight; }
 
 /* --- winziger Markdown-Renderer (genug für Chat) --- */
-function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');}
+/* auch Anführungszeichen: Link-Ziele landen in einem href-Attribut */
+function esc(s){return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;');}
 function md(src){
   const blocks=[];
   src = src.replace(/```([\s\S]*?)```/g,(m,c)=>{ blocks.push(c.replace(/^[a-zA-Z0-9]*\n/,'')); return '\uE000'+(blocks.length-1)+'\uE000'; });
@@ -789,31 +778,12 @@ function updateState(ev){
   if('helfer' in ev) setHelfer(ev.helfer);
   const name = (ev.model||'—') + (ev.strength?(' · '+ev.strength):'');
   $('#modelBtn').textContent = name;
-  $('#tokens').textContent = (ev.tokens? ('Σ '+ev.tokens+' Tok'):'') + (ev.chat?('  ·  Chat #'+ev.chat):'');
+  $('#tokens').textContent = (ev.tokens? ('Σ '+ev.tokens+' Tok'):'');
   if($('#sModel')) $('#sModel').textContent = ev.model||'—';
-  if($('#sChat')) $('#sChat').textContent = ev.chat?('#'+ev.chat):'—';
   if($('#sTok')) $('#sTok').textContent = ev.tokens? (ev.tokens+' Tok'):'—';
   const max=ev.ctx_max||0, cur=ev.ctx||0;
   if($('#sCtx')) $('#sCtx').textContent = max? (cur+' / '+max) : '—';
   if($('#sCtxBar')) $('#sCtxBar').style.width = (max? Math.min(100, Math.round(100*cur/max)) : 0)+'%';
-  renderChats(ev.chats||[], ev.chat);
-}
-function renderChats(list, current){
-  const box=$('#chatList'); if(!box) return;
-  box.innerHTML='';
-  if(!list.length){
-    box.innerHTML='<div style="padding:8px;font-size:.75em;color:var(--muted)">Noch keine gespeicherten Chats.</div>';
-    return;
-  }
-  list.forEach(c=>{
-    const b=document.createElement('button');
-    b.type='button';
-    b.className='chat'+(c.id===current?' active':'');
-    b.textContent='#'+c.id+' · '+(c.title||'(leer)');
-    b.title=c.updated||'';
-    b.onclick=()=>{ if(busy) return; api('/resume',{id:c.id}); };
-    box.appendChild(b);
-  });
 }
 function onChatSwitch(ev){
   log.innerHTML=''; cur=null; curRaw=''; curThink=''; progEl=null;

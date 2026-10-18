@@ -86,11 +86,11 @@ def laeuft() -> dict | None:
 
 
 def code_neuer_als(zeit: float) -> bool:
-    """Wurde am Programm (tools/wache, main.py, actions, modes, persona) seit `zeit`
+    """Wurde am Programm (tools/wache, main.py samt Teilen, actions, modes, persona) seit `zeit`
     etwas geändert? Dann läuft der Hintergrund-Prozess mit altem Stand."""
     install = Path(__file__).resolve().parent.parent.parent
-    dateien = list((install / "tools" / "wache").glob("*.py")) + [
-        install / "main.py", install / "tools" / "actions.py", install / "core" / "modes.py",
+    dateien = list((install / "tools" / "wache").glob("*.py")) + list(install.glob("main*.py")) + [
+        install / "tools" / "actions.py", install / "core" / "modes.py",
         install / "core" / "persona.py", install / "engines" / "comfyui.py"]
     try:
         return any(p.exists() and p.stat().st_mtime > zeit for p in dateien)

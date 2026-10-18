@@ -141,6 +141,11 @@ def wiederherstellen(eintrag: dict) -> str:
                 original.unlink()
     original.parent.mkdir(parents=True, exist_ok=True)
     shutil.move(str(kopie), str(original))
+    try:                                 # zurückgenommener Code zählt in der Coding-Sammlung nicht mehr
+        import codesammlung
+        codesammlung.verwerfen(original, eintrag.get("zeit", ""), str(kopie))
+    except Exception:
+        pass
     return str(original)
 
 

@@ -18,9 +18,9 @@ Zwei Einträge (nur für den angemeldeten Benutzer, HKCU – kein Admin nötig):
 
 Windows 11 zeigt solche Einträge unter „Weitere Optionen anzeigen" (Shift+F10).
 
-Aufruf aus dem Menü (ohne Konsolenfenster, pythonw.exe):
-    kontextmenue.py screenshot
-    kontextmenue.py bild "<pfad>"
+Aufruf aus dem Menü (ohne Konsolenfenster):
+    Quelltext:  pythonw.exe kontextmenue.py screenshot | bild "<pfad>" | antwort
+    exe:        NemiCLI.exe --kontext screenshot | bild "<pfad>" | antwort
 Ein-/Ausschalten in NemiCLI: /kontextmenue an · aus
 """
 
@@ -214,42 +214,69 @@ def uebergeben(nachricht: str) -> bool:
     return nemicli_starten(nachricht)
 
 
-def nemicli_starten(nachricht: str) -> bool:
-    """Öffnet ein neues NemiCLI-Fenster, das die Nachricht sofort abschickt. Der Text geht über
-    die Inbox-Datei, nicht über die Befehlszeile: cmd würde Zeichen wie %…% in Dateinamen
-    auswerten."""
-    if not NEMICLI_CMD.exists():
-        _hinweis("NemiCLI: nemicli.cmd nicht gefunden")
-        return False
-    if not an_laufendes(nachricht):
-        _hinweis("NemiCLI: Nachricht konnte nicht abgelegt werden")
-        return False
+def fenster_starten() -> bool:
+    """Ein neues NemiCLI-Fenster öffnen. exe: NemiCLI.exe öffnet sein eigenes Terminal-Fenster
+    (fehlt sie, NemiCLIc.exe in einer neuen Konsole); Quelltext: nemicli.cmd oder main.py."""
     try:
-        # `start` -> eigenes Konsolenfenster (Windows Terminal, wenn Standard)
-        subprocess.Popen(["cmd", "/c", "start", "", str(NEMICLI_CMD)], cwd=str(ROOT), close_fds=True)
+        if getattr(sys, "frozen", False):
+            from paths import exe_mit_fenster, exe_ohne_fenster
+            w = exe_ohne_fenster()
+            if w.name.lower() == "nemicli.exe":
+                subprocess.Popen([str(w)], cwd=str(Path.home()), close_fds=True)
+            else:
+                subprocess.Popen([str(exe_mit_fenster())], cwd=str(Path.home()), close_fds=True,
+                                 creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
+        elif NEMICLI_CMD.exists():
+            # `start` -> eigenes Konsolenfenster (Windows Terminal, wenn Standard)
+            subprocess.Popen(["cmd", "/c", "start", "", str(NEMICLI_CMD)], cwd=str(ROOT), close_fds=True)
+        else:
+            subprocess.Popen(["cmd", "/c", "start", "", "python", str(INSTALL / "main.py")],
+                             cwd=str(Path.home()), close_fds=True)
         return True
     except Exception as e:
         _hinweis(f"NemiCLI: Start fehlgeschlagen ({e})")
         return False
 
 
+def nemicli_starten(nachricht: str) -> bool:
+    """Öffnet ein neues NemiCLI-Fenster, das die Nachricht sofort abschickt. Der Text geht über
+    die Inbox-Datei, nicht über die Befehlszeile: cmd würde Zeichen wie %…% in Dateinamen
+    auswerten."""
+    if not an_laufendes(nachricht):
+        _hinweis("NemiCLI: Nachricht konnte nicht abgelegt werden")
+        return False
+    return fenster_starten()
+
+
 def nachricht_fuer(pfad: Path) -> str:
     return f"Schau dir bitte dieses Bild an und sag mir, was du siehst: {pfad}"
 
 
-def screenshot(warte_s: float = 0.6, ordner: Path | None = None, starten: bool = True) -> Path | None:
-    """Screenshot nach Bilder/Screenshots/, dann NemiCLI damit starten."""
+def bildschirm_speichern(pfad: Path) -> None:
+    """Bildschirm als PNG – mit Pillow, sonst mit Qt (die exe bringt kein Pillow mit)."""
     try:
         from PIL import ImageGrab
-    except Exception:
-        _hinweis("NemiCLI: PIL fehlt – kein Screenshot möglich")
-        return None
+    except ImportError:
+        ImageGrab = None
+    if ImageGrab is not None:
+        ImageGrab.grab().save(pfad)
+        return
+    from PySide6.QtGui import QGuiApplication
+    from PySide6.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication([])
+    screen = QGuiApplication.primaryScreen()
+    if screen is None or not screen.grabWindow(0).save(str(pfad), "PNG"):
+        raise RuntimeError("Bildschirm nicht lesbar")
+
+
+def screenshot(warte_s: float = 0.6, ordner: Path | None = None, starten: bool = True) -> Path | None:
+    """Screenshot nach Bilder/Screenshots/, dann NemiCLI damit starten."""
     time.sleep(warte_s)                                   # Rechtsklick-Menü erst schließen lassen
     ziel = (ordner or SCREENSHOT_DIR)
     try:
         ziel.mkdir(parents=True, exist_ok=True)
         pfad = ziel / f"screen_{datetime.now():%Y%m%d_%H%M%S}.png"
-        ImageGrab.grab().save(pfad)
+        bildschirm_speichern(pfad)
     except Exception as e:
         _hinweis(f"NemiCLI: Screenshot fehlgeschlagen ({e})")
         return None
@@ -298,7 +325,16 @@ def _python_ohne_fenster() -> str:
 
 
 def befehle() -> dict[str, str]:
-    """Die Kommandozeilen, die Windows beim Klick ausführt."""
+    """Die Kommandozeilen, die Windows beim Klick ausführt. In der exe gibt es kein Skript und
+    kein pythonw – dort startet die fensterlose NemiCLI.exe mit --kontext."""
+    if getattr(sys, "frozen", False):
+        from paths import exe_ohne_fenster
+        exe = str(exe_ohne_fenster())
+        return {
+            "screenshot": f'"{exe}" --kontext screenshot',
+            "bild": f'"{exe}" --kontext bild "%1"',
+            "antwort": f'"{exe}" --kontext antwort',
+        }
     py = _python_ohne_fenster()
     skript = str(Path(__file__).resolve())
     return {

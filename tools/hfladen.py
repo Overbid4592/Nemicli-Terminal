@@ -10,7 +10,9 @@ ModelGGUF/<Name>/ abgelegt; ein abgebrochener Download wird fortgesetzt.
 """
 from __future__ import annotations
 
+import functools
 import hashlib
+import json
 import math
 import re
 import shutil
@@ -33,8 +35,6 @@ GROESSEN = {                      # Schlüssel: (von, bis) in Milliarden Paramet
 _QUANT_VORZUG = ("Q4_K_M", "UD-Q4_K_XL", "Q4_K_S", "IQ4_XS", "IQ4_NL", "Q5_K_M", "UD-Q5_K_XL", "Q5_K_S",
                  "Q6_K", "UD-Q6_K_XL", "Q8_0", "Q4_0", "Q3_K_M", "UD-Q3_K_XL")
 _MMPROJ_VORZUG = ("BF16", "F16", "F32")
-_MOE_BAUARTEN = {"qwen2moe", "qwen3moe", "granitemoe", "ernie4_5-moe", "glm4moe", "gpt-oss", "deepseek2",
-                 "bailingmoe3"}
 _MOE_NAME = re.compile(r"(?i)(?:[-_ ]A(\d+(?:\.\d+)?)B\b|\b\d+x\d+(?:\.\d+)?B\b|\bMoE\b)")
 _EFFEKTIV = re.compile(r"(?i)[-_]E(\d+(?:\.\d+)?)B\b")     # Gemma „E4B“: effektive Größe zählt
 _QUANT = re.compile(r"(?i)(UD-)?((?:I?Q\d(?:_[A-Z0-9]+)+)|Q\d_\d|BF16|F16|F32|MXFP4(?:_MOE)?)(?=\.gguf$|-)")
@@ -127,17 +127,26 @@ def _json(url: str, params=None):
 # Suche
 # ---------------------------------------------------------------------------
 
-# Bauarten des Motors ohne torch abfragbar (ggufengine lädt torch schon beim Import) –
-# vor dem Einrichten soll man schon laden können. tests/test_hfladen.py hält die Liste
-# gleich mit ggufengine.models.SUPPORTED_ARCHS.
-BAUARTEN = ("qwen35", "gemma4", "bailingmoe3", "deepseek2", "llama", "mistral", "mistral3", "qwen2", "qwen3",
-            "qwen2moe", "qwen3moe", "k2-horizon", "gemma", "gemma2", "gemma3", "phi3", "granite", "granitemoe",
-            "olmo2", "olmo3", "gpt-oss", "ernie4_5", "ernie4_5-moe", "seed_oss", "exaone4", "cohere2",
-            "command-r", "glm4", "glm4moe", "smollm3")
+# Bauarten des Motors aus der Modell-Datenbank, direkt als JSON gelesen: ggufengine lädt torch
+# schon beim Import – vor dem Einrichten soll man schon laden können.
+try:                                     # exe: mitgeliefert im Bündel
+    from paths import ASSETS as _BASIS
+except ImportError:                      # ohne Bootstrap
+    _BASIS = Path(__file__).resolve().parent.parent
+_DB_BAUARTEN = _BASIS / "ggufengine" / "daten" / "bauarten.json"
+
+
+@functools.lru_cache(maxsize=1)
+def _bauarten() -> dict:
+    try:
+        tabelle = json.loads(_DB_BAUARTEN.read_text(encoding="utf-8")).get("bauarten")
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return tabelle if isinstance(tabelle, dict) else {}
 
 
 def unterstuetzt() -> set[str]:
-    return set(BAUARTEN)
+    return set(_bauarten())
 
 
 def ordnername(repo: str) -> str:
@@ -151,7 +160,7 @@ def ist_moe(bauart: str, repo: str) -> tuple[bool, str]:
     """(MoE?, aktive Parameter laut Name)."""
     m = _MOE_NAME.search(repo.split("/")[-1])
     aktiv = f"{m.group(1)}B" if m and m.group(1) else ""
-    return (bauart in _MOE_BAUARTEN or m is not None), aktiv.replace(".", ",")
+    return (bool((_bauarten().get(bauart) or {}).get("moe")) or m is not None), aktiv.replace(".", ",")
 
 
 def _modell(eintrag: dict, bauarten: set[str]) -> Optional[Modell]:
@@ -178,6 +187,8 @@ def katalog(holen: Callable = _json, neu: bool = False) -> list[Modell]:
     if _KATALOG is not None and not neu:
         return _KATALOG
     bauarten = unterstuetzt()
+    if not bauarten:
+        raise OSError(f"Modell-Datenbank nicht lesbar ({_DB_BAUARTEN}) – NemiCLI neu installieren")
     beste: dict[str, Modell] = {}
     fehler: Exception | None = None
     erreicht = False

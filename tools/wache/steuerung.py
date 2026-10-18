@@ -9,12 +9,16 @@ alle 1,5 s und setzt um, was neu ist.
              („isst Popcorn“) → Persoenlichkeiten/<Name>/<stimmung>.png
              (ältere Bilder: Persoenlichkeiten/<Name>_<stimmung>.png)
              (fehlt es: <Name>.png; fehlt auch das: die gemalte Kugel)
+  outfit     ein schon gemaltes Outfit anziehen (kugelbilder.py, Werkzeug kugel_anziehen) oder
+             „standard“ = Grundkleidung; Motive ohne Outfit-Bild bleiben in Grundkleidung
   sagen      Text für eine Sprechblase (+ sekunden)
   bewegung   huepfen · wackeln · nicken
   ecke       oben_links · oben_rechts · unten_links · unten_rechts · mitte
   position   [x, y] in Bildschirm-Pixeln
   versteckt  true/false – sich zurückziehen / wieder zeigen
   groesse    48 … 200 Pixel
+  bewegt     Gesichts-WebP von portraet_bewegen (<Video>_kugel.webp im eigenen Videos-Ordner) –
+             die Kugel spielt es zweimal rund ab und zeigt dann wieder ihr Bild
 
 GRENZEN (damit ein Desktop-Wesen nicht zur Nervensäge wird):
   • von sich aus reden höchstens alle `kugel_reden_min` Minuten (Config, Standard 10)
@@ -41,6 +45,7 @@ BEWEGUNGEN = ("huepfen", "wackeln", "nicken")
 ECKEN = ("oben_links", "oben_rechts", "unten_links", "unten_rechts", "mitte")
 GROESSE_MIN, GROESSE_MAX = 48, 200
 SAGEN_MAX = 200
+RUNDEN_MAX = 5                 # so oft spielt die Kugel ein bewegtes Porträt höchstens
 
 
 _hintergrund = 0
@@ -78,9 +83,43 @@ def _slug(name: str) -> str:
     return "".join(c for c in name.lower() if c.isalnum())
 
 
-def bilder(name: str) -> dict[str, Path]:
+def _outfit_bilder(ordner: Path) -> dict[str, Path]:
+    """Bilder des aktiven Outfits (outfit.json → Outfits/<outfit>/). Sie gelten vor den Grundbildern;
+    ein Motiv ohne Outfit-Bild bleibt in der Grundkleidung – der Ausdruck wechselt nie."""
+    try:
+        aktiv = str(json.loads((ordner / "outfit.json").read_text(encoding="utf-8")).get("aktiv") or "")
+    except Exception:
+        return {}
+    if not aktiv or _slug(aktiv) != aktiv:
+        return {}
+    out: dict[str, Path] = {}
+    for p in (ordner / "Outfits" / aktiv).glob("*.png"):
+        k = _slug(p.stem)
+        out["" if k == "neutral" else k] = p
+    return out
+
+
+def outfit_stand(name: str) -> tuple[str, set[str]]:
+    """(aktives Outfit oder "", Motive, die es darin schon gibt)."""
+    wer = _slug(name)
+    if BILDER_ORDNER.exists():
+        for ordner in BILDER_ORDNER.iterdir():
+            if ordner.is_dir() and _slug(ordner.name) == wer:
+                da = _outfit_bilder(ordner)
+                if da:
+                    return next(iter(da.values())).parent.name, set(da)
+                try:
+                    aktiv = str(json.loads((ordner / "outfit.json").read_text(encoding="utf-8")).get("aktiv") or "")
+                except Exception:
+                    aktiv = ""
+                return aktiv, set()
+    return "", set()
+
+
+def bilder(name: str, outfit: bool = True) -> dict[str, Path]:
     """Alle Bilder einer Persönlichkeit: {"": <Name>.png, "froh": <Name>_froh.png, …}
-    (Groß/klein egal: „Nemi_froh.png“, „nemi-froh.PNG“, „Mira_ernst.png“ passen alle)."""
+    (Groß/klein egal: „Nemi_froh.png“, „nemi-froh.PNG“, „Maia_ernst.png“ passen alle).
+    outfit=True: Bilder des aktiven Outfits ersetzen die gleichnamigen Grundbilder."""
     out: dict[str, Path] = {}
     if not BILDER_ORDNER.exists():
         return out
@@ -99,6 +138,8 @@ def bilder(name: str) -> dict[str, Path]:
             for p in ordner.glob("*.png"):
                 k = _slug(p.stem)
                 out["" if k == "neutral" else k] = p
+            if outfit:
+                out.update(_outfit_bilder(ordner))
     return out
 
 
@@ -110,12 +151,43 @@ def _reden_min() -> float:
         return 10.0
 
 
+def bewegt_pruefen(pfad: str, wer: str) -> str | None:
+    """Nur das Gesichts-WebP aus dem eigenen Videos-Ordner der Persönlichkeit."""
+    try:
+        import profilordner
+        p = Path(pfad).resolve()
+        eigen = profilordner.ordner("Videos", wer, anlegen=False).resolve()
+    except Exception:
+        return "bewegtes Porträt nicht lesbar"
+    if not p.name.endswith("_kugel.webp") or not p.is_relative_to(eigen) or not p.is_file():
+        return "bewegtes Porträt nur aus deinem Videos-Ordner (…_kugel.webp von portraet_bewegen)"
+    return None
+
+
 def steuern(a: dict, wer: str = "Persönlichkeit") -> str:
     """Die Aktion `kugel`: prüft, begrenzt, schreibt den Zustand. Gibt zurück, was passiert."""
     z = lesen()
     jetzt = time.time()
     getan: list[str] = []
     abgelehnt: list[str] = []
+
+    outfit = str(a.get("outfit") or "").strip()
+    if outfit:
+        try:
+            import kugelbilder as KB
+            key = KB.outfit_schluessel(outfit)
+            liste = KB.outfits(wer)["liste"]
+            if not key or key in KB.OUTFIT_STANDARD:
+                KB.outfit_anziehen(wer, "")
+                z["outfit_zeit"] = jetzt; getan.append("Grundkleidung")
+            elif key in liste:
+                KB.outfit_anziehen(wer, key)
+                z["outfit_zeit"] = jetzt; getan.append(f"Outfit {key}")
+            else:
+                abgelehnt.append(f"Outfit „{key}“ gibt es noch nicht – kugel_anziehen malt es"
+                                 + (f" (gemalt: {', '.join(liste)})" if liste else ""))
+        except Exception as exc:
+            abgelehnt.append(f"Outfit nicht gewechselt: {exc}")
 
     stimmung = str(a.get("stimmung") or a.get("bild") or "").strip().lower()
     if stimmung:
@@ -132,7 +204,12 @@ def steuern(a: dict, wer: str = "Persönlichkeit") -> str:
                     pass
             if stimmung in da or "" in da:
                 z["stimmung"] = stimmung
-                getan.append(f"Stimmung {stimmung}" + ("" if stimmung in da else f" (kein eigenes Bild dafür – zeige {da[''].name})"))
+                eigenes = stimmung in da or stimmung == "neutral"      # neutral.png ist das Standardbild
+                getan.append(f"Stimmung {stimmung}" + ("" if eigenes else f" (kein eigenes Bild dafür – zeige {da[''].name})"))
+                kleid, im_outfit = outfit_stand(wer)
+                if kleid and eigenes and ("" if stimmung == "neutral" else stimmung) not in im_outfit:
+                    getan.append(f"im Outfit {kleid} noch nicht gemalt – zeigt es in Grundkleidung "
+                                 "(kugel_anziehen mit motive malt es dazu)")
             else:
                 abgelehnt.append(f"kein Bild für „{stimmung}“ – /kugel malen legt Bilder in "
                                  f"Persoenlichkeiten/{wer}/ an (neutral.png = Standard)")
@@ -199,9 +276,21 @@ def steuern(a: dict, wer: str = "Persönlichkeit") -> str:
         except (TypeError, ValueError):
             abgelehnt.append("groesse muss eine Zahl sein")
 
+    bewegt = str(a.get("bewegt") or "").strip().strip('"')
+    if bewegt:
+        if (grund := bewegt_pruefen(bewegt, wer)):
+            abgelehnt.append(grund)
+        else:
+            z["bewegt"] = str(Path(bewegt).resolve()); z["bewegt_zeit"] = jetzt
+            try:
+                z["bewegt_runden"] = max(1, min(RUNDEN_MAX, int(a.get("runden") or 2)))
+            except (TypeError, ValueError):
+                z["bewegt_runden"] = 2
+            getan.append(f"bewegtes Porträt ({z['bewegt_runden']}×)")
+
     if not getan and not abgelehnt:
         da = bilder(wer)
-        return ("Nichts angegeben. Felder: stimmung, sagen (+sekunden, wichtig), bewegung, ecke, position, "
+        return ("Nichts angegeben. Felder: stimmung, outfit, sagen (+sekunden, wichtig), bewegung, ecke, position, "
                 "versteckt, groesse. " + (f"Bilder für dich: {', '.join(sorted(k or '(Standard)' for k in da))}."
                                           if da else f"Noch kein Bild für dich – /kugel malen legt sie in "
                                                      f"Persoenlichkeiten/{wer}/ an."))

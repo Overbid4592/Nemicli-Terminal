@@ -2,7 +2,7 @@
 indexdb.py - Bibliothekar nach der Chat-Runde.
 
 Ablauf (nicht im Dialog):
-  Chat → chats/*.json + *.md + learned/memory.json
+  Chat → Chat-Datenbank der Persönlichkeit (chatstore) + learned/memory.json
        → Embedding (CPU) → Vektoren
        → learned/memory.db
        → Encoder bleibt warm, schläft nach 10 min Ruhe von selbst ein
@@ -18,6 +18,9 @@ import hashlib
 import json
 import re
 import sqlite3
+import threading
+import time
+from array import array
 from datetime import datetime
 from pathlib import Path
 
@@ -33,16 +36,38 @@ OVERLAP = 80
 SEARCH_K = 8
 MIN_SCORE = 0.42
 BACKFILL_BATCH = 24
+UMWANDELN_JE_LAUF = 2000         # alte JSON-Vektoren je Bibliothekar-Lauf in float32 umschreiben
+SQL_WARTEN_S = 15.0              # so lange wartet ein Zugriff auf eine gerade schreibende Verbindung
 BERICHTE_BEHALTEN = 3            # so viele Berichte bleiben als Datei; ältere leben nur noch als Vektoren
 EMBED_BATCH = 16                 # so viele Brocken je Encoder-Aufruf – dazwischen wird Fortschritt gemeldet
 BERICHTE_JE_RUNDE = 2            # Berichte je Bibliothekar-Lauf (ein Wache-Bericht = bis zu 60 Brocken ≈ 90 s CPU)
 WISSEN_JE_RUNDE = 3              # geänderte Wissen-Dateien je Bibliothekar-Lauf
+CHAT_SCHRITT = 25_000            # Token: der laufende Chat steht im Kontext und wird erst je so viel Zuwachs eingebettet
+NACHZUEGLER_CHATS = 3            # so viele zuletzt benutzte andere Chats holt der Bibliothekar nach
+
+# Unterbrechen: Beginnt eine neue Runde, hört after_turn nach dem laufenden Stapel auf –
+# der Chat bekommt Encoder und CPU. Was fehlt, folgt im nächsten Lauf (Brocken ohne Vektor
+# holt nachvektorisieren nach). Ein Zähler statt eines Schalters: niemand muss zurücksetzen.
+_unterbrechung = 0
+_lauf_marke: int | None = None   # Zählerstand beim Start des laufenden after_turn (None = keiner läuft)
+_chat_stand: dict[str, int] = {}  # Chat-Ref → Token beim letzten Einbetten (in dieser Sitzung)
+_nachgeholt: dict[str, str] = {}    # Chat-Ref → Stand („aktualisiert“) beim letzten Nachholen
 
 # Fortschritt nach außen (Balken in der Statuszeile). after_turn(status=fn) setzt den Melder; die Einbett-Stellen
 # rufen _melden("Chat #152 · Brocken 12/40"). Ein „i/n“ in der Meldung wird in der Oberfläche
 # zum Balken (ui.progress_panel). Ohne Melder passiert nichts – Tests und Skripte merken nichts.
 _status = None
 _kontext = ""
+
+
+def unterbrechen() -> None:
+    """Neue Runde beginnt: ein laufender Bibliothekar hört nach dem aktuellen Stapel auf."""
+    global _unterbrechung
+    _unterbrechung += 1
+
+
+def _unterbrochen() -> bool:
+    return _lauf_marke is not None and _lauf_marke != _unterbrechung
 
 
 def _melden(text: str) -> None:
@@ -69,7 +94,11 @@ def _db_path() -> Path:
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
-    con = sqlite3.connect(str(path))
+    con = sqlite3.connect(str(path), timeout=SQL_WARTEN_S)
+    # WAL: Lesen (Prompt-Suche) und Schreiben (Bibliothekar) blockieren sich nicht gegenseitig.
+    # Die Einstellung bleibt in der Datei; /backup kopiert über die Backup-Schnittstelle samt WAL.
+    con.execute("PRAGMA journal_mode=WAL")
+    con.execute("PRAGMA synchronous=NORMAL")
     # REPLACE löscht die alte Zeile – ohne diesen Schalter liefe der Lösch-Trigger
     # dafür nicht, und der Stichwort-Index behielte eine Leiche.
     con.execute("PRAGMA recursive_triggers=ON")
@@ -107,6 +136,12 @@ def _nachruesten(con: sqlite3.Connection) -> None:
                con.execute("SELECT hash, vec FROM chunks WHERE vec IS NOT NULL").fetchall()]
         con.executemany("UPDATE chunks SET vec_modell=? WHERE hash=?", alt)
         con.commit()
+    # Abgleich des Such-Index (_zustand_lesen) ohne die Vektoren: datum und vec_modell liegen hinter dem
+    # großen vec-Text, ohne diesen Index liest SQLite dafür jede Zeile ganz.
+    con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_stand ON chunks(hash, vec_modell, datum)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_ref_stand ON chunks(ref, vec_modell)")
+    # wissen_namen liest nur diesen Index statt der Tabelle mit allen Texten
+    con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_kind_ref ON chunks(kind, ref)")
     fts_da = con.execute("SELECT 1 FROM sqlite_master WHERE name='chunks_fts'").fetchone()
     if not fts_da:
         con.execute("CREATE VIRTUAL TABLE chunks_fts USING fts5("
@@ -126,10 +161,27 @@ def _nachruesten(con: sqlite3.Connection) -> None:
         con.commit()
 
 
+def vec_packen(v) -> bytes:
+    """Vektor → float32-Bytes für die Spalte `vec` (vorher JSON-Text: etwa fünfmal größer, und
+    jedes Einlesen musste ihn Zahl für Zahl zerlegen)."""
+    return array("f", v).tobytes()
+
+
+def vec_entpacken(roh) -> list[float] | None:
+    """Spalte `vec` → Liste; liest float32-Bytes und das alte JSON."""
+    if roh is None:
+        return None
+    if isinstance(roh, (bytes, bytearray, memoryview)):
+        a = array("f")
+        a.frombytes(bytes(roh))
+        return a.tolist()
+    return json.loads(roh)
+
+
 def _alt_kennung(vec_json: str) -> str:
     try:
         import embedder
-        return embedder.alte_kennung(json.loads(vec_json))
+        return embedder.alte_kennung(vec_entpacken(vec_json))
     except Exception:
         return ""
 
@@ -261,7 +313,7 @@ def _upsert(kind: str, ref: str, texts: list[str]) -> int:
     kennung = _kennung() if vecs else ""
     rows = []
     for i, (h, p) in enumerate(new):
-        vec = json.dumps(vecs[i]) if vecs and i < len(vecs) else None
+        vec = vec_packen(vecs[i]) if vecs and i < len(vecs) else None
         rows.append((h, kind, ref, p, vec, now, datum, kennung if vec else ""))
     con.executemany(
         "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell) "
@@ -292,6 +344,8 @@ def _einbetten(texte: list[str]) -> list[list[float]] | None:
     with memory.auftrag(n) as auf_gpu:
         wo = " auf der GPU" if auf_gpu else ""
         for i in range(0, n, EMBED_BATCH):
+            if _unterbrochen():
+                return out or None                # Rest landet ohne Vektor, nachvektorisieren holt ihn
             teil = texte[i:i + EMBED_BATCH]
             _melden(f"{_kontext} · Brocken {i}/{n}{wo}" if _kontext else f"Brocken {i}/{n}{wo}")
             try:
@@ -332,20 +386,27 @@ def _profil_bedingung() -> tuple[str, list]:
             [f"chat:{eigen}:*", f"chatmd:{eigen}:*"])
 
 
-def _fremdes_profil(ref: str) -> bool:
+def _aktives_profil() -> str | None:
+    try:
+        import profilordner
+        return profilordner.aktiv()
+    except Exception:
+        return None
+
+
+def _fremdes_profil(ref: str, aktiv: str | None = None) -> bool:
+    """Chat einer anderen Persönlichkeit? `aktiv` vorher einmal holen, wenn viele Refs geprüft werden –
+    profilordner.aktiv() liest Einstellungen und Persönlichkeiten von der Platte."""
     teile = str(ref).split(":")
     if teile[0] not in ("chat", "chatmd") or len(teile) < 3:
         return False
-    try:
-        import profilordner
-        return teile[1] != profilordner.aktiv()
-    except Exception:
-        return False
+    aktiv = aktiv or _aktives_profil()
+    return aktiv is not None and teile[1] != aktiv
 
 
 def ingest_chat(chat_id: int, title: str, prompts: list[str], messages: list) -> int:
     global _kontext
-    _kontext = f"Chat #{chat_id}"
+    _kontext = f"Chat „{title[:24]}“" if title else "Chat"
     texts = []
     if title:
         texts.append(f"Chat #{chat_id}: {title}")
@@ -387,7 +448,7 @@ def ingest_note(note_id: int, text: str, kind: str = "fakt") -> int:
 
 
 def ingest_chat_file(chat_id: int) -> int:
-    """Liest chats/NNN.json (und .md, falls da) und schreibt Vektoren in memory.db."""
+    """Liest einen Chat aus der Chat-Datenbank (und eine alte NNN.md, falls da) und schreibt Vektoren in memory.db."""
     try:
         import chatstore
     except Exception:
@@ -408,6 +469,47 @@ def ingest_chat_file(chat_id: int) -> int:
             n += ingest_file("chatmd", md, f"chatmd:{teile[1]}:{md.name}" if len(teile) == 3 else None)
     except Exception:
         pass
+    return n
+
+
+def chat_tokens(chat_id: int) -> int:
+    """Geschätzte Token aller gespeicherten Nachrichten des Chats (~4 Zeichen je Token)."""
+    try:
+        import chatstore
+        data = chatstore.load(int(chat_id)) or {}
+    except Exception:
+        return 0
+    return sum(len(_msg_text(m)) for m in data.get("messages") or []) // 4
+
+
+def chat_faellig(chat_id: int, schritt: int = CHAT_SCHRITT) -> bool:
+    """Ist der Chat seit dem letzten Einbetten um `schritt` Token gewachsen?"""
+    return chat_tokens(chat_id) - _chat_stand.get(_chat_ref(chat_id), 0) >= schritt
+
+
+def chat_einbetten(chat_id: int) -> int:
+    n = ingest_chat_file(int(chat_id))
+    _chat_stand[_chat_ref(chat_id)] = chat_tokens(chat_id)
+    return n
+
+
+def nachzuegler_chats(aktuell: int | None, anzahl: int = NACHZUEGLER_CHATS) -> int:
+    """Die zuletzt benutzten anderen Chats vollständig einbetten – was dort unter
+    CHAT_SCHRITT liegen blieb (Chat gewechselt, Programm beendet), kommt so nach."""
+    try:
+        import chatstore
+        neueste = [m for m in chatstore.list_chats() if m["id"] != aktuell][:anzahl]   # neueste zuerst
+    except Exception:
+        return 0
+    n = 0
+    for meta in neueste:
+        if _unterbrochen():
+            break
+        ref = _chat_ref(meta["id"])
+        if _nachgeholt.get(ref) == meta["updated"]:      # seit dem letzten Nachholen unverändert
+            continue
+        n += chat_einbetten(int(meta["id"]))
+        _nachgeholt[ref] = meta["updated"]
     return n
 
 
@@ -450,8 +552,8 @@ def _ref_vollstaendig(ref: str) -> bool:
     erst mal ohne Vektor in der DB – dann darf die Datei nicht weg.)"""
     con = _connect()
     try:
-        r = con.execute("SELECT COUNT(*), SUM(vec IS NULL OR vec_modell != ?) FROM chunks WHERE ref=?",
-                        (_kennung(), ref)).fetchone()
+        r = con.execute("SELECT COUNT(*), SUM(vec_modell != ?) FROM chunks INDEXED BY idx_chunks_ref_stand "
+                        "WHERE ref=?", (_kennung(), ref)).fetchone()
     finally:
         con.close()
     return bool(r and r[0] and not r[1])
@@ -464,8 +566,8 @@ def nachvektorisieren(limit: int = BACKFILL_BATCH) -> int:
     if not kennung:
         return 0
     con = _connect()
-    rows = con.execute("SELECT hash, text FROM chunks WHERE vec IS NULL OR vec_modell != ? LIMIT ?",
-                       (kennung, limit)).fetchall()
+    rows = con.execute("SELECT hash, text FROM chunks WHERE rowid IN (SELECT rowid FROM chunks "
+                       "INDEXED BY idx_chunks_stand WHERE vec_modell != ? LIMIT ?)", (kennung, limit)).fetchall()
     con.close()
     if not rows:
         return 0
@@ -476,11 +578,36 @@ def nachvektorisieren(limit: int = BACKFILL_BATCH) -> int:
         return 0
     con = _connect()
     con.executemany("UPDATE chunks SET vec=?, vec_modell=? WHERE hash=?",
-                    [(json.dumps(v), kennung, h) for (h, _t), v in zip(rows, vecs)])
+                    [(vec_packen(v), kennung, h) for (h, _t), v in zip(rows, vecs)])
     con.commit()
     con.close()
     _invalidate()
     return len(vecs)
+
+
+def vektoren_umwandeln(limit: int = UMWANDELN_JE_LAUF) -> int:
+    """Alte JSON-Vektoren in float32-Bytes umschreiben, portionsweise. Hash, Modell und Werte
+    bleiben gleich – der Such-Index muss nichts neu einlesen."""
+    con = _connect()
+    n = 0
+    try:
+        zeilen = con.execute("SELECT rowid, vec FROM chunks WHERE typeof(vec) = 'text' LIMIT ?",
+                             (limit,)).fetchall()
+        for i in range(0, len(zeilen), 200):
+            if _unterbrochen():
+                break
+            teil = []
+            for rowid, roh in zeilen[i:i + 200]:
+                try:
+                    teil.append((vec_packen(json.loads(roh)), rowid))
+                except (ValueError, TypeError):
+                    continue
+            con.executemany("UPDATE chunks SET vec=? WHERE rowid=?", teil)
+            con.commit()
+            n += len(teil)
+    finally:
+        con.close()
+    return n
 
 
 def ingest_berichte(behalten: int | None = None, je_runde: int | None = BERICHTE_JE_RUNDE) -> tuple[int, int]:
@@ -510,6 +637,8 @@ def ingest_berichte(behalten: int | None = None, je_runde: int | None = BERICHTE
         neu = neu[:max(0, je_runde)]
     n = 0
     for i, p in enumerate(neu, 1):
+        if _unterbrochen():
+            break
         if len(neu) > 1:
             _melden(f"Berichte {i}/{len(neu)} · {p.name}")
         n += ingest_file("bericht", p)
@@ -567,7 +696,7 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
     neu = [(h, p) for h, p in reihe if h not in alt]
     vecs = _einbetten([p for _h, p in neu]) if neu else None
     kennung = _kennung() if vecs else ""
-    neue_vec = {h: json.dumps(vecs[i]) for i, (h, _p) in enumerate(neu) if vecs and i < len(vecs)}
+    neue_vec = {h: vec_packen(vecs[i]) for i, (h, _p) in enumerate(neu) if vecs and i < len(vecs)}
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     datum = _datum_fuer(kind, ref) or now
     rows = []
@@ -591,17 +720,26 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
     return len(neu)
 
 
+_WISSEN_NAMEN: dict = {}           # Stand der Datenbank -> Namen (der Prompt fragt jede Runde)
+
+
 def wissen_namen() -> list[str]:
     """Dateien aus Wissen/, die im Gedächtnis sind (Pfad relativ zu Wissen/).
     Legt keine Datenbank an – läuft auch beim Bau des System-Prompts."""
     if not _db_path().exists():
         return []
+    stand = (_db_stamp(), str(_db_path()))
+    if _WISSEN_NAMEN.get("stand") == stand:
+        return list(_WISSEN_NAMEN["namen"])
     con = _connect()
     try:
-        refs = [r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='wissen'")]
+        refs = [r[0] for r in con.execute(
+            "SELECT DISTINCT ref FROM chunks INDEXED BY idx_chunks_kind_ref WHERE kind='wissen'")]
     finally:
         con.close()
-    return sorted((r.split(":", 1)[1] for r in refs), key=str.casefold)
+    namen = sorted((r.split(":", 1)[1] for r in refs), key=str.casefold)
+    _WISSEN_NAMEN.update(stand=stand, namen=namen)
+    return list(namen)
 
 
 def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
@@ -620,7 +758,7 @@ def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
     basis = wissen.ordner()
     liste = wissen.dateien(basis)
     stempel = wissen.stempel(liste, basis)
-    if stempel == _stand("wissen"):
+    if stempel == _stand("wissen") or _unterbrochen():
         return 0
     texte, unlesbar = [], set()
     for p in liste:
@@ -647,7 +785,7 @@ def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
             if ref in drin:
                 drop_ref(ref)
             continue
-        if je_runde is not None and geschrieben >= je_runde:
+        if (je_runde is not None and geschrieben >= je_runde) or _unterbrochen():
             fertig = False
             break
         _kontext = f"Wissen {ref.split(':', 1)[1]}"
@@ -660,32 +798,42 @@ def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
     return n
 
 
-def after_turn(chat_id: int | None = None, status=None, alles: bool = False) -> int:
+def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
+               chat_erzwingen: bool = False) -> int:
     """Bibliothekar nach der Runde: Dateien lesen → embedden → memory.db.
 
-    chat_id: der gerade gespeicherte Chat (None = nur Notizen/Skills).
+    chat_id: der gerade gespeicherte Chat (None = nur Notizen/Skills). Er steht im Kontext
+             und wird nur je CHAT_SCHRITT Token Zuwachs eingebettet – oder sofort mit
+             `chat_erzwingen` (Kontext aufgeräumt: der ausgelagerte Teil muss findbar sein).
     status:  Melder für den Fortschritt (Text mit „i/n“ → Balken in der Oberfläche).
-    alles:   ohne Portionsgrenzen (Chats, Berichte, Nachzügler) – für /gedaechtnis indexieren."""
-    global _status, _kontext
+    alles:   ohne Portionsgrenzen und ohne Unterbrechen – für /gedaechtnis indexieren.
+    Beginnt währenddessen eine Runde (unterbrechen), bleiben die Rückstände für später."""
+    global _status, _kontext, _lauf_marke
     _status, _kontext = status, ""
+    _lauf_marke = None if alles else _unterbrechung
     n = 0
     try:
-        if chat_id:
-            n += ingest_chat_file(int(chat_id))
+        if chat_id and (alles or chat_erzwingen or chat_faellig(chat_id)):
+            n += chat_einbetten(int(chat_id))
         n += ingest_all_notes()
         n += ingest_learned()
-        n += backfill(10_000 if alles else BACKFILL_BATCH)
-        n += nachvektorisieren(1_000_000 if alles else BACKFILL_BATCH)
-        try:
-            n += ingest_berichte(je_runde=None if alles else BERICHTE_JE_RUNDE)[0]
-        except Exception:
-            pass
-        try:
-            n += ingest_wissen(None if alles else WISSEN_JE_RUNDE)
-        except Exception:
-            pass
+        rueckstand = [
+            lambda: nachzuegler_chats(chat_id),
+            lambda: backfill(10_000 if alles else BACKFILL_BATCH, ausser=None if alles else chat_id),
+            lambda: nachvektorisieren(1_000_000 if alles else BACKFILL_BATCH),
+            lambda: ingest_berichte(je_runde=None if alles else BERICHTE_JE_RUNDE)[0],
+            lambda: ingest_wissen(None if alles else WISSEN_JE_RUNDE),
+            lambda: vektoren_umwandeln(1_000_000 if alles else UMWANDELN_JE_LAUF) and 0,   # zählt nicht als neu
+        ]
+        for schritt in rueckstand:
+            if _unterbrochen():
+                break
+            try:
+                n += schritt()
+            except Exception:
+                pass
     finally:
-        _status, _kontext = None, ""
+        _status, _kontext, _lauf_marke = None, "", None
     return n
 
 
@@ -693,10 +841,10 @@ def offen() -> dict:
     """Was der Bibliothekar noch vor sich hat – für /gedaechtnis."""
     con = _connect()
     try:
-        ohne = int(con.execute("SELECT COUNT(*) FROM chunks WHERE vec IS NULL OR vec_modell != ?",
+        ohne = int(con.execute("SELECT COUNT(*) FROM chunks INDEXED BY idx_chunks_stand WHERE vec_modell != ?",
                                (_kennung(),)).fetchone()[0])
         drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='bericht'")}
-        gesamt = int(con.execute("SELECT COUNT(*) FROM chunks").fetchone()[0])
+        gesamt = int(con.execute("SELECT COUNT(*) FROM chunks INDEXED BY idx_chunks_stand").fetchone()[0])
     finally:
         con.close()
     ordner = _ROOT / "Berichte"
@@ -705,8 +853,9 @@ def offen() -> dict:
             "berichte_offen": sum(1 for p in berichte if f"bericht:{p.name}" not in drin)}
 
 
-def backfill(limit: int = BACKFILL_BATCH) -> int:
-    """Indexiert noch fehlende Chats/Skills/Snippets, portionsweise."""
+def backfill(limit: int = BACKFILL_BATCH, ausser: int | None = None) -> int:
+    """Indexiert noch fehlende Chats/Skills/Snippets, portionsweise. `ausser`: der laufende Chat –
+    der steht im Kontext und wird im eigenen Takt eingebettet (CHAT_SCHRITT)."""
     done = 0
     con = _connect()
     have_refs = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks")}
@@ -714,8 +863,10 @@ def backfill(limit: int = BACKFILL_BATCH) -> int:
     try:
         import chatstore
         for meta in chatstore.list_chats():
-            if done >= limit:
+            if done >= limit or _unterbrochen():
                 return done
+            if ausser is not None and meta["id"] == ausser:
+                continue
             ref = _chat_ref(meta["id"])
             if ref in have_refs:
                 continue
@@ -765,75 +916,203 @@ def backfill(limit: int = BACKFILL_BATCH) -> int:
 # einziges Matrix-Produkt. Neu eingelesen wird nur, wenn sich die Datei
 # geändert hat.
 
+#
+# Ändert sich die Datei (der Bibliothekar schreibt nach fast jeder Runde), werden nur geänderte Zeilen
+# nachgeladen: Jeder Vektor steht als JSON-Text in der DB, ein voller Aufbau kostet bei vielen Brocken
+# Minuten-Bruchteile bis Minuten. Den vollen Aufbau übernimmt im Prompt-Pfad ein Hintergrund-Faden.
+
 _CACHE: dict = {"stamp": None, "meta": None, "mat": None, "vecs": None, "idx": None, "zeile": {}}
+_INDEX_SPERRE = threading.Lock()
+_BAU_SPERRE = threading.Lock()
+_index_bau: threading.Thread | None = None
+_NACHLADEN_BIS = 0.5               # Anteil geänderter Zeilen, bis zu dem Nachladen billiger ist als neu bauen
+_IN_BLOCK = 500                    # Zeilen je „rowid IN (…)“-Abfrage
 
 
 def _db_stamp():
+    """Stand der Datenbank – mit der WAL-Datei, in der neue Einträge bis zum Checkpoint stehen."""
     try:
         st = _db_path().stat()
-        return (st.st_mtime_ns, st.st_size)
     except Exception:
         return None
+    try:
+        wal = Path(str(_db_path()) + "-wal").stat()
+        return (st.st_mtime_ns, st.st_size, wal.st_mtime_ns, wal.st_size)
+    except OSError:
+        return (st.st_mtime_ns, st.st_size)
 
 
 def _invalidate() -> None:
     _CACHE["stamp"] = None
 
 
-def _index() -> dict:
-    """Alle Brocken als Matrix im Speicher (mit Metadaten). Billig, wenn sich
-    an der DB nichts geändert hat."""
+def _index(warten: bool = True) -> dict | None:
+    """Alle Brocken als Matrix im Speicher (mit Metadaten). Billig, wenn sich an der DB nichts
+    geändert hat; sonst werden nur geänderte Zeilen nachgeladen.
+
+    warten=False (Prompt-Pfad): Baut gerade ein anderer Faden oder ist ein voller Aufbau nötig,
+    None – der volle Aufbau läuft dann im Hintergrund, die Suche nimmt diese Runde nur Stichworte."""
+    if not _INDEX_SPERRE.acquire(blocking=warten):
+        return None
+    try:
+        return _index_aktualisieren(voll_erlaubt=warten)
+    finally:
+        _INDEX_SPERRE.release()
+
+
+def _index_im_hintergrund() -> None:
+    global _index_bau
+    with _BAU_SPERRE:
+        if _index_bau is not None and _index_bau.is_alive():
+            return
+        _index_bau = threading.Thread(target=_index, name="nemi-index", daemon=True)
+        _index_bau.start()
+
+
+def _index_aktualisieren(voll_erlaubt: bool) -> dict | None:
     kennung = _kennung()
-    stamp = (_db_stamp(), kennung)
+    db = str(_db_path())
+    stamp = (_db_stamp(), kennung, db)
     if _CACHE["meta"] is not None and stamp[0] is not None and _CACHE["stamp"] == stamp:
         return _CACHE
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+    nachladbar = (np is not None and _CACHE["meta"] is not None and _CACHE.get("kennung") == kennung
+                  and _CACHE.get("db") == db and "zustand" in _CACHE)
+    if nachladbar:
+        try:
+            if _nachladen(stamp, kennung, np):
+                return _CACHE
+        except Exception:
+            pass
+    if not voll_erlaubt:
+        _index_im_hintergrund()
+        return None
+    _voll_aufbauen(stamp, kennung, db, np)
+    return _CACHE
+
+
+def _zustand_lesen(con, kennung: str) -> dict:
+    """rowid → (hash, hat Vektor des aktiven Modells, datum) – nur aus idx_chunks_stand, daher schnell.
+    vec_modell ist genau dann gesetzt, wenn ein Vektor da ist (alle Schreibstellen setzen beides zusammen)."""
+    return {r: (h, bool(kennung) and m == kennung, d or "") for r, h, m, d in con.execute(
+        "SELECT rowid, hash, vec_modell, datum FROM chunks INDEXED BY idx_chunks_stand")}
+
+
+def _vektor(vec_s, np):
+    if np is not None and isinstance(vec_s, (bytes, bytearray, memoryview)):
+        a = np.frombuffer(vec_s, dtype="<f4").astype("float32")   # float32: ohne Zerlegen
+    else:
+        try:
+            v = vec_entpacken(vec_s)
+        except Exception:
+            return None
+        if np is None or v is None:
+            return v
+        a = np.asarray(v, dtype="float32")
+    n = float(np.linalg.norm(a))
+    return a / n if n else a
+
+
+def _voll_aufbauen(stamp, kennung: str, db: str, np) -> None:
     meta: list[tuple] = []
-    vecs: list[list[float]] = []
-    idx: list[int] = []
+    vecs: list = []
+    vec_zeilen: list[int] = []
+    zustand: dict = {}
     try:
         con = _connect()
-        for rowid, kind, ref, text, vec_s, datum, vec_modell in con.execute(
-                "SELECT rowid, kind, ref, text, vec, datum, vec_modell FROM chunks"):
-            i = len(meta)
+        for rowid, h, kind, ref, text, vec_s, datum, vec_modell in con.execute(
+                "SELECT rowid, hash, kind, ref, text, vec, datum, vec_modell FROM chunks"):
             meta.append((kind, ref, text, datum or "", rowid))
-            if not vec_s or not kennung or vec_modell != kennung:
+            hat = vec_s is not None and bool(kennung) and vec_modell == kennung
+            zustand[rowid] = (h, hat, datum or "")
+            if not hat:
                 continue                  # kein Vektor oder von einem anderen Modell
-            try:
-                v = json.loads(vec_s)
-            except Exception:
-                continue
-            vecs.append(v)
-            idx.append(i)
+            v = _vektor(vec_s, np)
+            if v is not None:
+                vecs.append(v)
+                vec_zeilen.append(rowid)
         con.close()
     except Exception:
         pass
     mat = None
-    if vecs:
-        try:
-            import numpy as np
-            mat = np.asarray(vecs, dtype="float32")
-            norm = np.linalg.norm(mat, axis=1, keepdims=True)
-            norm[norm == 0] = 1.0
-            mat /= norm
-            vecs = []                 # numpy hat die Daten, Listen freigeben
-        except Exception:
-            mat = None                # ohne numpy: Notfall-Pfad in _scores
+    if vecs and np is not None:
+        mat = np.vstack(vecs)
+        vecs = []                         # numpy hat die Daten, Listen freigeben
+    _CACHE_setzen(stamp, kennung, db, meta, mat, vecs, vec_zeilen, zustand)
+
+
+def _nachladen(stamp, kennung: str, np) -> bool:
+    """Nur geänderte Zeilen einlesen. False, wenn sich so viel geändert hat, dass neu bauen billiger ist."""
+    con = _connect()
+    try:
+        jetzt = _zustand_lesen(con, kennung)
+        alt = _CACHE["zustand"]
+        weg = {r for r, z in alt.items() if r not in jetzt or jetzt[r][0] != z[0]}       # gelöscht/ersetzt
+        neu = [r for r, z in jetzt.items() if r not in alt or alt[r][0] != z[0]]
+        gleich = [r for r in jetzt if r in alt and alt[r][0] == jetzt[r][0]]
+        vec_dazu = [r for r in gleich if jetzt[r][1] and not alt[r][1]]                 # Vektor nachgetragen
+        vec_weg = {r for r in gleich if alt[r][1] and not jetzt[r][1]}
+        datum_neu = {r: jetzt[r][2] for r in gleich if jetzt[r][2] != alt[r][2]}
+        if len(neu) + len(vec_dazu) > _NACHLADEN_BIS * max(1, len(jetzt)):
+            return False
+        zeilen: dict[int, tuple] = {}
+        laden = neu + vec_dazu
+        for i in range(0, len(laden), _IN_BLOCK):
+            teil = laden[i:i + _IN_BLOCK]
+            zeilen.update({r[0]: r[1:] for r in con.execute(
+                "SELECT rowid, kind, ref, text, vec, datum FROM chunks WHERE rowid IN "
+                f"({','.join('?' * len(teil))})", teil)})
+    finally:
+        con.close()
+    meta_von = {m[4]: m for m in _CACHE["meta"] if m[4] not in weg}
+    for r, d in datum_neu.items():
+        if r in meta_von:
+            meta_von[r] = meta_von[r][:3] + (d,) + meta_von[r][4:]
+    dazu_r, dazu_v = [], []
+    for r in neu + vec_dazu:
+        if r not in zeilen:
+            continue                      # inzwischen gelöscht: der nächste Abgleich sieht es
+        kind, ref, text, vec_s, datum = zeilen[r]
+        meta_von[r] = (kind, ref, text, datum or "", r)
+        if jetzt[r][1] and (v := _vektor(vec_s, np)) is not None:
+            dazu_r.append(r)
+            dazu_v.append(v)
+    mat, vz = _CACHE["mat"], list(_CACHE["vec_zeilen"])
+    raus = weg | vec_weg | set(vec_dazu)
+    if mat is not None and raus:
+        behalten = [j for j, r in enumerate(vz) if r not in raus]
+        mat, vz = mat[behalten], [vz[j] for j in behalten]
+    if dazu_v:
+        mat = np.vstack(([mat] if mat is not None and len(mat) else []) + dazu_v)
+        vz += dazu_r
+    if mat is not None and not len(mat):
+        mat = None
+    meta = [meta_von[r] for r in sorted(meta_von)]
+    _CACHE_setzen(stamp, kennung, _CACHE["db"], meta, mat, [], vz, jetzt)
+    return True
+
+
+def _CACHE_setzen(stamp, kennung, db, meta, mat, vecs, vec_zeilen, zustand) -> None:
     zeile = {m[4]: i for i, m in enumerate(meta)}
-    _CACHE.update({"stamp": stamp, "meta": meta, "mat": mat, "vecs": vecs, "idx": idx, "zeile": zeile})
-    return _CACHE
+    idx = [zeile[r] for r in vec_zeilen]
+    _CACHE.update({"stamp": stamp, "meta": meta, "mat": mat, "vecs": vecs, "idx": idx, "zeile": zeile,
+                   "vec_zeilen": vec_zeilen, "zustand": zustand, "kennung": kennung, "db": db})
 
 
-def _scores(ix: dict, qv: list[float]) -> list[tuple[float, int]]:
-    """(Ähnlichkeit, meta-Index) für alle Brocken mit Vektor."""
+def _scores(ix: dict, qv: list[float], ab: float = -1.0) -> list[tuple[float, int]]:
+    """(Ähnlichkeit, meta-Index) für alle Brocken mit Vektor und Ähnlichkeit ≥ ab."""
     mat, idx = ix["mat"], ix["idx"]
     if mat is not None:
         import numpy as np
         q = np.asarray(qv, dtype="float32")
         n = float(np.linalg.norm(q)) or 1.0
         sims = mat @ (q / n)
-        return [(float(s), idx[j]) for j, s in enumerate(sims)]
+        return [(float(sims[j]), idx[j]) for j in np.flatnonzero(sims >= ab)]
     import memory
-    return [(memory._cos(qv, v), idx[j]) for j, v in enumerate(ix["vecs"] or [])]
+    return [(s, idx[j]) for j, v in enumerate(ix["vecs"] or []) if (s := memory._cos(qv, v)) >= ab]
 
 
 def _hit(meta_row: tuple, score: float, wie: str = "") -> dict:
@@ -896,9 +1175,9 @@ def _filter_sql(arten, seit, bis, ref_praefix) -> tuple[str, list]:
     return (" AND " + " AND ".join(teile)) if teile else "", werte
 
 
-def _passt(meta_row: tuple, arten, seit, bis, ref_praefix) -> bool:
+def _passt(meta_row: tuple, arten, seit, bis, ref_praefix, aktiv: str | None = None) -> bool:
     kind, ref, _t, datum = meta_row[:4]
-    if _fremdes_profil(ref):
+    if _fremdes_profil(ref, aktiv):
         return False
     if arten and kind not in arten:
         return False
@@ -922,12 +1201,15 @@ def suchen(frage: str, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: st
     Encoder bleibt die Stichwortsuche."""
     if not (frage or "").strip():
         return []
-    ix = _index()
-    meta = ix["meta"] or []
-    if not meta:
+    uhr = time.perf_counter()
+    ix = _index(warten=laden)            # Prompt-Pfad: nie auf einen Neuaufbau warten
+    uhr = _messen("Index", uhr)
+    if ix is not None and not ix["meta"]:
         return []
-    punkte: dict[int, float] = {}
+    meta = ix["meta"] if ix is not None else []
+    punkte: dict[int, float] = {}        # rowid → Punkte
     wie: dict[int, set] = {}
+    gefunden: dict[int, tuple] = {}      # rowid → (kind, ref, text, datum, rowid)
 
     ausdruck = _fts_anfrage(frage)
     if ausdruck:
@@ -935,39 +1217,50 @@ def suchen(frage: str, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: st
         try:
             con = _connect()
             zeilen = con.execute(
-                "SELECT c.rowid FROM chunks_fts JOIN chunks c ON c.rowid = chunks_fts.rowid "
-                f"WHERE chunks_fts MATCH ?{bedingung} ORDER BY bm25(chunks_fts) LIMIT ?",
+                "SELECT c.rowid, c.kind, c.ref, c.text, c.datum FROM chunks_fts JOIN chunks c "
+                f"ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ?{bedingung} "
+                "ORDER BY bm25(chunks_fts) LIMIT ?",
                 [ausdruck, *werte, KANDIDATEN]).fetchall()
             con.close()
         except sqlite3.Error:
             zeilen = []
-        for rang, (rowid,) in enumerate(zeilen):
-            i = ix["zeile"].get(rowid)
-            if i is not None:
-                punkte[i] = punkte.get(i, 0.0) + 1.0 / (RRF_K + rang)
-                wie.setdefault(i, set()).add("wort")
+        for rang, (rowid, kind, ref, text, datum) in enumerate(zeilen):
+            gefunden[rowid] = (kind, ref, text, datum or "", rowid)
+            punkte[rowid] = punkte.get(rowid, 0.0) + 1.0 / (RRF_K + rang)
+            wie.setdefault(rowid, set()).add("wort")
+    uhr = _messen("Stichworte", uhr)
 
-    if ix["mat"] is not None or ix["vecs"]:
+    if ix is not None and (ix["mat"] is not None or ix["vecs"]):
         qe = None
         try:
             import memory
-            if memory.encoder_loaded() or laden:
+            if laden:
                 qe = memory._embed_texts([frage], query=True)
+            elif memory.encoder_loaded():
+                qe = memory.frage_einbetten(frage)   # wartet nie auf den Bibliothekar
             else:
                 memory.warm_encoder()          # ab der nächsten Frage auch nach Bedeutung
         except Exception:
             qe = None
+        uhr = _messen("Einbetten", uhr)
         if qe:
-            bewertet = [(s, i) for s, i in _scores(ix, qe[0])
-                        if s >= MIN_SCORE * 0.75 and _passt(meta[i], arten, seit, bis, ref_praefix)]
-            bewertet.sort(key=lambda x: -x[0])
-            for rang, (_s, i) in enumerate(bewertet[:KANDIDATEN]):
-                punkte[i] = punkte.get(i, 0.0) + 1.0 / (RRF_K + rang)
-                wie.setdefault(i, set()).add("sinn")
+            aktiv = _aktives_profil()
+            bewertet = []                # beste zuerst, gefiltert nur bis genug beisammen sind
+            for s, i in sorted(_scores(ix, qe[0], MIN_SCORE * 0.75), key=lambda x: -x[0]):
+                if _passt(meta[i], arten, seit, bis, ref_praefix, aktiv):
+                    bewertet.append((s, i))
+                    if len(bewertet) >= KANDIDATEN:
+                        break
+            for rang, (_s, i) in enumerate(bewertet):
+                rowid = meta[i][4]
+                gefunden.setdefault(rowid, meta[i])
+                punkte[rowid] = punkte.get(rowid, 0.0) + 1.0 / (RRF_K + rang)
+                wie.setdefault(rowid, set()).add("sinn")
+        _messen("Vergleich", uhr)
 
     beste = sorted(punkte.items(), key=lambda x: -x[1])[:k]
-    return [_hit(meta[i], round(p * RRF_K / 2, 3),
-                 "+".join(sorted(wie.get(i, ())))) for i, p in beste]
+    return [_hit(gefunden[r], round(p * RRF_K / 2, 3),
+                 "+".join(sorted(wie.get(r, ())))) for r, p in beste]
 
 
 def quelle_lesen(ref: str, max_zeichen: int = 12_000, ab: int = 1) -> dict | None:
@@ -1058,13 +1351,42 @@ def _zeile(h: dict, memory) -> str:
     return f"- [{h.get('kind')}/{h.get('ref')}{tag}] {snippet}"
 
 
+_ZEITEN = threading.local()        # Teilzeiten der Suche für den Systemprompt (nur in guide_block)
+SUCHE_LANGSAM_S = 1.0              # ab so viel Suchzeit stehen die Teile im Debugbericht
+
+
+def _messen(teil: str, seit: float) -> float:
+    jetzt = time.perf_counter()
+    zeiten = getattr(_ZEITEN, "messen", None)
+    if zeiten is not None:
+        zeiten[teil] = zeiten.get(teil, 0.0) + jetzt - seit
+    return jetzt
+
+
+def _zeiten_melden(zeiten: dict) -> None:
+    if sum(zeiten.values()) < SUCHE_LANGSAM_S:
+        return
+    try:
+        import debugbericht
+        debugbericht.ereignis("Gedächtnissuche-Teile: " + " · ".join(
+            f"{n} {s:.1f} s" for n, s in zeiten.items() if s >= 0.05), speicher=False)
+    except Exception:
+        pass
+
+
 def guide_block(query: str) -> str:
     """Die besten Treffer für den System-Prompt – ein Vorgeschmack. Wer mehr
     braucht, sucht mit gedaechtnis_suchen selbst. Hat der laufende Chat aufgeräumt,
     kommen zuerst passende Stellen aus seinem ausgelagerten Teil."""
-    ref, kontext, ausgelagert = _laufender_chat()
-    vorhin = _vorhin_im_chat(query, ref, kontext) if ref and ausgelagert else []
-    hits = [h for h in search(query, GUIDE_K + VORHIN_K) if not (ref and h.get("ref") == ref)][:GUIDE_K]
+    _ZEITEN.messen = {}
+    uhr = time.perf_counter()
+    try:
+        ref, kontext, ausgelagert = _laufender_chat()
+        uhr = _messen("Chat", uhr)
+        vorhin = _vorhin_im_chat(query, ref, kontext) if ref and ausgelagert else []
+        hits = [h for h in search(query, GUIDE_K + VORHIN_K) if not (ref and h.get("ref") == ref)][:GUIDE_K]
+    finally:
+        _zeiten_melden(_ZEITEN.__dict__.pop("messen", None) or {})
     if not hits and not vorhin and not ausgelagert:
         return ""
     import memory                      # lazy, wie überall hier (Import-Kreis vermeiden)

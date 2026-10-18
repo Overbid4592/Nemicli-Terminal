@@ -13,8 +13,21 @@ gerade nicht im Terminal läuft.
              oder nichts. Nicht nachts, nicht bei Vollbild (Spiel, Präsentation).
   Klick      Chatfenster neben der Kugel: reden, Bilder bekommen,
              📸 Screenshot (sie sieht ihn), „Alles ok?“, „NemiCLI öffnen“.
-             Der Verlauf bleibt erhalten (Wache/kugel_verlauf.json), bis „+ Neu“ ihn leert.
+             Der Verlauf bleibt erhalten (Wache/kugel_verlauf_<name>.json, je Persönlichkeit),
+             bis „+ Neu“ ihn leert. Wechselt die aktive Persönlichkeit, wechselt die Kugel mit.
   Ziehen     Kugel verschieben – die Stelle wird gemerkt (Wache/kugel.json).
+  Ablegen    Bild oder Datei auf die Kugel ziehen: sie schaut es sich an und sagt etwas dazu.
+  Leben      (Config kugel_leben) schläft sichtbar, wenn niemand am Rechner ist, gähnt nachts,
+             freut sich, wenn man sie mit der Maus umkreist, und macht ab und zu einen kleinen
+             Ausflug – ein paar Schritte zur Seite oder auf die Oberkante des aktiven Fensters.
+  Musik      (Config kugel_musik) läuft ein Stück aus einem bekannten Musik-Programm länger
+             (Pegel des Lautsprechers, klang.py), bekommt die Persönlichkeit ab und zu einen
+             Moment, etwas dazu zu sagen.
+  Melden     Vor einer Blase (Gruß, Erinnerung, fertige Aufgabe) kurz Regenbogen und Denk-Punkte;
+             gehüpft wird nur bei einem Fund der Wache.
+  Erinnern   fällige Erinnerungen (erinnerungen.py): Blase; ist die Kugel nicht da, ein Hinweis
+             neben der Uhr.
+  Fertig     Bilder aus Hintergrund-Aufgaben und freien Momenten erscheinen klein in der Blase.
 
 Technik (seit 20.09.2026 Qt, vorher tkinter – siehe oberflaeche.py): ein
 rahmenloses, durchsichtiges Fenster; die Kugel wird mit QPainter gemalt
@@ -33,19 +46,22 @@ bis dahin gelten die Vorgaben unten. {name} = Persönlichkeit, {nutzer} = Nutzer
 from __future__ import annotations
 
 import asyncio
+import ctypes
 import json
 import math
 import os
 import random
+import re
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QCursor, QGuiApplication, QPainter, QPen, QPixmap, QRadialGradient,
-                           QTextDocument)
+from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QGuiApplication, QMovie, QPainter, QPainterPath, QPen,
+                           QPixmap, QRadialGradient, QTextDocument)
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
-                               QScrollArea, QSizePolicy, QVBoxLayout, QWidget)
+                               QScrollArea, QVBoxLayout, QWidget)
 
 from . import ORDNER
 from . import oberflaeche as O
@@ -55,6 +71,7 @@ from .oberflaeche import THEME
 GRUESSE_DATEI = ORDNER / "gruesse.md"
 LAGE_DATEI = ORDNER / "kugel.json"
 VERLAUF_DATEI = ORDNER / "kugel_verlauf.json"
+ZULETZT_DATEI = ORDNER / "kugel_zuletzt.txt"      # zuletzt aktiv gesehen – überdauert Ausschalten
 VERLAUF_MAX = 200            # so viele Einträge zeigt und speichert das Chatfenster
 EINLEITUNG = ("Klick auf die Kugel schließt das Fenster. Enter sendet. Hier wird nur gelesen und "
               "geredet – Änderungen am PC machst du im großen NemiCLI.")
@@ -62,10 +79,13 @@ GROESSE = 64                 # Durchmesser der Kugel
 RAND = 18                    # Platz für den Lichthof rundherum
 PANEL_BREITE, PANEL_HOEHE = 420, 580
 
+# Ältere Vorgaben, die in angelegten gruesse.md stehen geblieben sind -> heutige Fassung
+ALTE_GRUESSE = {"Kurz gemeldet: nichts Auffälliges. 🌙": "Kurz gemeldet: nichts Auffälliges. 🛡"}
+
 VORGABE_GRUESSE = [
     "Hey {nutzer} 🙂 alles ruhig hier.",
     "Ich bin da. Alles ok bei dir?",
-    "Kurz gemeldet: nichts Auffälliges. 🌙",
+    "Kurz gemeldet: nichts Auffälliges. 🛡",
     "Hey {nutzer} – {name} hier. Alles im grünen Bereich.",
     "Nur ein Hallo. Ich passe auf. 🙂",
     "Alles gut. Wenn du mich brauchst: einmal klicken.",
@@ -99,7 +119,7 @@ def gruesse(name: str, nutzer: str) -> list[str]:
             for z in GRUESSE_DATEI.read_text(encoding="utf-8").splitlines():
                 z = z.strip().lstrip("-•* ").strip()
                 if z and not z.startswith("#"):
-                    zeilen.append(z)
+                    zeilen.append(ALTE_GRUESSE.get(z, z))
     except OSError:
         pass
     if not zeilen:
@@ -135,8 +155,191 @@ def impuls_an() -> bool:
         return False
 
 
+def schalter(name: str, vorgabe: bool = True) -> bool:
+    """Ein- und Ausschalter der Kugel aus der Config (kugel_leben, kugel_musik)."""
+    try:
+        import config
+        return bool(config.load().get(name, vorgabe))
+    except Exception:
+        return vorgabe
+
+
+SCHLAF_AB_S = 10 * 60          # so lange ohne Eingabe, dann schläft die Kugel sichtbar
+AUSFLUG_ALLE_MIN = (25, 60)    # Abstand zwischen zwei Ausflügen (Minuten, zufällig)
+AUSFLUG_DAUER_S = (120, 360)   # so lange bleibt sie unterwegs
+MUSIK_AB_S = 120               # so lange Musik am Stück, dann darf sie etwas dazu sagen
+MUSIK_PAUSE_MIN = (40, 90)     # Abstand zwischen zwei Musik-Momenten
+ANKUENDIGUNG_S = 2.0           # Regenbogen und Denk-Punkte, bevor eine Blase erscheint
+BILD_ENDUNGEN = (".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif")
+_BILD_PFAD = re.compile(r"[A-Za-z]:\\[^\n\r\"'<>|*?]+?\.(?:png|jpe?g|webp)", re.IGNORECASE)
+
+
+def bilder_aus(text: str, hoechstens: int = 8) -> list[Path]:
+    """Vorhandene Bilddateien, deren Pfad in einem Ergebnistext steht (Videos zählen nicht)."""
+    out: list[Path] = []
+    for m in _BILD_PFAD.finditer(text or ""):
+        p = Path(m.group(0).strip())
+        if p not in out and p.is_file():
+            out.append(p)
+    return out[-hoechstens:]
+
+
+def kante_position(fenster: tuple[int, int, int, int], breite: int, hoehe: int,
+                   schirm: tuple[int, int, int, int], anteil: float) -> tuple[int, int] | None:
+    """Wohin sich die Kugel setzt, damit sie auf der Oberkante eines Fensters sitzt.
+    fenster/schirm = (links, oben, rechts, unten), breite/hoehe = Kugelfenster samt Rand,
+    anteil = 0 … 1 (Stelle entlang der Kante, links von den Fenster-Knöpfen). None = passt nicht."""
+    l, o, r, u = fenster
+    sl, so, sr, su = schirm
+    if r - l < 320 or u - o < 200:
+        return None
+    y = o + 2 - hoehe + RAND                     # Kugel-Unterkante liegt auf der Fensterkante
+    if y < so:
+        return None                              # Fenster ganz oben: kein Platz darüber
+    x = int(l + (r - l) * (0.12 + 0.45 * anteil) - breite / 2)
+    return max(sl, min(x, sr - breite)), y
+
+
+def musik_text(name: str, quelle: str, titel: str) -> str:
+    jetzt = datetime.now()
+    return MUSIK_TEXT.format(zeit=jetzt.strftime("%H:%M"), tag=_TAGE[jetzt.weekday()],
+                             tageszeit=tageszeit(jetzt.hour), quelle=quelle, titel=titel) + _bilder_zeile(name)
+
+
+def _schirme_nativ() -> list[tuple]:
+    """(Ursprung, Skalierung, logische Geometrie) je Bildschirm – zum Umrechnen von Windows-Pixeln."""
+    out = []
+    for sc in QGuiApplication.screens():
+        g = sc.geometry()
+        out.append((g.topLeft(), sc.devicePixelRatio() or 1.0, g))
+    return out
+
+
+def _logisch(x: int, y: int) -> QPoint:
+    """Windows-Pixel (GetWindowRect) → Qt-Koordinaten. Qt behält je Bildschirm den Ursprung
+    und teilt den Rest durch die Skalierung."""
+    for ursprung, dpr, g in _schirme_nativ():
+        if (ursprung.x() <= x < ursprung.x() + g.width() * dpr
+                and ursprung.y() <= y < ursprung.y() + g.height() * dpr):
+            return QPoint(int(ursprung.x() + (x - ursprung.x()) / dpr), int(ursprung.y() + (y - ursprung.y()) / dpr))
+    return QPoint(x, y)
+
+
+def vordergrund_fenster(eigene: set[int]) -> tuple[int, tuple[int, int, int, int]] | None:
+    """(Handle, Rechteck in Qt-Koordinaten) des aktiven Fensters – nicht maximiert, nicht minimiert,
+    nicht Desktop oder Taskleiste, nicht die Kugel selbst. Sonst None."""
+    try:
+        user32 = ctypes.windll.user32
+        hwnd = user32.GetForegroundWindow()
+        if not hwnd or hwnd in eigene or user32.IsZoomed(hwnd) or user32.IsIconic(hwnd):
+            return None
+        klasse = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(hwnd, klasse, 64)
+        if klasse.value in ("Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"):
+            return None
+        rect = (ctypes.c_long * 4)()
+        # sichtbarer Rahmen ohne unsichtbaren Schattenrand (DWMWA_EXTENDED_FRAME_BOUNDS)
+        if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) != 0:
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+        a, b = _logisch(rect[0], rect[1]), _logisch(rect[2], rect[3])
+        return int(hwnd), (a.x(), a.y(), b.x(), b.y())
+    except Exception:
+        return None
+
+
+def fenster_rechteck(hwnd: int) -> tuple[int, int, int, int] | None:
+    """Rechteck eines Fensters (Qt-Koordinaten) – None, wenn es weg, minimiert oder maximiert ist."""
+    try:
+        user32 = ctypes.windll.user32
+        if not user32.IsWindow(hwnd) or user32.IsIconic(hwnd) or user32.IsZoomed(hwnd):
+            return None
+        rect = (ctypes.c_long * 4)()
+        if ctypes.windll.dwmapi.DwmGetWindowAttribute(hwnd, 9, ctypes.byref(rect), ctypes.sizeof(rect)) != 0:
+            if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+                return None
+        a, b = _logisch(rect[0], rect[1]), _logisch(rect[2], rect[3])
+        return a.x(), a.y(), b.x(), b.y()
+    except Exception:
+        return None
+
+
+def ankommen_an() -> bool:
+    try:
+        import config
+        return bool(config.load().get("kugel_ankommen", True))
+    except Exception:
+        return True
+
+
+ANKOMMEN_AB_S = 3 * 3600      # so lange ohne Eingabe (oder im Standby), dann gilt die Rückkehr als Ankommen
+
+
+def zuletzt_lesen() -> float | None:
+    try:
+        return float(ZULETZT_DATEI.read_text(encoding="utf-8").strip())
+    except (OSError, ValueError):
+        return None
+
+
+def zuletzt_schreiben(zeit: float) -> None:
+    try:
+        ZULETZT_DATEI.write_text(f"{zeit:.0f}", encoding="utf-8")
+    except OSError:
+        pass
+
+
+def leerlauf_s() -> float:
+    """Sekunden seit der letzten Maus- oder Tastatureingabe (GetLastInputInfo)."""
+    try:
+        import ctypes
+
+        class _Info(ctypes.Structure):
+            _fields_ = [("cbSize", ctypes.c_uint), ("dwTime", ctypes.c_uint)]
+        info = _Info()
+        info.cbSize = ctypes.sizeof(info)
+        if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+            return 0.0
+        return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000.0
+    except Exception:
+        return 0.0
+
+
+def tageszeit(stunde: int) -> str:
+    if 5 <= stunde < 11:
+        return "Morgen"
+    if 11 <= stunde < 14:
+        return "Mittag"
+    if 14 <= stunde < 18:
+        return "Nachmittag"
+    if 18 <= stunde < 23:
+        return "Abend"
+    return "Nacht"
+
+
+def _dauer_text(sek: float) -> str:
+    stunden = sek / 3600
+    return f"{stunden:.0f} Stunden" if stunden < 48 else f"{stunden / 24:.0f} Tage"
+
+
+ANKOMMEN_TEXT = (
+    "[Ankommen · {zeit} · {tag} · {tageszeit}] Der Nutzer ist gerade an den Rechner zurückgekommen – "
+    "er war etwa {weg} weg. Niemand hat dich angesprochen; du darfst ihn von dir aus begrüßen "
+    "(deine Antwort erscheint als Sprechblase an der Kugel, höchstens zwei kurze Sätze), ein Bild "
+    "malen, dein Kugel-Bild wechseln – oder still bleiben. Was zuletzt war, steht in deinem Tagebuch.\n"
+    "Sag nur, was dir wirklich einfällt – keine Floskel. Willst du nichts tun, antworte genau: (still)"
+)
+
+
+def ankommen_text(name: str, weg_s: float) -> str:
+    jetzt = datetime.now()
+    text = ANKOMMEN_TEXT.format(zeit=jetzt.strftime("%H:%M"), tag=_TAGE[jetzt.weekday()],
+                                tageszeit=tageszeit(jetzt.hour), weg=_dauer_text(weg_s))
+    return text + _bilder_zeile(name)
+
+
 IMPULS_TEXT = (
-    "[Freier Moment · {zeit} · {tag}] Niemand hat dich gerade angesprochen. Du hast einen Moment "
+    "[Freier Moment · {zeit} · {tag} · {tageszeit}] Niemand hat dich gerade angesprochen. Du hast einen Moment "
     "für dich und darfst von dir aus etwas tun – oder nichts.\n"
     "Möglich: dem Nutzer etwas sagen (deine Antwort erscheint als Sprechblase an der Kugel, höchstens "
     "zwei kurze Sätze) · ein Bild malen (bild_malen) · dein Kugel-Bild wechseln (kugel mit stimmung) · "
@@ -147,36 +350,63 @@ IMPULS_TEXT = (
 _TAGE = ("Montag", "Dienstag", "Mittwoch", "Donnerstag", "Freitag", "Samstag", "Sonntag")
 
 
-def impuls_text(name: str) -> str:
-    jetzt = datetime.now()
-    text = IMPULS_TEXT.format(zeit=jetzt.strftime("%H:%M"), tag=_TAGE[jetzt.weekday()])
+def _bilder_zeile(name: str) -> str:
     try:
         import kugelmotive
         da = [k for k in steuerung.bilder(name) if k]
         if da:
-            text += ("\nDeine Kugel-Bilder (stimmung): "
-                     + ", ".join(kugelmotive.MOTIVE.get(k, (k, ""))[0] for k in sorted(da)))
+            return ("\nDeine Kugel-Bilder (stimmung): "
+                    + ", ".join(kugelmotive.MOTIVE.get(k, (k, ""))[0] for k in sorted(da)))
     except Exception:
         pass
-    return text
+    return ""
+
+
+MUSIK_TEXT = (
+    "[Musik · {zeit} · {tag} · {tageszeit}] Beim Nutzer läuft gerade Musik – {quelle}: „{titel}“. Niemand hat "
+    "dich angesprochen. Du darfst kurz etwas dazu sagen (deine Antwort erscheint als Sprechblase an der Kugel, "
+    "ein kurzer Satz; nicht laut vorlesen, die Musik läuft), dir merken, was er gern hört (merken), dein "
+    "Kugel-Bild wechseln (kugel mit stimmung) – oder still bleiben. Kennst du das Stück nicht, erfinde nichts "
+    "darüber. Willst du nichts tun, antworte genau: (still)"
+)
+
+
+def impuls_text(name: str) -> str:
+    jetzt = datetime.now()
+    return IMPULS_TEXT.format(zeit=jetzt.strftime("%H:%M"), tag=_TAGE[jetzt.weekday()],
+                              tageszeit=tageszeit(jetzt.hour)) + _bilder_zeile(name)
 
 
 def still(antwort: str) -> bool:
     return antwort.strip().strip("()[]. *_").lower() in ("", "still")
 
 
-def verlauf_laden() -> list[dict]:
+def _verlauf_datei(name: str) -> Path:
+    slug = "".join(c for c in name.lower() if c.isalnum())
+    return VERLAUF_DATEI.with_name(f"{VERLAUF_DATEI.stem}_{slug}{VERLAUF_DATEI.suffix}") if slug else VERLAUF_DATEI
+
+
+def verlauf_laden(name: str = "") -> list[dict]:
+    """Verlauf des Chatfensters – je Persönlichkeit. Der frühere gemeinsame Verlauf geht an die
+    Persönlichkeit, die ihn zuerst lädt (die aktive beim ersten Start nach dem Umstieg)."""
+    datei = _verlauf_datei(name)
+    if datei != VERLAUF_DATEI and not datei.exists() and VERLAUF_DATEI.exists():
+        try:
+            VERLAUF_DATEI.replace(datei)
+        except OSError:
+            pass
     try:
-        d = json.loads(VERLAUF_DATEI.read_text(encoding="utf-8"))
+        d = json.loads(datei.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return []
     return [e for e in d if isinstance(e, dict)][-VERLAUF_MAX:] if isinstance(d, list) else []
 
 
-def verlauf_speichern(eintraege: list[dict]) -> None:
+def verlauf_speichern(eintraege: list[dict], name: str = "") -> None:
+    datei = _verlauf_datei(name)
     try:
-        VERLAUF_DATEI.parent.mkdir(parents=True, exist_ok=True)
-        VERLAUF_DATEI.write_text(json.dumps(eintraege[-VERLAUF_MAX:], ensure_ascii=False), encoding="utf-8")
+        datei.parent.mkdir(parents=True, exist_ok=True)
+        datei.write_text(json.dumps(eintraege[-VERLAUF_MAX:], ensure_ascii=False), encoding="utf-8")
     except OSError:
         pass
 
@@ -211,12 +441,22 @@ class _Kugelfenster(QWidget):
 
     geklickt = Signal()
     gezogen = Signal()
+    abgelegt = Signal(list)                         # Dateien wurden auf die Kugel gezogen
+    gestreichelt = Signal()
 
     def __init__(self) -> None:
         super().__init__(None, Qt.WindowType.Tool | Qt.WindowType.FramelessWindowHint
                          | Qt.WindowType.WindowStaysOnTopHint)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+        self.setAcceptDrops(True)
+        self.setMouseTracking(True)
+        self.schlaeft = False
+        self.ablage = False                         # etwas wird gerade über die Kugel gezogen
+        self._herzen: list[tuple[float, float]] = []
+        self._streichel = [0.0, 0.0]                # [Weg in px, Beginn]
+        self._maus: QPoint | None = None
+        self._gestreichelt = 0.0
         self.groesse = GROESSE
         self.setFixedSize(GROESSE + 2 * RAND, GROESSE + 2 * RAND)
         self.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
@@ -231,6 +471,10 @@ class _Kugelfenster(QWidget):
         self.bild: QPixmap | None = None            # statt der Kugel: das Bild der Persönlichkeit
         self._bewegung = ""                         # huepfen · wackeln · nicken
         self._bewegung_start = 0.0
+        self._film: QMovie | None = None            # bewegtes Porträt (portraet_bewegen), rund gezeigt
+        self._film_rest = 0
+        self._film_fertig = None
+        self._rund = False
 
     def groesse_setzen(self, g: int) -> None:
         g = max(steuerung.GROESSE_MIN, min(steuerung.GROESSE_MAX, int(g)))
@@ -244,18 +488,54 @@ class _Kugelfenster(QWidget):
         self.bild = None if pix.isNull() else pix
         self.update()
 
+    def film_starten(self, pfad: Path, fertig, runden: int = 2) -> None:
+        """Bewegtes Porträt rund in der Kugel; danach ruft es `fertig` (das Bild kommt zurück)."""
+        self.film_stoppen(melden=False)
+        film = QMovie(str(pfad))
+        if not film.isValid():
+            return
+        self._film, self._film_fertig = film, fertig
+        self._film_rest = runden * max(1, film.frameCount())
+        film.frameChanged.connect(self._film_bild)
+        film.start()
+
+    def _film_bild(self, _nr: int) -> None:
+        if self._film is None:
+            return
+        self.bild, self._rund = self._film.currentPixmap(), True
+        self.update()
+        self._film_rest -= 1
+        if self._film_rest <= 0:
+            self.film_stoppen()
+
+    def film_stoppen(self, melden: bool = True) -> None:
+        if self._film is None:
+            return
+        self._film.stop()
+        fertig, self._film, self._film_fertig, self._rund = self._film_fertig, None, None, False
+        if melden and fertig:
+            fertig()
+
     def bewegen(self, art: str) -> None:
-        """Kurze Geste (1,2 s): huepfen (hoch und runter), wackeln (kippen), nicken (ducken)."""
+        """Kurze Geste: huepfen (hoch und runter), wackeln (kippen), nicken (ducken), gaehnen (strecken)."""
         self._bewegung, self._bewegung_start = art, time.time()
 
+    def herzen(self) -> None:
+        jetzt = time.time()
+        self._herzen = [h for h in self._herzen if jetzt - h[0] < 1.6][-6:]
+        for i in range(3):
+            self._herzen.append((jetzt + i * 0.18, random.uniform(-0.35, 0.35)))
+
     def _geste(self) -> tuple[float, float, float]:
-        """(Hebung in px, Drehung in Grad, Stauchung 0…1) der laufenden Geste."""
+        """(Hebung in px, Drehung in Grad, Stauchung) der laufenden Geste. Stauchung < 0 = strecken."""
         if not self._bewegung:
             return 0.0, 0.0, 0.0
         t = time.time() - self._bewegung_start
-        if t > 1.2:
+        if t > (1.8 if self._bewegung == "gaehnen" else 1.2):
             self._bewegung = ""
             return 0.0, 0.0, 0.0
+        if self._bewegung == "gaehnen":
+            return 0.0, 0.0, -abs(math.sin(t * math.pi / 1.8)) * 0.14
         if self._bewegung == "huepfen":
             return abs(math.sin(t * math.pi / 0.6)) * RAND * 0.9 * (1 - t / 1.4), 0.0, 0.0
         if self._bewegung == "wackeln":
@@ -273,8 +553,11 @@ class _Kugelfenster(QWidget):
         m = self.width() / 2
         atem = 0.5 + 0.5 * math.sin(self.phase)
         hoch, dreh, stauch = self._geste()
+        if self.schlaeft:
+            p.setOpacity(0.72)
         if self.bild is not None:
             self._bild_malen(p, kern, m, atem, hoch, dreh, stauch)
+            self._extras(p, m)
             p.end()
             return
         if hoch or dreh or stauch:
@@ -311,7 +594,32 @@ class _Kugelfenster(QWidget):
                 p.setPen(Qt.PenStyle.NoPen)
                 p.setBrush(QColor(255, 255, 255, 235 if an else 110))
                 p.drawEllipse(QRectF(m + (k - 1) * 9 - 3, m + r * 0.5 - 3, 6, 6))
+        p.resetTransform()
+        self._extras(p, m)
         p.end()
+
+    def _extras(self, p: QPainter, m: float) -> None:
+        """Über der Kugel: „z Z“ im Schlaf, aufsteigende Herzen nach dem Streicheln."""
+        p.resetTransform()
+        p.setOpacity(1.0)
+        if self.schlaeft:
+            f = QFont("Segoe UI", max(7, int(self.groesse * 0.14)), QFont.Weight.Bold)
+            for i, zeichen in enumerate("zZ"):
+                t = (self.phase * 0.25 + i * 0.5) % 1.0
+                p.setFont(f)
+                p.setPen(QColor(220, 230, 255, int(220 * (1 - t))))
+                p.drawText(QRectF(m + self.groesse * 0.22 + i * 7, RAND * 0.2 + (1 - t) * RAND * 1.2 + i * 2, 20, 20),
+                           Qt.AlignmentFlag.AlignLeft, zeichen)
+        jetzt = time.time()
+        for start, versatz in self._herzen:
+            t = jetzt - start
+            if not 0 <= t < 1.6:
+                continue
+            p.setFont(QFont("Segoe UI Emoji", max(8, int(self.groesse * 0.16))))
+            p.setPen(QColor(255, 105, 150, int(255 * (1 - t / 1.6))))
+            x = m + versatz * self.groesse * 0.6 - 7
+            y = m - self.groesse * 0.3 - t * RAND * 1.6
+            p.drawText(QRectF(x, y, 20, 20), Qt.AlignmentFlag.AlignCenter, "♥")
 
     def _farben(self):
         """(Kern, Glanz): Lagenfarbe – oder Regenbogen, solange sie im Hintergrund arbeitet."""
@@ -339,8 +647,15 @@ class _Kugelfenster(QWidget):
         p.translate(m, m - hoch)
         p.rotate(dreh)
         p.scale(skala * (1 + stauch * 0.4), skala * (1 - stauch))
-        pix = self.bild.scaled(QSize(g, g), Qt.AspectRatioMode.KeepAspectRatio,
-                               Qt.TransformationMode.SmoothTransformation)
+        if self._rund:                              # bewegtes Porträt: Gesicht im Kreis
+            weg = QPainterPath()
+            weg.addEllipse(QRectF(-g / 2, -g / 2, g, g))
+            p.setClipPath(weg)
+            pix = self.bild.scaled(QSize(g, g), Qt.AspectRatioMode.KeepAspectRatioByExpanding,
+                                   Qt.TransformationMode.SmoothTransformation)
+        else:
+            pix = self.bild.scaled(QSize(g, g), Qt.AspectRatioMode.KeepAspectRatio,
+                                   Qt.TransformationMode.SmoothTransformation)
         p.drawPixmap(QRectF(-pix.width() / 2, -pix.height() / 2, pix.width(), pix.height()).toRect(), pix)
         p.restore()
         if self.beschaeftigt:
@@ -351,8 +666,9 @@ class _Kugelfenster(QWidget):
                 p.drawEllipse(QRectF(m + (k - 1) * 9 - 3, self.height() - RAND - 2, 6, 6))
 
     def takt(self) -> None:
-        self.phase += 0.055 if self.farbe != "rot" else 0.16
-        ziel = 1.0 if self.schwebt else 0.0
+        schritt = 0.055 if self.farbe != "rot" else 0.16
+        self.phase += schritt * (0.35 if self.schlaeft else 1.0)
+        ziel = 1.0 if (self.schwebt or self.ablage) else 0.0
         self._hebung += (ziel - self._hebung) * 0.18
         self.update()
 
@@ -362,6 +678,38 @@ class _Kugelfenster(QWidget):
 
     def leaveEvent(self, _e) -> None:
         self.schwebt = False
+        self._maus = None
+        self._streichel = [0.0, 0.0]
+
+    # --- Ablegen (Drag & Drop)
+    def dragEnterEvent(self, e) -> None:
+        if e.mimeData().hasUrls() and any(u.isLocalFile() for u in e.mimeData().urls()):
+            self.ablage = True
+            e.acceptProposedAction()
+
+    def dragLeaveEvent(self, _e) -> None:
+        self.ablage = False
+
+    def dropEvent(self, e) -> None:
+        self.ablage = False
+        pfade = [Path(u.toLocalFile()) for u in e.mimeData().urls() if u.isLocalFile()]
+        if pfade:
+            e.acceptProposedAction()
+            self.abgelegt.emit(pfade[:5])
+
+    def _streicheln(self, punkt: QPoint) -> None:
+        """Maus kreist über der Kugel (ohne Klick): genug Weg in kurzer Zeit = gestreichelt."""
+        jetzt = time.time()
+        if self._maus is not None:
+            if jetzt - self._streichel[1] > 2.5:
+                self._streichel = [0.0, jetzt]
+            self._streichel[0] += (punkt - self._maus).manhattanLength()
+            if self._streichel[0] > 600 and jetzt - self._gestreichelt > 8:
+                self._gestreichelt = jetzt
+                self._streichel = [0.0, jetzt]
+                self.herzen()
+                self.gestreichelt.emit()
+        self._maus = punkt
 
     def mousePressEvent(self, e) -> None:
         if e.button() == Qt.MouseButton.LeftButton:
@@ -370,6 +718,7 @@ class _Kugelfenster(QWidget):
 
     def mouseMoveEvent(self, e) -> None:
         if self._druck is None:
+            self._streicheln(e.globalPosition().toPoint())
             return
         neu = e.globalPosition().toPoint() - self._druck
         if (neu - self.pos()).manhattanLength() > 2:
@@ -405,14 +754,24 @@ class _Blase(QWidget):
         self.label.setMaximumWidth(280)
         self.label.setStyleSheet("background: transparent; border: none;")
         lay.addWidget(self.label)
+        self.vorschau = QLabel("")
+        self.vorschau.setStyleSheet("background: transparent; border: none;")
+        self.vorschau.hide()
+        lay.addWidget(self.vorschau)
         self.ernst = False
         self._anim = QPropertyAnimation(self, b"windowOpacity")
         self._anim.setDuration(220)
         self._anim.setEasingCurve(QEasingCurve.Type.OutCubic)
 
-    def zeigen(self, text: str, ernst: bool) -> None:
+    def zeigen(self, text: str, ernst: bool, bild: Path | None = None) -> None:
         self.ernst = ernst
         self.label.setText(text)
+        self.label.setVisible(bool(text))
+        pix = QPixmap(str(bild)) if bild else QPixmap()
+        if not pix.isNull():
+            self.vorschau.setPixmap(pix.scaled(QSize(180, 180), Qt.AspectRatioMode.KeepAspectRatio,
+                                               Qt.TransformationMode.SmoothTransformation))
+            self.vorschau.show()
         self.adjustSize()
         self.setWindowOpacity(0.0)
         self.show()
@@ -514,7 +873,7 @@ class _Panel(QWidget):
         lay.addWidget(self.scroll, 1)
 
         self.eingabe = _Eingabe(); self.eingabe.setObjectName("eingabe")
-        self.eingabe.setPlaceholderText("Schreib ihr … (Enter sendet, Shift+Enter neue Zeile)")
+        self.eingabe.setPlaceholderText(f"Schreib {name} … (Enter sendet, Shift+Enter neue Zeile)")
         self.eingabe.setFixedHeight(74)
         self.eingabe.senden.connect(self.senden.emit)
         e = QHBoxLayout(); e.setContentsMargins(12, 0, 12, 0); e.addWidget(self.eingabe)
@@ -654,7 +1013,11 @@ class Kugel:
     `im_gui(...)`, `stop()`, `blase_spaeter(...)`."""
 
     def __init__(self, *, stand, chat, schleife: asyncio.AbstractEventLoop, sichtbar,
-                 name: str, nutzer: str, nemicli_oeffnen, screenshot, chat_neu=None):
+                 name: str, nutzer: str, nemicli_oeffnen, screenshot, chat_neu=None, name_von=None,
+                 erinnerungen: bool = False, leben: bool = False, musik: bool = False, melden=None):
+        """name_von: liefert den Namen der gerade aktiven Persönlichkeit (Wechsel zur Laufzeit).
+        erinnerungen/leben/musik schaltet der Wache-Dienst ein (Erinnerungen abholen, Desktop-Leben,
+        Pegel des Lautsprechers); melden(titel, text) zeigt einen Hinweis neben der Uhr."""
         self.app = O.anwendung()
         self._stand = stand
         self._chat = chat
@@ -663,12 +1026,33 @@ class Kugel:
         self._sichtbar = sichtbar
         self.name = name
         self.nutzer = nutzer
+        self._name_von = name_von
+        self._name_takt = 0
         self._nemicli = nemicli_oeffnen
         self._screenshot = screenshot
 
         self.fenster = _Kugelfenster()
         self.fenster.geklickt.connect(self.panel_umschalten)
         self.fenster.gezogen.connect(self._gezogen)
+        self.fenster.abgelegt.connect(self._abgelegt)
+        self.fenster.gestreichelt.connect(self._gestreichelt)
+        self._erinnerungen = erinnerungen
+        self._leben = leben
+        self._melden = melden
+        self._leben_an = self._musik_an = False
+        self._ausflug: dict | None = None
+        self._flug: QPropertyAnimation | None = None
+        self._naechster_ausflug = time.time() + random.uniform(*AUSFLUG_ALLE_MIN) * 60
+        self._naechstes_gaehnen = 0.0
+        self._pegel = None
+        self._gespuer = None
+        if musik:
+            from . import klang
+            self._pegel, self._gespuer = klang.Pegelmesser(), klang.Musikgespuer()
+            self._pegel.starten()
+        self._naechster_musik_moment = time.time() + 10 * 60
+        self._letztes_stueck: tuple | None = None
+        self._ankuendigung_bis = 0.0
         self._blase: _Blase | None = None
         self._blase_bis = 0.0
         self._panel: _Panel | None = None
@@ -678,14 +1062,22 @@ class Kugel:
         self._versteckt_fuer_foto = False
         self._farbe = "gruen"
         self._naechster_gruss = self._gruss_zeit()
+        self._rot_naechste = 0.0                     # Erinnerungsblase bei Rot
         self._naechster_impuls = self._impuls_zeit()
-        self._verlauf = verlauf_laden()
+        zuletzt = zuletzt_lesen()                    # war der Rechner aus? Dann zählt die Zeit seitdem
+        self._weg_seit: float | None = (zuletzt if zuletzt and time.time() - zuletzt >= ANKOMMEN_AB_S
+                                        else None)
+        self._letzter_takt = time.time()
+        self._zuletzt_gemerkt = 0.0
+        self._sicherung_versucht = 0.0
+        self._verlauf = verlauf_laden(name)
         gruesse(name, nutzer)                        # legt Wache/gruesse.md mit Vorgaben an
         # Steuerung durch die Persönlichkeit (Wache/kugel_zustand.json): was beim Start schon
         # drinsteht (Stimmung, Größe, versteckt, Lage) gilt; alte Blasen/Gesten werden nicht nachgeholt.
         z = steuerung.lesen()
         self._gesteuert = {"sagen": float(z.get("sagen_zeit") or 0), "bewegung": float(z.get("bewegung_zeit") or 0),
-                       "lage": 0.0, "stimmung": None, "groesse": None, "bild_pfad": None}
+                       "lage": 0.0, "stimmung": None, "groesse": None, "bild_pfad": None, "outfit": None,
+                       "bewegt": float(z.get("bewegt_zeit") or 0)}
         self._versteckt = bool(z.get("versteckt"))
         self._zustand_anwenden(z)
         self.fenster.move(*self._lage_laden())
@@ -698,7 +1090,10 @@ class Kugel:
     # ------------------------------------------------------------- Takt
 
     def _tick(self) -> None:
-        self.fenster.beschaeftigt = self._beschaeftigt or steuerung.im_hintergrund()
+        self.fenster.beschaeftigt = (self._beschaeftigt or steuerung.im_hintergrund()
+                                     or time.time() < self._ankuendigung_bis)
+        if self._gespuer is not None:
+            self._gespuer.fuettern(self._pegel.wert, time.time())
         if self._gezeigt:
             self.fenster.takt()
 
@@ -706,6 +1101,8 @@ class Kugel:
         """Was die Persönlichkeit über die Aktion `kugel` will – nur Neues wird umgesetzt."""
         st = self._gesteuert
         stimmung = str(z.get("stimmung") or "")
+        if z.get("wer") not in (None, "", self.name, "Persönlichkeit"):
+            stimmung = ""                          # Stimmung einer anderen Persönlichkeit gilt hier nicht
         if self.fenster.beschaeftigt and stimmung != "kugel":
             stimmung = "denkt"                     # während sie denkt: das Denk-Bild, falls es eins gibt
         try:
@@ -715,8 +1112,8 @@ class Kugel:
         if g != st["groesse"]:
             st["groesse"] = g
             self.fenster.groesse_setzen(g)
-        if stimmung != st["stimmung"]:
-            st["stimmung"] = stimmung
+        if stimmung != st["stimmung"] or z.get("outfit_zeit") != st["outfit"]:
+            st["stimmung"], st["outfit"] = stimmung, z.get("outfit_zeit")
             pfad = None
             if stimmung != "kugel":
                 da = steuerung.bilder(self.name)
@@ -729,6 +1126,12 @@ class Kugel:
         if t > st["bewegung"]:
             st["bewegung"] = t
             self.fenster.bewegen(str(z.get("bewegung") or ""))
+        t = float(z.get("bewegt_zeit") or 0)
+        if t > st["bewegt"] and z.get("bewegt"):
+            st["bewegt"] = t
+            if z.get("wer") in (None, "", self.name, "Persönlichkeit") and time.time() - t < 120:
+                self.fenster.film_starten(Path(z["bewegt"]), lambda: self.fenster.bild_setzen(st["bild_pfad"]),
+                                          runden=int(z.get("bewegt_runden") or 2))
         t = float(z.get("sagen_zeit") or 0)
         if t > st["sagen"] and z.get("sagen"):
             st["sagen"] = t
@@ -756,8 +1159,26 @@ class Kugel:
         self.fenster.move(x, y)
         self._gezogen()
 
+    def _name_pruefen(self) -> None:
+        """Hat der Nutzer die Persönlichkeit gewechselt? Dann Name, Bilder und Verlauf der neuen."""
+        self._name_takt += 1
+        if self._name_von is None or self._name_takt % 10:
+            return
+        try:
+            neu = str(self._name_von() or "").strip()
+        except Exception:
+            return
+        if not neu or neu == self.name:
+            return
+        self._panel_schliessen()
+        self._blase_weg()
+        self.name = neu
+        self._verlauf = verlauf_laden(neu)
+        self._gesteuert.update(stimmung=None, bild_pfad="")   # Bild neu wählen, auch wenn es keins gibt
+
     def _takt_tick(self) -> None:
         try:
+            self._name_pruefen()
             s = self._stand()
             self._farbe = s.get("farbe", "gruen")
             self.fenster.farbe = self._farbe
@@ -768,7 +1189,9 @@ class Kugel:
                 self._zustand_anwenden(steuerung.lesen())
             except Exception:
                 pass
-            soll = bool(self._sichtbar()) and not self._versteckt_fuer_foto and not self._versteckt
+            # „versteckt“ der Persönlichkeit wartet, solange der Nutzer im Fenster mit ihr redet
+            versteckt = self._versteckt and self._panel is None
+            soll = bool(self._sichtbar()) and not self._versteckt_fuer_foto and not versteckt
             if soll and not self._gezeigt:
                 self.fenster.show()
                 self._gezeigt = True
@@ -778,9 +1201,16 @@ class Kugel:
                 self._blase_weg()
                 if self._panel is not None and not self._versteckt_fuer_foto:
                     self._panel_schliessen()
+            self._ankommen_pruefen(s)
+            self._chats_sichern()
+            self._leben_an = self._leben and schalter("kugel_leben", True)
+            self._musik_an = self._gespuer is not None and schalter("kugel_musik", True)
+            self._erinnerungen_pruefen()
             if self._gezeigt:
                 self._gruss_pruefen(s)
                 self._impuls_pruefen(s)
+                self._leben_pruefen(s)
+                self._musik_pruefen(s)
             if self._blase is not None and time.time() > self._blase_bis:
                 self._blase_weg()
         except Exception:
@@ -789,6 +1219,10 @@ class Kugel:
     # ------------------------------------------------------------- Bewegen
 
     def _gezogen(self) -> None:
+        self._ausflug = None                        # wer sie verschiebt, bestimmt ihr neues Zuhause
+        if self._flug is not None:
+            self._flug.stop()
+            self._flug = None
         self._panel_platzieren()
         if self._blase is not None:
             self._blase_platzieren()
@@ -819,9 +1253,14 @@ class Kugel:
 
     def _gruss_pruefen(self, s: dict) -> None:
         jetzt = time.time()
-        if s.get("farbe") == "rot" and jetzt >= self._naechster_gruss - 3 * 3600:
-            self.blase("Ich hab was gefunden – klick mich. 🔴", 12)
-            self._naechster_gruss = jetzt + 1800
+        if s.get("farbe") == "rot":
+            # Erinnerung höchstens alle 30 min, nicht bei offenem Fenster – und nicht über eine
+            # Blase, die die Persönlichkeit gerade selbst geschrieben hat.
+            eigene = self._gesteuert["sagen"] + 1800
+            if jetzt >= max(self._rot_naechste, eigene) and self._panel is None:
+                self.blase("Ich hab was gefunden – klick mich. 🔴", 12)
+                self.fenster.bewegen("huepfen")
+                self._rot_naechste = jetzt + 1800
             return
         if jetzt < self._naechster_gruss:
             return
@@ -829,7 +1268,8 @@ class Kugel:
         stunde = datetime.now().hour
         if s.get("farbe") != "gruen" or stunde < 8 or stunde >= 23 or impuls_an():
             return
-        self.blase(random.choice(gruesse(self.name, self.nutzer)), 9)
+        gruss = random.choice(gruesse(self.name, self.nutzer))
+        self._ankuendigen(lambda: self.blase(gruss, 9))
 
     # ------------------------------------------------------------- Freier Moment
 
@@ -844,9 +1284,61 @@ class Kugel:
         if (self._chat is None or self._beschaeftigt or self._panel is not None
                 or s.get("farbe") != "gruen" or stunde < 8 or stunde >= 23 or vollbild()):
             return
+        self._impuls_starten(impuls_text(self.name))
+
+    def _ankommen_pruefen(self, s: dict) -> None:
+        """Nach mindestens ANKOMMEN_AB_S ohne Eingabe – oder im Standby, dann ruht dieser Prozess
+        und sieht die Pause nur am Zeitsprung – darf die Persönlichkeit den Nutzer begrüßen."""
+        jetzt = time.time()
+        if jetzt - self._letzter_takt >= ANKOMMEN_AB_S and self._weg_seit is None:
+            self._weg_seit = self._letzter_takt
+        self._letzter_takt = jetzt
+        leer = leerlauf_s()
+        if leer < 60 and jetzt - self._zuletzt_gemerkt >= 60:
+            self._zuletzt_gemerkt = jetzt
+            zuletzt_schreiben(jetzt)
+        if leer >= ANKOMMEN_AB_S:
+            self._weg_seit = min(self._weg_seit or jetzt, jetzt - leer)
+            return
+        if self._weg_seit is None or leer > 60 or self._chat is None:     # Chat noch nicht bereit: gleich nochmal
+            return
+        weg = jetzt - self._weg_seit
+        self._weg_seit = None
+        if (not ankommen_an() or not self._gezeigt or self._beschaeftigt
+                or self._panel is not None or s.get("farbe") == "rot" or vollbild()
+                or not 5 <= datetime.now().hour < 23):
+            return
+        self._naechster_impuls = self._impuls_zeit()       # danach nicht gleich der nächste Moment
+        self._naechster_gruss = self._gruss_zeit()
+        self._impuls_starten(ankommen_text(self.name, weg))
+
+    def _chats_sichern(self) -> None:
+        """Im Vollbild (Spiel, Film) die Chat-Datenbank sichern, wenn die letzte Sicherung alt ist –
+        höchstens alle 10 Minuten ein Versuch, im Hintergrund."""
+        jetzt = time.time()
+        if jetzt - self._sicherung_versucht < 600 or not vollbild():
+            return
+        self._sicherung_versucht = jetzt
+        try:
+            import chatstore
+            import profilordner
+            ort = profilordner.ordner("Chats", self.name, anlegen=False)
+            if not chatstore.faellig(ort, chatstore.AUTO_STUNDEN):
+                return
+        except Exception:
+            return
+
+        def los():
+            try:
+                chatstore.sichern(ort)
+            except Exception:
+                pass
+        threading.Thread(target=los, name="nemi-chats-sichern", daemon=True).start()
+
+    def _impuls_starten(self, text: str) -> None:
         self._beschaeftigt = True
         self.fenster.beschaeftigt = True
-        fut = asyncio.run_coroutine_threadsafe(self._chat(impuls_text(self.name), []), self._loop)
+        fut = asyncio.run_coroutine_threadsafe(self._chat(text, []), self._loop)
 
         def fertig(f):
             try:
@@ -874,19 +1366,23 @@ class Kugel:
         if self._panel is not None:
             return
         kurz = " ".join(text.split())[:steuerung.SAGEN_MAX] if text else ""
-        if bilder:
-            kurz = (kurz + " 🎨") if kurz else "🎨"
-        self.blase(kurz, 14)
+        self.blase(kurz, 14, bild=bilder[-1] if bilder else None)
 
-    def blase(self, text: str, sekunden: float = 8.0) -> None:
-        """Kurze Sprechblase neben der Kugel (GUI-Thread)."""
+    def blase(self, text: str, sekunden: float = 8.0, bild: Path | None = None) -> None:
+        """Kurze Sprechblase neben der Kugel (GUI-Thread), auf Wunsch mit kleinem Bild."""
         self._blase_weg()
         b = _Blase()
         b.geklickt.connect(self.panel_umschalten)
-        b.zeigen(text, ernst=self._farbe == "rot")
+        b.zeigen(text, ernst=self._farbe == "rot", bild=bild)
         self._blase = b
         self._blase_platzieren()
         self._blase_bis = time.time() + sekunden
+
+    def _ankuendigen(self, zeigen) -> None:
+        """Kurz Regenbogen und Denk-Punkte, danach `zeigen` (die Blase) – statt eines Hüpfers."""
+        self._ankuendigung_bis = time.time() + ANKUENDIGUNG_S
+        self.fenster.beschaeftigt = True
+        QTimer.singleShot(int(ANKUENDIGUNG_S * 1000), zeigen)
 
     def blase_spaeter(self, text: str, sekunden: float = 8.0) -> None:
         """Dasselbe aus einem fremden Thread."""
@@ -973,7 +1469,7 @@ class Kugel:
 
     def _merken(self, e: dict) -> None:
         self._verlauf = (self._verlauf + [e])[-VERLAUF_MAX:]
-        verlauf_speichern(self._verlauf)
+        verlauf_speichern(self._verlauf, self.name)
         self._eintrag_zeigen(e)
 
     def _eintrag_zeigen(self, e: dict) -> None:
@@ -991,10 +1487,10 @@ class Kugel:
     def _neu_klick(self) -> None:
         """Neuer Chat: Verlauf im Fenster und Gespräch der Persönlichkeit leeren."""
         if self._beschaeftigt:
-            self._schreiben("hinweis", "(sie antwortet gerade noch …)")
+            self._schreiben("hinweis", f"({self.name} antwortet gerade noch …)")
             return
         self._verlauf = []
-        verlauf_speichern(self._verlauf)
+        verlauf_speichern(self._verlauf, self.name)
         self._anhaenge = []
         if self._chat_neu is not None:
             asyncio.run_coroutine_threadsafe(self._chat_neu(), self._loop)
@@ -1020,12 +1516,12 @@ class Kugel:
         if pfad:
             self._anhaenge.append(Path(pfad))
             self._schreiben("hinweis", f"📸 Screenshot angehängt: {Path(pfad).name} – schreib dazu, "
-                                       "was sie sehen soll, oder drück Enter.")
+                                       f"was {self.name} sehen soll, oder drück Enter.")
             self._bild_zeigen(Path(pfad))
 
     def senden(self, text: str) -> None:
         if self._beschaeftigt:
-            self._schreiben("hinweis", "(sie antwortet gerade noch …)")
+            self._schreiben("hinweis", f"({self.name} antwortet gerade noch …)")
             return
         if self._panel is None:
             self._panel_oeffnen()
@@ -1059,7 +1555,184 @@ class Kugel:
             self._bild_zeigen(Path(b))
         if self._panel is None:                      # Fenster inzwischen zu → Blase
             kurz = antwort.strip().splitlines()[0][:120] if antwort.strip() else "Fertig."
-            self.blase(kurz, 10)
+            self.blase(kurz, 10, bild=Path(bilder[-1]) if bilder else None)
+
+    # ------------------------------------------------------------- Ablegen · Streicheln
+
+    def _abgelegt(self, pfade: list) -> None:
+        """Dateien auf die Kugel gezogen: Bilder gehen als Bild mit, alles andere als Pfad."""
+        pfade = [Path(p) for p in pfade if Path(p).exists()]
+        if not pfade:
+            return
+        if self._beschaeftigt:
+            self.blase(f"{self.name} ist gerade noch beschäftigt – gleich nochmal ablegen.", 6)
+            return
+        self.fenster.schlaeft = False
+        bilder = [p for p in pfade if p.is_file() and p.suffix.lower() in BILD_ENDUNGEN][:4]
+        andere = [p for p in pfade if p not in bilder]
+        if self._panel is None:
+            self._panel_oeffnen()
+        for b in bilder:
+            self._bild_zeigen(b)
+        self._anhaenge.extend(bilder)
+        teile = []
+        if bilder:
+            teile.append("Ich hab dir " + ("ein Bild" if len(bilder) == 1 else f"{len(bilder)} Bilder")
+                         + " auf die Kugel gelegt – schau es dir an.")
+        if andere:
+            teile.append("Ich hab dir das hier auf die Kugel gelegt: " + "; ".join(str(p) for p in andere)
+                         + ". Schau es dir an (datei_lesen, bei Ordnern ordner_auflisten) und sag mir kurz, was es ist.")
+        self.senden(" ".join(teile))
+
+    def _gestreichelt(self) -> None:
+        self.fenster.schlaeft = False
+        self.fenster.bewegen("huepfen")
+
+    # ------------------------------------------------------------- Erinnerungen
+
+    def _erinnerungen_pruefen(self) -> None:
+        if not self._erinnerungen:
+            return
+        from . import erinnerungen
+        for d in erinnerungen.abholen():
+            self.erinnern(erinnerungen.meldung(d))
+
+    def erinnern(self, text: str) -> None:
+        """Fällige Erinnerung zeigen: an der Kugel (Regenbogen, dann Blase) oder neben der Uhr."""
+        if not self._gezeigt or self._versteckt_fuer_foto:
+            if self._melden is not None:
+                self._melden("Erinnerung", text)
+            return
+        self.fenster.schlaeft = False
+        self._merken({"wer": "sie", "text": text})
+        if self._panel is None:
+            self._ankuendigen(lambda: self.blase(text, 45))
+
+    # ------------------------------------------------------------- Fertige Aufgaben
+
+    def aufgabe_fertig(self, e: dict) -> None:
+        """Hintergrund-Aufgabe fertig (GUI-Thread): Bilder klein in der Blase, sonst eine kurze Zeile.
+        Videos werden nicht gezeigt."""
+        titel = str(e.get("titel") or "Aufgabe")
+        bilder = bilder_aus(str(e.get("ergebnis") or "")) if e.get("ok") else []
+        text = (f"🎨 Fertig: {titel}" if bilder else f"✅ Fertig: {titel}") if e.get("ok") else f"⚠ Gescheitert: {titel}"
+        for b in bilder:
+            self._bild_zeigen(b)
+        if not self._gezeigt:
+            if self._melden is not None:
+                self._melden("NemiCLI", text)
+            return
+        if self._panel is not None:
+            self._schreiben("hinweis", text)
+        else:
+            bild = bilder[-1] if bilder else None
+            self._ankuendigen(lambda: self.blase(text, 20, bild=bild))
+
+    # ------------------------------------------------------------- Desktop-Leben
+
+    def _leben_pruefen(self, s: dict) -> None:
+        if not self._leben_an:
+            self.fenster.schlaeft = False
+            if self._ausflug is not None:
+                self._heimkehren()
+            return
+        jetzt = time.time()
+        leer = leerlauf_s()
+        schlafen = (leer >= SCHLAF_AB_S and not self._beschaeftigt and self._panel is None
+                    and s.get("farbe") != "rot")
+        if schlafen != self.fenster.schlaeft:
+            self.fenster.schlaeft = schlafen
+            if not schlafen:
+                self.fenster.bewegen("huepfen")      # aufgewacht
+        stunde = datetime.now().hour
+        if (stunde >= 23 or stunde < 5) and not schlafen and jetzt >= self._naechstes_gaehnen:
+            if self._naechstes_gaehnen:
+                self.fenster.bewegen("gaehnen")
+            self._naechstes_gaehnen = jetzt + random.uniform(20, 45) * 60
+        if self._ausflug is not None:
+            a = self._ausflug
+            weg = a["art"] == "kante" and fenster_rechteck(a["hwnd"]) != a["rechteck"]
+            if jetzt >= a["bis"] or weg or self._panel is not None or schlafen:
+                self._heimkehren()
+            return
+        if jetzt < self._naechster_ausflug:
+            return
+        self._naechster_ausflug = jetzt + random.uniform(*AUSFLUG_ALLE_MIN) * 60
+        if (self._beschaeftigt or self._panel is not None or self._blase is not None or schlafen
+                or s.get("farbe") != "gruen" or leer > 120 or not 8 <= stunde < 23 or vollbild()):
+            return
+        self._ausflug_starten()
+
+    def _eigene_fenster(self) -> set[int]:
+        out = {int(self.fenster.winId())}
+        for w in (self._panel, self._blase):
+            if w is not None:
+                out.add(int(w.winId()))
+        return out
+
+    def _ausflug_starten(self) -> None:
+        f = self.fenster
+        heim = f.pos()
+        g = _schirm(f.geometry().center())
+        ziel, art, vg = None, "", None
+        if random.random() < 0.6:
+            vg = vordergrund_fenster(self._eigene_fenster())
+            if vg is not None:
+                schirm = _schirm(QPoint((vg[1][0] + vg[1][2]) // 2, vg[1][1]))
+                pos = kante_position(vg[1], f.width(), f.height(),
+                                     (schirm.left(), schirm.top(), schirm.right(), schirm.bottom()), random.random())
+                if pos is not None:
+                    ziel, art = QPoint(*pos), "kante"
+        if ziel is None:
+            schritt = random.choice((-1, 1)) * random.randint(80, 220)
+            x = heim.x() + schritt
+            if not g.left() <= x <= g.right() - f.width():
+                x = heim.x() - schritt
+            ziel, art = QPoint(max(g.left(), min(x, g.right() - f.width())), heim.y()), "spaziergang"
+        self._ausflug = {"heim": heim, "bis": time.time() + random.uniform(*AUSFLUG_DAUER_S), "art": art,
+                         "hwnd": vg[0] if vg else 0, "rechteck": vg[1] if vg else None}
+        f.bewegen("huepfen")
+        self._fliegen(ziel)
+
+    def _heimkehren(self) -> None:
+        a, self._ausflug = self._ausflug, None
+        if a is not None:
+            self.fenster.bewegen("huepfen")
+            self._fliegen(a["heim"])
+
+    def _fliegen(self, ziel: QPoint) -> None:
+        if self._flug is not None:
+            self._flug.stop()
+        anim = QPropertyAnimation(self.fenster, b"pos")
+        anim.setDuration(1100)
+        anim.setStartValue(self.fenster.pos())
+        anim.setEndValue(ziel)
+        anim.setEasingCurve(QEasingCurve.Type.InOutCubic)
+        anim.valueChanged.connect(lambda _w: (self._blase_platzieren(), self._panel_platzieren()))
+        anim.start()
+        self._flug = anim
+
+    # ------------------------------------------------------------- Musik
+
+    def _musik_pruefen(self, s: dict) -> None:
+        """Läuft ein Stück aus einem bekannten Musik-Programm länger, ab und zu ein Moment dazu."""
+        if not self._musik_an or self._gespuer is None:
+            return
+        jetzt = time.time()
+        if self._gespuer.laeuft_seit(jetzt) < MUSIK_AB_S or jetzt < self._naechster_musik_moment:
+            return
+        if (self._chat is None or self._beschaeftigt or self._panel is not None or self.fenster.schlaeft
+                or s.get("farbe") != "gruen" or not 8 <= datetime.now().hour < 23 or vollbild()):
+            return
+        from . import klang
+        stueck = klang.stueck()
+        if stueck is None or stueck == self._letztes_stueck:
+            self._naechster_musik_moment = jetzt + 5 * 60
+            return
+        self._letztes_stueck = stueck
+        self._naechster_musik_moment = jetzt + random.uniform(*MUSIK_PAUSE_MIN) * 60
+        self._naechster_impuls = max(self._naechster_impuls, self._impuls_zeit())
+        self._impuls_starten(musik_text(self.name, *stueck))
 
     # ------------------------------------------------------------- Screenshot-Hilfe
 
@@ -1088,4 +1761,6 @@ class Kugel:
         self.app.exec()
 
     def stop(self) -> None:
+        if self._pegel is not None:
+            self._pegel.stop()
         O.im_gui(self.app.quit)

@@ -55,10 +55,12 @@ def symbol(farbe: str = "gruen", zahl: int = 0, groesse: int = 64) -> QIcon:
 
 
 class Tray:
-    def __init__(self, *, stand, aktion, install_ordner: Path, berichte: Path, extra_menue=None):
+    def __init__(self, *, stand, aktion, install_ordner: Path, berichte: Path, extra_menue=None, oeffnen=None):
         """stand(): dict mit farbe/zahl/text · aktion(name): Menüaktion ausführen ·
-        extra_menue(): Liste (text|callable, callback) für weitere Einträge."""
+        extra_menue(): Liste (text|callable, callback) für weitere Einträge ·
+        oeffnen(): NemiCLI-Fenster öffnen (auch in der exe, siehe kontextmenue.fenster_starten)."""
         self._stand = stand
+        self._nemicli = oeffnen
         self._aktion = aktion
         self._extra = extra_menue
         self.install = install_ordner
@@ -93,6 +95,9 @@ class Tray:
         m.addAction("Wache beenden", lambda: self._aktion("beenden"))
 
     def _oeffnen(self) -> None:
+        if self._nemicli is not None:
+            self._nemicli()
+            return
         cmd = self.install / "nemicli.cmd"
         try:
             if cmd.exists():

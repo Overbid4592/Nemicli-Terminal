@@ -198,8 +198,9 @@ def _adresse(a) -> str:
 
 def _verbindung_text(c, namen: dict | None = None) -> str:
     art_ = "TCP" if c.type == 1 else "UDP"
-    name = (namen or {}).get(c.pid, "")
-    wer = f"{c.pid or 0} {name}".strip()
+    pid = getattr(c, "pid", None)              # Process.net_connections() liefert Einträge ohne pid
+    name = (namen or {}).get(pid, "")
+    wer = f"{pid or 0} {name}".strip() if pid is not None else name
     return f"{art_}  {_adresse(c.laddr):<28} → {_adresse(c.raddr):<28} {c.status or '':<12} {wer}"
 
 

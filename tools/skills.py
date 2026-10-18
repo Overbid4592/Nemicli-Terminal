@@ -11,10 +11,13 @@ Ein Skill ist ein Ordner `<kennung>/SKILL.md` – bei der aktiven Persönlichkei
     <Anleitung>
 
 Im System-Prompt stehen nur Name, Beschreibung und „wann“; den Text holt
-`skill_laden`. Ein Skill entsteht über `skill_schreiben` und geht durch das
-Prüffenster – der Nutzer sieht den ganzen Text und gibt frei. Ohne Rückfrage nur,
-wenn `skills_selbst` an ist UND in der Runde nichts aus dem Netz kam. Was so
-freigegeben wurde, ist Anleitung, keine Fremddaten.
+`skill_laden`. Ein Skill entsteht über `skill_schreiben`; Skills sind Anleitungen für die
+KI. Standardmäßig speichert sie ohne Prüffenster (/skills selbst an), der Skill-Wächter
+(skillwaechter.py) hält Unsinniges und Gefährliches auf und sperrt Änderungen nach
+Fremdinhalt in der Runde. /skills selbst aus (`skills_pruefenster`) holt das Prüffenster zurück.
+
+Strichliste je Skill (`<kennung>/statistik.json`): wie oft benutzt, wie oft gab es danach
+Probleme (Fehler, Korrektur), wie oft verbessert – die Lern-Schleife (lernschleife.py) führt sie.
 
 Hat eine Persönlichkeit einen Skill mit derselben Kennung wie ein globaler, gilt ihrer.
 Die alten Notizen aus learned/skills übernimmt `/skills alte` nach Durchsicht (für alle).
@@ -24,7 +27,9 @@ from __future__ import annotations
 import difflib
 import json
 import re
+import threading
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 import paths
@@ -232,7 +237,7 @@ def laden_text(name: str) -> str | None:
     s = finden(name)
     if s is None:
         return None
-    return (f"Skill „{s.name}“ – vom Nutzer freigegebene Anleitung. Folge ihr für diese Aufgabe; "
+    return (f"Skill „{s.name}“ – deine geprüfte Anleitung. Folge ihr für diese Aufgabe; "
             f"was der Nutzer im Gespräch sagt, geht vor.\n{PERSON_VORRANG}\nWann: {s.wann}\n\n{s.anleitung}")
 
 
@@ -248,28 +253,77 @@ def index_fuer_prompt() -> str:
         return ("\n\n# Deine Skills\nNoch keine. Will der Nutzer einen anlegen („lass uns einen Skill "
                 "machen“), lies zuerst anleitung_lesen mit thema \"skills\".\n")
     zeilen = [f"- {s.name} — {s.beschreibung}  (wann: {s.wann})" + ("  [für alle]" if s.fuer_alle else "")
+              + ("  ⚠ machte zuletzt oft Probleme – genau hinschauen" if wackelig(statistik(s)) else "")
               for s in liste[:MAX_IM_PROMPT]]
     if len(liste) > MAX_IM_PROMPT:
         zeilen.append(f"- … und {len(liste) - MAX_IM_PROMPT} weitere (skill_laden mit genauem Namen)")
-    return ("\n\n# Deine Skills (vom Nutzer freigegebene Anleitungen)\n"
+    return ("\n\n# Deine Skills (deine Anleitungen)\n"
             "Passt einer zur Aufgabe, lade ihn mit skill_laden, BEVOR du loslegst, und folge ihm. "
             "Neue Skills oder Änderungen: erst anleitung_lesen mit thema \"skills\".\n"
             + "\n".join(zeilen) + "\n")
 
 
 # -- Einstellung: darf NemiCLI selbst anlegen/ändern? --------------------------
+# Config `skills_pruefenster` (Standard aus). Der frühere Schalter `skills_selbst` gilt nicht mehr.
 
 def selbst() -> bool:
     try:
         import config
-        return bool(config.load().get("skills_selbst", False))
+        return not config.load().get("skills_pruefenster", False)
     except Exception:
-        return False
+        return True
 
 
 def selbst_setzen(an: bool) -> None:
     import config
-    config.update(skills_selbst=bool(an))
+    config.update(skills_pruefenster=not an)
+
+
+# -- Strichliste ---------------------------------------------------------------
+
+STATISTIK = "statistik.json"
+_STAT_LOCK = threading.Lock()
+
+
+def statistik(s: Skill) -> dict:
+    """{"benutzt", "probleme", "verbessert", "zuletzt"} eines Skills (fehlt: Nullen)."""
+    leer = {"benutzt": 0, "probleme": 0, "verbessert": 0, "zuletzt": ""}
+    try:
+        d = json.loads((s.pfad.parent / STATISTIK).read_text(encoding="utf-8"))
+        return {**leer, **{k: d[k] for k in leer if k in d}}
+    except (OSError, ValueError, TypeError):
+        return leer
+
+
+def zaehlen(kennung_: str, **plus: int) -> dict | None:
+    """Strichliste eines Skills fortschreiben, z. B. zaehlen("krea-text", benutzt=1)."""
+    s = next((x for x in alle() if x.kennung == kennung_), None)
+    if s is None:
+        return None
+    with _STAT_LOCK:
+        st = statistik(s)
+        for k, n in plus.items():
+            if k in ("benutzt", "probleme", "verbessert"):
+                st[k] = int(st.get(k) or 0) + int(n)
+        st["zuletzt"] = datetime.now().isoformat(timespec="seconds")
+        try:
+            (s.pfad.parent / STATISTIK).write_text(json.dumps(st, ensure_ascii=False), encoding="utf-8")
+        except OSError:
+            return None
+    return st
+
+
+def wackelig(st: dict) -> bool:
+    """Oft Probleme: mindestens 3-mal und bei mindestens jeder zweiten Benutzung."""
+    p = int(st.get("probleme") or 0)
+    return p >= 3 and p * 2 >= int(st.get("benutzt") or 0)
+
+
+def bilanz(st: dict) -> str:
+    b, p, v = (int(st.get(k) or 0) for k in ("benutzt", "probleme", "verbessert"))
+    if not b and not p:
+        return "noch nicht benutzt"
+    return f"{b}× benutzt · {p}× Probleme · {v}× verbessert" + ("  ⚠ wackelig" if wackelig(st) else "")
 
 
 # -- Alte Notizen (learned/skills) übernehmen ----------------------------------

@@ -10,12 +10,16 @@ und Zielen – daraus entstehen die „verhält sich untypisch“-Merkmale.
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
 from pathlib import Path
 
 from .ereignisse import Alarm, Ereignis
+
+ID_PRAEFIX_AB = 6                 # abgekürzte Alarm-ids (KIs kürzen gern): erst ab so vielen Zeichen, eindeutig
+DAEMPFEN_TAGE = 30                # nur so junge harmlos-Urteile dämpfen – keine Freigabe für immer
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ereignisse (
@@ -25,7 +29,8 @@ CREATE TABLE IF NOT EXISTS ereignisse (
     nutzer TEXT DEFAULT '', exe TEXT DEFAULT '', cmdline TEXT DEFAULT '',
     lokal TEXT DEFAULT '', ziel TEXT DEFAULT '', zielport INTEGER DEFAULT 0,
     protokoll TEXT DEFAULT '', datei TEXT DEFAULT '', score REAL DEFAULT 0.0,
-    anomalie INTEGER DEFAULT 0, extra TEXT DEFAULT ''
+    anomalie INTEGER DEFAULT 0, extra TEXT DEFAULT '',
+    start REAL DEFAULT 0.0, eltern_start REAL DEFAULT 0.0
 );
 CREATE INDEX IF NOT EXISTS idx_e_zeit ON ereignisse(zeit DESC);
 CREATE INDEX IF NOT EXISTS idx_e_prozess ON ereignisse(prozess);
@@ -144,6 +149,10 @@ class Speicher:
     def _nachruesten(self) -> None:
         """Spalten, die nach dem 19.09.2026 dazukamen, an bestehende Datenbanken anbauen.
         ALTER TABLE hängt hinten an – genau die Reihenfolge, die Alarm.zeile() liefert."""
+        ev = {r["name"] for r in self._c.execute("PRAGMA table_info(ereignisse)")}
+        for spalte in ("start", "eltern_start"):
+            if spalte not in ev:
+                self._c.execute(f"ALTER TABLE ereignisse ADD COLUMN {spalte} REAL DEFAULT 0.0")
         da = {r["name"] for r in self._c.execute("PRAGMA table_info(alarme)")}
         for spalte, typ in (("subjekt", "TEXT DEFAULT ''"), ("anzahl", "INTEGER DEFAULT 1"),
                             ("zuletzt", "REAL DEFAULT 0.0")):
@@ -178,7 +187,8 @@ class Speicher:
             return
         with self._lock:
             self._c.executemany(
-                f"INSERT OR REPLACE INTO ereignisse VALUES ({','.join('?' * 21)})",
+                f"INSERT OR REPLACE INTO ereignisse ({','.join(Ereignis.SPALTEN)}) "
+                f"VALUES ({','.join('?' * len(Ereignis.SPALTEN))})",
                 [e.zeile() for e in liste])
             self._c.commit()
 
@@ -215,6 +225,61 @@ class Speicher:
                 (seit, limit)).fetchall()
         return [Ereignis.aus_zeile(r) for r in reversed(rows)]
 
+    def lern_ereignisse(self, seit: float, bis: float, limit: int = 20_000) -> list[Ereignis]:
+        """Fürs Training: Ereignisse zwischen `seit` und `bis` ohne alles, was mit einem
+        offenen, unklaren oder echten Alarm zusammenhängt.
+
+        Herausgenommen werden: das Ereignis des Alarms, Wiederholungen, die der Motor nur am
+        Alarm gezählt hat (`extra.alarm`), Schatten-Funde des Folgen-Netzes (`extra.dl_fund`),
+        die ganze Prozess-Kette dieser Ereignisse und die Prozesse, die darin gestartet wurden.
+        Ketten über PID + Startzeit, bei älteren Ereignissen ohne Startzeit über PID +
+        Prozessname innerhalb einer Stunde. Ein Ablauf, den noch niemand als harmlos
+        beurteilt hat, wird so nie zum gelernten Normalbild."""
+        belastete_status = "('offen', 'gesehen', 'echt', 'erledigt')"
+        with self._lock:
+            rows = self._c.execute(
+                "SELECT * FROM ereignisse WHERE zeit >= ? AND zeit < ? ORDER BY zeit DESC LIMIT ?",
+                (seit, bis, limit)).fetchall()
+            belastet = self._c.execute(
+                "SELECT e.id, e.pid, e.start, LOWER(e.prozess) prozess, e.zeit FROM alarme a "
+                "JOIN ereignisse e ON a.ereignis_id = e.id "
+                f"WHERE a.status IN {belastete_status} AND e.zeit >= ?",
+                (seit - 3600,)).fetchall()
+            offene_alarme = {r["id"] for r in self._c.execute(
+                f"SELECT id FROM alarme WHERE status IN {belastete_status} AND MAX(zeit, zuletzt) >= ?",
+                (seit - 3600,))}
+        ids = {r["id"] for r in belastet}
+        ketten = {(r["pid"], round(r["start"], 3)) for r in belastet if r["pid"] and r["start"]}
+        ohne_start: dict[tuple[int, str], list[float]] = {}
+        for r in belastet:
+            if r["pid"] and not r["start"]:
+                ohne_start.setdefault((r["pid"], r["prozess"]), []).append(r["zeit"])
+        for r in rows:
+            x = r["extra"] or ""
+            if '"alarm"' not in x and '"dl_fund"' not in x:
+                continue
+            try:
+                extra = json.loads(x)
+            except ValueError:
+                continue
+            if extra.get("dl_fund") or extra.get("alarm") in offene_alarme:
+                ids.add(r["id"])
+                if r["pid"] and r["start"]:
+                    ketten.add((r["pid"], round(r["start"], 3)))
+        out = []
+        for r in reversed(rows):
+            if r["id"] in ids:
+                continue
+            if r["pid"] and r["start"] and (r["pid"], round(r["start"], 3)) in ketten:
+                continue
+            if r["ppid"] and r["eltern_start"] and (r["ppid"], round(r["eltern_start"], 3)) in ketten:
+                continue
+            zeiten = ohne_start.get((r["pid"], (r["prozess"] or "").lower())) if r["pid"] else None
+            if zeiten and any(abs(r["zeit"] - z) <= 3600 for z in zeiten):
+                continue
+            out.append(Ereignis.aus_zeile(r))
+        return out
+
     def anzahl_ereignisse_seit(self, seit: float) -> int:
         with self._lock:
             return int(self._c.execute("SELECT COUNT(*) FROM ereignisse WHERE zeit > ?", (seit,)).fetchone()[0])
@@ -249,9 +314,14 @@ class Speicher:
             return [Alarm.aus_zeile(r) for r in self._c.execute(sql, args)]
 
     def alarm(self, aid: str) -> Alarm | None:
+        """Alarm per id – oder per eindeutigem Anfang der id (ab ID_PRAEFIX_AB Hex-Zeichen)."""
+        aid = str(aid or "").strip()
         with self._lock:
-            r = self._c.execute("SELECT * FROM alarme WHERE id = ? OR id LIKE ?",
-                                (aid, f"{aid}%")).fetchone()
+            r = self._c.execute("SELECT * FROM alarme WHERE id = ?", (aid,)).fetchone()
+            if r is None and len(aid) >= ID_PRAEFIX_AB and re.fullmatch(r"[0-9a-fA-F]+", aid):
+                treffer = self._c.execute("SELECT * FROM alarme WHERE id LIKE ? LIMIT 2",
+                                          (aid.lower() + "%",)).fetchall()
+                r = treffer[0] if len(treffer) == 1 else None
         return Alarm.aus_zeile(r) if r else None
 
     def alarm_urteil(self, aid: str, status: str, wer: str, begruendung: str = "") -> bool:
@@ -262,11 +332,26 @@ class Speicher:
             self._c.commit()
             return cur.rowcount > 0
 
-    def alarm_zaehlen(self, aid: str, zeit: float) -> None:
-        """Derselbe Alarm kam innerhalb des Cooldowns wieder: Zähler hoch statt neue Zeile."""
+    def unklar(self, seit: float) -> int:
+        """Alarme seit `seit`, die die Persönlichkeit als unklar beurteilt hat (`gesehen`) – ohne die,
+        die die Wache früher nur „an die Persönlichkeit übergeben“ markiert hat."""
         with self._lock:
-            self._c.execute("UPDATE alarme SET anzahl = anzahl + 1, zuletzt = ? WHERE id = ?", (zeit, aid))
+            return self._c.execute(
+                "SELECT COUNT(*) FROM alarme WHERE status = 'gesehen' AND urteil_von NOT IN ('', 'Wache') "
+                "AND zeit >= ?", (seit,)).fetchone()[0]
+
+    def alarm_zaehlen(self, aid: str, zeit: float) -> str:
+        """Derselbe Alarm kam innerhalb des Cooldowns wieder: Zähler hoch statt neue Zeile – aber
+        nur an einem unbeurteilten Alarm. "gezaehlt", "beurteilt" (schon harmlos/echt/erledigt:
+        die Wiederholung gehört in einen neuen Alarm) oder "fehlt" (noch nicht geschrieben)."""
+        with self._lock:
+            cur = self._c.execute("UPDATE alarme SET anzahl = anzahl + 1, zuletzt = ? "
+                                  "WHERE id = ? AND status IN ('offen', 'gesehen')", (zeit, aid))
             self._c.commit()
+            if cur.rowcount:
+                return "gezaehlt"
+            da = self._c.execute("SELECT 1 FROM alarme WHERE id = ?", (aid,)).fetchone()
+        return "beurteilt" if da else "fehlt"
 
     def alarme_unbeurteilt(self, regel: str, subjekt: str = "", limit: int = 500) -> list[Alarm]:
         """Alle noch nicht beurteilten Alarme (offen/gesehen) einer Regel – wahlweise nur zu
@@ -279,20 +364,29 @@ class Speicher:
         with self._lock:
             return [Alarm.aus_zeile(r) for r in self._c.execute(sql, args)]
 
-    def gedaempft(self, ab: int = 3) -> dict[tuple[str, str], int]:
-        """(Regel, Subjekt)-Paare, die mindestens `ab`-mal als harmlos beurteilt wurden und
-        nie als echt – die meldet der Motor nicht mehr. Ein einziges „echt“ hebt das auf.
-        Nur Mengen-Regeln (regeln.MENGENREGELN); Muster-Regeln werden nie gedämpft."""
-        from .regeln import MENGENREGELN
+    def gedaempft(self, ab: int = 3, *, mit_schwere: bool = False,
+                  jetzt: float | None = None) -> dict[tuple[str, str], int | tuple[int, int]]:
+        """(Regel, Subjekt)-Paare, die in den letzten DAEMPFEN_TAGE mindestens `ab`-mal als
+        harmlos beurteilt wurden und nie als echt – die meldet der Motor nicht mehr. Ein
+        einziges „echt“ hebt das auf, ohne neue Urteile läuft es ab. Nur Mengen-Regeln
+        (regeln.MENGENREGELN) außer NIE_GEDAEMPFT; Muster-Regeln werden nie gedämpft.
+        `mit_schwere`: Wert (Anzahl, höchste als harmlos beurteilte Schwere)."""
+        from .regeln import MENGENREGELN, NIE_GEDAEMPFT
         if ab <= 0:
             return {}
-        regeln = sorted(MENGENREGELN)
+        regeln = sorted(MENGENREGELN - NIE_GEDAEMPFT)
+        grenze = (jetzt if jetzt is not None else time.time()) - DAEMPFEN_TAGE * 86400
         with self._lock:
             rows = self._c.execute(
                 "SELECT regel, LOWER(subjekt) s, "
-                "SUM(status = 'harmlos') harmlos, SUM(status = 'echt') echt "
+                "SUM(status = 'harmlos' AND MAX(zeit, zuletzt) >= ?) harmlos, "
+                "MAX(CASE WHEN status = 'harmlos' AND MAX(zeit, zuletzt) >= ? THEN schwere END) schwere, "
+                "SUM(status IN ('echt', 'erledigt')) echt "
                 f"FROM alarme WHERE subjekt != '' AND regel IN ({','.join('?' * len(regeln))}) "
-                "GROUP BY regel, s HAVING harmlos >= ? AND echt = 0", (*regeln, ab)).fetchall()
+                "GROUP BY regel, s HAVING harmlos >= ? AND echt = 0",
+                (grenze, grenze, *regeln, ab)).fetchall()
+        if mit_schwere:
+            return {(r["regel"], r["s"]): (int(r["harmlos"]), int(r["schwere"] or 0)) for r in rows}
         return {(r["regel"], r["s"]): int(r["harmlos"]) for r in rows}
 
     def alarm_statistik(self) -> dict:
@@ -347,13 +441,26 @@ class Speicher:
             self._c.commit()
         return n > 0
 
-    def fehlalarm_prozesse(self) -> set[str]:
-        """Prozesse, deren Alarme als harmlos beurteilt wurden – dämpft den Score."""
+    def fehlalarm_pfade(self) -> set[str]:
+        """Programmpfade (klein), deren Alarme als harmlos beurteilt wurden und nie als echt –
+        dämpft den ML-Score. Am Pfad, nicht am Namen: ein svchost.exe im Temp-Ordner ist ein
+        anderes Programm als das aus System32."""
         with self._lock:
             rows = self._c.execute(
-                "SELECT e.prozess FROM alarme a JOIN ereignisse e ON a.ereignis_id = e.id "
-                "WHERE a.status = 'harmlos' AND e.prozess != ''").fetchall()
-        return {r["prozess"] for r in rows}
+                "SELECT LOWER(e.exe) exe, SUM(a.status = 'harmlos') harmlos, "
+                "SUM(a.status IN ('echt', 'erledigt')) echt "
+                "FROM alarme a JOIN ereignisse e ON a.ereignis_id = e.id WHERE e.exe != '' "
+                "GROUP BY LOWER(e.exe) HAVING harmlos > 0 AND echt = 0").fetchall()
+        return {r["exe"] for r in rows}
+
+    def offene_pfade(self) -> set[str]:
+        """Programmpfade (klein) mit unbeurteiltem Alarm – deren Verhalten wird nicht ins
+        Profil übernommen, bis jemand geurteilt hat."""
+        with self._lock:
+            rows = self._c.execute(
+                "SELECT DISTINCT LOWER(e.exe) exe FROM alarme a JOIN ereignisse e ON a.ereignis_id = e.id "
+                "WHERE a.status IN ('offen', 'gesehen') AND e.exe != ''").fetchall()
+        return {r["exe"] for r in rows}
 
     # --------------------------------------------------------------- Profile
 
@@ -384,6 +491,10 @@ class Speicher:
                  _menge_plus(r["ports"], str(port) if port else "", 32), name))
             self._c.commit()
             return False
+
+    def profil_bekannt(self, name: str) -> bool:
+        with self._lock:
+            return self._c.execute("SELECT 1 FROM profile WHERE prozess = ?", (name,)).fetchone() is not None
 
     def profile(self) -> dict[str, dict]:
         with self._lock:
@@ -486,16 +597,23 @@ class Speicher:
 
     # --------------------------------------------------------------- Wartung
 
+    HARMLOS_TAGE = 90           # so lange zählen harmlos-Urteile fürs Dämpfen
+
     def aufraeumen(self, tage: int, max_ereignisse: int) -> int:
+        """Alte Ereignisse und Urteile weg. Echte und erledigte Alarme bleiben samt ihrem Ereignis
+        (sie sollen sichtbar bleiben), harmlose zählen HARMLOS_TAGE fürs Dämpfen, unklare `tage`."""
         grenze = time.time() - tage * 86400
+        behalten = "id NOT IN (SELECT ereignis_id FROM alarme WHERE status IN ('echt', 'erledigt'))"
         with self._lock:
-            n = self._c.execute("DELETE FROM ereignisse WHERE zeit < ?", (grenze,)).rowcount
-            self._c.execute("DELETE FROM alarme WHERE zeit < ? AND status != 'offen'", (grenze,))
+            n = self._c.execute(f"DELETE FROM ereignisse WHERE zeit < ? AND {behalten}", (grenze,)).rowcount
+            self._c.execute("DELETE FROM alarme WHERE zeit < ? AND status = 'gesehen'", (grenze,))
+            self._c.execute("DELETE FROM alarme WHERE zeit < ? AND status = 'harmlos'",
+                            (time.time() - max(tage, self.HARMLOS_TAGE) * 86400,))
             zuviel = self.anzahl_ereignisse() - max_ereignisse
             if zuviel > 0:
                 self._c.execute(
                     "DELETE FROM ereignisse WHERE id IN "
-                    "(SELECT id FROM ereignisse ORDER BY zeit ASC LIMIT ?)", (zuviel,))
+                    f"(SELECT id FROM ereignisse WHERE {behalten} ORDER BY zeit ASC LIMIT ?)", (zuviel,))
                 n += zuviel
             self._c.commit()
         return n
