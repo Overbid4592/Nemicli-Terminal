@@ -42,7 +42,7 @@ _NORMAL = [("chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.ex
            ("OneDrive.exe", r"C:\Users\test\AppData\Local\Microsoft\OneDrive\OneDrive.exe", "explorer.exe"),
            ("Teams.exe", r"C:\Users\test\AppData\Local\Microsoft\Teams\current\Teams.exe", "explorer.exe"),
            ("git.exe", r"C:\Program Files\Git\cmd\git.exe", "code.exe")]
-_ZIELE = ["11.22.33.1", "11.22.33.2", "11.22.33.3", "11.22.33.4"]
+_ZIELE = ["192.0.2.1", "192.0.2.2", "192.0.2.3", "192.0.2.4"]
 _PORTS = [443] * 16 + [80, 80, 8080, 53]
 _SELTEN = [(f"tool{i}.exe", rf"C:\Program Files\Tools\tool{i}.exe", "explorer.exe") for i in range(30)]
 _DOWNLOADS = r"C:\Users\test\Downloads"
@@ -157,7 +157,7 @@ class _Ketten:
 
     def netz(self, p: tuple, port: int, ts: float, extern: bool = True) -> None:
         self.out.append(Ereignis(NETZ, "conn_open", f"Verbindung: {p[2]} → :{port}", zeit=ts, prozess=p[2],
-                                 pid=p[0], start=p[1], zielport=port, ziel="11.22.33.7" if extern else "10.0.0.2",
+                                 pid=p[0], start=p[1], zielport=port, ziel="192.0.2.7" if extern else "10.0.0.2",
                                  extra={"extern": extern}))
 
     def listen(self, p: tuple, port: int, ts: float) -> None:
