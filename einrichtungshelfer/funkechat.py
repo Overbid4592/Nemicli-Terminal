@@ -33,8 +33,7 @@ def ordner() -> Path:
 
 def verfuegbar(pfad: Path | None = None) -> bool:
     pfad = pfad or ordner()
-    stuecke_zusammensetzen(pfad / "helfer.bin")
-    return all((pfad / d).is_file() for d in _DATEIEN)
+    return stuecke_zusammensetzen(pfad / "helfer.bin") and all((pfad / d).is_file() for d in _DATEIEN)
 
 
 def kopf(pfad: Path | None = None) -> dict:
@@ -46,7 +45,8 @@ def kopf(pfad: Path | None = None) -> dict:
 
     from einrichtungshelfer.laufzeit import KENNUNG
     datei = (pfad or ordner()) / "helfer.bin"
-    stuecke_zusammensetzen(datei)
+    if not stuecke_zusammensetzen(datei):
+        raise ValueError("Funke-Modell fehlt oder SHA-256-Pruefung fehlgeschlagen")
     with open(datei, "rb") as f:
         if f.read(len(KENNUNG)) != KENNUNG:
             raise ValueError("unbekanntes Format")
@@ -77,7 +77,8 @@ class Motor:
     def __init__(self, pfad: Path, seed: int | None = None):
         self.ws = Wortschatz.laden(pfad / "wortschatz.json")
         self.rng = random.Random(seed)
-        stuecke_zusammensetzen(pfad / "helfer.bin")
+        if not stuecke_zusammensetzen(pfad / "helfer.bin"):
+            raise ValueError("Funke-Modell fehlt oder SHA-256-Pruefung fehlgeschlagen")
         try:
             from einrichtungshelfer.torchmodell import Generator
             self.torch = Generator(pfad / "helfer.bin", threads=None)
