@@ -135,7 +135,6 @@ Or simply ask the AI – it knows all commands and opens suitable menus itself.
 |---|---|
 | `/modus [chat\|lesen\|normal\|auto\|autoan]` | work mode (also Shift+Tab) |
 | `/code [aufgabe\|status]` · `/codeend` | 🟦 start coding assistant · end it |
-| `/workspace [pfad]` · `/workspaceend` | 📌 pin project folder – it works only there · release |
 | `/doku [laden python\|mdn]` | 📚 offline docs for the coding assistant |
 | `/sandbox [freigeben <Ordner> [schreiben]\|entziehen <Ordner>]` | 🧪 sandbox: status, authorize/revoke project folder |
 | `/uebung [an\|aus\|jetzt]` | practice mode: small programs while idle |
@@ -232,7 +231,7 @@ Please report security vulnerabilities privately: [SECURITY.md](SECURITY.md) (Ge
 NemiCli/
 ├─ main.py                Chat loop, action logic, commands, startup
 ├─ start.bat · nemicli.cmd Starter
-├─ core/                  Persona, commands, modes, config, keys, paths, workspace, coding assistant
+├─ core/                  Persona, commands, modes, config, keys, paths, coding assistant
 ├─ engines/               Chat engines, Krea 2, image describer, WebUI/ComfyUI, systemcheck
 ├─ ggufengine/            own GGUF engine (reader, tokenizer, kernel, models)
 ├─ tools/                 Tools, memory, sandbox, web, watch (tools/wache/)
@@ -312,7 +311,6 @@ starting with empty memory.
 - [ ] `/backup`: Normal (your data) and Complete (with program), as Zip with SHA-256
 - [ ] Installer with its own windows (Next-Next-Done, desktop icon selectable)
 - [ ] LoRA support for the image pipeline
-- [ ] Move `Agenten/workspace.md` into the data folder (`/workspace` searches for it there)
 - [ ] Decide on a license (love project – never for sale)
 - [ ] Signature with a recognized certificate if NemiCLI goes to others
 - [ ] Submit build to Bitdefender false-positive form

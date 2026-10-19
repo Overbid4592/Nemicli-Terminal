@@ -84,3 +84,8 @@ Backup/
 *.key
 *.pfx
 *.p12
+
+# Weitere lokale Nutzerdaten (core/paths.py)
+/Wissen/
+/Papierkorb/
+/Skills/
