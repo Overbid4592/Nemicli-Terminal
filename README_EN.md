@@ -14,7 +14,7 @@ Deutsche Fassung: README.md
 
 **Your own AI agent in the terminal – cloud & local, with tools, memory, and heart.** ✦
 
-**Developed by D. Hoffmann (Vibecoder) · built with Claude Opus 5 (Anthropic)**
+**Developed by VibeCoder (@Overbid4592) · built with Claude Opus 5 (Anthropic)**
 
 </div>
 
