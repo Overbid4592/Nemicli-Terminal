@@ -27,8 +27,7 @@ def ordner() -> Path:
 
 def verfuegbar(pfad: Path | None = None) -> bool:
     pfad = pfad or ordner()
-    stuecke_zusammensetzen(pfad / "helfer.bin")
-    return all((pfad / d).is_file() for d in _DATEIEN)
+    return stuecke_zusammensetzen(pfad / "helfer.bin") and all((pfad / d).is_file() for d in _DATEIEN)
 
 
 @dataclass
