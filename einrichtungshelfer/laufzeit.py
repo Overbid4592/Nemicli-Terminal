@@ -22,32 +22,63 @@ _sumprod = math.sumprod
 
 
 def stuecke_zusammensetzen(datei: Path) -> bool:
-    """Fehlt `datei`, liegen aber Stücke daneben (helfer.bin.001, .002 …), werden sie einmal zur Datei
-    zusammengesetzt – große Modelldateien stehen im Repo in Stücken, weil der Web-Upload keine großen
-    Einzeldateien annimmt. Mit `<datei>.sha256` daneben wird das Ergebnis geprüft. True = Datei da."""
+    """Modell nur mit gueltiger SHA-256-Solldatei bereitstellen.
+
+    Geprueft werden zusammengesetzte Dateien und bereits vorhandene Modelle.
+    Fehlende oder inkorrekte Pruefsummen lassen das Modell unverfuegbar.
+    """
+    import tempfile
+
     datei = Path(datei)
+    soll = datei.with_name(datei.name + ".sha256")
+    try:
+        teile = soll.read_text(encoding="utf-8").split()
+        if len(teile) != 2 or teile[1] != datei.name:
+            return False
+        erwartet = teile[0].lower()
+        if len(erwartet) != 64 or any(c not in "0123456789abcdef" for c in erwartet):
+            return False
+    except (OSError, UnicodeError):
+        return False
+
+    def pruefsumme(pfad: Path) -> str:
+        h = hashlib.sha256()
+        with pfad.open("rb") as quelle:
+            for block in iter(lambda: quelle.read(1 << 20), b""):
+                h.update(block)
+        return h.hexdigest()
+
     if datei.is_file():
-        return True
+        try:
+            return pruefsumme(datei) == erwartet
+        except OSError:
+            return False
+
     stuecke = sorted(datei.parent.glob(datei.name + ".[0-9][0-9][0-9]"))
     if not stuecke or [int(s.suffix[1:]) for s in stuecke] != list(range(1, len(stuecke) + 1)):
-        return False                                        # keine Stücke oder eins fehlt
-    tmp = datei.with_name(datei.name + ".tmp")
-    pruef = hashlib.sha256()
+        return False
+
+    tmp = None
     try:
-        with open(tmp, "wb") as aus:
-            for s in stuecke:
-                teil = s.read_bytes()
-                pruef.update(teil)
-                aus.write(teil)
-        soll = datei.with_name(datei.name + ".sha256")
-        if soll.is_file() and soll.read_text(encoding="utf-8").split()[0].lower() != pruef.hexdigest():
-            tmp.unlink()
+        h = hashlib.sha256()
+        with tempfile.NamedTemporaryFile(mode="wb", dir=datei.parent,
+                                         prefix=datei.name + ".", suffix=".tmp",
+                                         delete=False) as aus:
+            tmp = Path(aus.name)
+            for stueck in stuecke:
+                with stueck.open("rb") as quelle:
+                    for block in iter(lambda: quelle.read(1 << 20), b""):
+                        h.update(block)
+                        aus.write(block)
+        if h.hexdigest() != erwartet:
             return False
         os.replace(tmp, datei)
         return True
-    except (OSError, IndexError):
-        tmp.unlink(missing_ok=True)
+    except OSError:
         return False
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
 
 
 def _flach(roh: memoryview, typ: str) -> array:
@@ -169,7 +200,8 @@ class Helfer:
     def __init__(self, ordner: Path, seed: int | None = None):
         ordner = Path(ordner)
         self.ws = Wortschatz.laden(ordner / "wortschatz.json")
-        stuecke_zusammensetzen(ordner / "helfer.bin")
+        if not stuecke_zusammensetzen(ordner / "helfer.bin"):
+            raise ValueError("Helfer-Modell fehlt oder SHA-256-Pruefung fehlgeschlagen")
         self.modell = Modell(ordner / "helfer.bin")
         self.rng = random.Random(seed)
         self.ende = self.ws.id["</h>"]
