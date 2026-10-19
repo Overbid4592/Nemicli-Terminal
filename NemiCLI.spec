@@ -99,10 +99,15 @@ DATAS.append((str(ROOT / "engines" / "liveportrait" / "LIZENZ.txt"), "liveportra
 DATAS.append((str(ROOT / "engines" / "musik" / "LIZENZ.txt"), "musik"))                 # MIT-Hinweise der Vorbilder
 for _db in sorted((ROOT / "ggufengine" / "daten").glob("*.json")):      # Modell-Datenbank
     DATAS.append((str(_db), "ggufengine/daten"))
-for _ordner in ("modell", "modell_gross"):           # Funke (gespraech.ordner) und Funke Groß (funkechat.ordner)
-    for _helfer in ("helfer.bin", "wortschatz.json"):
-        if (ROOT / "einrichtungshelfer" / _ordner / _helfer).exists():
-            DATAS.append((str(ROOT / "einrichtungshelfer" / _ordner / _helfer), f"einrichtungshelfer/{_ordner}"))
+# Auch ein frischer Checkout muss beide Modelle korrekt ins EXE-Paket aufnehmen.
+_sys.path.insert(0, str(ROOT))
+from einrichtungshelfer.laufzeit import stuecke_zusammensetzen as _modell_pruefen
+for _ordner in ("modell", "modell_gross"):
+    _basis = ROOT / "einrichtungshelfer" / _ordner
+    if not (_basis / "wortschatz.json").is_file() or not _modell_pruefen(_basis / "helfer.bin"):
+        raise RuntimeError(f"Funke-Modell fehlt oder SHA-256 falsch: {_ordner}")
+    for _helfer in ("helfer.bin", "helfer.bin.sha256", "wortschatz.json"):
+        DATAS.append((str(_basis / _helfer), f"einrichtungshelfer/{_ordner}"))
 
 # Build-Nummer in die exe: dort gibt es kein Git, das die Commits zählt.
 _sys.path.insert(0, str(ROOT / "core"))
