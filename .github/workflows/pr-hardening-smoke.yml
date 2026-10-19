@@ -11,6 +11,7 @@ on:
       - "installer/aufspielen.py"
       - "einrichtungshelfer/**"
       - "test_release_hardening.py"
+      - "test_repository_model_parts.py"
       - ".github/workflows/pr-hardening-smoke.yml"
 
 permissions:
@@ -18,12 +19,20 @@ permissions:
 
 jobs:
   smoke:
-    runs-on: ubuntu-24.04
-    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     steps:
       - name: Checkout tested revision
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Python version
-        run: python3 --version
-      - name: Run isolated offline regression tests
-        run: python3 -m unittest -v test_release_hardening
+      - name: Python 3.12
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5.6.0
+        with:
+          python-version: "3.12"
+      - name: Compile modified Python modules
+        run: python -m compileall -q einrichtungshelfer installer test_release_hardening.py test_repository_model_parts.py
+      - name: Run offline tests and verify both real Funke models
+        run: python -m unittest -v test_release_hardening test_repository_model_parts
