@@ -1,0 +1,29 @@
+name: PR hardening smoke tests
+
+on:
+  push:
+    branches:
+      - audit/2026-10-19-small-hardening
+  pull_request:
+    branches:
+      - main
+    paths:
+      - "installer/aufspielen.py"
+      - "einrichtungshelfer/**"
+      - "test_release_hardening.py"
+      - ".github/workflows/pr-hardening-smoke.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout tested revision
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Python version
+        run: python3 --version
+      - name: Run isolated offline regression tests
+        run: python3 -m unittest -v test_release_hardening
