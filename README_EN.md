@@ -284,10 +284,16 @@ starting with empty memory.
 
 ---
 
+## 📜 License
+
+NemiCLI is distributed under the **GNU General Public License v3.0 (GPL-3.0)**. See the [LICENSE](LICENSE) file for the full license text and conditions.
+
+---
+
 ## 🗺 Roadmap
 
 **Completed according to the project documentation:** custom GGUF engine and vision, Windows installer, AppContainer sandbox, GUI, coding assistant, skill safeguards, backup/restore, character LoRA, music and animated portrait engines, model reasoning/review, reranked memory retrieval and browser-page checks.
 
-**Planned:** a dedicated restricted Windows user for the agent, final licensing decisions, publicly trusted code signing and antivirus false-positive submission.
+**Planned:** a dedicated restricted Windows user for the agent, publicly trusted code signing and antivirus false-positive submission.
 
 The project is in **alpha**. See [README.md](README.md) and [CHANGELOG.md](CHANGELOG.md) for the authoritative detailed status.
