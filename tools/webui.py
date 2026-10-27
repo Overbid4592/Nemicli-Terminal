@@ -24,6 +24,7 @@ Prozess/keine Webseite die Aktionen (Datei/Shell!) der CLI fernsteuern.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import queue
 import secrets
@@ -31,6 +32,9 @@ import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
+
+
+FRAGE_ZEIT_S = 600            # so lange wartet eine Rückfrage im Browser, dann gilt die sichere Option
 
 
 class WebBridge:
@@ -50,12 +54,15 @@ class WebBridge:
         self._lock = threading.Lock()
         self._confirms: dict[int, object] = {}  # id -> asyncio.Future
         self._cid = 0
+        self._offene_frage: dict | None = None   # bekommt auch ein neu geladener Tab
 
     # --- SSE-Clients (je offener Tab eine Queue) ---------------------------
     def add_client(self) -> queue.Queue:
         q: queue.Queue = queue.Queue(maxsize=2000)
         with self._lock:
             self._clients.add(q)
+        if (frage := self._offene_frage) is not None:      # Tab neu geladen, während eine Frage offen ist
+            q.put_nowait(json.dumps(frage, ensure_ascii=False))
         return q
 
     def remove_client(self, q: queue.Queue) -> None:
@@ -76,17 +83,28 @@ class WebBridge:
     # --- Bestätigungen (async, vom Server-Thread aufgelöst) ----------------
     async def ask(self, question: str, options: list[tuple[str, str]],
                   preview: str | None = None) -> str:
-        """Im Browser nachfragen und auf die Wahl warten. Läuft auf der CLI-Schleife."""
+        """Im Browser nachfragen und auf die Wahl warten. Läuft auf der CLI-Schleife.
+        Kein Tab offen oder keine Antwort in FRAGE_ZEIT_S: die sichere letzte Option (wie Esc) – sonst
+        hielte ein geschlossener Tab den Zug und damit TURN_LOCK für immer."""
+        sicher = options[-1][0] if options else "no"
+        with self._lock:
+            offen = bool(self._clients)
+        if not offen:
+            return sicher
         self._cid += 1
         cid = self._cid
         fut = self.loop.create_future()
         self._confirms[cid] = fut
-        self.broadcast({"t": "confirm", "id": cid, "question": question,
-                        "options": [[v, l] for v, l in options], "preview": preview})
+        self._offene_frage = {"t": "confirm", "id": cid, "question": question,
+                              "options": [[v, l] for v, l in options], "preview": preview}
+        self.broadcast(self._offene_frage)
         try:
-            return await fut
+            return await asyncio.wait_for(fut, FRAGE_ZEIT_S)
+        except asyncio.TimeoutError:
+            return sicher
         finally:
             self._confirms.pop(cid, None)
+            self._offene_frage = None
 
     def answer(self, cid: int, choice: str) -> None:
         """Aus dem Server-Thread: die wartende Bestätigung auflösen."""
@@ -115,7 +133,7 @@ def _make_handler(bridge: WebBridge, handlers: dict):
     def token_ok(parsed, headers) -> bool:
         q = parse_qs(parsed.query)
         tok = (q.get("token", [""])[0]) or headers.get("X-Token", "")
-        return secrets.compare_digest(tok, bridge.token)
+        return secrets.compare_digest(str(tok).encode("utf-8", "replace"), bridge.token.encode())
 
     class Handler(BaseHTTPRequestHandler):
         protocol_version = "HTTP/1.1"
@@ -140,8 +158,11 @@ def _make_handler(bridge: WebBridge, handlers: dict):
                        "application/json; charset=utf-8")
 
         def _body(self) -> dict:
-            n = int(self.headers.get("Content-Length", 0) or 0)
-            if n <= 0:
+            try:
+                n = int(self.headers.get("Content-Length", 0) or 0)
+            except ValueError:
+                return {}
+            if n <= 0 or n > 2_000_000:              # Anfragen sind kurze Texte
                 return {}
             try:
                 return json.loads(self.rfile.read(n).decode("utf-8") or "{}")

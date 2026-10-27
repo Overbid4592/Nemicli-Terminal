@@ -143,7 +143,8 @@ def aendern(was: str, wert, grund: str = "") -> str:
     p = datei()
     import snapshot
     kopie = snapshot.sichern(p, "einstellung_aendern") if p.is_file() else None
-    p.write_text(_text(neu), encoding="utf-8")
+    from atomar import text_schreiben
+    text_schreiben(p, _text(neu))
     import webfetch
     webfetch.neu_laden()
     return satz.replace(" wird ", " ist jetzt ", 1) + (" Alter Stand im Papierkorb (/undo)." if kopie else "")

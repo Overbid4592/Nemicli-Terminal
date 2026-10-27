@@ -19,7 +19,7 @@ auf. Helfer-Agenten schreiben mit, mit ihrem Namen.
 Nur Namen und Beschreibungen, keine Inhalte. Die Datei ist Text, grep-bar,
 und dreht sich ab 5 MB (die alte wird zu aktionen.log.1).
 
-Hinter der
+Damit nachvollziehbar ist, welches Ergebnis eine Aktion hatte, steht hinter der
 Beschreibung steht „→ Ergebnis: …“ – die erste Zeile dessen, was das Werkzeug
 zurückgab (gekürzt), bei Risiko-Aktionen ein „⚠RISIKO“ vor dem Werkzeug, und
 wenn im gelesenen Inhalt Befehlsmuster steckten, ein „⚠ Befehlsmuster“. Die

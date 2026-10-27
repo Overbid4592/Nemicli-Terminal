@@ -53,6 +53,10 @@ def save_skill(name: str, content: str) -> Path:
     """Speichert eine selbst-geschriebene Lektion/Anleitung als Markdown."""
     _ensure()
     path = SKILLS_DIR / f"{_slug(name)}.md"
+    n = 2
+    while path.exists():                       # nie eine vorhandene Notiz überschreiben
+        path = SKILLS_DIR / f"{_slug(name)}-{n}.md"
+        n += 1
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     body = f"# {name.strip()}\n\n_gelernt am {now}_\n\n{content.strip()}\n"
     path.write_text(body, encoding="utf-8")
@@ -91,15 +95,17 @@ def fremdes_in_runde(user_prompt: str, messages: list) -> bool:
     """Kam in dieser Runde Fremd-Inhalt herein (Webseite, Datei, Bild, Werkzeug-Ergebnis mit dem
     Fremddaten-Rahmen)? Gesucht wird rückwärts bis zur Nachricht des Nutzers."""
     try:
-        from fremddaten import _HINWEIS as marke
+        from fremddaten import _HINWEIS, FREMD_MARKEN
+        marken = (_HINWEIS, *FREMD_MARKEN, "📎 ANGEHÄNGTE DATEI")
     except Exception:
-        marke = "stammt NICHT vom Nutzer"
+        marken = ("stammt NICHT vom Nutzer", "📎 ANGEHÄNGTE DATEI")
     anfang = (user_prompt or "").strip()[:200]
     for m in reversed(messages[-80:]):
         t = _text(m)
-        if marke in t:
+        if any(x in t for x in marken):
             return True
-        if m.get("role") == "user" and anfang and t.strip().startswith(anfang):
+        # Rundenanfang: die Nachricht des Nutzers – auch wenn Datenblöcke (Anhänge) davor stehen.
+        if m.get("role") == "user" and anfang and anfang in t:
             return False
     return False
 
@@ -167,7 +173,8 @@ def list_snippets() -> list[tuple[Path, str]]:
 
 
 def _safe(s: str) -> str:
-    return (s or "").replace("```", "'''").replace("\n", " ").strip()
+    """Eine Zeile im Wissens-Index: einzeilig und kurz – sie steht in jedem System-Prompt."""
+    return " ".join((s or "").replace("```", "'''").split())[:80]
 
 
 def index_for_prompt() -> str:

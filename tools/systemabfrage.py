@@ -336,6 +336,9 @@ def _datei_pfad(pfad: str) -> Path:
     if not str(pfad or "").strip():
         raise AbfrageFehler("Es fehlt 'pfad'.")
     p = Path(os.path.expandvars(str(pfad).strip().strip('"')))
+    if str(p).replace("/", "\\").startswith("\\\\") and not str(p).startswith("\\\\?\\"):
+        # Schon das Nachsehen schickt die Windows-Anmeldung an den fremden Rechner.
+        raise AbfrageFehler("Netzwerkpfade (\\\\rechner\\…) frage ich nicht ab.")
     _schutz_pruefen(str(p))
     if not p.is_file():
         raise AbfrageFehler(f"Keine Datei: {p}")

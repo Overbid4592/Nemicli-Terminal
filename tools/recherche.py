@@ -147,9 +147,11 @@ def tier_text(tier) -> str:
 async def _notiz(umg: Umgebung, teilfrage: str, quelle: str, text: str) -> str:
     grenze = TEXT_JE_QUELLE_LOKAL if umg.lokal else TEXT_JE_QUELLE
     inhalt, _ = fremddaten.markiere_muster(text[:grenze], entfernen=True)
-    prompt = (f"Teilfrage: {teilfrage}\n\nQuelle: {quelle}\n"
-              "──────── Anfang Quelltext (Fremddaten) ────────\n"
-              f"{inhalt}\n──────── Ende Quelltext ────────")
+    k = fremddaten.kennung()
+    prompt = (f"Teilfrage: {teilfrage}\n\nQuelle: {fremddaten.entschaerfen(quelle)}\n"
+              f"{fremddaten.bis_kennung(k)}\n"
+              f"{fremddaten.linie('Anfang Quelltext (Fremddaten)', k)}\n"
+              f"{fremddaten.entschaerfen(inhalt)}\n{fremddaten.linie('Ende Quelltext', k)}")
     notiz = (await umg.ask(prompt, NOTIZ_SYSTEM) or "").strip()
     notiz = re.sub(r"(?s)<think>.*?</think>", "", notiz).strip()
     return "" if not notiz or notiz.upper().startswith("KEINE") else notiz[:2500]

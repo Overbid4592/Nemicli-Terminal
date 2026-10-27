@@ -94,7 +94,9 @@ def flush() -> None:
         return
     try:
         _FILE.parent.mkdir(parents=True, exist_ok=True)
-        _FILE.write_text(json.dumps(_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp = _FILE.with_suffix(".tmp")                   # atomar: ein Absturz setzt die Statistik nicht zurück
+        tmp.write_text(json.dumps(_data, ensure_ascii=False, indent=2), encoding="utf-8")
+        tmp.replace(_FILE)
         _dirty = False
         _last_save = time.monotonic()
     except Exception:

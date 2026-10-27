@@ -49,6 +49,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+import ersatzbank
 import foldersense
 import fremddaten
 import learn
@@ -100,7 +101,7 @@ def bild_status() -> str | None:
 # ---------------------------------------------------------------------------
 # SCHUTZ: Windows-/Systemordner sind für die KI KOMPLETT tabu.
 # ---------------------------------------------------------------------------
-# Regel vom Nutzer (12.09.2026): „Da soll die KI erst gar nicht ran." Verändernde
+# Systemordner sind kein Arbeitsgebiet der KI. Verändernde
 # Werkzeuge prüfen über _guard(), lesende über _read_guard(), Befehle über
 # _guard_command() – jeder Zielpfad wird gegen diese Liste geprüft, Pfade werden
 # vorher aufgelöst (…/.., Links, \\?\-Präfix), damit kein Umweg
@@ -181,13 +182,7 @@ def _lokaler_host(host: str) -> bool:
         import ipaddress
         return ipaddress.ip_address(h).is_loopback
     except ValueError:
-        pass
-    try:                                           # Alias auf diesen Rechner (hosts-Datei, DNS)
-        import socket
-        ip = socket.gethostbyname(h)
-        return ip.startswith("127.") or ip in _LOKALE_HOSTS
-    except (OSError, UnicodeError):
-        return False
+        return False                               # keine Namensauflösung: schon die Anfrage verrät den Namen
 
 
 def _normieren(roh: str) -> str | None:
@@ -208,10 +203,13 @@ def _normieren(roh: str) -> str | None:
         if not m:
             return None
         host, freigabe, rest = m.groups()
-        if _lokaler_host(host):
-            if not re.fullmatch(r"[A-Za-z]\$", freigabe):
-                return None
-            s = freigabe[0] + ":" + (rest or "\\")
+        if not _lokaler_host(host):
+            # Fremde Freigaben nie öffnen – schon der Zugriff schickt die Windows-Anmeldung (NTLM)
+            # an den fremden Rechner. Verbundene Netzlaufwerke (Z:\) gehen weiter.
+            return None
+        if not re.fullmatch(r"[A-Za-z]\$", freigabe):
+            return None
+        s = freigabe[0] + ":" + (rest or "\\")
     # Win32 schneidet Punkte und Leerzeichen am Ende jedes Namens ab: "Windows ." = "Windows".
     teile = s.split("\\")
     return "\\".join(t if t in (".", "..") else (t.rstrip(" .") or t) for t in teile)
@@ -228,7 +226,7 @@ def _kandidaten(path: str) -> list[Path] | None:
     for v in {roh, os.path.expandvars(roh), os.path.expanduser(roh),
               os.path.expanduser(os.path.expandvars(roh))}:
         n = _normieren(v)
-        if n is None:
+        if n is None or ":" in n[2:]:              # datei.txt:strom (alternativer Datenstrom)
             return None
         try:
             p = Path(n).resolve()
@@ -268,11 +266,10 @@ def _is_protected(path: str) -> bool:
 
 # --- Eigene Sperren des Nutzers ---------------------------------------------
 # Oben ging es um Windows. Hier geht es um Orte, die dem Nutzer gehören, an
-# denen die KI aber nichts zu suchen hat. Anlass war der 15.09.2026: beim
-# Einrichten des Musicnemi-Workspace kam ein Audio-VAE dazu, und das Bilder-
-# malen fiel aus, weil NemiCLI seinen VAE per "nimm den ersten" wählte.
-# Kaputtgeschrieben war nichts – der Nutzer will diese Orte trotzdem
-# grundsätzlich aus der Hand der KI. Zwei Stufen:
+# denen die KI aber nichts zu suchen hat. Beispiel: legt ein Workspace einen
+# Audio-VAE in einen Modell-Ordner, fällt das Bildermalen aus, wenn NemiCLI
+# seinen VAE per "nimm den ersten" wählt. Solche Orte bleiben grundsätzlich
+# aus der Hand der KI. Zwei Stufen:
 #
 #   ABSOLUT  – der NemiCLI-Ordner. Genau wie C:\Windows: nicht ändern und
 #              auch nicht ansehen. Damit kann sich NemiCLI nicht mehr selbst
@@ -448,6 +445,12 @@ def _gesperrt_zum_aendern(path: str) -> Path | None:
     return _liegt_unter(path, _schreibsperre_bases())
 
 
+# Stand des Coding-Assistenten: „fertig“ setzt nur die Prüfung im Werkzeug todo, nie ein Dateiwerkzeug.
+_TODO_STAND = re.compile(r"(?i)\.nemicli[\\/]+todo\.json")
+_TODO_MELDUNG = ("Fehler: 🔒 Die Todo-Liste (.nemicli/todo.json) ändert nur das Werkzeug todo – "
+                 "„fertig“ setzt die Prüfung, nicht eine Dateiänderung.")
+
+
 def _guard(*paths: str) -> str | None:
     """Gibt eine Fehlermeldung zurück, wenn EINER der Pfade geschützt ist
     (dann NICHT ausführen) – sonst None."""
@@ -459,6 +462,9 @@ def _guard(*paths: str) -> str | None:
         if path and (fremd := _fremde_persoenlichkeit_meldung(path)):
             return fremd
     for path in paths:
+        if path and _TODO_STAND.search(str(path)):
+            return _TODO_MELDUNG
+    for path in paths:
         if path and (base := _gesperrt_zum_aendern(path)) is not None:
             return ("Fehler: 🔒 Schreibgeschützt – der Nutzer hat diesen Bereich "
                     f"gesperrt: {base}. Ansehen darfst du ihn, ändern nicht. "
@@ -469,7 +475,7 @@ def _guard(*paths: str) -> str | None:
 
 # --- Systemordner sind komplett tabu – auch fürs Lesen -----------------------
 # Ursprünglich durfte NemiCLI in C:\Windows & Co. *lesen* (nur nicht ändern).
-# Entscheidung vom 12.09.2026: Die KI hat dort gar nichts zu suchen. Also
+# Danach galt: Die KI hat dort gar nichts zu suchen. Also
 # sperren wir auch datei_lesen, ordner_auflisten, dateien_suchen, inhalt_suchen,
 # ordner_erkennen/ordner_lernen und jeden Befehl, der einen Systemordner nennt.
 # Die Laufwerks-Wurzel (C:\) darf weiterhin AUFGELISTET werden – nur die
@@ -487,9 +493,9 @@ def _in_system_dir(path: str) -> bool:
 def _read_guard(*paths: str) -> str | None:
     """Lese-Sperre: nur die absolut gesperrten Orte des Nutzers sind unsichtbar.
 
-    Bis 18.09.2026 waren auch Windows-/Systemordner fürs Lesen tabu. Für die
+    Früher waren auch Windows-/Systemordner fürs Lesen tabu. Für die
     Systemwache (svchost am richtigen Ort? Signatur von C:\\Windows\\System32\\…?)
-    muss die KI aber hinschauen dürfen. Der Nutzer hat entschieden: nachschauen
+    muss die KI aber hinschauen dürfen. Regel: nachschauen
     ja, ändern nie – fürs Ändern bleibt _guard() so streng wie vorher."""
     for path in paths:
         if path and (base := _absolut_gesperrt(path)) is not None:
@@ -799,6 +805,54 @@ def _befehl_orte(roh: str) -> tuple[str, str, str | None]:
     return t, "\n".join(orte), None
 
 
+_ZUWEISUNG = re.compile(r"(?i)\$(\w+)\s*=\s*([^;|\n]+)")
+# 8.3-Kurzname als Pfadteil (NEMICL~1\…, …\PROGRA~1) – nicht HEAD~1 aus git.
+_KURZNAME = re.compile(r"(?i)(?<=[\\/])[\w.$-]{1,8}~\d+|[\w.$-]{1,8}~\d+(?=[\\/])")
+_UMWEG = re.compile(r"(?i)\$|join-path|(?<![\w-])(?:set-location|cd|chdir|sl|push-location|pushd)\s")
+# Pfad aus Stücken: '{0}\x' -f …, 'C:\a' + 'b', "\" + … – das Ergebnis sieht keine Textprüfung.
+_PFAD_GEBAUT = re.compile(r"""(?i)(["'])(?=[^"']*[\\/])[^"']*\{\d+\}[^"']*\1\s*-f\b"""
+                          r"""|(["'])[^"']*[\\/][^"']*\2\s*\+|\+\s*(["'])[\\/]""")
+
+
+def _umweg_text(t: str) -> str:
+    """Befehl mit aufgelösten Umwegen: eigene Variablen ($a = $env:…), Join-Path, Ortswechsel
+    plus relativer Pfad. Ergebnis ist nur zum Vergleichen gedacht, nicht zum Ausführen."""
+    werte = {m.group(1).lower(): m.group(2).strip().strip("\"'") for m in _ZUWEISUNG.finditer(t)}
+    for _ in range(2):                                   # $b = "$a\x" nach $a = …
+        t = re.sub(r"(?i)\$\{?(\w+)\}?", lambda m: werte.get(m.group(1).lower(), m.group(0)), t)
+    flach = re.sub(r"[\"'`()]", " ", t)
+    flach = re.sub(r"(?i)join-path\s+(?:-path\s+)?(\S+)\s+(?:-childpath\s+)?(\S+)", r"\1\\\2", flach)
+    for ziel in _ORTSWECHSEL.findall(t):                # cd X; Get-Content y\z  ->  X\y\z
+        ziel = ziel.strip("\"'").rstrip("\\/")
+        flach += "\n" + re.sub(r"(?<![\w:\\/.$])([\w.-]+[\\/])", lambda m: f"{ziel}\\{m.group(1)}", flach)
+    return flach.lower().replace("/", "\\")
+
+
+def _umweg_zum_sperrbereich(t: str) -> Path | None:
+    """Nennt der Befehl über einen Umweg einen absolut gesperrten Ort? Geprüft wird der Ordnername
+    als Pfadteil (\\NemiCli\\ …); Nennungen des Daten-Ordners zählen nicht. Ohne Umweg (Variable,
+    Join-Path, Ortswechsel) entscheidet allein die normale Pfadprüfung."""
+    if not _UMWEG.search(t):
+        return None
+    flach = _umweg_text(t)
+    try:
+        import paths
+        daten = str(Path(paths.DATEN).resolve()).lower()
+    except Exception:
+        daten = ""
+    if daten:
+        flach = flach.replace(daten, " ")
+    for base in _absolut_bases():
+        b = str(base).lower().replace("/", "\\")
+        if b in flach:
+            return base
+        name = re.escape(base.name.lower())
+        if len(base.name) >= 4 and re.search(
+                rf"(?:\\{name}(?=$|[\\\s,;]))|(?:(?:^|[\s,;=]){name}\\)", flach):
+            return base
+    return None
+
+
 def _ortswechsel_gefaehrlich(roh: str) -> bool:
     """Wechselt ein ändernder Befehl an einen Ort über geschützten Ordnern (C:\\, C:\\Users …)
     und arbeitet dann mit relativen Pfaden? Dann sieht die Pfadprüfung das Ziel nicht."""
@@ -823,7 +877,7 @@ def _guard_command(cmd: str, lesend: bool = False) -> str | None:
     Zwei Stufen:
       1. `_IMMER_STOPP` – Werkzeuge, die am System selbst arbeiten. Sofort aus.
       2. Jede Nennung eines System-Ziels – auch nur zum Anschauen
-         (Get-ChildItem C:\\Windows). Seit 12.09.2026 sind Systemordner für
+         (Get-ChildItem C:\\Windows). Systemordner sind für
          die KI komplett tabu, nicht nur fürs Schreiben.
 
     Als System-Ziel zählen die geschützten Ordner UND die System-Zweige der
@@ -868,6 +922,16 @@ def _guard_command(cmd: str, lesend: bool = False) -> str | None:
         return ("Fehler: 🛡️ Geschützt – der Befehl wechselt den Ordner (cd) über geschützte Bereiche "
                 "und ändert dann etwas mit relativen Pfaden oder ..\\ – so ist das Ziel nicht prüfbar. "
                 "Nenn die Pfade vollständig.")
+    if (m := _PFAD_GEBAUT.search(t)):
+        return ("Fehler: 🛡️ Geschützt – der Befehl setzt einen Pfad aus Stücken zusammen "
+                f"('{m.group(0)[:60]}'). So ist das Ziel nicht prüfbar. Bitte den Pfad im Klartext schreiben.")
+    if (m := _KURZNAME.search(t)):
+        return ("Fehler: 🛡️ Geschützt – der Befehl benutzt einen Kurznamen "
+                f"('{m.group(0)}'). Dahinter kann jeder Ordner stecken. Bitte den vollen Pfad schreiben.")
+    if (base := _umweg_zum_sperrbereich(t)) is not None:
+        return ("Fehler: 🔒 Komplett gesperrt – der Befehl baut den Pfad zu einem Bereich zusammen, den "
+                f"der Nutzer für dich zugesperrt hat: {base}. Dort gehst du grundsätzlich nicht hin, "
+                "auch nicht zum Anschauen.")
 
     # Schrägstriche angleichen, damit C:/Windows genauso erkannt wird wie C:\Windows;
     # dahinter die aufgelösten Orte (Kurznamen, \\localhost\c$\, Platzhalter …).
@@ -932,38 +996,43 @@ def _datei_lesen(a: dict) -> str | ActionResult:
         return ActionResult(f"(Binärdatei {p.name} – kann nicht als Text gelesen werden.)", ok=False)
     # Heuristik: enthält der Anfang Null-Bytes? -> binär
     try:
-        head = p.read_bytes()[:2048]
+        with open(p, "rb") as f:                         # nur den Anfang – nicht die ganze Datei
+            head = f.read(2048)
         if b"\x00" in head:
             return ActionResult(f"(Datei {p.name} sieht binär aus – nicht als Text lesbar.)", ok=False)
     except Exception as e:
         return ActionResult(f"Fehler beim Lesen: {e}", ok=False)
-    with open(p, "r", encoding="utf-8", errors="replace") as f:
-        lines = f.readlines()
-    if not lines:
-        return "(leere Datei)"
     # `ab`: ab dieser Zeile lesen. Lange Dateien kommen so in Stücken, statt dass
     # das Modell nach der Kürzung zu Get-Content greift (das las UTF-8 falsch).
     try:
         ab = max(1, int(a.get("ab") or 1))
     except (TypeError, ValueError):
         ab = 1
-    if ab > len(lines):
-        return f"(Die Datei hat nur {len(lines)} Zeilen – ab Zeile {ab} steht nichts mehr.)"
-    # mit Zeilennummern, damit das Modell gezielt bearbeiten kann
-    out, laenge, ende = [], 0, len(lines)
-    for i in range(ab - 1, len(lines)):
-        zeile = f"{i + 1:>5}  {lines[i]}"
-        if laenge + len(zeile) > MAX_OUT and out:
-            ende = i
-            break
-        out.append(zeile)
-        laenge += len(zeile)
+    # Zeile für Zeile: auch eine Logdatei von mehreren GB belegt nur das, was ausgegeben wird.
+    # Mit Zeilennummern, damit das Modell gezielt bearbeiten kann.
+    out, laenge, ende, gesamt = [], 0, None, 0
+    with open(p, "r", encoding="utf-8", errors="replace") as f:
+        for i, zeile_roh in enumerate(f):
+            gesamt = i + 1
+            if i < ab - 1 or ende is not None:
+                continue
+            zeile = f"{i + 1:>5}  {zeile_roh}"
+            if laenge + len(zeile) > MAX_OUT and out:
+                ende = i
+                continue
+            out.append(zeile)
+            laenge += len(zeile)
+    if gesamt == 0:
+        return "(leere Datei)"
+    if ab > gesamt:
+        return f"(Die Datei hat nur {gesamt} Zeilen – ab Zeile {ab} steht nichts mehr.)"
+    ende = gesamt if ende is None else ende
     netz = fremddaten.aus_dem_netz(p)
     if netz:
         fremdinhalt()                        # heruntergeladene Datei: wie eine Webseite
     text = fremddaten.rahmen("".join(out).rstrip("\n"), "datei", p.name, netz=netz)
-    if ende < len(lines):
-        text += (f"\n… gekürzt: Zeilen {ende + 1}–{len(lines)} fehlen noch. Weiter mit "
+    if ende < gesamt:
+        text += (f"\n… gekürzt: Zeilen {ende + 1}–{gesamt} fehlen noch. Weiter mit "
                  f"datei_lesen, pfad wie eben, ab: {ende + 1}")
     return text
 
@@ -1051,6 +1120,44 @@ def _paket_info(a: dict) -> ActionResult:
     return ActionResult(text, ok=ok)
 
 
+def _app_liste(a: dict) -> str:
+    """Apps im Appstore und ihre Funktionen für die KI."""
+    import appstore
+    return appstore.liste_text()
+
+
+def _app_pruefen(a: dict) -> ActionResult:
+    """App in NemiView prüfen: Syntax, Laufzeit, CSS, fehlende Dateien, Internet-Adressen."""
+    import appstore
+    from nemiview.pruefen import pruefen
+    name = str(a.get("app") or a.get("name") or "").strip().lower()
+    app_ = appstore.app(name)
+    ordner = app_.ordner if app_ is not None else appstore.ORDNER / name
+    if not name or not ordner.is_dir():
+        return ActionResult(f"Keine App „{name}“ – welche es gibt, zeigt app_liste.", ok=False)
+    ok, text = pruefen(ordner)
+    return ActionResult(text, ok=ok)
+
+
+def _app_aufrufen(a: dict) -> ActionResult:
+    """Funktion einer App aus dem Appstore ausführen. Felder: app, funktion, felder (Objekt)."""
+    import appstore
+    name = str(a.get("app") or a.get("name") or "").strip()
+    funktion = str(a.get("funktion") or "").strip()
+    if not name or not funktion:
+        return ActionResult("Fehler: app und funktion angeben – welche es gibt, zeigt app_liste.", ok=False)
+    felder = a.get("felder")
+    if isinstance(felder, str):
+        try:
+            felder = json.loads(felder or "{}")
+        except ValueError:
+            return ActionResult("Fehler: felder ist kein gültiges JSON-Objekt.", ok=False)
+    if felder is not None and not isinstance(felder, dict):
+        return ActionResult("Fehler: felder muss ein Objekt sein, z. B. {\"seiten\": 20}.", ok=False)
+    ok, text = appstore.aufrufen(name, funktion, felder or {})
+    return ActionResult(text, ok=ok)
+
+
 def _seite_ansehen(a: dict) -> ActionResult:
     import seite
     ziel = str(a.get("ziel") or a.get("pfad") or a.get("url") or "").strip()
@@ -1116,7 +1223,7 @@ def _einstellung_aendern(a: dict) -> ActionResult:
 
 
 def _bild_fragen(a: dict) -> ActionResult:
-    """Gezielte Frage zu einem Bild an den Bildbeschreiber (lokale Modelle ohne Bild-Eingang)."""
+    """Gezielte Frage zu einem Bild an den Bildbeschreiber (Modelle ohne Bild-Eingang)."""
     if (blocked := _read_guard(a.get("pfad", ""))):
         return ActionResult(blocked, ok=False)
     p = Path(str(a.get("pfad", "")).strip().strip('"'))
@@ -1130,12 +1237,26 @@ def _bild_fragen(a: dict) -> ActionResult:
     try:
         import bildbeschreiber
         if bildbeschreiber.finden() is None:
-            return ActionResult("Kein Bildbeschreiber eingerichtet (Ordner Vision/ im Programm-Ordner).",
+            return ActionResult("Kein Bildbeschreiber eingerichtet (Seh-Modell in einem Ordner unter Vision/ "
+                                "im Programm-Ordner, Wahl mit /vision).",
                                 ok=False)
         antwort = bildbeschreiber.beschreiben(p, frage)
     except Exception as e:
         return ActionResult(f"Bildbeschreiber-Fehler: {e}", ok=False)
     return ActionResult(bildbeschreiber.block(p, antwort, frage) + _bild_aus_dem_netz(p), ok=True)
+
+
+def _bild_protokoll(a: dict) -> ActionResult:
+    """Seh-Protokoll der aktiven Persönlichkeit: welche Bilder der Bildbeschreiber angesehen hat."""
+    try:
+        import sehprotokoll
+        anzahl = int(a.get("anzahl") or 10)
+    except (TypeError, ValueError):
+        anzahl = 10
+    try:
+        return ActionResult(sehprotokoll.fuer_ki(anzahl, str(a.get("pfad") or "").strip() or None), ok=True)
+    except Exception as e:
+        return ActionResult(f"Seh-Protokoll nicht lesbar: {e}", ok=False)
 
 
 def _bildschirm_ansehen(a: dict) -> ActionResult:
@@ -1194,16 +1315,34 @@ def _ordner_erkennen(a: dict) -> str | ActionResult:
             f"({r['tokens']} Merkmale ausgewertet)")
 
 
+SUCHE_TREFFER_MAX = 200
+SUCHE_ZEIT_S = 60.0               # ein Suchlauf hört danach auf und sagt, dass er nicht fertig ist
+INHALT_DATEI_MAX = 20 * 2**20     # größere Dateien durchsucht inhalt_suchen nicht (Modelle, Videos, Abbilder)
+_BINAER_PROBE = 8192              # so viele Bytes am Anfang zeigen, ob eine Datei Text ist
+
+
+def _such_ende(gestoppt: str) -> str:
+    return f"\n\n(Suche nicht vollständig: {gestoppt} – Ordner oder Muster enger fassen.)" if gestoppt else ""
+
+
 def _dateien_suchen(a: dict) -> str | ActionResult:
     base = Path(a.get("pfad", "."))
     if (blocked := _read_guard(str(base))):
         return ActionResult(blocked, ok=False)
     muster = a.get("muster", "*")
-    treffer = [str(p) for p in base.rglob(muster)
-               if p.is_file() and not _skip_system(p, base)][:200]
+    treffer, gestoppt, ende = [], "", time.monotonic() + SUCHE_ZEIT_S
+    for p in base.rglob(muster):
+        if time.monotonic() > ende:
+            gestoppt = f"nach {SUCHE_ZEIT_S:.0f} s abgebrochen"
+            break
+        if p.is_file() and not _skip_system(p, base):
+            treffer.append(str(p))
+            if len(treffer) >= SUCHE_TREFFER_MAX:     # nicht erst den ganzen Baum ablaufen
+                gestoppt = f"die ersten {SUCHE_TREFFER_MAX} Treffer"
+                break
     if not treffer:
-        return "Keine Dateien gefunden."
-    return fremddaten.rahmen(_cut("\n".join(treffer)), "suche", muster)
+        return "Keine Dateien gefunden." + _such_ende(gestoppt)
+    return fremddaten.rahmen(_cut("\n".join(treffer)), "suche", muster) + _such_ende(gestoppt)
 
 
 def _web_lesen(a: dict) -> ActionResult:
@@ -1234,21 +1373,42 @@ def _inhalt_suchen(a: dict) -> str | ActionResult:
     muster = a["muster"]
     glob = a.get("glob", "*")
     rx = re.compile(muster, re.IGNORECASE)
-    out = []
+    out, gestoppt, gross, ende = [], "", 0, time.monotonic() + SUCHE_ZEIT_S
+    netz = False
     for p in base.rglob(glob):
+        if time.monotonic() > ende:
+            gestoppt = f"nach {SUCHE_ZEIT_S:.0f} s abgebrochen"
+            break
         if not p.is_file() or _skip_system(p, base):
             continue
         try:
-            for i, line in enumerate(p.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
-                if rx.search(line):
-                    out.append(f"{p}:{i}: {line.strip()[:160]}")
-                    if len(out) >= 200:
-                        break
+            if p.stat().st_size > INHALT_DATEI_MAX:   # ganz eingelesen hielte das den Prozess fest (RAM, GIL)
+                gross += 1
+                continue
+            with open(p, "rb") as f:
+                if b"\0" in f.read(_BINAER_PROBE):     # Binärdatei: kein Text zum Durchsuchen
+                    continue
+            vorher = len(out)
+            with open(p, encoding="utf-8", errors="ignore") as f:   # Zeile für Zeile, nicht die ganze Datei
+                for i, line in enumerate(f, 1):
+                    if rx.search(line):
+                        out.append(f"{p}:{i}: {line.strip()[:160]}")
+                        if len(out) >= SUCHE_TREFFER_MAX:
+                            break
+            if len(out) > vorher and not netz and fremddaten.aus_dem_netz(p):
+                netz = True                                # Treffer aus einer heruntergeladenen Datei
         except Exception:
             continue
-        if len(out) >= 200:
+        if len(out) >= SUCHE_TREFFER_MAX:
+            gestoppt = f"die ersten {SUCHE_TREFFER_MAX} Treffer"
             break
-    return fremddaten.rahmen(_cut("\n".join(out)), "suche", muster) if out else "Keine Treffer."
+    hinweis = (f"\n({gross} Datei(en) über {INHALT_DATEI_MAX // 2**20} MB nicht durchsucht.)" if gross else "")
+    if not out:
+        return "Keine Treffer." + hinweis + _such_ende(gestoppt)
+    if netz:
+        fremdinhalt()
+    return (fremddaten.rahmen(_cut("\n".join(out)), "suche", muster, netz=netz)
+            + hinweis + _such_ende(gestoppt))
 
 
 # ---------------------------------------------------------------------------
@@ -1332,9 +1492,27 @@ def _ordner_erstellen(a: dict) -> str | ActionResult:
     return f"Ordner erstellt: {p}"
 
 
+def _endziel_sperre(quelle: Path, ziel: Path) -> str | None:
+    """Sperrgrund für die Orte, die wirklich entstehen: in einen Ordner hinein heißt das Ziel
+    ziel/quelle.name, bei Ordnern jede einzelne Datei darin – Sperren gelten auch für Dateien."""
+    if (grund := _guard(str(ziel))):
+        return grund
+    if quelle.is_dir():
+        for i, p in enumerate(quelle.rglob("*")):
+            if i >= 5000:
+                break
+            if (grund := _guard(str(ziel / p.relative_to(quelle)))):
+                return grund
+    return None
+
+
 def _verschieben(a: dict) -> str | ActionResult:
     von, nach = a["von"], a["nach"]
     if (blocked := _guard(von, nach)):       # Quelle UND Ziel prüfen
+        return ActionResult(blocked, ok=False)
+    quelle = Path(von)
+    endziel = Path(nach) / quelle.name if Path(nach).is_dir() else Path(nach)
+    if (blocked := _endziel_sperre(quelle, endziel)):
         return ActionResult(blocked, ok=False)
     # Wird am Ziel eine Datei überschrieben? Die vorher sichern – die Quelle
     # selbst geht nicht verloren, sie liegt danach am neuen Ort.
@@ -1354,6 +1532,8 @@ def _datei_kopieren(a: dict) -> str | ActionResult:
         return ActionResult(f"Fehler: {quelle} gibt es nicht.", ok=False)
     if ziel.is_dir():
         ziel = ziel / quelle.name
+    if (blocked := _endziel_sperre(quelle, ziel)):
+        return ActionResult(blocked, ok=False)
     if quelle.is_dir():
         if ziel.exists():
             return ActionResult(f"Fehler: {ziel} gibt es schon – einen neuen Zielordner angeben.", ok=False)
@@ -1555,6 +1735,27 @@ def _befehl(a: dict, lesend: bool = False) -> ActionResult:
     return res
 
 
+_RELATIV_HOCH = re.compile(r"""(?:"([^"]*\.\.[^"]*)"|'([^']*\.\.[^']*)'|"""
+                           r"""(?<![\w.])(\.\.(?:[\\/][^\s"';|,()<>]*)?))""")
+
+
+def _relativ_sperre(cmd: str, lesend: bool = False) -> str | None:
+    """Relative Pfade mit ..\\ zeigen vom Arbeitsordner aus woandershin – gegen den Ort prüfen,
+    an dem der Befehl wirklich läuft (Coding-Projekt bzw. aktueller Ordner)."""
+    import coding
+    if not lesend and _TODO_STAND.search(cmd or ""):
+        return _TODO_MELDUNG
+    ordner = coding.arbeitsordner() or Path(os.getcwd())
+    for m in _RELATIV_HOCH.finditer(cmd or ""):
+        teil = next(g for g in m.groups() if g is not None)
+        if re.match(r"(?i)^(?:[a-z]:|\\\\|//)", teil):
+            continue                                       # absolute Pfade prüft _guard_command
+        ziel = str(ordner / teil)
+        if (grund := (_read_guard(ziel) if lesend else _guard(ziel))):
+            return grund
+    return None
+
+
 def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
     cmd = _befehl_text(a)
     if not cmd.strip():
@@ -1570,7 +1771,7 @@ def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
     # $ProgressPreference='SilentlyContinue' unterdrückt PowerShells Fortschritts-
     # balken (Write-Progress), den z.B. Test-NetConnection/Invoke-WebRequest zeigen –
     # der malt sonst direkt auf die Konsole und zerschießt unser Vollbild-TUI.
-    if (blocked := _guard_command(cmd, lesend)):     # System-Pfad + verändernd = Stopp
+    if (blocked := _guard_command(cmd, lesend) or _relativ_sperre(cmd, lesend)):
         return ActionResult(blocked, ok=False)
     # Cmdlet-Fehler sind standardmäßig nicht terminierend. Stop + catch macht
     # daraus einen Prozessfehler; $Error erfasst auch explizites -ErrorAction
@@ -1647,13 +1848,13 @@ def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
             # Fehler in den catch-Zweig geschrieben. So sieht es aus, wenn der
             # Virenschutz die Befehlszeile abgefangen hat (Bitdefender: „Schädliche
             # Befehlszeile erkannt“ – trifft lange Einzeiler mit Prozesslisten
-            # und Signaturprüfungen). Chat 19.09.2026: achtmal in einer Stunde.
+            # und Signaturprüfungen).
             text += ("\nKeine Ausgabe und kein Fehlertext – so sieht es aus, wenn der Virenschutz "
-                     "(Bitdefender) die Befehlszeile geblockt hat. Lange Einzeiler, die Prozesse "
+                     "(z. B. Bitdefender) die Befehlszeile geblockt hat. Lange Einzeiler, die Prozesse "
                      "auflisten und Signaturen prüfen, treffen seine Muster. Teile den Befehl in "
                      "kleine Einzelbefehle auf (eine Sache pro Aufruf). Klappt es dann immer noch "
-                     "nicht, sag dem Nutzer, dass Bitdefender geblockt hat – er sieht es unter "
-                     "Bitdefender → Benachrichtigungen.")
+                     "nicht, sag dem Nutzer, dass der Virenschutz geblockt hat – er sieht es in "
+                     "dessen Benachrichtigungen.")
         return ActionResult(text, ok=False, returncode=r.returncode)
     return ActionResult(out if out else "(kein Output)", ok=True, returncode=0)
 
@@ -1914,6 +2115,54 @@ def _paket_installieren(a: dict) -> ActionResult:
 
 
 # ---------------------------------------------------------------------------
+# updates – Programme über winget aktualisieren (tools/aktualisieren.py)
+# ---------------------------------------------------------------------------
+
+def _updates_suchen(a: dict) -> ActionResult:
+    """Welche installierten Programme haben ein Update über winget? Nur nachsehen."""
+    import aktualisieren as AK
+    try:
+        eintraege, roh = AK.liste()
+    except AK.WingetFehlt as exc:
+        return ActionResult(f"Fehler: {exc}", ok=False)
+    except subprocess.TimeoutExpired:
+        return ActionResult("Fehler: winget hat nicht rechtzeitig geantwortet (Internet?).", ok=False)
+    if not eintraege:
+        if "----" in roh:                                   # Tabelle da, aber nicht lesbar: roh zeigen
+            return ActionResult(fremddaten.rahmen(roh[-4000:], "ausgabe", "winget upgrade"), ok=True)
+        return ActionResult("Keine Updates über winget – alle Programme, die winget kennt, sind aktuell.", ok=True)
+    zeilen = [f"{len(eintraege)} Update(s) über winget:"]
+    zeilen += [f"- {e['name']} · Id {e['id']} · {e['version']} → {e['verfuegbar']}"
+               + (f" ({e['quelle']})" if e["quelle"] else "") for e in eintraege]
+    text = fremddaten.rahmen("\n".join(zeilen), "ausgabe", "winget upgrade")
+    return ActionResult(text + "\n\nInstallieren mit updates_installieren und ids=[…] – erst wenn der Nutzer gesagt "
+                        "hat, welche (oder „alle“). " + AK.ADMIN_HINWEIS, ok=True)
+
+
+def _updates_installieren(a: dict) -> ActionResult:
+    """Ausgewählte Updates über winget installieren – nach Freigabe des Nutzers, ohne Rechte-Erhöhung durch NemiCLI."""
+    import aktualisieren as AK
+    try:
+        ids = AK.gueltige_ids(a.get("ids") or a.get("id") or [])
+    except ValueError as exc:
+        return ActionResult(f"Fehler: {exc}", ok=False)
+    zeichen = {"ok": "✅", "kein_update": "➖ kein Update nötig", "abgebrochen": "⛔ abgebrochen",
+               "fehler": "❌", "zeit": "⏳"}
+    zeilen, alle_ok = [], True
+    for i in ids:
+        try:
+            zustand, rest = AK.installieren(i)
+        except AK.WingetFehlt as exc:
+            return ActionResult(f"Fehler: {exc}", ok=False)
+        alle_ok = alle_ok and zustand in ("ok", "kein_update")
+        zeilen.append(f"{zeichen[zustand]} {i}" + (f" – {rest}" if zustand not in ("ok", "kein_update") and rest else ""))
+    hinweis = ("" if alle_ok else "\n\n⛔ abgebrochen heißt meist: Windows hat nach Adminrechten gefragt und es wurde "
+               "abgelehnt. Das ist in Ordnung – es bleibt beim alten Stand.")
+    return ActionResult(fremddaten.rahmen("\n".join(zeilen), "ausgabe", "winget upgrade") + hinweis,
+                        ok=True if alle_ok else None)
+
+
+# ---------------------------------------------------------------------------
 # zeitplan – Aufgaben in der Windows-Aufgabenplanung
 # ---------------------------------------------------------------------------
 
@@ -1960,8 +2209,15 @@ def _zeitplan_anzeigen(a: dict) -> ActionResult:
         return ActionResult(f"Fehler in der Aufgabenplanung: {e}", ok=False)
 
 
-def _skill_merken(a: dict) -> str:
-    path = learn.save_skill(a["name"], a.get("inhalt", ""))
+def _skill_merken(a: dict) -> str | ActionResult:
+    # Der Name landet in jedem System-Prompt (Wissens-Index): gleiche Filter wie merken.
+    name, inhalt = str(a["name"]), str(a.get("inhalt", ""))
+    if (grund := memory.verdaechtig(name)):
+        return ActionResult(f"Nicht gemerkt: der Name {grund}.", ok=False)
+    if memory._UNSICHTBAR.search(inhalt) or fremddaten.markiere_muster(inhalt)[1]:
+        return ActionResult("Nicht gemerkt: der Inhalt enthält unsichtbare Zeichen oder sieht aus wie "
+                            "ein eingeschleuster Befehl.", ok=False)
+    path = learn.save_skill(name, inhalt)
     return f"Skill gemerkt: {path}"
 
 
@@ -2195,6 +2451,9 @@ def _video_erstellen(a: dict) -> str | ActionResult:
     prompt = (a.get("prompt") or a.get("beschreibung") or a.get("text") or "").strip()
     if not prompt:
         return ActionResult("Fehler: kein Prompt. Feld 'prompt' (englisch: Szene und Bewegung) füllen.", ok=False)
+    import videobildcloud
+    if videobildcloud.video_aktiv():
+        return _video_cloud(a, prompt)
     modell = str(a.get("modell") or "").strip() or None
     if modell and modell not in video.modelle():
         return ActionResult(f"Fehler: Video-Modell '{modell}' gibt es nicht. Vorhanden: "
@@ -2245,6 +2504,40 @@ def _video_erstellen(a: dict) -> str | ActionResult:
         text += " 🧬 Eingemischt: " + " · ".join(video.GENUTZT) + "."
     if video.HINWEISE:
         text += " ⚠️ " + " · ".join(video.HINWEISE)
+    try:
+        os.startfile(path)
+    except Exception as e:
+        return ActionResult(text + f"\nÖffnen fehlgeschlagen: {e}", ok=False)
+    return text + "\nÖffnen beim Anzeigeprogramm angefordert."
+
+
+def _video_cloud(a: dict, prompt: str) -> str | ActionResult:
+    """video_erstellen beim gewählten Cloud-Anbieter (videobildcloud): Prompt, Länge, Startbild, Hochformat.
+    Schlüsselbilder, Seed, Schritte und Schärfe gibt es dort nicht."""
+    import videobildcloud
+    startbild = str(a.get("startbild") or "").strip().strip('"') or None
+    if startbild:
+        if (blocked := _read_guard(startbild)):
+            return ActionResult(blocked, ok=False)
+        if not Path(startbild).is_file():
+            return ActionResult(f"Fehler: startbild nicht gefunden: {startbild}", ok=False)
+    try:
+        sekunden = float(a.get("sekunden") or 5.0)
+    except (TypeError, ValueError):
+        sekunden = 5.0
+    ohne = [k for k in ("schluesselbilder", "seed", "steps", "schaerfe", "modell") if a.get(k) not in (None, "", [])]
+    _BILD_STATUS["msg"] = "starte …"
+    try:
+        path = videobildcloud.video_generate(prompt, sekunden=sekunden, startbild=startbild,
+                                             hochkant=bool(a.get("hochkant")),
+                                             on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
+    except Exception as e:
+        return ActionResult(f"Fehler beim Cloud-Video: {e}", ok=False)
+    finally:
+        _BILD_STATUS["msg"] = None
+    text = f"Video fertig 🎬✅ ({videobildcloud.label('video')}) gespeichert: {path}."
+    if ohne:
+        text += f" ⚠️ In der Cloud nicht möglich, weggelassen: {', '.join(ohne)}."
     try:
         os.startfile(path)
     except Exception as e:
@@ -2310,11 +2603,13 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
             return ActionResult(f"Fehler: Ablauf '{ablauf}' gibt es nicht – " + " · ".join(LP.ABLAEUFE) + ".",
                                 ok=False)
     sagen = str(a.get("sagen") or "").strip()
+    ohne_ton = ""
     if sagen:
         s = _stimme()
-        if s.modus() == "aus":
-            return ActionResult(_STIMME_AUS, ok=False)
-        if not s.verfuegbar():
+        if s.modus() == "aus":                     # Stimme bleibt aus – der Clip entsteht trotzdem, nur stumm
+            sagen, ohne_ton = "", (" Die Stimme ist aus (/voice aus) – der Clip ist ohne Ton und ohne "
+                                   "Mundbewegung entstanden; nur der Nutzer schaltet die Stimme wieder ein.")
+        elif not s.verfuegbar():
             return ActionResult("Fehler: Für ein sprechendes Porträt fehlt das Stimm-Modell (Qwen3-TTS unter Vision/).",
                                 ok=False)
     import modes
@@ -2349,7 +2644,7 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
     sekunden = erg["bilder"] / LP.FPS
     text = (f"Porträt {'spricht 🗣' if sagen else 'bewegt 🎭'}✅ gespeichert: {erg['pfad']} ({sekunden:.0f} s, "
             f"{erg['bilder']} Bilder in {erg['sekunden_rechnen']:.0f} s auf "
-            f"{'der Grafikkarte' if erg['geraet'] == 'cuda' else 'der CPU'}).")
+            f"{'der Grafikkarte' if erg['geraet'] == 'cuda' else 'der CPU'})." + ohne_ton)
     gezeigt, fehler = [], []
     if zeigen in ("kugel", "beides"):
         from wache import steuerung
@@ -2806,8 +3101,12 @@ def _ordner_lernen(a: dict) -> str | ActionResult:
 # Systemwache – Werkzeuge der Persönlichkeit (Logik in tools/wache/werkzeuge.py)
 # ---------------------------------------------------------------------------
 
-def _coding_start(a: dict) -> str:
+def _coding_start(a: dict) -> str | ActionResult:
     import coding
+    # Im Projekt laufen Befehle mit relativen Pfaden – es darf nur ein Ordner sein, in dem die KI
+    # auch schreiben dürfte (nicht Programm-, System- oder gesperrte Ordner).
+    if (blocked := _guard(str(a.get("projekt") or ""))):
+        return ActionResult(blocked, ok=False)
     erg = coding.starten(str(a.get("projekt") or ""), str(a.get("aufgabe") or ""))
     text = f"🟦 Coding-Assistent ist an. Projekt: {erg['projekt']}"
     if not erg["projekt"].exists():
@@ -2829,7 +3128,12 @@ def _todo(a: dict) -> str:
     def befehl_ausfuehren(cmd: str) -> tuple[bool, str]:
         res = _befehl({"befehl": cmd})
         return bool(res.ok), res.text
-    return coding.ausfuehren(a, befehl_ausfuehren)
+    try:
+        return coding.ausfuehren(a, befehl_ausfuehren)
+    except ValueError as exc:                 # falsch benutzt: Antwort ans Modell, kein Programmfehler
+        tipp = ("" if coding.aktiv() else
+                " Für eine Liste mit mehreren Schritten außerhalb des Coding-Assistenten: Werkzeug plan.")
+        return ActionResult(f"{exc}{tipp}", ok=False)
 
 
 def _plan(a: dict) -> str | ActionResult:
@@ -2845,7 +3149,7 @@ def _wache(name: str, a: dict) -> str | ActionResult:
         return ActionResult(f"Die Wache ist nicht verfügbar: {exc}", ok=False)
     fn = getattr(W, name)
     try:
-        if name in ("bewerten", "justieren"):
+        if name in ("bewerten", "justieren", "programm"):
             return fn(a, wer=_wer())
         return fn(a)
     except Exception as exc:
@@ -3364,8 +3668,10 @@ def _wache_status(a): return _wache("status", a)
 def _wache_alarme(a): return _wache("alarme", a)
 def _wache_ereignisse(a): return _wache("ereignisse", a)
 def _wache_inventar(a): return _wache("inventar", a)
+def _wache_netz(a): return _wache("netz", a)
 def _wache_bewerten(a): return _wache("bewerten", a)
 def _wache_justieren(a): return _wache("justieren", a)
+def _wache_programm(a): return _wache("programm", a)
 
 
 ACTIONS: dict[str, dict] = {
@@ -3373,6 +3679,7 @@ ACTIONS: dict[str, dict] = {
     "datei_lesen":      {"func": _datei_lesen,      "confirm": False, "felder": ["pfad"]},
     "bild_ansehen":     {"func": _bild_ansehen,     "confirm": False, "felder": ["pfad"]},
     "bild_fragen":      {"func": _bild_fragen,      "confirm": False, "felder": ["pfad", "frage"]},
+    "bild_protokoll":   {"func": _bild_protokoll,   "confirm": False, "felder": []},   # anzahl / pfad
     "anleitung_lesen":  {"func": _anleitung_lesen,  "confirm": False, "felder": ["thema"]},
     "menue_oeffnen":    {"func": _menue_oeffnen,    "confirm": False, "felder": ["befehl"]},
     # Coding: aktuell bleiben – alles nur lesend
@@ -3380,6 +3687,9 @@ ACTIONS: dict[str, dict] = {
     "code_pruefen":     {"func": _code_pruefen,     "confirm": False, "felder": []},
     "paket_info":       {"func": _paket_info,       "confirm": False, "felder": ["name"]},
     "seite_ansehen":    {"func": _seite_ansehen,    "confirm": False, "felder": []},
+    "app_liste":        {"func": _app_liste,        "confirm": False, "felder": []},
+    "app_aufrufen":     {"func": _app_aufrufen,     "confirm": False, "felder": ["app", "funktion"]},
+    "app_pruefen":      {"func": _app_pruefen,      "confirm": False, "felder": ["app"]},
     "doku_suchen":      {"func": _doku_suchen,      "confirm": False, "felder": []},
     "ordner_auflisten": {"func": _ordner_auflisten, "confirm": False, "felder": []},
     "dateien_suchen":   {"func": _dateien_suchen,   "confirm": False, "felder": ["muster"]},
@@ -3414,6 +3724,9 @@ ACTIONS: dict[str, dict] = {
     # Python im AppContainer: nur Lauf-Ordner, freigegebene Projekte + Internet
     "code_ausfuehren":  {"func": _code_ausfuehren,  "confirm": True,  "felder": []},
     "paket_installieren": {"func": _paket_installieren, "confirm": True, "felder": ["pakete"]},
+    # Programm-Updates über winget: nachsehen frei, installieren nur nach Freigabe (UAC fragt Windows selbst)
+    "updates_suchen":   {"func": _updates_suchen,   "confirm": False, "felder": []},
+    "updates_installieren": {"func": _updates_installieren, "confirm": True, "felder": ["ids"]},
     # Windows-Aufgabenplanung: NemiCLI zu einer Zeit mit einem Auftrag starten
     "zeitplan":         {"func": _zeitplan,         "confirm": True,  "felder": ["aktion", "name"]},
     # Bildschirm fotografieren – fragt, weil Privates zu sehen sein kann
@@ -3456,8 +3769,11 @@ ACTIONS: dict[str, dict] = {
     "wache_alarme":     {"func": _wache_alarme,     "confirm": False, "felder": []},
     "wache_ereignisse": {"func": _wache_ereignisse, "confirm": False, "felder": []},
     "wache_inventar":   {"func": _wache_inventar,   "confirm": False, "felder": []},
+    "wache_netz":       {"func": _wache_netz,       "confirm": False, "felder": []},   # ip / text (Meldung) / stunden
     "wache_bewerten":   {"func": _wache_bewerten,   "confirm": False, "felder": ["urteil"]},   # + id/ids/regel(+subjekt), begruendung, bezeichnung
     "wache_justieren":  {"func": _wache_justieren,  "confirm": False, "felder": ["was", "wert", "begruendung"]},
+    # Programm-Absolvierung: ein Programm beobachten und sein Normalbild lernen (schreibt nur nach Wache/programme)
+    "wache_programm":   {"func": _wache_programm,   "confirm": False, "felder": []},   # aktion, programm, tage, prozess
     # Die Schwebekugel steuern: stimmung (Bild), sagen, bewegung, ecke/position, versteckt, groesse
     "kugel":            {"func": _kugel,            "confirm": False, "felder": []},
     "kugel_anziehen":   {"func": _kugel_anziehen,   "confirm": False, "felder": [], "hintergrund": True},
@@ -3498,8 +3814,8 @@ _FENCE_OPEN = re.compile(r"```(?:aktion|json)\s*\n")
 
 
 # Windows-Pfade im JSON: Modelle schreiben gern "C:\Users\…" mit EINEM Backslash.
-# In JSON ist \U kein gültiges Escape – json.loads wirft, und der Block fiel bis
-# 20.09.2026 stumm unter den Tisch (das Modell glaubte, die Datei sei gelesen).
+# In JSON ist \U kein gültiges Escape – json.loads wirft, und der Block fiel ohne
+# Reparatur stumm unter den Tisch (das Modell glaubte, die Datei sei gelesen).
 # Reparatur in Stufen: erst ungültige Escapes verdoppeln (\U → \\U), dann zur
 # Not alle Backslashes. Gültige Escapes wie \n bleiben dabei Zeilenumbrüche –
 # in einem Pfad-Feld ("C:\neu\temp") wären das aber falsche Steuerzeichen,
@@ -3539,7 +3855,8 @@ def parse_actions(text: str) -> tuple[list[dict], str]:
         if obj is None:
             continue
         if isinstance(obj, dict):
-            obj = _pfade_entsteuern(obj)
+            # Felder mit „_“ setzt nur NemiCLI selbst (z. B. _frei für die Anzeige) – nie die KI.
+            obj = _pfade_entsteuern({k: v for k, v in obj.items() if not str(k).startswith("_")})
         if isinstance(obj, dict) and "tool" in obj:
             actions.append(obj)
             spans.append(m.span())
@@ -3556,8 +3873,47 @@ def unparsed_action_note(text: str, actions: list[dict]) -> str | None:
     (z.B. abgeschnittenes JSON). Sonst None."""
     if actions or not _FENCE_OPEN.search(text):
         return None
-    return ("⚠ Aktionsblock nicht lesbar (JSON unvollständig?) – NICHTS ausgeführt. "
-            "Bitte das Modell, die Aktion noch einmal zu senden.")
+    return f"⚠ Aktionsblock nicht lesbar ({unlesbar_grund(text)}) – NICHTS ausgeführt."
+
+
+UNLESBAR_KI = ("[System] ⚠ Dein Aktionsblock war nicht lesbar – NICHTS wurde ausgeführt ({grund}). Schick die "
+               "Aktion noch einmal: genau ein ```aktion-Block mit EINEM JSON-Objekt samt \"tool\", geschlossen mit "
+               "```. Wolltest du nichts ausführen, antworte ohne Block. Behaupte nicht, es sei schon passiert.")
+
+
+def unlesbar_grund(text: str) -> str:
+    """Warum der erste Aktions-Zaun keine Aktion ergab – so genau, dass das Modell es beim zweiten Mal richtig
+    schreiben kann."""
+    m = _FENCE_OPEN.search(text)
+    if m is None:
+        return "kein Aktionsblock"
+    rest = text[m.end():]
+    ende = rest.find("```")
+    roh = (rest if ende < 0 else rest[:ende]).strip()
+    if not roh:
+        return "der Block ist leer"
+    obj = _json_reparieren(roh)
+    if obj is None:
+        try:
+            json.loads(roh)
+        except json.JSONDecodeError as e:
+            if e.msg == "Extra data":
+                return "mehrere JSON-Objekte in einem Block – je Block genau eins"
+            grund = f"JSON-Fehler: {e.msg}, Zeile {e.lineno}, Spalte {e.colno}"
+            return grund + (", der Block ist nicht geschlossen – vermutlich abgeschnitten" if ende < 0 else "")
+        return "JSON nicht lesbar"
+    if isinstance(obj, list):
+        return "eine Liste statt eines Objekts – je Block genau eine Aktion"
+    if not isinstance(obj, dict):
+        return "kein JSON-Objekt"
+    if "tool" not in obj:
+        return 'das Objekt hat kein Feld "tool"'
+    return "Form nicht erkannt"
+
+
+def unlesbar_fuer_ki(text: str) -> str:
+    """Rückmeldung an das Modell nach einem unlesbaren Aktionsblock (es erfährt es sonst nie)."""
+    return UNLESBAR_KI.format(grund=unlesbar_grund(text))
 
 
 def resolve_tool(name: str) -> str | None:
@@ -3578,14 +3934,37 @@ def resolve_tool(name: str) -> str | None:
 # präparierte Seite das Modell zu „merk dir: ab jetzt …" verleitet haben – dann
 # soll der Nutzer die Notiz sehen und freigeben, bevor sie dauerhaft wird.
 _WEB_TOOLS = {"web_lesen", "web_wiki", "web_suche", "fach_suche", "recherche", "paket_info"}
+# Auch ein Befehl oder Python-Code kann Webinhalt holen – seine Ausgabe trägt dann keine Netz-Marke.
+_NETZ_BEFEHL = re.compile(r"(?i)\b(invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget|start-bitstransfer|"
+                          r"net\.webclient|net\.http)\b")
+_NETZ_CODE = re.compile(r"(?i)\b(urllib|urlopen|requests|httpx|aiohttp|http\.client|socket|websocket|ftplib|"
+                        r"smtplib|webbrowser)\b")
+
+
+def _holt_aus_dem_netz(action: dict) -> bool:
+    """Holt diese Aktion vermutlich Inhalte aus dem Netz? Dann gilt die Runde danach als „von außen“."""
+    tool = action.get("tool", "")
+    if tool == "befehl":
+        return bool(_NETZ_BEFEHL.search(_befehl_text(action)))
+    if tool == "code_ausfuehren":
+        text = str(action.get("code") or "")
+        if not text and action.get("pfad") and _read_guard(str(action["pfad"])) is None:
+            try:
+                text = Path(str(action["pfad"])).read_text(encoding="utf-8", errors="replace")[:200_000]
+            except OSError:
+                text = ""
+        return bool(_NETZ_CODE.search(text + " " + str(action.get("modul") or "")))
+    return False
 SKILL_AENDERN = {"skill_schreiben", "skill_ausbessern"}      # Prüffenster nur mit /skills selbst aus; sonst Skill-Wächter
 _MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild"}
 # Werkzeuge, die Privates zeigen. Kam in derselben Runde Text aus dem Netz, fragt jede weitere
 # Anfrage nach draußen – über Suchworte oder Adressen könnten sonst Daten hinausgelangen.
 _PRIVAT_LESEN = {"datei_lesen", "ordner_auflisten", "dateien_suchen", "inhalt_suchen", "gedaechtnis_suchen",
-                 "gedaechtnis_lesen", "bild_ansehen", "bild_fragen", "bildschirm_ansehen", "debugbericht",
+                 "gedaechtnis_lesen", "bild_ansehen", "bild_fragen", "bild_protokoll", "bildschirm_ansehen",
+                 "debugbericht",
                  "selbstdiagnose", "abfragen", "charakter_zeigen", "wache_status", "wache_alarme",
-                 "wache_ereignisse", "wache_inventar", "backup_liste", "zwischenablage_lesen"}
+                 "wache_ereignisse", "wache_inventar", "wache_netz", "wache_programm", "backup_liste", "updates_suchen",
+                 "zwischenablage_lesen"}
 NETZ_SPERRE_SCHALTER = "netz_sperre"       # "verlauf" (Vorgabe) oder "runde"
 _web_taint = False
 _privat_gelesen = False
@@ -3781,10 +4160,14 @@ def _describe(action: dict) -> str:
     if t == "code_pruefen":     return f"Code prüfen (ruff):  {g('pfad', 'Projekt')}"
     if t == "paket_info":       return f"Paket-Info (PyPI, Lücken):  {g('name', '?')}"
     if t == "seite_ansehen":    return f"Seite ansehen:  {g('ziel', g('pfad', g('url', '?')))}"
+    if t == "app_liste":        return "Apps im Appstore ansehen"
+    if t == "app_aufrufen":     return f"App {g('app', '?')} · {g('funktion', '?')}"
+    if t == "app_pruefen":      return f"App {g('app', '?')} in NemiView prüfen"
     if t == "doku_suchen":
         return f"Offline-Doku lesen:  #{g('id')}" if g("id") not in (None, "") else f"Offline-Doku suchen:  {g('frage', '?')}"
     if t == "theme_erstellen":  return f"Theme anlegen:  {g('name', '?')}  ({g('brand', '?')} / {g('accent', '?')})"
     if t == "bild_fragen":      return f"Bild nachfragen:  {g('pfad', '?')}  – {g('frage', '?')}"
+    if t == "bild_protokoll":   return f"Seh-Protokoll 👁{('  ' + g('pfad', '')) if g('pfad', '') else ''}"
     if t == "bildschirm_ansehen": return "Bildschirm fotografieren und ansehen (Screenshot)"
     if t == "ordner_auflisten": return f"Ordner auflisten:  {g('pfad', '.')}"
     if t == "ordner_erkennen":  return f"Ordner-Typ erkennen (ML):  {g('pfad', '.')}"
@@ -3794,7 +4177,11 @@ def _describe(action: dict) -> str:
     if t == "web_wiki":         return f"Wikipedia suchen:  {g('suche', '?')}"
     if t == "gedaechtnis_suchen":
         filter_ = " · ".join(f"{k} {g(k)}" for k in ("quelle", "seit", "bis") if g(k))
-        return f"Gedächtnis durchsuchen:  {g('frage', '?')}" + (f"  ({filter_})" if filter_ else "")
+        mehr = g("fragen")
+        mehr = mehr.split("|") if isinstance(mehr, str) else (mehr if isinstance(mehr, list) else [])
+        frage = " | ".join([g("frage", "?")] + [str(f) for f in mehr if str(f).strip()])
+        return (f"Gedächtnis durchsuchen:  {frage}" + ("  (mit Vermutung)" if g("vermutung") else "")
+                + (f"  ({filter_})" if filter_ else ""))
     if t == "gedaechtnis_lesen": return f"Gedächtnis lesen:  {g('ref', '?')}" + (f"  (ab {g('ab')})" if g("ab") else "")
     if t == "web_suche":        return f"Web durchsuchen:  {g('suche', '?')}"
     if t == "fach_suche":       return f"Fachquelle {g('quelle', '?')} durchsuchen:  {g('suche', '?')}"
@@ -3827,6 +4214,12 @@ def _describe(action: dict) -> str:
     if t == "einstellung_aendern":
         return (f"Einstellung ändern ⚙:  {g('was', '?')}  {g('wert', '?')}"
                 + (f"\n    Grund: {g('grund')}" if g("grund") else "") + _taint_hinweis())
+    if t == "updates_suchen":
+        return "Updates nachsehen (winget upgrade)"
+    if t == "updates_installieren":
+        ids = action.get("ids") or action.get("id") or "?"
+        return ("Updates installieren (winget): " + (", ".join(map(str, ids)) if isinstance(ids, list) else str(ids))
+                + "\n    Braucht eins Adminrechte, fragt Windows selbst (UAC) – bei Bedenken dort abbrechen (Esc).")
     if t == "paket_installieren":
         p = action.get("pakete") or action.get("paket") or "?"
         return "Pakete in der Sandbox installieren: " + (", ".join(map(str, p)) if isinstance(p, list) else str(p))
@@ -3910,6 +4303,7 @@ def _describe(action: dict) -> str:
         return f"Wache 🛡: Alarm {g('id')} ansehen" if g("id") else f"Wache 🛡: Alarme auflisten ({g('status', 'alle')})"
     if t == "wache_ereignisse": return f"Wache 🛡: Ereignisse ({g('prozess') or g('kategorie') or 'alle'})"
     if t == "wache_inventar":   return f"Wache 🛡: Inventar {g('art', 'Übersicht')}"
+    if t == "wache_netz":       return f"Wache 🛡: Netz {g('ip', '') or ('Meldung' if g('text') else 'Übersicht')}"
     if t == "wache_bewerten":
         ziel = (f"alle offenen {g('regel')}" + (f' zu "{g("subjekt")}"' if g("subjekt") else "")
                 if g("regel") and not g("id") and not g("ids")
@@ -3917,6 +4311,7 @@ def _describe(action: dict) -> str:
         return (f"Wache 🛡: {ziel} → {g('urteil', '?')}"
                 + (f" = {g('bezeichnung', '')}" if g('bezeichnung', '') else "")
                 + f"\n    {g('begruendung', '')}")
+    if t == "wache_programm":   return f"Wache 🛡: Programm {g('aktion', 'status')} {g('programm', '')}".rstrip()
     if t == "wache_justieren":  return f"Wache 🛡 JUSTIEREN: {g('was', '?')} = {g('wert', '?')}\n    {g('begruendung', '')}"
     if t == "coding_sammlung":
         return f"Coding-Sammlung {g('aktion', 'suchen')}" + (f":  {g('frage')}" if g("frage") else "")
@@ -3992,13 +4387,15 @@ async def run(action: dict) -> ActionResult:
     if fehlend:
         return ActionResult(f"Fehler: es fehlen Felder {fehlend} für '{tool}'.", ok=False)
     global _web_taint, _privat_gelesen
-    if tool in _WEB_TOOLS:
+    if tool in _WEB_TOOLS or _holt_aus_dem_netz(action):
         _web_taint = True
     if tool in _PRIVAT_LESEN:
         _privat_gelesen = True
     try:
         with _DBG.messen(f"Werkzeug {tool}"):
             result = await asyncio.to_thread(spec["func"], action)
+        if isinstance(result, ActionResult) and ersatzbank.ist_sperre(result.text, result.ok):
+            ersatzbank.sperre()
         if isinstance(result, ActionResult):
             return result
         # Unsere einfachen Werkzeuge liefern nur auf ihrem Erfolgsweg Text.

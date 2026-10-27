@@ -165,7 +165,8 @@ def _pip(befehl: str) -> list[str]:
 
 
 def _ausfuehren(cmd: list[str], timeout: int) -> subprocess.CompletedProcess:
-    return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout, env=uvsetup._env(),
+    return subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", timeout=timeout,
+                          env=uvsetup._env(),
                           creationflags=uvsetup._NOWIN)
 
 

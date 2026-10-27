@@ -22,7 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 API = "https://huggingface.co/api"
-DATEI_URL = "https://huggingface.co/{repo}/resolve/main/{pfad}"
+DATEI_URL = "https://huggingface.co/{repo}/resolve/{revision}/{pfad}"
 ANBIETER = ("unsloth", "bartowski", "ggml-org", "lmstudio-community")
 MIN_B = 4.0
 GROESSEN = {                      # Schlüssel: (von, bis) in Milliarden Parametern, Anzeige
@@ -297,13 +297,21 @@ def gb(n: int) -> str:
 # Laden
 # ---------------------------------------------------------------------------
 
+class _Vollstaendig(Exception):
+    pass
+
+
 def laden(repo: str, datei: Datei, ordner: Path, fortschritt: Callable[[str, int, int], None],
-          stopp: threading.Event, session=None) -> Path:
+          stopp: threading.Event, session=None, revision: str = "main") -> Path:
     """Lädt `datei` nach `ordner`, prüft Größe und SHA-256 und legt sie erst dann ab.
     fortschritt(phase, erledigt, gesamt) mit phase "pruefe" (angefangene Datei) oder "lade".
     Abbruch über `stopp`: die .part-Datei bleibt liegen und wird beim nächsten Mal fortgesetzt."""
     ordner.mkdir(parents=True, exist_ok=True)
     ziel = ordner / datei.name
+    # Der Name kommt aus dem Dateibaum von Hugging Face: nie aus dem Zielordner heraus.
+    if not datei.name or any(z in datei.name for z in ("\\", "/", ":")) or datei.name in (".", "..") \
+            or not ziel.resolve().is_relative_to(ordner.resolve()):
+        raise PruefFehler(f"Ungültiger Dateiname von Hugging Face: {datei.name!r}")
     if ziel.is_file() and ziel.stat().st_size == datei.groesse:
         if _hash_datei(ziel, datei.groesse, fortschritt, stopp) == datei.sha256:
             return ziel
@@ -317,10 +325,12 @@ def laden(repo: str, datei: Datei, ordner: Path, fortschritt: Callable[[str, int
             start = 0
         else:
             h = _hash_datei(teil, datei.groesse, fortschritt, stopp, nur_hash=False)
-    s = session or _session()
+    s = (session or _session()) if start < datei.groesse else None
     try:
+        if s is None:                                   # .part schon vollständig (Absturz vor dem Ablegen)
+            raise _Vollstaendig()
         kopf = {"Range": f"bytes={start}-"} if start else {}
-        url = DATEI_URL.format(repo=repo, pfad=datei.pfad)
+        url = DATEI_URL.format(repo=repo, pfad=datei.pfad, revision=revision)
         with s.stream("GET", url, headers=kopf) as r:
             if start and r.status_code == 200:          # Server setzt nicht fort: von vorn
                 start, h = 0, hashlib.sha256()
@@ -335,8 +345,10 @@ def laden(repo: str, datei: Datei, ordner: Path, fortschritt: Callable[[str, int
                     h.update(stueck)
                     erledigt += len(stueck)
                     fortschritt("lade", erledigt, datei.groesse)
+    except _Vollstaendig:
+        pass                                            # nichts mehr zu laden, nur noch prüfen
     finally:
-        if session is None:
+        if session is None and s is not None:
             s.close()
     groesse = teil.stat().st_size
     if groesse != datei.groesse or h.hexdigest() != datei.sha256:

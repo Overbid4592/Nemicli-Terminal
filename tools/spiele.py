@@ -200,7 +200,7 @@ class SpieleServer:
         def token_ok(parsed, headers) -> bool:
             q = parse_qs(parsed.query)
             tok = (q.get("token", [""])[0]) or headers.get("X-Token", "")
-            return secrets.compare_digest(tok, server.token)
+            return secrets.compare_digest(str(tok).encode("utf-8", "replace"), server.token.encode())
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
@@ -232,9 +232,12 @@ class SpieleServer:
                 parsed = urlparse(self.path)
                 if not token_ok(parsed, self.headers):
                     self._send(403); return
-                n = int(self.headers.get("Content-Length", 0) or 0)
                 try:
-                    data = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if n > 0 else {}
+                    n = int(self.headers.get("Content-Length", 0) or 0)
+                except ValueError:
+                    n = 0
+                try:
+                    data = json.loads(self.rfile.read(n).decode("utf-8") or "{}") if 0 < n <= 200_000 else {}
                 except Exception:
                     data = {}
                 if parsed.path == "/zug":

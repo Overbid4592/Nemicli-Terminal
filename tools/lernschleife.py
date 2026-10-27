@@ -162,11 +162,11 @@ _hinweise: dict[str, list[str]] = {}
 _hinweise_lock = threading.Lock()
 
 
-def melden(text: str, wer: str) -> None:
-    """Notiz für die Persönlichkeit `wer` (ihre Kennung)."""
+def melden(text: str, wer: str, max_zeichen: int = 300) -> None:
+    """Notiz für die Persönlichkeit `wer` (ihre Kennung), gekürzt auf `max_zeichen`."""
     with _hinweise_lock:
         liste = _hinweise.setdefault(wer, [])
-        liste.append(" ".join(str(text).split())[:300])
+        liste.append(" ".join(str(text).split())[:max_zeichen])
         del liste[:-MAX_HINWEISE]
 
 

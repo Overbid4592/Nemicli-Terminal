@@ -269,7 +269,7 @@ def suchen(frage: str, quelle: str = "", anzahl: int = TREFFER) -> str:
             sql = ("SELECT rowid, quelle, titel, pfad, snippet(seiten, 3, '«', '»', ' … ', 30) FROM seiten "
                    "WHERE seiten MATCH ?" + (" AND quelle = ?" if quelle else "")
                    + " ORDER BY bm25(seiten, 0.0, 10.0, 0.0, 1.0) LIMIT ?")
-            werte = [_anfrage(frage, verbinder)] + ([quelle] if quelle else []) + [max(1, min(int(anzahl), 12))]
+            werte = [_anfrage(frage, verbinder)] + ([quelle] if quelle else []) + [max(1, min(int(float(anzahl)) if str(anzahl).replace('.', '', 1).isdigit() else 6, 12))]
             try:
                 zeilen = con.execute(sql, werte).fetchall()
             except sqlite3.OperationalError:

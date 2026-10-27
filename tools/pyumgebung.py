@@ -40,13 +40,40 @@ def _ohne_geheimnisse() -> dict:
 
 # --- Welches Python ----------------------------------------------------------
 
+# Basis-Python eines Projekt-venv → dessen site-packages (für _lauf).
+_SITE: dict[str, Path] = {}
+
+
+def _projekt_venv(ordner: Path, name: str) -> tuple[Path, Path] | None:
+    """(Basis-Python, site-packages) eines venv im Projekt. Gestartet wird nie die python.exe aus dem
+    Projekt (die kann jede Datei sein), sondern das Python, aus dem das venv laut pyvenv.cfg entstand –
+    und nur, wenn es außerhalb des Projekts liegt."""
+    v = Path(ordner) / name
+    sp = v / "Lib" / "site-packages"
+    try:
+        zeilen = (v / "pyvenv.cfg").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    home = next((z.split("=", 1)[1].strip() for z in zeilen if z.split("=", 1)[0].strip().lower() == "home"), "")
+    if not home or not sp.is_dir():
+        return None
+    basis = Path(home) / "python.exe"
+    try:
+        if not basis.is_file() or basis.resolve().is_relative_to(Path(ordner).resolve()):
+            return None
+    except OSError:
+        return None
+    return basis, sp
+
+
 def python_fuer(ordner: Path | None) -> tuple[Path | None, str]:
-    """(Python, Herkunft): das venv des Projekts, sonst das Python von NemiCLI."""
+    """(Python, Herkunft): das venv des Projekts (über sein Basis-Python), sonst das Python von NemiCLI."""
     if ordner is not None:
         for name in ("venv", ".venv", "env"):
-            p = Path(ordner) / name / "Scripts" / "python.exe"
-            if p.is_file():
-                return p, f"{name}\\Scripts\\python.exe im Projekt"
+            if (gefunden := _projekt_venv(Path(ordner), name)) is not None:
+                basis, sp = gefunden
+                _SITE[str(basis)] = sp
+                return basis, f"{name} im Projekt"
     try:
         import uvsetup
         p = Path(uvsetup.venv_python())
@@ -61,9 +88,15 @@ def python_fuer(ordner: Path | None) -> tuple[Path | None, str]:
 
 def _lauf(python: Path, skript: str, eingabe: str, cwd: Path | None) -> tuple[bool, str]:
     """Fester Code im Projekt-Python. -I (isoliert): weder der Projektordner noch PYTHON*-Variablen
-    kommen in den Suchpfad – eine Projektdatei wie json.py wird nie statt der Bibliothek geladen."""
+    kommen in den Suchpfad – eine Projektdatei wie json.py wird nie statt der Bibliothek geladen.
+    Beim Projekt-venv zusätzlich -S: dessen site-packages kommt von Hand in den Pfad, .pth-Dateien
+    (die beim Start Code ausführen würden) werden nicht gelesen."""
+    befehl = [str(python), "-I", "-X", "utf8", "-c", skript]
+    if (sp := _SITE.get(str(python))) is not None:
+        befehl = [str(python), "-I", "-S", "-X", "utf8", "-c",
+                  f"import sys; sys.path.append({str(sp)!r})\n" + skript]
     try:
-        r = subprocess.run([str(python), "-I", "-X", "utf8", "-c", skript], input=eingabe, capture_output=True,
+        r = subprocess.run(befehl, input=eingabe, capture_output=True,
                            text=True, encoding="utf-8", errors="replace", timeout=ZEIT,
                            cwd=str(cwd) if cwd else None,
                            env=_ohne_geheimnisse(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))

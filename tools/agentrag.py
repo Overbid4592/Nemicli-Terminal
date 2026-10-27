@@ -6,10 +6,14 @@ was kommt. Hier entscheidet die Persönlichkeit: ob sie sucht, womit, in welcher
 Quelle und welchem Zeitraum, und ob sie eine gefundene Quelle ganz liest.
 Mehrere Suchen hintereinander sind ausdrücklich gewollt.
 
-  gedaechtnis_suchen   frage, quelle, seit, bis, anzahl   → Treffer mit Quelle und Datum
-  gedaechtnis_lesen    ref, ab                            → die Quelle (Chat, Bericht, Wissen …), lange stückweise
+  gedaechtnis_suchen   frage, fragen, vermutung, quelle, seit, bis, anzahl
+                       → Treffer mit Quelle, Datum und dem Text davor/danach
+  gedaechtnis_lesen    ref, ab   → die Quelle (Chat, Bericht, Wissen …), lange stückweise
 
-Beide nur lesend; die Suche selbst ist hybrid (indexdb.suchen).
+Beide nur lesend; die Suche selbst ist hybrid (indexdb.suchen): mehrere Fassungen einer
+Frage (Multi-Query) und eine vermutete Antwort (HyDE) gehen in dieselbe Fusion. Sind die
+Treffer schwach, sagt das Ergebnis es und schlägt vor, wie weiter (Corrective RAG). Was
+danach gelesen wird, lernt die Rangliste (rangliste.py).
 """
 
 from __future__ import annotations
@@ -23,6 +27,10 @@ import indexdb
 ANZAHL_STANDARD = 8
 ANZAHL_MAX = 20
 SNIPPET = 420
+NACHBAR = 160                     # so viel vom Text davor und danach (Small-to-Big)
+NACHBARN_FUER = 5                 # die ersten so vielen Treffer bekommen ihn
+SCHWACH_AB = 0.5                  # bester Kosinus darunter (und kein Stichwort): schwache Treffer
+RELEVANZ_AB = 0.3                 # mit Reranker: beste Relevanz darunter = schwache Treffer
 
 # Quelle (wie die Persönlichkeit sie nennt) → Arten in memory.db und optionaler ref-Anfang.
 QUELLEN = {
@@ -63,7 +71,7 @@ def datum_lesen(text: str, heute: date | None = None) -> str:
         return (heute - timedelta(days=1)).isoformat()
     m = re.fullmatch(r"(\d+)\s*(t|tag|tage|tagen|d|w|woche|wochen|m|monat|monate|monaten)", t)
     if m:
-        n, einheit = int(m.group(1)), m.group(2)
+        n, einheit = min(int(m.group(1)), 36500), m.group(2)       # höchstens 100 Jahre zurück
         tage = n * (7 if einheit.startswith("w") else 30 if einheit.startswith("m") else 1)
         return (heute - timedelta(days=tage)).isoformat()
     if re.fullmatch(r"\d{4}-\d{2}-\d{2}", t):
@@ -116,9 +124,59 @@ def _kopf(h: dict) -> str:
     return f"{art} · ref={h.get('ref', '')}" + (f" · {datum}" if datum else "")
 
 
+def _fragen(a: dict) -> list[str]:
+    """frage (Text) und fragen (Liste oder durch | getrennt) → alle Fassungen."""
+    raus = [str(a.get("frage") or a.get("suche") or "")]
+    mehr = a.get("fragen")
+    if isinstance(mehr, str):
+        mehr = mehr.split("|")
+    raus += [str(f) for f in (mehr or []) if isinstance(f, (str, int, float))]
+    return [f.strip() for f in raus if f and f.strip()]
+
+
+def _flach(text: str) -> str:
+    return " ".join((text or "").split())
+
+
+def _ausschnitt(text: str) -> str:
+    text = _flach(text)
+    return text if len(text) <= SNIPPET else text[:SNIPPET] + " …"
+
+
+def _mit_nachbarn(h: dict) -> str:
+    """Der Treffer mit dem Text davor (↑) und danach (↓) aus derselben Quelle."""
+    text = _ausschnitt(h.get("text"))
+    vorher, nachher = indexdb.nachbarn(h["rowid"]) if h.get("rowid") is not None else ("", "")
+    teile = []
+    if vorher:
+        teile.append("↑ …" + _flach(vorher)[-NACHBAR:])
+    teile.append(text)
+    if nachher:
+        teile.append("↓ " + _flach(nachher)[:NACHBAR] + " …")
+    return "\n".join(teile)
+
+
+def _schwach(treffer: list[dict]) -> bool:
+    """Die Suche hat wohl nicht das Richtige: der Reranker hält nichts für passend – oder, ohne ihn,
+    kein Stichwort-Treffer und keine gute Ähnlichkeit."""
+    relevanz = [h["relevanz"] for h in treffer if h.get("relevanz") is not None]
+    if relevanz:
+        return max(relevanz) < RELEVANZ_AB
+    if any("wort" in (h.get("wie") or "") for h in treffer):
+        return False
+    werte = [h["aehnlich"] for h in treffer if h.get("aehnlich") is not None]
+    return not werte or max(werte) < SCHWACH_AB
+
+
+_WEITER_SUCHEN = ("Andere Worte oder Synonyme versuchen, mehrere Fassungen auf einmal in „fragen“ schicken, eine "
+                  "vermutete Antwort in „vermutung“ (sucht nach Bedeutung), Filter lockern – oder dem Nutzer sagen, "
+                  "dass es dazu nichts im Gedächtnis gibt. Nicht raten.")
+
+
 def suchen(a: dict) -> str:
-    frage = str(a.get("frage") or a.get("suche") or "").strip()
-    if not frage:
+    fragen = _fragen(a)
+    vermutung = str(a.get("vermutung") or "").strip()
+    if not fragen and not vermutung:
         return "Keine Frage angegeben – Feld „frage“ mit den Suchworten füllen."
     try:
         anzahl = max(1, min(int(a.get("anzahl") or ANZAHL_STANDARD), ANZAHL_MAX))
@@ -127,26 +185,47 @@ def suchen(a: dict) -> str:
     arten, praefixe, unbekannt = _quelle(str(a.get("quelle") or ""))
     seit = datum_lesen(str(a.get("seit") or ""))
     bis = datum_lesen(str(a.get("bis") or ""))
-    treffer = indexdb.suchen(frage, anzahl, arten=arten, seit=seit, bis=bis,
-                             ref_praefix=praefixe, laden=True)
+    treffer = indexdb.suchen(fragen, anzahl, arten=arten, seit=seit, bis=bis,
+                             ref_praefix=praefixe, laden=True, vermutung=vermutung)
+    titel = " | ".join(fragen) or vermutung[:80]
     filter_text = ", ".join(x for x in (
         f"Quelle {a.get('quelle')}" if arten else "", f"seit {seit}" if seit else "",
-        f"bis {bis}" if bis else "") if x)
+        f"bis {bis}" if bis else "", "mit Vermutung" if vermutung else "") if x)
     hinweis = (f"Unbekannte Quelle(n) ignoriert: {', '.join(unbekannt)} – möglich: "
                "chat, notiz, bericht, wache, vollscan, skill, code, wissen, aktuell.\n" if unbekannt else "")
     if not treffer:
-        return (hinweis + f"Nichts gefunden zu „{frage}“" + (f" ({filter_text})" if filter_text else "")
-                + ". Andere Worte versuchen, Filter lockern – oder dem Nutzer sagen, dass es dazu "
-                  "nichts im Gedächtnis gibt. Nicht raten.")
+        return (hinweis + f"Nichts gefunden zu „{titel}“" + (f" ({filter_text})" if filter_text else "")
+                + ". " + _WEITER_SUCHEN)
+    try:
+        import rangliste
+        rangliste.gezeigt(treffer)
+    except Exception:
+        pass
     zeilen = []
     for n, h in enumerate(treffer, 1):
-        text = " ".join((h.get("text") or "").split())
-        if len(text) > SNIPPET:
-            text = text[:SNIPPET] + " …"
-        zeilen.append(f"[{n}] {_kopf(h)} · gefunden über {h.get('wie') or '?'}\n{text}")
-    kopf = (hinweis + f"{len(treffer)} Treffer zu „{frage}“" + (f" ({filter_text})" if filter_text else "")
-            + ". Ganze Quelle: gedaechtnis_lesen mit ref.")
-    return kopf + "\n" + fremddaten.rahmen("\n\n".join(zeilen), "suche", frage)
+        aehnl = (f" · Relevanz {h['relevanz']:.2f}" if h.get("relevanz") is not None else
+                 f" · Ähnlichkeit {h['aehnlich']:.2f}" if h.get("aehnlich") is not None else "")
+        text = _mit_nachbarn(h) if n <= NACHBARN_FUER else _ausschnitt(h.get("text"))
+        zeilen.append(f"[{n}] {_kopf(h)} · gefunden über {h.get('wie') or '?'}{aehnl}\n{text}")
+    kopf = (hinweis + f"{len(treffer)} Treffer zu „{titel}“" + (f" ({filter_text})" if filter_text else "")
+            + ". ↑/↓ = Text davor/danach in derselben Quelle. Ganze Quelle: gedaechtnis_lesen mit ref.")
+    if _schwach(treffer):
+        kopf += "\n⚠ Die Treffer sind schwach – wohl nicht das Gesuchte. " + _WEITER_SUCHEN
+    netz = any(_von_aussen(h.get("ref")) for h in treffer)
+    return kopf + "\n" + fremddaten.rahmen("\n\n".join(zeilen), "suche", titel, netz=netz)
+
+
+def _von_aussen(ref) -> bool:
+    """Berichte (Recherche, Zeitplan-Aufträge, Wache) sind aus Fremdinhalt entstanden: sie behalten die
+    Netz-Marke, auch wenn sie nur noch im Gedächtnis liegen – und die Runde gilt dann als „von außen“."""
+    if str(ref or "").startswith("bericht:"):
+        try:
+            import actions
+            actions.fremdinhalt()
+        except Exception:
+            pass
+        return True
+    return False
 
 
 def lesen(a: dict) -> str:
@@ -160,6 +239,12 @@ def lesen(a: dict) -> str:
     q = indexdb.quelle_lesen(ref, ab=ab)
     if not q:
         return f"Keine Quelle „{ref}“ im Gedächtnis. Den ref genau so übernehmen, wie die Suche ihn nennt."
+    if ab == 1:
+        try:
+            import rangliste
+            rangliste.gelesen(ref)                 # der Treffer war nützlich: lernt die Rangliste
+        except Exception:
+            pass
     kopf = f"{_kopf(q)} · {q['brocken']} Abschnitte"
     if q["ab"] > 1 or q["weiter"]:
         kopf += f" · hier Abschnitt {q['ab']}–{(q['weiter'] - 1) if q['weiter'] else q['brocken']}"
@@ -167,4 +252,4 @@ def lesen(a: dict) -> str:
         kopf += f" · weiter mit ab={q['weiter']}"
     elif q["gekuerzt"]:
         kopf += " · gekürzt"
-    return kopf + "\n" + fremddaten.rahmen(q["text"], "datei", ref)
+    return kopf + "\n" + fremddaten.rahmen(q["text"], "datei", ref, netz=_von_aussen(ref))

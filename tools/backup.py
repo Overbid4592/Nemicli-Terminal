@@ -498,7 +498,7 @@ def _erstellen(plan: Plan, melde: Callable[[str], None],
                     fertig += d.groesse
                     continue
                 with src:
-                    zinfo = zipfile.ZipInfo.from_file(quelle, d.name)
+                    zinfo = zipfile.ZipInfo.from_file(quelle, d.name, strict_timestamps=False)   # Datei vor 1980: Datum 1980
                     zinfo.compress_type = (zipfile.ZIP_STORED if d.pfad.suffix.lower() in _GEPACKT
                                            else zipfile.ZIP_DEFLATED)
                     h = hashlib.sha256()

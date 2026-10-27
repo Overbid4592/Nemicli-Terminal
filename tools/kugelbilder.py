@@ -391,9 +391,7 @@ def entfernen(name: str) -> int:
             continue                                  # Motive bleiben, nur die Grundbilder gehen
         try:
             if snapshot is not None and snapshot.sichern(p, "kugel_entfernen", verschieben=True):
-                n += 1
-            elif p.exists():
-                p.unlink(); n += 1
+                n += 1                                 # ohne Papierkorb-Kopie nie endgültig löschen
         except Exception:
             pass
     if outfits(name)["aktiv"]:

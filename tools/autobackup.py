@@ -190,6 +190,29 @@ def sichern(erzwingen: bool = False) -> dict:
         _laeuft.release()
 
 
+MAX_GEDAECHTNIS = 500 * 1024 * 1024
+
+
+def _gedaechtnis_kopie() -> Path | None:
+    """Stimmige Kopie von learned/memory.db über die SQLite-Sicherungs-API (auch während geschrieben wird).
+    Der Index ist sonst neu rechenbar – ältere Berichte leben aber nur noch dort."""
+    import sqlite3
+    quelle = Path(os.path.abspath(paths.DATEN)) / "learned" / "memory.db"
+    try:
+        if not quelle.is_file() or quelle.stat().st_size > MAX_GEDAECHTNIS:
+            return None
+        ziel = _ordner() / f"memory_{os.getpid()}.db.tmp"
+        ziel.parent.mkdir(parents=True, exist_ok=True)
+        ziel.unlink(missing_ok=True)
+        from contextlib import closing                 # „with connect()“ allein schließt nicht (nur commit)
+        with closing(sqlite3.connect(f"file:{quelle}?mode=ro", uri=True, timeout=10)) as alt, \
+                closing(sqlite3.connect(ziel)) as neu:
+            alt.backup(neu)
+        return ziel
+    except (OSError, sqlite3.Error):
+        return None
+
+
 def _sichern(erzwingen: bool) -> dict:
     jetzt = time.time()
     vorher = stand()
@@ -209,7 +232,11 @@ def _sichern(erzwingen: bool) -> dict:
         return {"ok": False, "angehalten": True, "text": "💾 Automatische Sicherung angehalten: " + grund}
     if not backup._LOCK.acquire(blocking=False):
         return {"ok": False, "text": "Es läuft gerade ein Backup – die automatische Sicherung kommt später."}
+    kopie = _gedaechtnis_kopie()
     try:
+        if kopie is not None:
+            dateien = dateien + [backup.Datei(kopie, "Daten/learned/memory.db", kopie.stat().st_size,
+                                              kopie.stat().st_mtime)]
         plan = backup.Plan("auto", False, dateien, ausgelassen)
         erg = backup._erstellen(plan, lambda _m: None, None, name=NEU)
         z = _ordner()
@@ -221,6 +248,8 @@ def _sichern(erzwingen: bool) -> dict:
         return {"ok": False, "text": f"💾 Automatische Sicherung fehlgeschlagen: {e}"}
     finally:
         backup._LOCK.release()
+        if kopie is not None:
+            kopie.unlink(missing_ok=True)
     _stand_schreiben({"zeit": jetzt, "notizen": notizen, "dateien": erg.dateien, "bytes": erg.zip,
                       "sha256": erg.sha256, "fehler": erg.fehler[:5]})
     try:

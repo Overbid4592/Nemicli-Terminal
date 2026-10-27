@@ -221,7 +221,8 @@ def ausbessern(name: str, suchen: str, ersetzen: str) -> Path:
         snapshot.sichern(s.pfad, "skill_ausbessern")
     except Exception:
         pass
-    s.pfad.write_text(neu, encoding="utf-8")
+    from atomar import text_schreiben
+    text_schreiben(s.pfad, neu)
     return s.pfad
 
 

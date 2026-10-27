@@ -79,6 +79,8 @@ def sauberer_name(name: str) -> str | None:
         return None
     if not re.fullmatch(r"[A-Za-z0-9ÄÖÜäöüß _-]+", n):
         return None
+    if re.fullmatch(r"(?i)(con|prn|aux|nul|com\d|lpt\d)", n.split(" ")[0]):   # Gerätenamen unter Windows
+        return None
     return n
 
 
@@ -416,7 +418,8 @@ def bericht_pfad(name: str) -> Path:
 def letzter_bericht(name: str) -> Path | None:
     if not BERICHTE.exists():
         return None
-    treffer = sorted(BERICHTE.glob(f"{name}_*.md"))
+    muster = re.compile(re.escape(name) + r"_\d{8}-\d{6}\.md")   # nicht auch „backup_woche_…“ für „backup“
+    treffer = sorted(p for p in BERICHTE.glob(f"{name}_*.md") if muster.fullmatch(p.name))
     return treffer[-1] if treffer else None
 
 

@@ -244,6 +244,26 @@ def _cos(a: list[float], b: list[float]) -> float:
     return dot / (na * nb) if na and nb else 0.0
 
 
+def _cos_alle(q: list[float], vecs: list[list[float]]) -> list[float]:
+    """Wie _cos für viele Vektoren auf einmal – mit numpy eine Matrixmultiplikation statt Python-Schleifen."""
+    try:
+        import numpy as np
+    except Exception:
+        return [_cos(q, v) for v in vecs]
+    gleich = [i for i, v in enumerate(vecs) if v and len(v) == len(q)]
+    raus = [0.0] * len(vecs)
+    if not q or not gleich:
+        return raus
+    m = np.asarray([vecs[i] for i in gleich], dtype="float64")
+    qa = np.asarray(q, dtype="float64")
+    nq = float(np.linalg.norm(qa))
+    norm = np.linalg.norm(m, axis=1) * nq
+    sims = np.divide(m @ qa, norm, out=np.zeros(len(gleich)), where=norm > 0)
+    for j, i in enumerate(gleich):
+        raus[i] = float(sims[j])
+    return raus
+
+
 _WORD = re.compile(r"[a-zäöüß0-9]{3,}", re.IGNORECASE)
 
 
@@ -597,9 +617,32 @@ def _get_encoder():
             return None
 
 
+RUHE_TAKT_S = 0.5
+RUHE_HOECHSTENS_S = 900         # länger wartet Hintergrund-Arbeit nicht auf das Ende einer Runde
+
+
+def warten_bis_ruhe(hoechstens_s: float = RUHE_HOECHSTENS_S) -> None:
+    """Für Hintergrund-Arbeit (Encoder laden, Index bauen): erst anfangen, wenn keine Runde läuft – der Chat
+    soll nie mit ihr um Prozessor, Platte und Python teilen."""
+    try:
+        import notstopp
+    except Exception:
+        return
+    ende = time.monotonic() + hoechstens_s
+    while notstopp.runde_laeuft() and time.monotonic() < ende:
+        time.sleep(RUHE_TAKT_S)
+
+
+def _warm_laden() -> None:
+    warten_bis_ruhe()
+    if not gpu_pause():
+        _get_encoder()
+
+
 def warm_encoder() -> None:
-    """Lädt den Encoder im Hintergrund vor – der Aufrufer wartet nicht. Nicht während eine
-    Bilderserie läuft: sonst lädt jede Suche ihn zwischen zwei Bildern wieder auf die GPU."""
+    """Lädt den Encoder im Hintergrund vor – der Aufrufer wartet nicht, und geladen wird erst nach der
+    laufenden Runde. Nicht während eine Bilderserie läuft: sonst lädt jede Suche ihn zwischen zwei Bildern
+    wieder auf die GPU."""
     global _warm_thread
     if gpu_pause():
         return
@@ -609,7 +652,7 @@ def warm_encoder() -> None:
         if _warm_thread is not None and _warm_thread.is_alive():
             return
         _warm_thread = threading.Thread(
-            target=_get_encoder, name="nemi-embed-warm", daemon=True)
+            target=_warm_laden, name="nemi-embed-warm", daemon=True)
         _warm_thread.start()
 
 
@@ -677,6 +720,11 @@ def gpu_freigeben() -> None:
         if encoder_loaded() and _geraet_aktiv == "cuda":
             with _encoder._lock:
                 _unload_locked()
+    try:
+        import reranker
+        reranker.freigeben()
+    except Exception:
+        pass
 
 
 def release_encoder() -> None:
@@ -851,7 +899,8 @@ def recall(query: str, k: int = RECALL_K) -> list[dict]:
             entries += data["entries"]
         qv = qe[0]
         kennung = modell_kennung()
-        scored = [(_cos(qv, e["vec"]), e) for e in entries if vektor_gueltig(e, kennung)]
+        gueltig = [e for e in entries if vektor_gueltig(e, kennung)]
+        scored = list(zip(_cos_alle(qv, [e["vec"] for e in gueltig]), gueltig))
         scored.sort(key=lambda x: -x[0])
         hits = [e for s, e in scored if s >= MIN_SCORE][:k]
         if hits:

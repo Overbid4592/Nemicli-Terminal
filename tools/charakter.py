@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import random
+import re
 from pathlib import Path
 
 MAX_TEXT = 800
@@ -108,7 +109,8 @@ def stimme_setzen(voice: dict, name: str | None = None) -> Path:
     if p.is_file():
         import snapshot
         snapshot.sichern(p, "stimme_festlegen")
-    p.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+    from atomar import text_schreiben
+    text_schreiben(p, json.dumps(d, indent=2, ensure_ascii=False))
     return p
 
 
@@ -212,9 +214,29 @@ def aendern(a: dict) -> tuple[str, bool]:
     if p.is_file():
         import snapshot
         snapshot.sichern(p, "charakter_aendern")
-    p.write_text(json.dumps(neu, indent=2, ensure_ascii=False), encoding="utf-8")
+    from atomar import text_schreiben
+    text_schreiben(p, json.dumps(neu, indent=2, ensure_ascii=False))
+    hinweis = kleidung_im_kern(neu.get("kern", ""))
     return ("Charakter-Datei gespeichert" + (" (alter Stand im Papierkorb)" if alt else "")
-            + f": {p}\n{zeigen(neu)}"), True
+            + f": {p}\n{zeigen(neu)}"
+            + (f"\n⚠ Kleidung im kern erkannt ({', '.join(hinweis)}) – Kleidung gehört in outfits, nicht in den "
+               "kern: Der kern steht in jedem Bild-Auftrag und wiegt schwerer als der Rest – so taucht die "
+               "Kleidung auch dort auf, wo sie nicht hingehört." if hinweis else "")), True
+
+
+# Kleidungswörter (englisch und deutsch); der kern beschreibt nur, wer die Figur ist (Gesicht, Haare, Körper).
+# Mehrdeutige Wörter fehlen absichtlich (hat = „sie hat“, top, rock, hut, tie, cap).
+_KLEIDUNG = re.compile(
+    r"\b(dress|gown|skirt|shirt|t-shirt|blouse|jacket|coat|hoodie|sweater|pullover|cardigan|"
+    r"jeans|pants|trousers|shorts|leggings|stockings|tights|socks|boots|shoes|heels|sneakers|sandals|"
+    r"bikini|swimsuit|lingerie|bra|panties|underwear|corset|uniform|scarf|gloves|"
+    r"kleid|kleidchen|hemd|bluse|jacke|mantel|pulli|hose|strümpfe|socken|stiefel|schuhe|badeanzug|"
+    r"unterwäsche|korsett|krawatte|schal|handschuhe|mütze)(s|es|en|n)?\b", re.I)
+
+
+def kleidung_im_kern(kern: str) -> list[str]:
+    """Kleidungswörter im kern (je Wort einmal, höchstens fünf); leer, wenn keine drin sind."""
+    return list(dict.fromkeys(m.group(0).lower() for m in _KLEIDUNG.finditer(kern or "")))[:5]
 
 
 def kurzinfo(name: str | None = None) -> str:

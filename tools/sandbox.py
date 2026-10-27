@@ -330,8 +330,8 @@ def _projekt_verboten(pfad: Path) -> str | None:
 
 
 def _projekte_speichern(eintraege: list[tuple[Path, bool]]) -> None:
-    _projektliste().write_text("".join(f"{'rw' if rw else 'r'}|{p}\n" for p, rw in eintraege),
-                               encoding="utf-8")
+    from atomar import text_schreiben                  # halb geschrieben fehlten Freigaben
+    text_schreiben(_projektliste(), "".join(f"{'rw' if rw else 'r'}|{p}\n" for p, rw in eintraege))
 
 
 def projekt_freigeben(pfad: Path, schreiben: bool = False) -> Path:

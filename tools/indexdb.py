@@ -32,13 +32,15 @@ except Exception:
 _DB_NEW = _ROOT / "learned" / "memory.db"
 _DB_OLD = _ROOT / "learned" / "index.sqlite"
 CHUNK = 900
-OVERLAP = 80
+SCHNITT = 2                      # Fassung des Zerschneidens (1: alle 900 Zeichen hart); ältere werden nachgeschnitten
+NEU_SCHNEIDEN_JE_LAUF = 2        # so viele alt geschnittene Quellen je Bibliothekar-Lauf
 SEARCH_K = 8
 MIN_SCORE = 0.42
 BACKFILL_BATCH = 24
 UMWANDELN_JE_LAUF = 2000         # alte JSON-Vektoren je Bibliothekar-Lauf in float32 umschreiben
 SQL_WARTEN_S = 15.0              # so lange wartet ein Zugriff auf eine gerade schreibende Verbindung
 BERICHTE_BEHALTEN = 3            # so viele Berichte bleiben als Datei; ältere leben nur noch als Vektoren
+VOLLSCAN_BEHALTEN = 2            # davon getrennt: die letzten Vollscan-Berichte
 EMBED_BATCH = 16                 # so viele Brocken je Encoder-Aufruf – dazwischen wird Fortschritt gemeldet
 BERICHTE_JE_RUNDE = 2            # Berichte je Bibliothekar-Lauf (ein Wache-Bericht = bis zu 60 Brocken ≈ 90 s CPU)
 WISSEN_JE_RUNDE = 3              # geänderte Wissen-Dateien je Bibliothekar-Lauf
@@ -94,6 +96,7 @@ def _db_path() -> Path:
 def _connect() -> sqlite3.Connection:
     path = _db_path()
     path.parent.mkdir(parents=True, exist_ok=True)
+    vorhanden = path.is_file()
     con = sqlite3.connect(str(path), timeout=SQL_WARTEN_S)
     # WAL: Lesen (Prompt-Suche) und Schreiben (Bibliothekar) blockieren sich nicht gegenseitig.
     # Die Einstellung bleibt in der Datei; /backup kopiert über die Backup-Schnittstelle samt WAL.
@@ -102,6 +105,8 @@ def _connect() -> sqlite3.Connection:
     # REPLACE löscht die alte Zeile – ohne diesen Schalter liefe der Lösch-Trigger
     # dafür nicht, und der Stichwort-Index behielte eine Leiche.
     con.execute("PRAGMA recursive_triggers=ON")
+    if vorhanden and str(path) in _SCHEMA_FERTIG:      # Tabellen und Nachrüsten nur einmal je Prozess
+        return con
     con.execute(
         """CREATE TABLE IF NOT EXISTS chunks (
             hash TEXT PRIMARY KEY,
@@ -115,7 +120,13 @@ def _connect() -> sqlite3.Connection:
     con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_ref ON chunks(ref)")
     con.execute("CREATE TABLE IF NOT EXISTS stand (schluessel TEXT PRIMARY KEY, wert TEXT)")
     _nachruesten(con)
+    _SCHEMA_FERTIG.add(str(path))
     return con
+
+
+# Datenbanken, deren Schema in diesem Prozess schon geprüft ist: nach jeder Runde öffnet das Einlesen je
+# Notiz eine Verbindung – rund ein Dutzend Schema-Befehle je Notiz kostete bei vielen Notizen Sekunden.
+_SCHEMA_FERTIG: set[str] = set()
 
 
 def _nachruesten(con: sqlite3.Connection) -> None:
@@ -129,6 +140,10 @@ def _nachruesten(con: sqlite3.Connection) -> None:
     neu_datum = "datum" not in spalten
     if neu_datum:
         con.execute("ALTER TABLE chunks ADD COLUMN datum TEXT DEFAULT ''")
+    if "schnitt" not in spalten:                 # Fassung des Zerschneidens, siehe SCHNITT
+        con.execute("ALTER TABLE chunks ADD COLUMN schnitt INTEGER DEFAULT 1")
+        con.commit()
+    con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_schnitt ON chunks(schnitt, ref)")
     if "vec_modell" not in spalten:
         # Welches Modell den Vektor gerechnet hat. Alles davor war Qwen3-Embedding.
         con.execute("ALTER TABLE chunks ADD COLUMN vec_modell TEXT DEFAULT ''")
@@ -250,17 +265,106 @@ def _hash(kind: str, ref: str, text: str) -> str:
     return hashlib.sha1(f"{kind}\n{ref}\n{text}".encode("utf-8")).hexdigest()[:20]
 
 
+_SATZENDE = re.compile(r"(?<=[.!?…])\s+")
+_SPRECHER = re.compile(r"^(Nutzer|Nemi):\s")
+_UEBERSCHRIFT = re.compile(r"^#{1,6}\s+(.+)")
+
+
+def _bloecke(text: str) -> list[tuple[str, str]]:
+    """Text → (Block, Überschrift darüber). Blöcke sind Absätze; ein Code-Block (```) bleibt ganz,
+    auch mit Leerzeilen darin."""
+    raus: list[tuple[str, str]] = []
+    abschnitt, aktuell, im_code = "", [], False
+
+    def fertig():
+        block = "\n".join(aktuell).strip()
+        if block:
+            raus.append((block, abschnitt))
+        aktuell.clear()
+
+    for zeile in text.replace("\r\n", "\n").split("\n"):
+        if zeile.lstrip().startswith("```"):
+            if not im_code:
+                fertig()
+            aktuell.append(zeile)
+            im_code = not im_code
+            if not im_code:
+                fertig()
+            continue
+        if im_code:
+            aktuell.append(zeile)
+            continue
+        if not zeile.strip():
+            fertig()
+            continue
+        if (m := _UEBERSCHRIFT.match(zeile.strip())):
+            fertig()
+            abschnitt = m.group(1).strip()[:80]
+        aktuell.append(zeile)
+    fertig()
+    return raus
+
+
+def _teilen(block: str, platz: int) -> list[str]:
+    """Ein zu langer Block: an Satzenden, Code an Zeilen, überlange Stücke hart."""
+    stuecke = block.split("\n") if block.lstrip().startswith("```") else _SATZENDE.split(block)
+    raus, aktuell = [], ""
+    for s in stuecke:
+        while len(s) > platz:
+            if aktuell:
+                raus.append(aktuell)
+                aktuell = ""
+            raus.append(s[:platz])
+            s = s[platz:]
+        trenner = "\n" if block.lstrip().startswith("```") else " "
+        if aktuell and len(aktuell) + 1 + len(s) > platz:
+            raus.append(aktuell)
+            aktuell = ""
+        aktuell = f"{aktuell}{trenner}{s}" if aktuell else s
+    if aktuell:
+        raus.append(aktuell)
+    return raus
+
+
 def _pieces(text: str) -> list[str]:
+    """Text → Brocken bis CHUNK Zeichen, an Absätzen, Sätzen und Code-Blöcken geschnitten. Folge-Brocken
+    tragen vorn, woher sie stammen ([Sprecher] oder [erste Zeile › Überschrift]) – so findet und versteht
+    man sie auch allein. Den Zusammenhang davor und danach liefert die Suche als Nachbarn."""
     text = (text or "").strip()
     if len(text) < 20:
         return []
     if len(text) <= CHUNK:
         return [text]
-    out, i = [], 0
-    while i < len(text):
-        out.append(text[i:i + CHUNK].strip())
-        i += CHUNK - OVERLAP
-    return [p for p in out if len(p) >= 20]
+    erste = text.split("\n", 1)[0].strip()
+    if (m := _SPRECHER.match(text)):
+        kopf = m.group(1)
+    elif len(erste) <= 80 and "\n" in text and not _SATZENDE.search(erste):
+        kopf = erste                                     # Dateiname, Chat-Titel
+    else:
+        kopf = ""
+    raus: list[str] = []
+    aktuell, abschnitt = "", None
+
+    def vorsatz(ueber: str) -> str:
+        marke = " › ".join(x for x in (kopf, ueber) if x)
+        return f"[{marke}] " if marke else ""
+
+    for block, ueber in _bloecke(text):
+        neuer_abschnitt, abschnitt = ueber != abschnitt, ueber
+        vorn = vorsatz("" if block.startswith("#") else ueber)   # die Überschrift steht dann selbst da
+        platz = max(200, CHUNK - len(vorn))
+        for t in ([block] if len(block) <= platz else _teilen(block, platz)):
+            if aktuell and (neuer_abschnitt or len(aktuell) + 2 + len(t) > CHUNK):
+                raus.append(aktuell)
+                aktuell = ""
+            neuer_abschnitt = False
+            if aktuell:
+                aktuell = f"{aktuell}\n\n{t}"
+            else:
+                aktuell = (vorn if raus else "") + t     # der erste Brocken beginnt mit dem Text selbst
+    if aktuell:
+        raus.append(aktuell)
+    return [p.strip() for p in raus if len(p.strip()) >= 20]
 
 
 def _msg_text(msg: dict) -> str:
@@ -279,51 +383,14 @@ def _msg_text(msg: dict) -> str:
 
 
 def _upsert(kind: str, ref: str, texts: list[str]) -> int:
+    """Texte einer Quelle zerschneiden und speichern – in Dokument-Reihenfolge (die Suche liefert die
+    Nachbarn eines Treffers mit). Rückgabe: neu eingebettete Brocken."""
     pieces = []
     for t in texts:
         pieces.extend(_pieces(t))
     if not pieces:
         return 0
-    hashes = [_hash(kind, ref, p) for p in pieces]
-    con = _connect()
-    have = {
-        r[0]
-        for r in con.execute(
-            f"SELECT hash FROM chunks WHERE hash IN ({','.join('?' * len(hashes))})",
-            hashes,
-        )
-    }
-    stale = [
-        r[0]
-        for r in con.execute("SELECT hash FROM chunks WHERE ref=?", (ref,))
-        if r[0] not in hashes
-    ]
-    if stale:
-        con.executemany("DELETE FROM chunks WHERE hash=?", [(h,) for h in stale])
-    new = [(h, p) for h, p in zip(hashes, pieces) if h not in have]
-    if not new:
-        con.commit()
-        con.close()
-        if stale:
-            _invalidate()
-        return 0
-    vecs = _einbetten([p for _, p in new])
-    now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    datum = _datum_fuer(kind, ref) or now
-    kennung = _kennung() if vecs else ""
-    rows = []
-    for i, (h, p) in enumerate(new):
-        vec = vec_packen(vecs[i]) if vecs and i < len(vecs) else None
-        rows.append((h, kind, ref, p, vec, now, datum, kennung if vec else ""))
-    con.executemany(
-        "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell) "
-        "VALUES (?,?,?,?,?,?,?,?)",
-        rows,
-    )
-    con.commit()
-    con.close()
-    _invalidate()
-    return len(rows)
+    return _upsert_geordnet(kind, ref, pieces) or 0
 
 
 def _einbetten(texte: list[str]) -> list[list[float]] | None:
@@ -643,7 +710,10 @@ def ingest_berichte(behalten: int | None = None, je_runde: int | None = BERICHTE
             _melden(f"Berichte {i}/{len(neu)} · {p.name}")
         n += ingest_file("bericht", p)
     weg = 0
-    alte = dateien[:-behalten] if behalten > 0 else dateien
+    # Vollscan-Berichte zählen für sich: sonst schöben drei Weckrufe den letzten Vollscan in den Papierkorb.
+    vollscan = [p for p in dateien if p.name.startswith("Vollscan_")]
+    uebrige = [p for p in dateien if not p.name.startswith("Vollscan_")]
+    alte = (uebrige[:-behalten] if behalten > 0 else uebrige) + vollscan[:-VOLLSCAN_BEHALTEN]
     if alte:
         try:
             import snapshot
@@ -687,13 +757,18 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
             reihe.append((h, p))
     con = _connect()
     try:
-        alt = {h: (v, m, u) for h, v, m, u in con.execute(
-            "SELECT hash, vec, vec_modell, updated FROM chunks WHERE ref=? ORDER BY rowid", (ref,))}
+        alt = {h: (v, m, u, s) for h, v, m, u, s in con.execute(
+            "SELECT hash, vec, vec_modell, updated, schnitt FROM chunks WHERE ref=? ORDER BY rowid", (ref,))}
     finally:
         con.close()
-    if list(alt) == [h for h, _p in reihe]:
+    hashes = [h for h, _p in reihe]
+    if list(alt) == hashes:
+        if any(s != SCHNITT for _v, _m, _u, s in alt.values()):
+            _schnitt_merken(ref)                  # neu geschnitten, gleich geblieben
         return None
     neu = [(h, p) for h, p in reihe if h not in alt]
+    if alt and list(alt) == hashes[:len(alt)]:    # nur hinten dazu (ein Chat wächst): anhängen
+        return _anhaengen(kind, ref, neu)
     vecs = _einbetten([p for _h, p in neu]) if neu else None
     kennung = _kennung() if vecs else ""
     neue_vec = {h: vec_packen(vecs[i]) for i, (h, _p) in enumerate(neu) if vecs and i < len(vecs)}
@@ -702,22 +777,54 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
     rows = []
     for h, p in reihe:
         if h in alt:
-            v, m, u = alt[h]
+            v, m, u, _s = alt[h]
         else:
             v = neue_vec.get(h)
             m, u = (kennung if v else ""), now
-        rows.append((h, kind, ref, p, v, u, datum, m))
+        rows.append((h, kind, ref, p, v, u, datum, m, SCHNITT))
     con = _connect()
     try:
         con.execute("DELETE FROM chunks WHERE ref=?", (ref,))
         con.executemany(
-            "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell) "
-            "VALUES (?,?,?,?,?,?,?,?)", rows)
+            "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", rows)
         con.commit()
     finally:
         con.close()
     _invalidate()
     return len(neu)
+
+
+def _anhaengen(kind: str, ref: str, neu: list[tuple[str, str]]) -> int:
+    """Neue Brocken hinter die vorhandenen einer Quelle (Reihenfolge bleibt, nichts wird umgeschrieben)."""
+    vecs = _einbetten([p for _h, p in neu])
+    kennung = _kennung() if vecs else ""
+    now = datetime.now().strftime("%Y-%m-%d %H:%M")
+    datum = _datum_fuer(kind, ref) or now
+    rows = []
+    for i, (h, p) in enumerate(neu):
+        v = vec_packen(vecs[i]) if vecs and i < len(vecs) else None
+        rows.append((h, kind, ref, p, v, now, datum, kennung if v else "", SCHNITT))
+    con = _connect()
+    try:
+        con.executemany(
+            "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt) "
+            "VALUES (?,?,?,?,?,?,?,?,?)", rows)
+        con.execute("UPDATE chunks SET datum=? WHERE ref=?", (datum, ref))
+        con.commit()
+    finally:
+        con.close()
+    _invalidate()
+    return len(neu)
+
+
+def _schnitt_merken(ref: str) -> None:
+    con = _connect()
+    try:
+        con.execute("UPDATE chunks SET schnitt=? WHERE ref=?", (SCHNITT, ref))
+        con.commit()
+    finally:
+        con.close()
 
 
 _WISSEN_NAMEN: dict = {}           # Stand der Datenbank -> Namen (der Prompt fragt jede Runde)
@@ -757,7 +864,7 @@ def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
         return 0
     basis = wissen.ordner()
     liste = wissen.dateien(basis)
-    stempel = wissen.stempel(liste, basis)
+    stempel = f"schnitt{SCHNITT}:{wissen.stempel(liste, basis)}"   # neue Schnitt-Fassung: einmal neu
     if stempel == _stand("wissen") or _unterbrochen():
         return 0
     texte, unlesbar = [], set()
@@ -823,6 +930,7 @@ def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
             lambda: nachvektorisieren(1_000_000 if alles else BACKFILL_BATCH),
             lambda: ingest_berichte(je_runde=None if alles else BERICHTE_JE_RUNDE)[0],
             lambda: ingest_wissen(None if alles else WISSEN_JE_RUNDE),
+            lambda: neu_schneiden(1_000_000 if alles else NEU_SCHNEIDEN_JE_LAUF),
             lambda: vektoren_umwandeln(1_000_000 if alles else UMWANDELN_JE_LAUF) and 0,   # zählt nicht als neu
         ]
         for schritt in rueckstand:
@@ -845,12 +953,67 @@ def offen() -> dict:
                                (_kennung(),)).fetchone()[0])
         drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='bericht'")}
         gesamt = int(con.execute("SELECT COUNT(*) FROM chunks INDEXED BY idx_chunks_stand").fetchone()[0])
+        alt = int(con.execute("SELECT COUNT(DISTINCT ref) FROM chunks INDEXED BY idx_chunks_schnitt WHERE schnitt < ?",
+                              (SCHNITT,)).fetchone()[0])
     finally:
         con.close()
     ordner = _ROOT / "Berichte"
     berichte = [p for p in ordner.glob("*.md")] if ordner.exists() else []
-    return {"brocken": gesamt, "ohne_vektor": ohne,
+    return {"brocken": gesamt, "ohne_vektor": ohne, "alt_geschnitten": alt,
             "berichte_offen": sum(1 for p in berichte if f"bericht:{p.name}" not in drin)}
+
+
+_NICHT_JETZT: set[str] = set()     # alt geschnittene Quellen, die gerade nicht neu gelesen werden können
+
+
+def neu_schneiden(limit: int = NEU_SCHNEIDEN_JE_LAUF) -> int:
+    """Quellen mit Brocken einer älteren Schnitt-Fassung neu einlesen (höchstens `limit` je Lauf); die
+    Vektoren gleicher Brocken bleiben. Ohne Quelle (weggeräumter Bericht) bleibt der alte Schnitt und
+    gilt als erledigt. Chats einer anderen Persönlichkeit warten, bis sie aktiv ist. Wissen schneidet
+    ingest_wissen neu."""
+    con = _connect()
+    try:
+        alte = con.execute("SELECT DISTINCT kind, ref FROM chunks INDEXED BY idx_chunks_schnitt "
+                           "WHERE schnitt < ?", (SCHNITT,)).fetchall()
+    finally:
+        con.close()
+    n, gemacht = 0, 0
+    for kind, ref in alte:
+        if gemacht >= limit or _unterbrochen():
+            break
+        if kind == "wissen" or ref in _NICHT_JETZT:
+            continue
+        gemacht += 1
+        try:
+            if kind in ("chat", "chatmd"):
+                if _fremdes_profil(ref):
+                    _NICHT_JETZT.add(ref)
+                    gemacht -= 1
+                    continue
+                import chatstore
+                nr = int(re.sub(r"\D", "", ref.rsplit(":", 1)[-1]) or 0)
+                eigen = chatstore.index_ref(nr) if nr else ""
+                # chatmd:<Profil>:152.md gehört zu chat:<Profil>:152 – beide liest chat_einbetten
+                passt = (ref == eigen if kind == "chat" else
+                         ref.rsplit(":", 1)[0] == eigen.replace("chat:", "chatmd:", 1).rsplit(":", 1)[0])
+                if passt and chatstore.load(nr):
+                    n += chat_einbetten(nr)
+            elif kind in ("skill", "code"):
+                import learn
+                liste = learn.list_skills() if kind == "skill" else learn.list_snippets()
+                pfad = next((p for p, _t in liste if f"{kind}:{p.name}" == ref), None)
+                if pfad is not None:
+                    n += ingest_file(kind, pfad)
+            elif kind == "bericht":
+                pfad = _ROOT / "Berichte" / ref.split(":", 1)[1]
+                if pfad.is_file():
+                    n += ingest_file("bericht", pfad)
+            elif kind == "note":
+                n += ingest_all_notes()
+        except Exception:
+            pass
+        _schnitt_merken(ref)                      # neu gelesen – oder ohne Quelle: so lassen
+    return n
 
 
 def backfill(limit: int = BACKFILL_BATCH, ausser: int | None = None) -> int:
@@ -955,9 +1118,22 @@ def _index(warten: bool = True) -> dict | None:
     if not _INDEX_SPERRE.acquire(blocking=warten):
         return None
     try:
-        return _index_aktualisieren(voll_erlaubt=warten)
+        ix = _index_aktualisieren(voll_erlaubt=warten)
+        # Schnappschuss unter der Sperre: ein anderer Faden ersetzt _CACHE-Einträge, während die Suche noch
+        # meta, mat und idx liest – mit dem gemeinsamen Dict passten die Indizes dann nicht mehr zusammen.
+        return dict(ix) if ix is not None else None
     finally:
         _INDEX_SPERRE.release()
+
+
+def _index_nach_der_runde() -> None:
+    """Den vollen Aufbau (Python-Schleifen über alle Brocken) erst, wenn keine Runde läuft."""
+    try:
+        import memory
+        memory.warten_bis_ruhe()
+    except Exception:
+        pass
+    _index()
 
 
 def _index_im_hintergrund() -> None:
@@ -965,7 +1141,7 @@ def _index_im_hintergrund() -> None:
     with _BAU_SPERRE:
         if _index_bau is not None and _index_bau.is_alive():
             return
-        _index_bau = threading.Thread(target=_index, name="nemi-index", daemon=True)
+        _index_bau = threading.Thread(target=_index_nach_der_runde, name="nemi-index", daemon=True)
         _index_bau.start()
 
 
@@ -1035,8 +1211,17 @@ def _voll_aufbauen(stamp, kennung: str, db: str, np) -> None:
                 vecs.append(v)
                 vec_zeilen.append(rowid)
         con.close()
-    except Exception:
-        pass
+    except Exception as e:
+        # Ein halber Index unter dem aktuellen Stand gespeichert hieße: Suche still leer, bis die DB
+        # sich wieder ändert. Also nicht merken – der nächste Abruf baut neu.
+        try:
+            import debugbericht
+            debugbericht.fehler("Gedächtnis-Index aufbauen", e)
+        except Exception:
+            pass
+        _CACHE_setzen(None, kennung, db, meta, None, [], [], {})
+        _CACHE.pop("zustand", None)               # kein Nachladen auf halbem Stand
+        return
     mat = None
     if vecs and np is not None:
         mat = np.vstack(vecs)
@@ -1099,6 +1284,7 @@ def _CACHE_setzen(stamp, kennung, db, meta, mat, vecs, vec_zeilen, zustand) -> N
     zeile = {m[4]: i for i, m in enumerate(meta)}
     idx = [zeile[r] for r in vec_zeilen]
     _CACHE.update({"stamp": stamp, "meta": meta, "mat": mat, "vecs": vecs, "idx": idx, "zeile": zeile,
+                   "mat_zeile": {i: j for j, i in enumerate(idx)},
                    "vec_zeilen": vec_zeilen, "zustand": zustand, "kennung": kennung, "db": db})
 
 
@@ -1138,19 +1324,90 @@ the a an and or of to in on for is are was were be it this that with
 """.split())
 
 
-def _fts_anfrage(frage: str) -> str:
-    """Frage → FTS5-Ausdruck: Wörter als Phrase, ab 4 Zeichen mit Präfix, ODER-verknüpft."""
+def _fts_woerter(frage: str) -> list[str]:
     woerter = []
     for w in re.findall(r"[\w.\-]+", frage.lower()):
-        w = w.strip(".-")
+        w = w.strip(".-").replace('"', "")
         if len(w) < 2 or w in _FUELLWOERTER or w in woerter:
             continue
         woerter.append(w)
-    teile = []
-    for w in woerter[:16]:
-        sicher = w.replace('"', "")
-        teile.append(f'"{sicher}"*' if len(sicher) >= 4 else f'"{sicher}"')
-    return " OR ".join(teile)
+    return woerter[:16]
+
+
+def _fts_teil(w: str) -> str:
+    return f'"{w}"*' if len(w) >= 4 else f'"{w}"'
+
+
+def _fts_anfrage(frage: str) -> str:
+    """Frage → FTS5-Ausdruck: Wörter als Phrase, ab 4 Zeichen mit Präfix, ODER-verknüpft."""
+    return " OR ".join(_fts_teil(w) for w in _fts_woerter(frage))
+
+
+HAEUFIG_ANTEIL = 0.3               # ein Wort in mehr als so vielen Brocken findet „alles“ und kostet am meisten
+VORAUSWAHL = 200                   # so viele beste Stichwort-Treffer holt die erste Stufe
+
+
+def _wie_im_index(w: str) -> str:
+    """So, wie der Tokenizer (unicode61 remove_diacritics 2) das Wort ablegt: ohne Akzente."""
+    import unicodedata
+    return "".join(z for z in unicodedata.normalize("NFKD", w) if not unicodedata.combining(z))
+
+
+SELTENSTE_REST = 3                 # stehen alle Wörter in sehr vielen Brocken: so viele seltenste bleiben
+
+
+def _seltene_woerter(con: sqlite3.Connection, woerter: list[str]) -> list[str]:
+    """Wörter ohne Treffer fallen weg (sie finden nichts), ebenso solche in mehr als HAEUFIG_ANTEIL der Brocken
+    (sie finden alles) – sind alle vorhandenen so häufig, bleiben die SELTENSTE_REST seltensten. Gezählt wird im
+    Wortlexikon des Index (fts5vocab, Präfix-Wörter als Bereich), ohne Text zu lesen."""
+    if len(woerter) < 2:
+        return woerter
+    try:
+        con.execute("CREATE VIRTUAL TABLE IF NOT EXISTS temp.fts_woerter USING fts5vocab(main, chunks_fts, 'row')")
+        gesamt = con.execute("SELECT max(rowid) FROM chunks").fetchone()[0] or 0
+        if gesamt < 1000:                    # kleine Datenbank: schnell genug, alles behalten
+            return woerter
+        zahl = {}
+        for w in woerter:
+            n = _wie_im_index(w)
+            if len(w) >= 4:
+                doc = con.execute("SELECT coalesce(sum(doc), 0) FROM temp.fts_woerter WHERE term >= ? AND term <= ?",
+                                  (n, n + chr(0x10FFFF))).fetchone()[0]
+            else:
+                doc = (con.execute("SELECT doc FROM temp.fts_woerter WHERE term = ?", (n,)).fetchone() or (0,))[0]
+            zahl[w] = doc
+    except sqlite3.Error:
+        return woerter
+    vorhanden = [w for w in woerter if zahl[w] > 0]
+    if not vorhanden:
+        return woerter                       # nichts davon im Index: die Suche bleibt ohnehin leer
+    selten = [w for w in vorhanden if zahl[w] <= gesamt * HAEUFIG_ANTEIL]
+    return selten or sorted(vorhanden, key=lambda w: zahl[w])[:SELTENSTE_REST]
+
+
+def _stichwort_treffer(con: sqlite3.Connection, frage: str, arten, seit, bis, ref_praefix) -> list[tuple]:
+    """(rowid, kind, ref, text, datum) nach BM25. Zwei Stufen: erst die besten VORAUSWAHL nur im Index, dann deren
+    Zeilen mit den Filtern – statt jede passende Zeile zu holen und danach zu sortieren. Bleiben nach den Filtern zu
+    wenige übrig, entscheidet die volle Abfrage wie bisher."""
+    woerter = _seltene_woerter(con, _fts_woerter(frage))
+    ausdruck = " OR ".join(_fts_teil(w) for w in woerter)
+    if not ausdruck:
+        return []
+    bedingung, werte = _filter_sql(arten, seit, bis, ref_praefix)
+    ids = [r[0] for r in con.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
+                                     (ausdruck, VORAUSWAHL))]
+    if not ids:
+        return []
+    rang = {r: i for i, r in enumerate(ids)}
+    zeilen = con.execute(f"SELECT c.rowid, c.kind, c.ref, c.text, c.datum FROM chunks c WHERE c.rowid IN "
+                         f"({','.join('?' * len(ids))}){bedingung}", [*ids, *werte]).fetchall()
+    zeilen.sort(key=lambda z: rang[z[0]])
+    if len(zeilen) >= KANDIDATEN or len(ids) < VORAUSWAHL:
+        return zeilen[:KANDIDATEN]
+    return con.execute(
+        "SELECT c.rowid, c.kind, c.ref, c.text, c.datum FROM chunks_fts JOIN chunks c "
+        f"ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ?{bedingung} "
+        "ORDER BY bm25(chunks_fts) LIMIT ?", [ausdruck, *werte, KANDIDATEN]).fetchall()
 
 
 def _filter_sql(arten, seit, bis, ref_praefix) -> tuple[str, list]:
@@ -1190,16 +1447,37 @@ def _passt(meta_row: tuple, arten, seit, bis, ref_praefix, aktiv: str | None = N
     return True
 
 
-def suchen(frage: str, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "",
-           ref_praefix=None, laden: bool = False) -> list[dict]:
+FRAGEN_MAX = 4                     # so viele Fassungen einer Suche (Multi-Query)
+VIELFALT = 0.75                    # MMR: Gewicht der Passung gegen die Nähe zu schon gewählten Treffern
+DOPPELT_AB = 0.95                  # so ähnlich (Kosinus) gilt ein Treffer als fast derselbe
+
+
+def _fragen_liste(frage) -> list[str]:
+    roh = [frage] if isinstance(frage, str) else list(frage or [])
+    raus: list[str] = []
+    for f in roh:
+        f = " ".join(str(f or "").split())
+        if f and f.casefold() not in {x.casefold() for x in raus}:
+            raus.append(f)
+    return raus[:FRAGEN_MAX]
+
+
+def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "",
+           ref_praefix=None, laden: bool = False, vermutung: str = "", lernen: bool = True) -> list[dict]:
     """Hybride Suche über memory.db.
 
     Stichworte (FTS5, BM25) finden exakte Begriffe; Vektoren finden Sinnverwandtes.
-    Beide Ranglisten werden per Reciprocal Rank Fusion vereint – ein Brocken, den
-    beide finden, steht oben. `laden=True` lädt den Encoder notfalls (~6 s): nur
-    für das Werkzeug der Persönlichkeit, nie im Prompt-Pfad. Ohne Vektoren oder
-    Encoder bleibt die Stichwortsuche."""
-    if not (frage or "").strip():
+    Alle Ranglisten werden per Reciprocal Rank Fusion vereint – ein Brocken, den
+    mehrere finden, steht oben. `frage` darf eine Liste von Fassungen sein (Multi-Query);
+    `vermutung` ist eine vermutete Antwort, gesucht wird mit ihr nach Bedeutung (HyDE).
+    Danach sortiert das gelernte Rangmodell um (rangliste, `lernen`), und MMR sorgt für
+    Vielfalt: keine Nachbarn und Beinahe-Kopien derselben Stelle nebeneinander.
+    `laden=True` lädt den Encoder notfalls (~6 s): nur für das Werkzeug der Persönlichkeit,
+    nie im Prompt-Pfad. Ohne Vektoren oder Encoder bleibt die Stichwortsuche.
+    Jeder Treffer trägt `aehnlich` (bester Kosinus, None ohne Vektor) und `rowid`."""
+    fragen = _fragen_liste(frage)
+    vermutung = " ".join(str(vermutung or "").split())
+    if not fragen and not vermutung:
         return []
     uhr = time.perf_counter()
     ix = _index(warten=laden)            # Prompt-Pfad: nie auf einen Neuaufbau warten
@@ -1209,58 +1487,139 @@ def suchen(frage: str, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: st
     meta = ix["meta"] if ix is not None else []
     punkte: dict[int, float] = {}        # rowid → Punkte
     wie: dict[int, set] = {}
+    aehnlich: dict[int, float] = {}      # rowid → bester Kosinus
     gefunden: dict[int, tuple] = {}      # rowid → (kind, ref, text, datum, rowid)
 
-    ausdruck = _fts_anfrage(frage)
-    if ausdruck:
-        bedingung, werte = _filter_sql(arten, seit, bis, ref_praefix)
+    if any(_fts_anfrage(f) for f in fragen):
         try:
             con = _connect()
-            zeilen = con.execute(
-                "SELECT c.rowid, c.kind, c.ref, c.text, c.datum FROM chunks_fts JOIN chunks c "
-                f"ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ?{bedingung} "
-                "ORDER BY bm25(chunks_fts) LIMIT ?",
-                [ausdruck, *werte, KANDIDATEN]).fetchall()
-            con.close()
+            try:
+                listen = [_stichwort_treffer(con, f, arten, seit, bis, ref_praefix) for f in fragen
+                          if _fts_anfrage(f)]
+            finally:
+                con.close()
         except sqlite3.Error:
-            zeilen = []
-        for rang, (rowid, kind, ref, text, datum) in enumerate(zeilen):
-            gefunden[rowid] = (kind, ref, text, datum or "", rowid)
-            punkte[rowid] = punkte.get(rowid, 0.0) + 1.0 / (RRF_K + rang)
-            wie.setdefault(rowid, set()).add("wort")
+            listen = []
+        for zeilen in listen:
+            for rang, (rowid, kind, ref, text, datum) in enumerate(zeilen):
+                gefunden[rowid] = (kind, ref, text, datum or "", rowid)
+                punkte[rowid] = punkte.get(rowid, 0.0) + 1.0 / (RRF_K + rang)
+                wie.setdefault(rowid, set()).add("wort")
     uhr = _messen("Stichworte", uhr)
 
     if ix is not None and (ix["mat"] is not None or ix["vecs"]):
-        qe = None
+        vektoren: list[tuple[list[float], str]] = []
         try:
             import memory
             if laden:
-                qe = memory._embed_texts([frage], query=True)
-            elif memory.encoder_loaded():
-                qe = memory.frage_einbetten(frage)   # wartet nie auf den Bibliothekar
+                vektoren += [(v, "sinn") for v in (memory._embed_texts(fragen, query=True) or [])] if fragen else []
+                if vermutung:              # wie ein Dokument einbetten: vergleicht Antwort mit Antwort
+                    vektoren += [(v, "vermutung") for v in (memory._embed_texts([vermutung]) or [])]
+            elif memory.encoder_loaded() and fragen:
+                vektoren += [(v, "sinn") for v in (memory.frage_einbetten(fragen[0]) or [])]
             else:
                 memory.warm_encoder()          # ab der nächsten Frage auch nach Bedeutung
         except Exception:
-            qe = None
+            vektoren = []
         uhr = _messen("Einbetten", uhr)
-        if qe:
-            aktiv = _aktives_profil()
+        aktiv = _aktives_profil()
+        for qv, art in vektoren:
             bewertet = []                # beste zuerst, gefiltert nur bis genug beisammen sind
-            for s, i in sorted(_scores(ix, qe[0], MIN_SCORE * 0.75), key=lambda x: -x[0]):
+            for s, i in sorted(_scores(ix, qv, MIN_SCORE * 0.75), key=lambda x: -x[0]):
                 if _passt(meta[i], arten, seit, bis, ref_praefix, aktiv):
                     bewertet.append((s, i))
                     if len(bewertet) >= KANDIDATEN:
                         break
-            for rang, (_s, i) in enumerate(bewertet):
+            for rang, (s, i) in enumerate(bewertet):
                 rowid = meta[i][4]
                 gefunden.setdefault(rowid, meta[i])
                 punkte[rowid] = punkte.get(rowid, 0.0) + 1.0 / (RRF_K + rang)
-                wie.setdefault(rowid, set()).add("sinn")
+                wie.setdefault(rowid, set()).add(art)
+                aehnlich[rowid] = max(aehnlich.get(rowid, -1.0), s)
         _messen("Vergleich", uhr)
 
-    beste = sorted(punkte.items(), key=lambda x: -x[1])[:k]
-    return [_hit(gefunden[r], round(p * RRF_K / 2, 3),
-                 "+".join(sorted(wie.get(r, ())))) for r, p in beste]
+    kandidaten = sorted(punkte.items(), key=lambda x: -x[1])[:max(3 * k, 24)]
+    hits = []
+    for r, p in kandidaten:
+        h = _hit(gefunden[r], round(p * RRF_K / 2, 3), "+".join(sorted(wie.get(r, ()))))
+        h["rowid"], h["aehnlich"] = r, (round(aehnlich[r], 3) if r in aehnlich else None)
+        hits.append(h)
+    if lernen:
+        try:
+            import rangliste
+            hits = rangliste.umsortieren(hits)
+        except Exception:
+            pass
+    if laden:                                # nur die Suche der Persönlichkeit, nie der Prompt-Pfad
+        try:
+            import reranker
+            hits = reranker.nachsortieren(fragen[0] if fragen else vermutung, hits)
+        except Exception:
+            pass
+    return _vielfalt(hits, k, ix)
+
+
+def _vektor_von(ix: dict | None, rowid: int):
+    """Der normierte Vektor eines Brockens aus dem Such-Index, oder None."""
+    if ix is None or ix.get("mat") is None or "zeile" not in ix:
+        return None
+    i = ix["zeile"].get(rowid)
+    j = ix.get("mat_zeile", {}).get(i) if i is not None else None
+    return ix["mat"][j] if j is not None else None
+
+
+def _woerter(text: str) -> set[str]:
+    return set(re.findall(r"\w{3,}", (text or "").casefold()))
+
+
+def _gleich(a: dict, b: dict, ix: dict | None) -> float:
+    """0..1: wie sehr b dasselbe sagt wie a (Kosinus der Vektoren, sonst gemeinsame Wörter)."""
+    va, vb = _vektor_von(ix, a["rowid"]), _vektor_von(ix, b["rowid"])
+    if va is not None and vb is not None:
+        return max(0.0, float(va @ vb))
+    wa, wb = _woerter(a["text"]), _woerter(b["text"])
+    return len(wa & wb) / max(1, len(wa | wb))
+
+
+def _naehe(a: dict, b: dict, ix: dict | None) -> float:
+    """0..1: wie sehr b zeigt, was a schon zeigt – direkte Nachbarn derselben Quelle zählen voll."""
+    if a["ref"] == b["ref"] and abs(a["rowid"] - b["rowid"]) <= 1:
+        return 1.0
+    return _gleich(a, b, ix)
+
+
+def _vielfalt(hits: list[dict], k: int, ix: dict | None) -> list[dict]:
+    """Maximal Marginal Relevance: der nächste Treffer ist der, der am besten passt und am wenigsten
+    zeigt, was schon gewählt ist. Beinahe-Kopien (ab DOPPELT_AB) fallen ganz weg."""
+    if len(hits) <= 1:
+        return hits[:k]
+    beste = max(h["score"] for h in hits) or 1.0
+    gewaehlt: list[dict] = []
+    rest = list(hits)
+    while rest and len(gewaehlt) < k:
+        def wert(h):
+            naehe = max((_naehe(g, h, ix) for g in gewaehlt), default=0.0)
+            return VIELFALT * h["score"] / beste - (1 - VIELFALT) * naehe
+        naechster = max(rest, key=wert)
+        rest.remove(naechster)
+        if any(_gleich(g, naechster, ix) >= DOPPELT_AB for g in gewaehlt):
+            continue
+        gewaehlt.append(naechster)
+    return gewaehlt
+
+
+def nachbarn(rowid: int) -> tuple[str, str]:
+    """Text des Brockens davor und danach in derselben Quelle (Small-to-Big), "" wenn keiner da ist."""
+    ix = _CACHE if _CACHE.get("meta") else None
+    if ix is None:
+        return "", ""
+    meta, i = ix["meta"], ix["zeile"].get(rowid)
+    if i is None:
+        return "", ""
+    ref = meta[i][1]
+    vorher = meta[i - 1][2] if i > 0 and meta[i - 1][1] == ref else ""
+    nachher = meta[i + 1][2] if i + 1 < len(meta) and meta[i + 1][1] == ref else ""
+    return vorher, nachher
 
 
 def quelle_lesen(ref: str, max_zeichen: int = 12_000, ab: int = 1) -> dict | None:
@@ -1398,6 +1757,9 @@ def guide_block(query: str) -> str:
                   "ausgelagert. Brauchst du etwas von früher, such mit gedaechtnis_suchen und quelle "
                   "„aktuell“." + (" Passend zur Nachricht:" if vorhin else ""), ""]
         lines += [_zeile(h, memory) for h in vorhin] + [""]
+    # Berichte (Recherche, Zeitplan, Wache) bestehen aus Fremdinhalt: nie ungefragt in den Systemprompt –
+    # über gedaechtnis_suchen kommen sie mit Netz-Marke.
+    hits = [h for h in hits if h.get("kind") != "bericht"]
     if hits:
         lines += [
             "# 🧭 Was aus dem Gedächtnis zur aktuellen Frage passen könnte",

@@ -132,7 +132,10 @@ def treffer(quelle: str, suche: str, anzahl: int = 5) -> list[dict] | str:
     suche = " ".join((suche or "").split())
     if not suche:
         return "Bitte gib einen Suchbegriff an."
-    n = max(1, min(int(anzahl or 5), 10))
+    try:
+        n = max(1, min(int(float(anzahl or 5)), 10))
+    except (TypeError, ValueError):
+        n = 5
     schluessel = (q, suche.lower(), n)
     if (alt := _CACHE.get(schluessel)) and time.time() - alt[0] <= _CACHE_S:
         return alt[1]

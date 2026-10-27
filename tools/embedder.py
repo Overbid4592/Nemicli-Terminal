@@ -23,7 +23,7 @@ Laenge 1 normieren. Das ist alles. Dafuer reichen torch und transformers.
 WICHTIG - die Vektoren muessen zu den ALTEN passen. Im Gedaechtnis liegen
 bereits Vektoren, die sentence-transformers erzeugt hat. Waere diese Umsetzung
 auch nur beim Pooling anders, wuerde die Aehnlichkeitssuche stillschweigend
-Unsinn liefern. Deshalb prueft tests/test_embedder.py die neuen Vektoren gegen
+Unsinn liefern. Deshalb prueft ein eigener Test die neuen Vektoren gegen
 die gespeicherten alten.
 """
 

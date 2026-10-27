@@ -24,6 +24,7 @@ VERFAHREN = "2"                    # ändert sich Lesen oder Zerlegung, wird all
 STEUER_MAX = 0.05                  # Anteil Steuerzeichen, ab dem ein „Text“ als binär gilt
 
 _SATZENDE = re.compile(r"(?<=[.!?…])\s+")
+_UEBERSCHRIFT = re.compile(r"^#{1,6}\s+(.+)")
 _WORT = re.compile(r"[^\W\d_]{2,}")
 _SEITE = re.compile(r"^(--- Seite \d+ ---)\n", re.M)
 
@@ -102,9 +103,16 @@ def _absaetze(text: str) -> list[list[str]]:
     PDF bricht Sätze mitten im Satz um)."""
     raus = []
     for absatz in re.split(r"\n\s*\n", text.replace("\r\n", "\n")):
-        flach = " ".join(absatz.split())
-        if flach:
-            raus.append([s for s in _SATZENDE.split(flach) if s])
+        stuecke: list[list[str]] = [[]]
+        for zeile in absatz.split("\n"):            # eine Überschrift ist ein Absatz für sich
+            if _UEBERSCHRIFT.match(zeile.strip()):
+                stuecke += [[zeile], []]
+            else:
+                stuecke[-1].append(zeile)
+        for stueck in stuecke:
+            flach = " ".join(" ".join(stueck).split())
+            if flach:
+                raus.append([s for s in _SATZENDE.split(flach) if s])
     return raus
 
 
@@ -137,28 +145,37 @@ def entdoppeln(texte: list[str]) -> tuple[list[list[str]], list[int]]:
 
 def brocken(kopf: str, absaetze: list[str], groesse: int) -> list[str]:
     """Absätze zu Brocken bis `groesse` Zeichen (mit Kopfzeile). Zu lange Absätze
-    werden an Satzgrenzen geteilt, überlange Sätze hart."""
-    platz = max(100, groesse - len(kopf) - 1)
-    teile: list[str] = []
+    werden an Satzgrenzen geteilt, überlange Sätze hart. Eine Markdown-Überschrift
+    beginnt einen neuen Brocken; die folgenden tragen sie in der Kopfzeile
+    („📚 a.md › Kapitel“)."""
+    teile: list[tuple[str, str]] = []                 # (Text, Überschrift darüber)
+    abschnitt = ""
     for a in absaetze:
+        if (m := _UEBERSCHRIFT.match(a)):
+            abschnitt = m.group(1).strip()[:80]
+        platz = max(100, groesse - len(kopf) - len(abschnitt) - 4)
         if len(a) <= platz:
-            teile.append(a)
+            teile.append((a, abschnitt))
             continue
         for s in _SATZENDE.split(a):
             while len(s) > platz:
-                teile.append(s[:platz])
+                teile.append((s[:platz], abschnitt))
                 s = s[platz:]
             if s:
-                teile.append(s)
-    raus, aktuell = [], ""
-    for t in teile:
-        if aktuell and len(aktuell) + 2 + len(t) > platz:
-            raus.append(aktuell)
+                teile.append((s, abschnitt))
+    raus: list[tuple[str, str]] = []
+    aktuell, ueber = "", ""
+    for t, ab in teile:
+        platz = max(100, groesse - len(kopf) - len(ab) - 4)
+        if aktuell and (ab != ueber or len(aktuell) + 2 + len(t) > platz):
+            raus.append((aktuell, ueber))
             aktuell = ""
+        if not aktuell:
+            ueber = ab
         aktuell = f"{aktuell}\n\n{t}" if aktuell else t
     if aktuell:
-        raus.append(aktuell)
-    return [f"{kopf}\n{r}" for r in raus]
+        raus.append((aktuell, ueber))
+    return [f"{kopf} › {ab}\n{r}" if ab and not r.startswith("#") else f"{kopf}\n{r}" for r, ab in raus]
 
 
 def prompt_hinweis() -> str:
@@ -170,6 +187,8 @@ def prompt_hinweis() -> str:
         return ""
     if not namen:
         return ""
+    import fremddaten                                  # Dateinamen sind Fremdtext im Systemprompt
+    namen = [fremddaten.entschaerfen(str(n))[:120] for n in namen]
     if len(namen) <= LISTE_MAX:
         zeilen = [f"- {n}" for n in namen]
     else:

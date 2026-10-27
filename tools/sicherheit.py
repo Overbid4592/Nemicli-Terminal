@@ -212,8 +212,8 @@ def stufe(act: dict) -> str:
 # ---------------------------------------------------------------------------
 # Arbeitsbereich der Persönlichkeit: dauerhaft bearbeiten ohne Rückfrage
 # ---------------------------------------------------------------------------
-# Ohne dieses Recht hätte die Persönlichkeit ein Gedächtnis ohne Stift. Gilt für
-# jede Persönlichkeit, nicht für einen Namen. Bedingungen, alle zugleich:
+# Ohne dieses Recht hätte die Persönlichkeit ein Gedächtnis ohne Stift.
+# Gilt für jede Persönlichkeit, nicht für einen Namen. Bedingungen, alle zugleich:
 #   • schreibendes Datei-Werkzeug, Stufe harmlos/ändert (loeschen und Ordner-
 #     Verschieben bleiben riskant → fragen weiter)
 #   • JEDER Pfad der Aktion liegt im Daten-Ordner (paths.DATEN), und der ist
@@ -252,7 +252,7 @@ def arbeitsbereich(act: dict) -> bool:
             if p == skills or skills in p.parents:
                 return False
             if profile in p.parents and len(p.relative_to(profile).parts) >= 2 \
-                    and p.relative_to(profile).parts[1] == "Skills":
+                    and p.relative_to(profile).parts[1].casefold() == "skills":   # Windows: Groß/Klein egal
                 return False
         if steuerdatei_grund(act):
             return False
@@ -270,6 +270,10 @@ def arbeitsbereich(act: dict) -> bool:
 #   Zeitplan/, Befehle/ – immer Rückfrage (läuft von allein bzw. ist ein Programm).
 # Gilt in jedem Modus (modes.decide), „Immer“ gibt es dafür nicht.
 _STEUERND_IMMER = ("zeitplan", "befehle")
+# Wache/ (Stopp-Datei, Modelle, Normalbild) und learned/ (Gedächtnis, Aktions-Protokoll):
+# wer dort Dateien schreibt, schaltet die Wache ab oder umgeht die Filter von merken.
+_WACHE_UND_PROTOKOLL = ("wache", "learned")
+_WACHE_FREI = {("wache", "gruesse.md")}       # die Grüße der Kugel schreibt die Persönlichkeit selbst
 _STEUERND_TEXT = ("persoenlichkeiten", "agenten")
 _MIN_REST = 0.4
 
@@ -317,6 +321,10 @@ def steuerdatei_grund(act: dict) -> str | None:
                 erster = p.relative_to(daten).parts[0].lower()
                 if erster in _STEUERND_IMMER:
                     return f"{p.relative_to(daten).parts[0]}/ läuft später von allein – das entscheidest du"
+                if erster in _WACHE_UND_PROTOKOLL \
+                        and tuple(t.lower() for t in p.relative_to(daten).parts) not in _WACHE_FREI:
+                    return (f"{p.relative_to(daten).parts[0]}/ gehört der Wache bzw. dem Gedächtnis und "
+                            "Protokoll – Änderungen dort entscheidest du")
                 if erster in _STEUERND_TEXT and p.suffix.lower() == ".md" \
                         and not p.name.lower().endswith(".sprueche.md"):
                     if (text := _neuer_text(act, p)) is None:
