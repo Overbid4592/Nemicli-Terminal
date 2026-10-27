@@ -23,6 +23,7 @@ from . import adapter as A
 MIN_BEISPIELE = 10
 MAX_TOKEN = 1536
 SICHERN_ALLE = 50
+BETONUNG = 4.0                           # so viel zählen die betonten Antwort-Token mehr
 SYSTEM = "Du bist ein sorgfältiger Coding-Assistent. Du schreibst sauberen, geprüften Code."
 _ENDEN = ("<|im_end|>", "<end_of_turn>", "<|eot_id|>", "<|end|>", "<turn|>")
 
@@ -99,19 +100,25 @@ def gespraech(b: dict) -> tuple[str, str]:
     return "\n".join(frage), f"```{kennung}\n{b['nachher']}\n```"
 
 
-def kodieren(beispiele: list[dict], tokenizer, formatter) -> list[tuple[list[int], int, int]]:
-    """[(Token, Beginn der Antwort, Gewicht)] – zu lange Fragen fallen weg, Antworten werden gekürzt;
-    geprüfte Beispiele zählen doppelt."""
+def kodieren(beispiele: list[dict], tokenizer, formatter) -> list[tuple[list[int], int, int, int]]:
+    """[(Token, Beginn der Antwort, Gewicht, betonte Token)] – zu lange Fragen fallen weg, Antworten werden
+    gekürzt; geprüfte Beispiele zählen doppelt. Ein Beispiel ist ein Eintrag der Coding-Sammlung oder schon ein
+    Gespräch {system, frage, antwort, betont}; `betont` ist der Anfang der Antwort, der beim Lernen mehr zählt
+    (z. B. die Aktions-Klammer)."""
     from ggufengine.chat import Message
     ende = next((tokenizer.special[n] for n in _ENDEN if n in tokenizer.special), tokenizer.eos_id)
     raus = []
     for b in beispiele:
-        frage, antwort = gespraech(b)
-        vorn = formatter.encode([Message("system", SYSTEM), Message("user", frage)], add_generation_prompt=True)
+        if "frage" in b and "antwort" in b:
+            system, frage, antwort = b.get("system") or SYSTEM, b["frage"], b["antwort"]
+        else:
+            (frage, antwort), system = gespraech(b), SYSTEM
+        vorn = formatter.encode([Message("system", system), Message("user", frage)], add_generation_prompt=True)
         if len(vorn) > MAX_TOKEN - 64:
             continue
         ids = (vorn + tokenizer.encode(antwort) + ([ende] if ende is not None else []))[:MAX_TOKEN]
-        raus.append((ids, len(vorn), 2 if b.get("status") == "geprueft" else 1))
+        betont = len(tokenizer.encode(b["betont"])) if b.get("betont") and antwort.startswith(b["betont"]) else 0
+        raus.append((ids, len(vorn), 2 if b.get("status") == "geprueft" else 1, betont))
     return raus
 
 
@@ -119,20 +126,20 @@ def _daten_kennung(daten: list) -> str:
     """Fingerabdruck der kodierten Beispiele – passt ein Zwischenstand noch zur Sammlung?"""
     import hashlib
     h = hashlib.sha256()
-    for ids, ab, gewicht in daten:
-        h.update(f"{ab}|{gewicht}|{','.join(map(str, ids))}\n".encode())
+    for ids, ab, gewicht, betont in daten:
+        h.update(f"{ab}|{gewicht}|{betont}|{','.join(map(str, ids))}\n".encode())
     return h.hexdigest()[:16]
 
 
 def trainieren(modell: str | None = None, schritte: int = 300, rang: int = 16, lr: float = 1e-4,
                on_status=None, abbruch=None, *, gguf: str | Path | None = None, beispiele: list | None = None,
-               geraet: str | None = None) -> Path:
-    """Trainiert und speichert das Coding-LoRA. Gibt den Pfad zurück."""
+               geraet: str | None = None, ziel: str | Path | None = None, titel: str = "Coding-LoRA") -> Path:
+    """Trainiert und speichert ein LoRA – ohne `ziel` das Coding-LoRA des Modells. Gibt den Pfad zurück."""
     if not _LAEUFT.acquire(blocking=False):
-        raise RuntimeError("Es läuft schon ein Coding-LoRA-Training.")
+        raise RuntimeError("Es läuft schon ein LoRA-Training.")
     try:
         return _trainieren(modell, schritte, rang, lr, on_status, abbruch or ANHALTEN.is_set, gguf,
-                           beispiele, geraet)
+                           beispiele, geraet, Path(ziel) if ziel else None, titel)
     finally:
         _status["laeuft"] = False
         _LAEUFT.release()
@@ -147,14 +154,14 @@ def _melde(on_status, **felder) -> None:
             pass
 
 
-def _trainieren(modell, schritte, rang, lr, on_status, abbruch, gguf, beispiele, geraet) -> Path:
+def _trainieren(modell, schritte, rang, lr, on_status, abbruch, gguf, beispiele, geraet, ziel, titel) -> Path:
     import torch
     from ggufengine.chat import ChatFormatter, detect_format
     from ggufengine.gguf import GGUFFile
     from ggufengine.models import build_model
     from ggufengine.tokenizer import Tokenizer
 
-    from .lernweg import Lernweg
+    from .lernweg import fuer as lernweg_fuer
 
     schritte = max(10, int(schritte))
     rang = max(2, min(64, int(rang)))
@@ -168,7 +175,7 @@ def _trainieren(modell, schritte, rang, lr, on_status, abbruch, gguf, beispiele,
         raise ValueError(f"Zu wenig Beispiele in der Coding-Sammlung ({len(beispiele)}, mindestens "
                          f"{MIN_BEISPIELE}). Sie füllt sich von selbst beim Coden mit dem Coding-Assistenten.")
     _melde(on_status, laeuft=True, modell=name, schritt=0, schritte=schritte, verlust=None, start=time.time(),
-           text=f"Coding-LoRA: lade {name} …")
+           text=f"{titel}: lade {name} …")
     dev = torch.device(geraet or ("cuda" if torch.cuda.is_available() else "cpu"))
     dtype = torch.bfloat16 if dev.type == "cuda" else torch.float32
     gg = GGUFFile(str(gguf))
@@ -182,12 +189,13 @@ def _trainieren(modell, schritte, rang, lr, on_status, abbruch, gguf, beispiele,
         daten = kodieren(beispiele, tok, fmt)
         if len(daten) < MIN_BEISPIELE:
             raise ValueError(f"Nach dem Kürzen bleiben nur {len(daten)} Beispiele.")
-        model = build_model(gg, dev, dtype, 64, quant=dev.type == "cuda")
-        lern = Lernweg(model, gg.architecture, rang=rang)
+        # Kontext: so lang wie das längste Beispiel (Gemma 4 rechnet RoPE aus Tabellen dieser Länge)
+        model = build_model(gg, dev, dtype, max(64, max(len(d[0]) for d in daten)), quant=dev.type == "cuda")
+        lern = lernweg_fuer(model, gg.architecture, rang=rang)
         opt = torch.optim.AdamW(lern.parameter(), lr=lr, weight_decay=0.0)
         meta = {"basis": A.basis_kennung(gguf), "rang": rang, "alpha": lern.alpha, "schritte": schritte,
                 "beispiele": len(daten), "modell": Path(gguf).name, "lr": lr, "daten": _daten_kennung(daten)}
-        stand = _stand_datei(gguf)
+        stand = ziel.with_name(f"{ziel.stem}_stand.safetensors") if ziel else _stand_datei(gguf)
         beginn = 0
         if stand.is_file():
             try:
@@ -206,11 +214,15 @@ def _trainieren(modell, schritte, rang, lr, on_status, abbruch, gguf, beispiele,
                 raise RuntimeError(f"Angehalten bei Schritt {schritt}/{schritte} – ein neuer Start mit gleichem "
                                    "Rang und gleichen Schritten macht dort weiter.")
             zufall = random.Random(7_000_003 + schritt)      # je Schritt: nach Pause dieselbe Folge
-            ids, ab, _ = zufall.choices(daten, weights=[d[2] for d in daten])[0]
+            ids, ab, _, betont = zufall.choices(daten, weights=[d[2] for d in daten])[0]
             t = torch.tensor(ids, device=dev)
-            maske = torch.arange(len(ids), device=dev) >= ab
+            stelle = torch.arange(len(ids), device=dev)
+            maske = stelle >= ab
+            gewicht = None
+            if betont:
+                gewicht = torch.where((stelle >= ab) & (stelle < ab + betont), BETONUNG, 1.0)
             opt.zero_grad(set_to_none=True)
-            verlust = lern.verlust(t, maske)
+            verlust = lern.verlust(t, maske, gewicht)
             verlust.backward()
             torch.nn.utils.clip_grad_norm_(lern.parameter(), 1.0)
             opt.step()
@@ -220,15 +232,15 @@ def _trainieren(modell, schritte, rang, lr, on_status, abbruch, gguf, beispiele,
                 mittel = sum(verluste[-20:]) / len(verluste[-20:])
                 rest = (time.time() - t0) / max(1, fertig - beginn) * (schritte - fertig)
                 _melde(on_status, schritt=fertig, verlust=round(mittel, 4),
-                       text=f"Coding-LoRA: Schritt {fertig}/{schritte} · Verlust {mittel:.3f} · noch ~{rest / 60:.0f} min")
+                       text=f"{titel}: Schritt {fertig}/{schritte} · Verlust {mittel:.3f} · noch ~{rest / 60:.0f} min")
             if fertig % SICHERN_ALLE == 0 and fertig < schritte:
                 A.speichern(stand, lern.gewichte(), {**meta, "schritt": fertig}, opt)
         mittel = sum(verluste[-20:]) / max(1, len(verluste[-20:]))
-        ziel = A.speichern(A.datei_fuer(gguf), lern.gewichte(),
-                           {**meta, "verlust": round(mittel, 4), "zeit": time.strftime("%Y-%m-%d %H:%M")})
+        ziel = A.speichern(ziel or A.datei_fuer(gguf), lern.gewichte(),
+                           {**meta, "verlust": round(mittel, 4), "zeit": time.strftime("%Y-%m-%d %H:%M")}, halb=True)
         stand.unlink(missing_ok=True)
-        _melde(on_status, text=f"Coding-LoRA fertig: {ziel.name}")
-        _protokoll(f"Coding-LoRA für {Path(gguf).name}: {schritte} Schritte, Rang {rang}, "
+        _melde(on_status, text=f"{titel} fertig: {ziel.name}")
+        _protokoll(f"{titel} für {Path(gguf).name}: {schritte} Schritte, Rang {rang}, "
                    f"{len(daten)} Beispiele, Verlust {mittel:.3f}")
         return ziel
     finally:

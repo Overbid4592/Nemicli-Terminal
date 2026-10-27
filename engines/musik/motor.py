@@ -141,6 +141,27 @@ def _leeren():
         torch.cuda.empty_cache()
 
 
+def _aufraeumend(fn):
+    """Bei Abbruch oder Fehler nur den Text weitergeben: der Traceback hielte DiT, Encoder und
+    Latente (mehrere GB VRAM) fest. Danach wird geleert."""
+    import functools
+
+    @functools.wraps(fn)
+    def huelle(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except Abbruch as e:
+            art, text = Abbruch, str(e)
+        except Exception as e:
+            # Einfache Arten bleiben erhalten (Aufrufer prüfen darauf), alles andere wird RuntimeError.
+            einfach = (ValueError, RuntimeError, OSError, FileNotFoundError, TypeError)
+            art = type(e) if type(e) in einfach else RuntimeError
+            text = str(e) or type(e).__name__
+        _leeren()
+        raise art(text)
+    return huelle
+
+
 def _tokenizer(datei):
     from ggufengine.tokenizer import Tokenizer
     tok = Tokenizer(datei.gg)
@@ -148,6 +169,7 @@ def _tokenizer(datei):
     return tok
 
 
+@_aufraeumend
 def komponieren(stil: str, text: str = INSTRUMENTAL, sekunden: float = 30, bpm: int | None = None,
                 tonart: str | None = None, takt: str | None = None, sprache: str | None = None,
                 seed: int | None = None, ziel: Path | None = None, on_status=None, abbruch=None,
@@ -289,6 +311,7 @@ def _titel_aus(pfad: Path, info: dict) -> str:
     return re.sub(r"_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?(_\d+)?$", "", Path(pfad).stem).strip(" _")
 
 
+@_aufraeumend
 def covern(vorlage: Path, stil: str, text: str | None = None, titel: str = "", naehe: float = 0.0,
            seed: int | None = None, ziel: Path | None = None, on_status=None, abbruch=None,
            geraet: str | None = None, kuenstler: str = "") -> dict:

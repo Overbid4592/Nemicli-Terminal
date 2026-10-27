@@ -869,6 +869,16 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Te
 
 
 _CUDNN_ATTENTION = {"geht": None}      # None: noch nicht versucht, False: nicht verfügbar
+
+
+def cudnn_zuerst():
+    """SDPA mit cuDNN zuerst, die übrigen Kerne als Reserve. `sdpa_kernel` stellt die Kerne für den ganzen
+    Prozess um, nicht je Faden: „nur cuDNN“ ließ gleichzeitig rechnende Fäden (Musik in fp32, Köpfe über 128)
+    ohne Kern („No available kernel“), und zwei sich überkreuzende Umschaltungen hinterließen „nur cuDNN“
+    dauerhaft. Mit Reihenfolge statt Ausschluss bleibt jeder Kern erlaubt."""
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    return sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                        SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True)
 CUDNN_KOPF_BIS = 128                   # cuDNN-SDPA kann Köpfe bis zu dieser Größe (gemessen: 256 nicht)
 CUDNN_KOPIE_BIS = 256 * 2**20          # vervielfachte K/V höchstens so groß (langer Kontext, knapper VRAM)
 
@@ -877,7 +887,6 @@ def _kausal_rechts(q: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor, scale: f
     """q (L, H, D), kh/vh (1, Hkv, S, D) mit den Abfragen auf den letzten L Plätzen. cuDNN-SDPA (auf Blackwell
     gemessen 2–4× schneller als mit Maske; ohne GQA – KV-Köpfe werden vervielfacht), sonst der effiziente Kern
     mit derselben Kausalität."""
-    from torch.nn.attention import SDPBackend, sdpa_kernel
     from torch.nn.attention.bias import causal_lower_right
     L, H, D = q.shape
     Hkv, S = kh.shape[1], kh.shape[2]
@@ -889,7 +898,7 @@ def _kausal_rechts(q: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor, scale: f
         kk = kh if Hkv == H else kh.repeat_interleave(H // Hkv, dim=1)
         vv = vh if Hkv == H else vh.repeat_interleave(H // Hkv, dim=1)
         try:
-            with sdpa_kernel([SDPBackend.CUDNN_ATTENTION]):
+            with cudnn_zuerst():
                 out = F.scaled_dot_product_attention(qh, kk, vv, attn_mask=kausal, scale=scale)
             _CUDNN_ATTENTION["geht"] = True
             return out[0].transpose(0, 1)
@@ -1196,12 +1205,13 @@ class GraphDecoder:
         if key not in self.graphs:
             # only the current bucket keeps several-token graphs, in a pool of their own that
             # goes with them: each holds its (L, V) logits and activations (measured: 48 graphs
-            # over 12k positions in the shared pool = 1 GiB that never came back)
-            alte = [k for k in self.graphs if self._mehrfach(k) and k[-1] != kv_len]
-            for alt in alte:
-                del self.graphs[alt]
-            if alte and not any(self._mehrfach(k) for k in self.graphs):
-                self.pool_mehr = None
+            # over 12k positions in the shared pool = 1 GiB that never came back).  Single-token
+            # graphs captured while that pool lived can point into it (library workspaces of a
+            # capture land in its pool): they go too, else their replay reads freed memory
+            # (measured on Gemma 4 12B: illegal memory access after a bucket change)
+            if any(self._mehrfach(k) and k[-1] != kv_len for k in self.graphs):
+                torch.cuda.synchronize()
+                self.leeren()
             try:
                 self._capture(kv_len, L)
             except Exception:

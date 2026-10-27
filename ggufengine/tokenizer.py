@@ -226,6 +226,92 @@ def regex_split(text: str, muster) -> List[str]:
     return teile
 
 
+VERSCHMELZEN_HEAP_AB = 64              # ab so vielen Symbolen: Vorrangliste statt Runde für Runde
+
+
+def _verschmelzen(word: List[str], ranks: Dict[Tuple[str, str], int]) -> List[str]:
+    """BPE: immer das Paar mit dem kleinsten Rang verschmelzen, bis keins mehr passt."""
+    if len(word) < VERSCHMELZEN_HEAP_AB:
+        return _verschmelzen_runden(word, ranks)
+    return _verschmelzen_heap(word, ranks)
+
+
+def _verschmelzen_runden(word: List[str], ranks: Dict[Tuple[str, str], int]) -> List[str]:
+    """Je Runde das beste Paar suchen und alle seine Vorkommen von links verschmelzen (GPT-2) –
+    O(n²) über ein langes Wort, für kurze das schnellste."""
+    while len(word) > 1:
+        best = None
+        best_rank = None
+        for a, b in zip(word, word[1:]):
+            r = ranks.get((a, b))
+            if r is not None and (best_rank is None or r < best_rank):
+                best, best_rank = (a, b), r
+        if best is None:
+            break
+        a, b = best
+        merged = a + b
+        new_word = []
+        k = 0
+        while k < len(word):
+            if k < len(word) - 1 and word[k] == a and word[k + 1] == b:
+                new_word.append(merged)
+                k += 2
+            else:
+                new_word.append(word[k])
+                k += 1
+        word = new_word
+    return word
+
+
+def _verschmelzen_heap(word: List[str], ranks: Dict[Tuple[str, str], int]) -> List[str]:
+    """Dasselbe Ergebnis wie Runde für Runde, in O(n log n): Paare in einer Vorrangliste nach (Rang, Position),
+    Symbole als verkettete Liste. Ein Rang wird wie eine Runde ganz abgearbeitet – alle seine Vorkommen von
+    links –, bevor neu entstandene Paare drankommen, auch wenn deren Rang kleiner ist (Gemma: die Merges sind
+    nicht nach Lernreihenfolge sortiert, Leerzeichen-Folgen verschmolzen sonst anders)."""
+    import heapq
+    sym = list(word)
+    n = len(sym)
+    links = list(range(-1, n - 1))
+    rechts = list(range(1, n + 1))
+    lebt = [True] * n
+    heap = []
+    for i in range(n - 1):
+        r = ranks.get((sym[i], sym[i + 1]))
+        if r is not None:
+            heap.append((r, i, sym[i], sym[i + 1]))
+    heapq.heapify(heap)
+    while heap:
+        rang = heap[0][0]
+        runde = []                                    # alle Vorkommen dieses Rangs, von links (= eine Runde)
+        while heap and heap[0][0] == rang:
+            runde.append(heapq.heappop(heap))
+        neu = []
+        for _r, i, a, b in runde:
+            j = rechts[i]
+            if not lebt[i] or j >= n or not lebt[j] or sym[i] != a or sym[j] != b:
+                continue                              # veraltet: Nachbarn haben sich geändert
+            sym[i] = a + b
+            lebt[j] = False
+            rechts[i] = rechts[j]
+            if rechts[i] < n:
+                links[rechts[i]] = i
+            neu.append(i)
+        for i in neu:                                 # neue Paare erst nach der Runde (wie das alte Verfahren)
+            if not lebt[i]:
+                continue
+            if links[i] >= 0:
+                k = links[i]
+                rr = ranks.get((sym[k], sym[i]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, k, sym[k], sym[i]))
+            if rechts[i] < n:
+                k = rechts[i]
+                rr = ranks.get((sym[i], sym[k]))
+                if rr is not None:
+                    heapq.heappush(heap, (rr, i, sym[i], sym[k]))
+    return [sym[i] for i in range(n) if lebt[i]]
+
+
 class Tokenizer:
     def __init__(self, gg: GGUFFile):
         model = gg.get("tokenizer.ggml.model")
@@ -322,28 +408,7 @@ class Tokenizer:
             word = list(piece)
         else:
             word = [BYTE_TO_UNI[b] for b in piece.encode("utf-8")]
-        ranks = self.ranks
-        while len(word) > 1:
-            best = None
-            best_rank = None
-            for a, b in zip(word, word[1:]):
-                r = ranks.get((a, b))
-                if r is not None and (best_rank is None or r < best_rank):
-                    best, best_rank = (a, b), r
-            if best is None:
-                break
-            a, b = best
-            merged = a + b
-            new_word = []
-            k = 0
-            while k < len(word):
-                if k < len(word) - 1 and word[k] == a and word[k + 1] == b:
-                    new_word.append(merged)
-                    k += 2
-                else:
-                    new_word.append(word[k])
-                    k += 1
-            word = new_word
+        word = _verschmelzen(word, self.ranks)
         ids = []
         for sym in word:
             tid = self.vocab.get(sym)
@@ -362,8 +427,8 @@ class Tokenizer:
                     ids.append(b)
             else:
                 ids.append(tid)
-        if len(self._bpe_cache) < 200_000:
-            if len(self._bpe_cache) >= BPE_CACHE_MAX:     # long sessions with many web pages
+        if len(piece) <= 256:                            # whole lines (Gemma style) would bloat the cache
+            if len(self._bpe_cache) >= BPE_CACHE_MAX:    # long sessions with many web pages
                 self._bpe_cache.clear()
             self._bpe_cache[piece] = ids
         return ids

@@ -76,8 +76,10 @@ def dry_penalties(history, own, breaker, cfg: SamplerConfig, max_match: int = 64
 
 
 class Sampler:
-    def __init__(self, cfg: SamplerConfig, device):
+    def __init__(self, cfg: SamplerConfig, device, n_vocab: Optional[int] = None):
+        """n_vocab: tokens the tokenizer knows – output rows beyond it (padding) are never chosen."""
         self.cfg = cfg
+        self.n_vocab = n_vocab
         self.gen = torch.Generator(device=device)
         if cfg.seed is not None:
             self.gen.manual_seed(int(cfg.seed))
@@ -87,6 +89,8 @@ class Sampler:
     @torch.inference_mode()
     def sample(self, logits: torch.Tensor, history: List[int], own=None, breaker=None, word_start=None) -> int:
         cfg = self.cfg
+        if self.n_vocab and logits.numel() > self.n_vocab:
+            logits = logits[:self.n_vocab]
         logits = logits.float()
         if cfg.dry_multiplier > 0 and own is not None and breaker is not None:
             strafe = dry_penalties(history, own, breaker, cfg, word_start=word_start)
@@ -94,7 +98,7 @@ class Sampler:
                 logits = logits.clone()
                 idx = torch.tensor(list(strafe), device=logits.device)
                 logits[idx] -= torch.tensor(list(strafe.values()), device=logits.device, dtype=logits.dtype)
-        if history and (cfg.repeat_penalty != 1.0 or cfg.presence_penalty != 0.0):
+        if history and cfg.repeat_last_n > 0 and (cfg.repeat_penalty != 1.0 or cfg.presence_penalty != 0.0):   # 0 = aus (wie llama.cpp)
             logits = logits.clone()
             recent = torch.unique(torch.tensor(history[-cfg.repeat_last_n:], device=logits.device))
             vals = logits[recent]

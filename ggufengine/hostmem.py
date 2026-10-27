@@ -86,7 +86,7 @@ def abbilden(host: torch.Tensor, device) -> torch.Tensor:
 def abgebildet(t: torch.Tensor) -> bool:
     """t lives in a block from `empty()` (also as a CUDA tensor from `abbilden`)."""
     p = t.data_ptr()
-    return any(a <= p < e for a, e in _bereiche.items())
+    return any(a <= p < e for a, e in list(_bereiche.items()))     # Schnappschuss: andere Fäden ändern das Dict
 
 
 def flush() -> None:

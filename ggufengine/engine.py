@@ -56,6 +56,10 @@ def bild_nr(img) -> int:
     return nr
 
 
+# Objekte dieser Pakete enthalten Gewichte: auch die LoRA-Hüllen (loramotor.adapter.LoraSchicht),
+# die eingeklinkt an Stelle der Original-Schichten stehen – sonst blieben sie beim Auslagern im VRAM.
+_EIGENE_MODULE = (__package__, "loramotor")
+
 _DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp16": torch.float16,
            "float16": torch.float16, "fp32": torch.float32, "float32": torch.float32}
 
@@ -98,7 +102,7 @@ def _move_tensors(root, select, convert, ansichten: bool = False) -> set:
             for k in list(v):
                 v[k] = conv(v[k])
             return v
-        if type(v).__module__.startswith(__package__) and id(v) not in seen:
+        if type(v).__module__.startswith(_EIGENE_MODULE) and id(v) not in seen:
             walk(v)
         return v
 
@@ -419,11 +423,11 @@ class Engine:
         if self.vision is None:
             raise RuntimeError("no vision projector attached (enable_vision)")
         t0 = time.time()
-        with GPU_SPERRE:
-            self.vision.load()
-            if self.device.type == "cuda":
-                release_pinned_memory()
         try:
+            with GPU_SPERRE:
+                self.vision.load()            # OOM mitten im Laden: finally räumt die halben Gewichte ab
+                if self.device.type == "cuda":
+                    release_pinned_memory()
             out = self.vision.encode(image, tokens or self.vision.default_tokens)
         finally:
             self.vision.unload()
@@ -609,7 +613,7 @@ class Engine:
         if denk_budget:
             grenze, auf, zu, drin = denk_budget
             gedacht, zuletzt = 0, []
-        smp = Sampler(cfg, self.device)
+        smp = Sampler(cfg, self.device, getattr(self.tokenizer, "n_vocab", None))
         stop = set(self.tokenizer.stop_ids)
         if stop_ids:
             stop |= set(stop_ids)
@@ -712,7 +716,9 @@ class Engine:
         dbg.kv({"Template": self.chat_format.fmt, "Thinking": self.chat_format.thinking,
                 "max_tokens": kw.get("max_tokens"), "Sampler": smp.__dict__ if smp else "default",
                 "Rollen": " → ".join(m.role for m in messages)})
-        dbg.code(self.tokenizer.decode(ids, skip_special=False), "text", "Gerenderter Prompt (Template + Nachrichten)", limit=4000)
+        if dbg.path():                       # den ganzen Prompt zurückverwandeln nur, wenn das Log an ist
+            dbg.code(self.tokenizer.decode(ids, skip_special=False), "text",
+                     "Gerenderter Prompt (Template + Nachrichten)", limit=4000)
         dbg.code(" ".join(map(str, ids[:48])) + (" …" if len(ids) > 48 else ""), "text", "Erste Prompt-Token-IDs")
         marken = self.chat_format.denk_marken() if self.chat_format.thinking else None
         if getattr(self, "denk_budget", None) and marken and "denk_budget" not in kw:
@@ -877,7 +883,7 @@ class Engine:
             if isinstance(obj, (list, tuple)):
                 for x in obj:
                     walk(x)
-            elif wurzel or type(obj).__module__.startswith(__package__):
+            elif wurzel or type(obj).__module__.startswith(_EIGENE_MODULE):
                 names = list(getattr(obj, "__dict__", {}))
                 for cls in type(obj).__mro__:
                     names += [n for n in getattr(cls, "__slots__", ()) if n not in names]

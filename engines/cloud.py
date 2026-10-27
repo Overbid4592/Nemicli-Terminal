@@ -14,10 +14,13 @@ So funktioniert die Aktions-Schleife in main.py für jeden Anbieter gleich.
 
 from __future__ import annotations
 
+import asyncio
 import re
 import time
 from typing import AsyncIterator
 
+import denkwerk
+import gespraechsstand as GS
 import persona
 import pricing
 import providers as P
@@ -90,6 +93,17 @@ class CloudChat:
         self.strength = (reasoning.normalize_strength(strength)
                          if reasoning.profile(self.model) else None)
         self.messages: list[dict] = []
+        self.stand = ""                              # Stand des Gesprächs (gespraechsstand)
+        # Lokales Ollama (nicht „…:cloud“ über Ollama): kompakte Anleitung wie der eigene Motor, Treffer und
+        # nachgereichte Anleitungen an der Nachricht, Stand des Gesprächs und Aufräumen im Hintergrund
+        self._lokal = provider_id == "ollama" and not re.search(r"[-:]cloud\b", model_id.lower())
+        self.kompakter_prompt = self._lokal
+        self._gesendet: dict[int, tuple[dict, str]] = {}   # je Nachricht: wie sie gesendet wird
+        self._puffer: asyncio.Task | None = None     # laufendes Hintergrund-Aufräumen
+        self._puffer_hinweis = ""
+        self._kontext_gemessen = False
+        self.denk_hinweis = ""                       # Denkwerk: nur mit der nächsten gesendeten Nachricht
+        self._hat_gedacht = False                    # das Modell lieferte schon eigenes Nachdenken
 
         # --- Auto-Stark-Modus (nur lokales Ollama, nur leichtes Gemma) ----------
         # Bei einer schweren Frage schalten wir für DIESE eine Antwort auf das
@@ -119,6 +133,184 @@ class CloudChat:
 
     def reset(self) -> None:
         self.messages = []
+        self.stand = ""
+        self._gesendet = {}
+        if self._puffer is not None and not self._puffer.done():
+            self._puffer.cancel()
+        self._puffer, self._puffer_hinweis = None, ""
+
+    @property
+    def denkt_selbst(self) -> bool:
+        """Denkt das Modell selbst (bekannte Denkstufe an, oder schon eigenes Nachdenken geliefert)?"""
+        if self._hat_gedacht:
+            return True
+        art = reasoning.profile(self.model)
+        if art in ("openai_effort", "kimi", "ollama_effort"):
+            return self.strength != "schnell"
+        if art == "ollama_cloud":
+            familie = reasoning.ollama_family(self.model_id)
+            info = reasoning.OLLAMA_CLOUD.get(familie) or {}
+            if not info.get("think"):
+                return False
+            stufe = reasoning.cloud_effort(familie, reasoning.normalize_strength(self.strength))
+            return bool(info.get("default")) if stufe is None else stufe != "none"
+        return False
+
+    async def schliessen(self, warten_s: float = 5.0) -> None:
+        """Modellwechsel: ein laufendes Hintergrund-Aufräumen abbrechen."""
+        puffer, self._puffer = self._puffer, None
+        if puffer is not None and not puffer.done():
+            puffer.cancel()
+            await asyncio.wait({puffer}, timeout=warten_s)
+
+    # -- Stand des Gesprächs: lokales Ollama räumt selbst auf, /compact geht bei jedem Anbieter ----------
+    def _mit_stand(self, verlauf: list[dict]) -> list[dict]:
+        """Der Verlauf, wie er gesendet wird: der Stand des Gesprächs vor der ersten Nachricht."""
+        if not self.stand:
+            return verlauf
+        i = next((i for i, m in enumerate(verlauf) if m.get("role") == "user"), -1)
+        if i < 0:
+            return verlauf
+        m, vorsatz = verlauf[i], GS.vorsatz(self.stand)
+        inhalt = m.get("content")
+        neu = (vorsatz + inhalt if isinstance(inhalt, str)
+               else [{"type": "text", "text": vorsatz}] + list(inhalt or []))
+        return verlauf[:i] + [dict(m, content=neu)] + verlauf[i + 1:]
+
+    def _senden_als(self, verlauf: list[dict]) -> list[dict]:
+        """Der Verlauf, wie er gesendet wird: Nachrichten mit ihrem Hintergrund (Treffer, nachgereichte
+        Anleitungen) und der Stand des Gesprächs vor der ersten. Gespeichert bleibt nur die Nachricht selbst."""
+        raus = []
+        for m in verlauf:
+            g = self._gesendet.get(id(m))
+            if g is not None and g[0] is m:
+                inhalt = m.get("content")
+                m = dict(m, content=g[1] if isinstance(inhalt, str) else
+                         [{"type": "text", "text": g[1]}] + [b for b in inhalt or []
+                                                             if not (isinstance(b, dict) and b.get("type") == "text")])
+            raus.append(m)
+        return self._mit_stand(raus)
+
+    async def _hintergrund_anhaengen(self, frage: dict, text: str) -> None:
+        """Lokales Ollama: Gedächtnis-Treffer und passende Anleitungen vor die neue Nachricht – die kompakte
+        Anleitung im Systemprompt bleibt so jede Runde gleich, Ollama liest sie nicht neu ein."""
+        self._gesendet = {k: v for k, v in self._gesendet.items() if any(v[0] is m for m in self.messages)}
+        teile = []
+        if not GS.ohne_treffer(text) and not GS.ist_ergebnis(text):
+            try:
+                teile.append(await asyncio.to_thread(persona.gedaechtnis_treffer, text, GS.TREFFER_WARTEN_S))
+            except Exception:
+                pass
+        try:
+            teile.append(GS.anleitungen_fuer(text, [g for _, g in self._gesendet.values()]))
+        except Exception:
+            pass
+        teile = [x.strip() for x in teile if x and x.strip()]
+        if teile:
+            self._gesendet[id(frage)] = (frage, "\n\n".join(teile + [GS.NACHRICHT_MARKE + text]))
+
+    async def _kontext_messen(self) -> None:
+        """Den Kontext übernehmen, mit dem Ollama das Modell geladen hat – sonst gälte der Richtwert nach
+        dem Namen (oft 128k), und Ollama schnitte selbst ab, bevor NemiCLI zusammenfasst."""
+        if not self._lokal or self._kontext_gemessen:
+            return
+        try:
+            n = await asyncio.to_thread(P.ollama_kontext, self.model_id)
+        except Exception:
+            return
+        if n:
+            pricing.kontext_merken(self.model, n)
+            self._kontext_gemessen = True
+
+    def _budget(self) -> int:
+        """So viele Token darf der Verlauf belegen (wie pricing.trim_history)."""
+        return max(2048, int(pricing.context_window(self.model) * pricing.HISTORY_SHARE))
+
+    def _verlauf_tokens(self) -> int:
+        return sum(pricing.est_tokens(m.get("content")) for m in self.messages)
+
+    async def _fragen(self, system: str, text: str) -> str:
+        """Einzel-Anfrage für den Stand – bei Ollama ohne Denken."""
+        kwargs = dict(model=self.model_id,
+                      messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
+                      **reasoning.request_options(self.provider_id, self.model_id, self.strength, helper=True))
+        if self._lokal:
+            kwargs["extra_body"] = {"think": False}
+        r = await self.client.chat.completions.create(**kwargs)
+        return (r.choices[0].message.content or "") if r.choices else ""
+
+    async def _aufraeumen(self, behalten: int, fehler_melden: bool = False) -> int:
+        """Älteres in den Stand des Gesprächs (und über `weggefallen` ins Gedächtnis); die neuesten Nachrichten,
+        zusammen höchstens `behalten` Token (mindestens zwei), bleiben. Erst der Stand, dann der Schnitt: klappt
+        die Zusammenfassung nicht, bleibt der Verlauf, wie er war. Gibt die Zahl der ausgelagerten zurück."""
+        alt = self.messages
+        ab = GS.behalten_ab(alt, behalten, lambda m: pricing.est_tokens(m.get("content")))
+        n = pricing.schnitt(alt, max(ab, len(alt) - pricing.HARD_MAX // 2))
+        if n <= 0:
+            return 0
+        grenze = max(4000, min(120_000, int((pricing.context_window(self.model) - 3000) * 2.5)))   # Zeichen
+        try:
+            neu = await GS.fortschreiben(self._fragen, self.stand, alt[:n], grenze)
+        except Exception:
+            if fehler_melden:
+                raise
+            return 0
+        if not neu or self.messages is not alt:
+            if fehler_melden and not neu:
+                raise RuntimeError("Das Modell hat keine Zusammenfassung geschrieben – der Verlauf bleibt, wie er war.")
+            return 0
+        self.stand = neu
+        gezaehlt = getattr(self, "aufgeraeumt", 0)
+        pricing.abschneiden(self, n)
+        self.aufgeraeumt = gezaehlt                  # eigener Hinweis statt „Kontext voll“
+        return n
+
+    async def _hintergrund(self) -> None:
+        """Nach einer Antwort (lokales Ollama): ab PUFFER_AB des Budgets im Hintergrund aufräumen – die nächste
+        Nachricht wartet darauf (`_puffer_abwarten`), statt dass der Verlauf auf drei Nachrichten schrumpft."""
+        try:
+            await self._kontext_messen()
+            budget = self._budget()
+            if (self._verlauf_tokens() <= GS.PUFFER_AB * budget
+                    and len(self.messages) <= GS.PUFFER_AB * pricing.HARD_MAX):
+                return
+            if (n := await self._aufraeumen(int(GS.PUFFER_BEHALTEN * budget))):
+                self._puffer_hinweis = (f"📌 Kontext im Hintergrund aufgeräumt: {n} ältere Nachrichten stehen jetzt "
+                                        f"im Stand des Gesprächs (und im Gedächtnis), {len(self.messages)} bleiben.")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:                       # ein Bonus: nie das Gespräch stören
+            self._puffer_hinweis = f"⚠ Kontext im Hintergrund zusammenfassen ging nicht: {exc}"
+
+    async def _puffer_abwarten(self) -> AsyncIterator[dict]:
+        """Vor einer neuen Nachricht: ein laufendes Aufräumen erst fertig werden lassen."""
+        if self._puffer is not None:
+            if not self._puffer.done():
+                yield {"type": "note", "text": "📌 einen Moment – der Kontext wird gerade zusammengefasst …"}
+            try:
+                await self._puffer
+            except (Exception, asyncio.CancelledError):
+                pass
+            self._puffer = None
+        if self._puffer_hinweis:
+            yield {"type": "note", "text": self._puffer_hinweis}
+            self._puffer_hinweis = ""
+
+    async def kompakt(self) -> str:
+        """/compact: jetzt zusammenfassen – Älteres in den Stand des Gesprächs, nur die neuesten Nachrichten
+        (KOMPAKT_BEHALTEN des Budgets, mindestens zwei) bleiben. "" = nichts zu tun."""
+        async for _ in self._puffer_abwarten():
+            pass
+        if len(self.messages) < 3:
+            return ""
+        await self._kontext_messen()
+        vorher = self._verlauf_tokens()
+        n = await self._aufraeumen(int(GS.KOMPAKT_BEHALTEN * self._budget()), fehler_melden=True)
+        if not n:
+            return ""
+        return (f"📌 Zusammengefasst: {n} ältere Nachrichten stehen jetzt im Stand des Gesprächs (und im "
+                f"Gedächtnis), {len(self.messages)} bleiben – Verlauf ~{vorher:,} → ~{self._verlauf_tokens():,} "
+                "Token.").replace(",", ".")
 
     async def ask_once(self, prompt: str, system: str) -> str:
         """Fokussierte Einzel-Antwort (für Helfer-Agenten), ohne den Hauptverlauf."""
@@ -129,7 +321,9 @@ class CloudChat:
             **reasoning.request_options(self.provider_id, self.model_id,
                                         self.strength, helper=True),
         )
-        if r.choices and getattr(r.choices[0], "finish_reason", None) == "length":
+        if not r.choices:                                  # z. B. Inhaltsfilter des Anbieters
+            raise RuntimeError("Der Anbieter hat keine Antwort geliefert (leere Auswahl).")
+        if getattr(r.choices[0], "finish_reason", None) == "length":
             raise RuntimeError("Tokenbudget erreicht: Die Helferantwort ist unvollständig.")
         return r.choices[0].message.content or ""
 
@@ -194,11 +388,21 @@ class CloudChat:
             return False
 
     async def stream(self, user_text: str, images: list[str] | None = None) -> AsyncIterator[dict]:
+        async for hinweis in self._puffer_abwarten():
+            yield hinweis
         self.messages.append({"role": "user", "content": _user_content(user_text, images)})
         zeiten = []                              # Vorarbeit bis zur Antwort des Anbieters (Debugbericht)
         t = time.monotonic()
 
-        # Verlauf auf das Kontextfenster dieses Modells kürzen
+        # Verlauf auf das Kontextfenster dieses Modells kürzen – lokales Ollama fasst vorher zusammen,
+        # kuerzen bleibt die Notbremse (Zusammenfassung ging nicht)
+        if self._lokal and GS.an():
+            await self._kontext_messen()
+            if self._verlauf_tokens() > self._budget() or len(self.messages) > pricing.HARD_MAX:
+                yield {"type": "note", "text": "📌 Kontext voll – ich schreibe den Stand des Gesprächs fort …"}
+                if (n := await self._aufraeumen(int(GS.PUFFER_BEHALTEN * self._budget()))):
+                    yield {"type": "note", "text": f"📌 {n} ältere Nachrichten stehen jetzt im Stand des Gesprächs "
+                                                   f"(und im Gedächtnis), {len(self.messages)} bleiben."}
         pricing.kuerzen(self)
         zeiten.append(("kürzen", time.monotonic() - t))
         if hinweis := pricing.aufraeum_hinweis(self):
@@ -217,13 +421,24 @@ class CloudChat:
                        "text": f"🧠 knifflige Frage – ich schalte auf {kurz} hoch"}
 
         t = time.monotonic()
+        if self._lokal:
+            await self._hintergrund_anhaengen(self.messages[-1], user_text)
+        hinweis, self.denk_hinweis = self.denk_hinweis, ""
+        gebeten = bool(hinweis) and not self.denkt_selbst    # <think> im Text ist dann erbetenes Nachdenken
+        if hinweis:
+            frage = self.messages[-1]
+            self._gesendet = {k: v for k, v in self._gesendet.items() if any(v[0] is m for m in self.messages)}
+            g = self._gesendet.get(id(frage))
+            self._gesendet[id(frage)] = (frage, denkwerk.mit_hinweis(g[1] if g else user_text, hinweis))
         sys_msg = {"role": "system",
-                   "content": await persona.build_system_prompt_async(user_text)}
+                   "content": await persona.build_system_prompt_async(
+                       "" if self._lokal else user_text, kompakt_fuer_lokal=self._lokal,
+                       mit_gedaechtnis=not self._lokal)}
         zeiten.append(("Systemprompt", time.monotonic() - t))
         full = ""
         t = time.monotonic()
         try:
-            stream = await self._open([sys_msg] + self.messages, model_id=use_model)
+            stream = await self._open([sys_msg] + self._senden_als(self.messages), model_id=use_model)
             zeiten.append(("Anbieter antwortet", time.monotonic() - t))
             _zeiten_melden(zeiten)
         except Exception as exc:
@@ -232,16 +447,19 @@ class CloudChat:
                 yield {"type": "note", "text": "🖼 Anfrage war zu groß – ältere Bilder aus dem Verlauf "
                                                "genommen, neuer Versuch."}
                 try:
-                    stream = await self._open([sys_msg] + self.messages, model_id=use_model)
+                    stream = await self._open([sys_msg] + self._senden_als(self.messages), model_id=use_model)
                 except Exception:
                     if self.messages and self.messages[-1]["role"] == "user":
                         self.messages.pop()
                     raise
             # Modell ohne Vision lehnt das Bild ab -> ohne Bild als reinen Text nachreichen.
             elif images and "image" in str(exc).lower():
+                alt = self.messages[-1]
                 self.messages[-1] = {"role": "user", "content": user_text}
+                if (g := self._gesendet.pop(id(alt), None)) is not None:
+                    self._gesendet[id(self.messages[-1])] = (self.messages[-1], g[1])
                 try:
-                    stream = await self._open([sys_msg] + self.messages)
+                    stream = await self._open([sys_msg] + self._senden_als(self.messages))
                 except Exception:
                     self.messages.pop()
                     raise
@@ -274,12 +492,15 @@ class CloudChat:
                 d = choice.delta
                 think = getattr(d, "reasoning_content", None) or getattr(d, "reasoning", None)
                 if think:
+                    self._hat_gedacht = True
                     yield {"type": "thinking", "text": think}
                 delta = d.content or ""
                 if delta:
                     for kind, txt in feed(delta):
                         if kind == "text":
                             full += txt
+                        elif not gebeten and txt.strip():
+                            self._hat_gedacht = True
                         yield {"type": kind, "text": txt}
             for kind, txt in flush():
                 if kind == "text":
@@ -297,3 +518,5 @@ class CloudChat:
 
         placeholder = "(Tokenbudget erreicht, keine fertige Antwort)" if truncated else "(keine Antwort)"
         self.messages.append({"role": "assistant", "content": full or placeholder})
+        if self._lokal and GS.an():
+            self._puffer = asyncio.get_running_loop().create_task(self._hintergrund())

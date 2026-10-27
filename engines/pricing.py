@@ -38,11 +38,21 @@ _CTX: list[tuple[str, int]] = [
 # Fallback, wenn wir ein Cloud-Modell nicht kennen
 DEFAULT_CTX = 128_000
 
+# Gemessene Kontexte (lokales Ollama: so, wie Ollama das Modell geladen hat) gelten vor den Richtwerten.
+_GEMESSEN: dict[str, int] = {}
+
+
+def kontext_merken(ref: str, n: int) -> None:
+    if ref and n > 0:
+        _GEMESSEN[ref] = int(n)
+
 
 def context_window(ref: str | None) -> int:
     """Wie viele Tokens passen ins Gedächtnis dieses Modells (Richtwert)."""
     if not ref:
         return DEFAULT_CTX
+    if ref in _GEMESSEN:
+        return _GEMESSEN[ref]
     _prov, mid = M.split_ref(ref)
     low = mid.lower()
     if _prov == "gguf":                       # eigener Motor: eingestellter Kontext

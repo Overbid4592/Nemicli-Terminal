@@ -26,22 +26,36 @@ except Exception:
 ORDNER = _ROOT / "learned" / "coding_lora"
 ART = "nemicli-coding-lora"
 
-# Bauarten mit Lernweg; je Klasse: Attribut -> GGUF-Name der Schicht
-BAUARTEN = ("qwen35",)
+# Bauarten mit Lernweg; je Klasse (Modul.Klasse oder nur Klasse): Attribut -> GGUF-Name der Schicht
+BAUARTEN = ("qwen35", "gemma4")
 SCHICHTEN = {
     "_AttentionLayer": {"q": "attn_q", "k": "attn_k", "v": "attn_v", "o": "attn_output"},
     "_GatedDeltaNetLayer": {"qkv": "attn_qkv", "z": "attn_gate", "out": "ssm_out"},
     "_Block": {"gate": "ffn_gate", "up": "ffn_up", "down": "ffn_down"},
+    "gemma4._Layer": {"q": "attn_q", "k": "attn_k", "v": "attn_v", "qkv": "attn_qkv", "o": "attn_output",
+                      "gate": "ffn_gate", "up": "ffn_up", "down": "ffn_down"},
 }
 _MERKER = "_nemicli_coding_lora"         # am Modell: Kennung des angeklinkten LoRA
+
+
+def bloecke(model) -> list:
+    """Die Schichten-Blöcke eines Modells (qwen35: blocks, gemma4: layers)."""
+    return list(getattr(model, "blocks", None) or getattr(model, "layers", None) or [])
+
+
+def _tabelle(obj) -> dict:
+    art = type(obj)
+    return SCHICHTEN.get(f"{art.__module__.rsplit('.', 1)[-1]}.{art.__name__}") or SCHICHTEN.get(art.__name__, {})
 
 
 def schichten(model) -> dict[str, tuple[object, str]]:
     """GGUF-Name -> (Besitzer, Attribut) der Schichten, die ein LoRA bekommen können."""
     out = {}
-    for i, blk in enumerate(getattr(model, "blocks", None) or []):
+    for i, blk in enumerate(bloecke(model)):
         for obj in (getattr(blk, "mixer", None), blk):
-            for attr, name in SCHICHTEN.get(type(obj).__name__, {}).items():
+            if obj is None:
+                continue
+            for attr, name in _tabelle(obj).items():
                 if getattr(obj, attr, None) is not None:
                     out[f"blk.{i}.{name}.weight"] = (obj, attr)
     return out
@@ -74,17 +88,19 @@ class LoraSchicht:
 
 
 def speichern(pfad: str | os.PathLike, gewichte: dict[str, tuple[torch.Tensor, torch.Tensor]],
-              meta: dict, opt=None) -> Path:
+              meta: dict, opt=None, halb: bool = False) -> Path:
     """gewichte: GGUF-Name -> (A (rang, n_in), B (n_out, rang)). Mit `opt` (AdamW, für Zwischenstände) auch
-    dessen Momente je Matrix und der Schrittzähler – Fortsetzen rechnet dann wie ohne Pause."""
+    dessen Momente je Matrix und der Schrittzähler – Fortsetzen rechnet dann wie ohne Pause. `halb`: als
+    bfloat16 (fertige LoRA – angeklinkt rechnet die Grafikkarte ohnehin in bfloat16)."""
     from safetensors.torch import save_file
     pfad = Path(pfad)
     pfad.parent.mkdir(parents=True, exist_ok=True)
     tensoren = {}
     meta = dict(meta)
+    art = torch.bfloat16 if halb else torch.float32
     for name, (a, b) in gewichte.items():
-        tensoren[f"{name}.lora_a"] = a.detach().to("cpu", torch.float32).contiguous()
-        tensoren[f"{name}.lora_b"] = b.detach().to("cpu", torch.float32).contiguous()
+        tensoren[f"{name}.lora_a"] = a.detach().to("cpu", art).contiguous()
+        tensoren[f"{name}.lora_b"] = b.detach().to("cpu", art).contiguous()
         for teil, p in (("lora_a", a), ("lora_b", b)):
             st = opt.state.get(p) if opt is not None else None
             if st and "exp_avg" in st:

@@ -143,12 +143,11 @@ def aufspielen(zip_pfad: Path, ziel: Path, fortschritt: Optional[Callable[[int, 
     for rest in (neu, alt):                          # Reste eines abgebrochenen Laufs (nur eigene Ordner)
         shutil.rmtree(rest, ignore_errors=True)
     with zipfile.ZipFile(zip_pfad) as z:
-        # Nur explizit bekannte Programmteile austauschen. Andernfalls koennte
-        # ein ZIP auch Nutzerordner wie chats oder Profile ersetzen.
-        unerwartet = _teile(z) - set(PROGRAMMTEILE)
-        if unerwartet:
-            raise ValueError("Unzulaessige Paketbestandteile: " + ", ".join(sorted(unerwartet)))
+        # Nur die festen Programmteile tauschen: läge im Paket versehentlich eine Konfiguration oder ein
+        # chats-Ordner, würde sonst der des Empfängers ersetzt und gelöscht.
         teile = sorted(PROGRAMMTEILE)
+        if (fremd := sorted(_teile(z) - set(PROGRAMMTEILE))):
+            raise ValueError("Das Paket enthält mehr als Programmteile: " + ", ".join(fremd[:5]))
         _sicher_entpacken(z, neu, fortschritt)
     if not ist_installation(neu):
         shutil.rmtree(neu, ignore_errors=True)

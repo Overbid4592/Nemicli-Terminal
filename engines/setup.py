@@ -9,9 +9,9 @@ NemiCLI soll auch ohne Vorwissen laufen. Dieses Modul:
   • erkennt, ob Ollama installiert/erreichbar ist, gibt sonst einen
     Hinweis, und lädt Ollama-Modelle direkt herunter (/api/pull).
 
-Bis zum 15.09.2026 lud dieses Modul zusätzlich die llama.cpp-Binaries von
-GitHub (passend zur GPU, mit Zip-Slip-Schutz und Host-Allowlist). Das ist auf
-Wunsch des Nutzers komplett entfallen - lokale Modelle laufen jetzt
+Früher lud dieses Modul zusätzlich die llama.cpp-Binaries von
+GitHub (passend zur GPU, mit Zip-Slip-Schutz und Host-Allowlist). Das ist
+komplett entfallen - lokale Modelle laufen jetzt
 ausschließlich über Ollama, das sein eigenes Laufzeit-Paket mitbringt.
 """
 
@@ -264,7 +264,7 @@ def ollama_pull(model: str,
     on_progress(status, completed, total) wird laufend aufgerufen.
     Wirft bei Fehler eine Exception."""
     host = P.ollama_host()
-    with httpx.Client(timeout=None) as c:
+    with httpx.Client(timeout=httpx.Timeout(30.0, read=120.0)) as c:   # stehende Verbindung bricht ab
         with c.stream("POST", f"{host}/api/pull",
                       json={"model": model, "stream": True}) as r:
             r.raise_for_status()

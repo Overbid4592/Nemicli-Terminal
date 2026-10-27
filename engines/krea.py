@@ -16,8 +16,8 @@ Ablauf:
 Krea 2 kennt keinen Negativ-Prompt und läuft mit CFG 1: ein Modelldurchlauf
 pro Schritt. Speicher wie ComfyUI mit --disable-smart-memory: jedes Teil ist
 nur während seines Rechenschritts im VRAM und wartet sonst im Arbeitsspeicher.
-Kommt 15 Minuten kein Bild (Config: `bild_krea_entladen`), wird auch der
-Arbeitsspeicher geräumt.
+Nach 5 Minuten Ruhe (Config: `bild_krea_entladen`; keine Runde, keine
+Hintergrund-Aufgabe) wird auch der Arbeitsspeicher geräumt.
 
 Alle Netze sind hier von Hand nachgebaut. Es wird nichts aus dem Netz geladen.
 """
@@ -27,6 +27,7 @@ from __future__ import annotations
 import json
 import math
 import struct
+import sys
 import threading
 
 try:
@@ -66,7 +67,7 @@ DEFAULTS = {
     "size": (832, 1216),
     "sampler": "euler_ancestral",       # oder "euler"
     "shift": 1.15,
-    "entladen_nach": 900,               # Sekunden ohne Bild, dann auch RAM frei (nächstes Bild lädt neu)
+    "entladen_nach": 300,               # Sekunden Ruhe, dann auch RAM frei (nächstes Bild lädt neu)
     "gesicht": True,                    # Gesichter nach dem Malen vergrößert nachmalen
     "gesicht_staerke": 0.35,            # Rauschstärke beim Nachmalen: Augen und Mund bleiben, wo sie sind
     "gesicht_schritte": 10,
@@ -78,7 +79,7 @@ DEFAULTS = {
 # Krea-Prosa statt Stichworten; ohne Bildart („photograph“), damit gezeichnete Bilder ihren Stil behalten.
 GESICHT_SATZ = ("A close-up of the same face, with the same expression, hairstyle, makeup, lighting and art "
                 "style as before. Both eyes are clear and evenly shaped, the irises show natural patterns, "
-                "and a small reflection of the light sits on the wet surface of each eye. Every eyelash is "
+                "and a small catchlight shines in each eye. Every eyelash is "
                 "cleanly defined, and the skin keeps its natural texture.")
 
 # Qwen3-VL-Eingabe: dieselbe Systemvorlage wie Qwen-Image. Vor dem Weiterreichen
@@ -942,11 +943,22 @@ def _frei():
     import torch
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        leeren = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
-        if leeren:
-            leeren()
-        torch.cuda.empty_cache()
+        with gpu_sperre():                   # sonst würde ein gerade aufgenommener CUDA-Graph (Stimme) ungültig
+            torch.cuda.synchronize()
+            leeren = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+            if leeren:
+                leeren()
+            torch.cuda.empty_cache()
+
+
+def gpu_sperre():
+    """Die Sperre, unter der der GGUF-Motor CUDA-Graphen aufnimmt (ohne Motor: keine)."""
+    try:
+        from ggufengine.models.common import GPU_SPERRE
+        return GPU_SPERRE
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
 
 
 # Wie ComfyUI mit --disable-smart-memory: Jedes Teil kommt nur für seinen
@@ -1006,6 +1018,10 @@ def entladen() -> None:
         if _TIMER is not None:
             _TIMER.cancel()
             _TIMER = None
+        zustand = sys.modules.get("gpuzustand")
+        if zustand is not None and zustand.kaputt():   # gepinnten RAM freizugeben kann dann abstürzen
+            _DBG.ereignis("Bildmotor: Entladen übersprungen – CUDA-Sitzung unbrauchbar")
+            return
         while _RAM:                         # Stück für Stück: Freigeben hält Python kurz fest
             _RAM.popitem()
             time.sleep(0.02)
@@ -1025,8 +1041,52 @@ def entladen() -> None:
     _DBG.ereignis("Bildmotor entladen")
 
 
-# Kommt eine Weile kein Bild mehr, wird auch der Arbeitsspeicher geräumt.
-_TIMER: threading.Timer | None = None
+# Nach einer Weile Ruhe wird auch der Arbeitsspeicher geräumt. Gezählt wird nur Ruhe:
+# Solange eine Runde oder Hintergrund-Aufgabe läuft, beginnt die Uhr von vorn.
+RUHE_TAKT_S = 5.0
+
+
+def _beschaeftigt() -> bool:
+    """Läuft eine Runde oder eine Hintergrund-Aufgabe?"""
+    try:
+        import notstopp
+        if notstopp.runde_laeuft():
+            return True
+    except Exception:
+        pass
+    try:
+        import hintergrund
+        return bool(hintergrund.laufend())
+    except Exception:
+        return False
+
+
+class _Ruheuhr(threading.Thread):
+    """Entlädt nach `sek` Sekunden ohne Arbeit; `cancel()` hält sie an."""
+
+    def __init__(self, sek: float):
+        super().__init__(daemon=True)
+        self.sek = sek
+        self._halt = threading.Event()
+
+    def cancel(self) -> None:
+        self._halt.set()
+
+    def run(self) -> None:
+        ruhig_seit = time.monotonic()
+        while not self._halt.wait(min(RUHE_TAKT_S, self.sek)):
+            if _beschaeftigt():
+                ruhig_seit = time.monotonic()
+            elif time.monotonic() - ruhig_seit >= self.sek:
+                with _LOCK:
+                    if self._halt.is_set():      # inzwischen kam ein neues Bild
+                        return
+                    _DBG.ereignis(f"Bildmotor: {self.sek:g} s Ruhe")
+                    entladen()
+                return
+
+
+_TIMER: _Ruheuhr | None = None
 
 
 def _entladen_nach() -> float:
@@ -1047,8 +1107,7 @@ def _uhr_neu() -> None:
         _TIMER = None
         entladen()
         return
-    _TIMER = threading.Timer(sek, entladen)
-    _TIMER.daemon = True
+    _TIMER = _Ruheuhr(sek)
     _TIMER.start()
 
 
@@ -1233,7 +1292,10 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
         except Exception as e:
             # Nur den Text behalten: der Traceback hielte sonst alle Tensoren fest.
             fehler = f"{type(e).__name__}: {e}"
-        _frei()                             # bei Fehlern hingen die Arbeitskopien am Traceback
+        try:
+            _frei()                         # bei Fehlern hingen die Arbeitskopien am Traceback
+        except Exception:                   # CUDA nach einem Fehler unbrauchbar: die Meldung zählt
+            pass
         _uhr_neu()
         if fehler:
             raise RuntimeError(f"Krea 2: {fehler}")

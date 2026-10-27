@@ -48,6 +48,21 @@ except Exception:                                    # Selbsttest ohne core/ im 
             def __exit__(self, *a): return False
 from typing import AsyncIterator, NamedTuple
 
+import gespraechsstand as GS
+
+try:
+    import gpuzustand
+except Exception:                                    # Selbsttest ohne core/ im Pfad
+    class gpuzustand:                                # type: ignore[no-redef]
+        @staticmethod
+        def kaputt(): return False
+
+        @staticmethod
+        def sicherstellen(): pass
+
+        @staticmethod
+        def pruefen(*a): return False
+
 try:
     from paths import INSTALL as _INSTALL
 except Exception:                                    # Selbsttest ohne Bootstrap
@@ -58,29 +73,24 @@ PROVIDER = "gguf"
 VORGABE_KONTEXT = 25600                # 25k: schnelles Vorlesen des Verlaufs, wenig VRAM; mehr über /kontext
 VORGABE_TOK_S = 30
 MAX_ANTWORT = 8192
-ANLEITUNG_MARKE = "📘 Anleitung „{}“ (von NemiCLI nachgereicht, gilt ab jetzt):"
+ANLEITUNG_MARKE = GS.ANLEITUNG_MARKE
 # Stehen Treffer oder Anleitungen vor der Nachricht, markiert das, worauf geantwortet wird.
-NACHRICHT_MARKE = "# Die Nachricht deines Gegenübers – darauf antwortest du (alles darüber ist Hintergrund):\n"
-KURZ_OHNE_SUCHE = 4                 # weniger Wörter und kein „?“: keine Gedächtnissuche
+NACHRICHT_MARKE = GS.NACHRICHT_MARKE
+KURZ_OHNE_SUCHE = GS.KURZ_OHNE_SUCHE
 # Werkzeug-Ergebnisse vor der letzten echten Nachricht: nur der Anfang bleibt im Kontext
 ERGEBNIS_LANG = 1200                # ab so vielen Zeichen wird gekürzt
 ERGEBNIS_ANFANG = 400               # so viel bleibt stehen
-# Stand des Gesprächs: Zusammenfassung des ausgelagerten Teils, vor der ersten Nachricht
-STAND_MARKE = "# Stand des Gesprächs bis hierher (deine Zusammenfassung des ausgelagerten Teils):\n"
-STAND_MAX = 2500                    # Zeichen
+# Stand des Gesprächs: Zusammenfassung des ausgelagerten Teils, vor der ersten Nachricht (gespraechsstand)
+STAND_MARKE = GS.MARKE
+STAND_MAX = GS.MAX_ZEICHEN
+STAND_SYSTEM = GS.SYSTEM
 # Doppelpuffer: Platz für Nachrichten = Kontext ohne Anleitung (Systemprompt, Werkzeuge) und ohne
 # Antwort-Reserve. Belegen die Nachrichten nach einer Antwort mehr als PUFFER_AB davon, räumt NemiCLI im
 # Hintergrund auf – Älteres in den Stand des Gesprächs, die neuesten (bis PUFFER_BEHALTEN des Platzes)
 # bleiben – und liest den neuen Kontext schon vor. Der Abstand dazwischen ist Puffer für die nächsten
 # Runden; die nächste Nachricht liest nur sich.
-PUFFER_AB = 0.75
-PUFFER_BEHALTEN = 0.35
-STAND_SYSTEM = (
-    "Du schreibst den „Stand des Gesprächs“ für dich selbst: Der ältere Teil des Chats fällt gleich aus "
-    "deinem Kontext, danach arbeitest du nur mit dieser Zusammenfassung weiter. Deutsch, Stichpunkte, "
-    "höchstens 15 Zeilen: Ziel und Wünsche des Gegenübers, Entscheidungen, Erledigtes, Offenes, wichtige "
-    "Fakten (Namen, Pfade, Zahlen, Befehle). Schreib den bisherigen Stand fort, nichts erfinden, nur die "
-    "Stichpunkte.")
+PUFFER_AB = GS.PUFFER_AB
+PUFFER_BEHALTEN = GS.PUFFER_BEHALTEN
 
 
 def _ergebnis_kurz(text: str) -> str:
@@ -105,6 +115,9 @@ _lock = threading.Lock()                             # ein Modell, eine Rechnung
 _lade_lock = threading.Lock()                        # ein Ladevorgang zur Zeit
 _stopp = threading.Event()                           # entladen() läuft an: Hintergrund-Arbeit hört auf
 _motor = None                                        # (Pfad, Kontext, Engine)
+# Jedes entladen() zählt hoch: ein Ladevorgang, der währenddessen lief (Modellwechsel mitten im Laden),
+# behält sein Modell danach nicht, sonst bliebe es im Grafikspeicher, obwohl es keiner mehr will.
+_abbestellt = 0
 
 
 # ---------------------------------------------------------------------------
@@ -212,7 +225,7 @@ def system_nachricht(system: str, dialekt=None):
 
 
 def doppelpuffer() -> bool:
-    """Hintergrund-Aufräumen ab PUFFER_AB (`gguf_doppelpuffer`, Preview, Vorgabe an)."""
+    """Hintergrund-Aufräumen ab PUFFER_AB (`gguf_doppelpuffer`, Preview, Vorgabe an; gilt auch für Ollama)."""
     return bool(_config().get("gguf_doppelpuffer", True))
 
 
@@ -581,7 +594,9 @@ def _motor_laden(name: str):
     ctx = kontext(name)
     if _motor is not None and _motor[0] == datei and _motor[1] == _schluessel(name):
         return _motor[2]
+    gpuzustand.sicherstellen()
     entladen()
+    auftrag = _abbestellt
     _torch_bereit()
     from ggufengine import Engine
     frei = _frei_vram()
@@ -592,8 +607,17 @@ def _motor_laden(name: str):
     _DBG.motor_log()
     _DBG.ereignis(f"Modell laden: {name} (Kontext {v.n_ctx}, Gesprächsspeicher {v.bits} Bit, KV im VRAM "
                   f"{v.kv_vram}, frei {frei}, Experten-Budget {v.experten}, Schichten-Budget {v.schichten})")
-    engine = Engine(str(datei), n_ctx=v.n_ctx, verbose=False, max_tok_s=tok_s(), kv_bits=v.bits,
-                    experts_vram=v.experten, kv_gpu_tokens=v.kv_vram, weights_vram=v.schichten)
+    meldung = None
+    try:
+        engine = Engine(str(datei), n_ctx=v.n_ctx, verbose=False, max_tok_s=tok_s(), kv_bits=v.bits,
+                        experts_vram=v.experten, kv_gpu_tokens=v.kv_vram, weights_vram=v.schichten)
+    except Exception as e:
+        # Nur den Text behalten: der Traceback hielte die halb geladene Engine (Datei-Abbild, festgenagelter
+        # Speicher, Tensoren) fest – unter Windows bliebe sogar die GGUF-Datei gesperrt.
+        meldung, art = str(e) or type(e).__name__, type(e)
+    if meldung is not None:
+        _nach_fehlschlag_aufraeumen()
+        raise (art if art in (RuntimeError, ValueError, MemoryError, OSError) else RuntimeError)(meldung)
     engine.kv_im_vram = v.kv_vram
     engine.kv_bits_wahl = v.bits
     _DBG.ereignis(f"Modell geladen: {name}")
@@ -606,6 +630,10 @@ def _motor_laden(name: str):
         _DBG.ereignis("Experten-Lager: Zählung vom letzten Mal übernommen")
     _trt_anbinden(engine, datei)
     _motor = (datei, _schluessel(name), engine)
+    if _abbestellt != auftrag:                       # während des Ladens abgewählt: gleich wieder frei
+        del engine
+        entladen("während des Ladens abgewählt")
+        raise MotorWeg(f"{name} wurde während des Ladens abgewählt")
     _leerlauf_starten()
     _lora_abgleich(engine, datei)
     return engine
@@ -668,6 +696,26 @@ LEIHE_WARTEN_S = 5.0                                 # so lange wartet entladen(
 LEERLAUF_PRUEFEN_S = 30.0
 
 
+def _nach_fehlschlag_aufraeumen() -> None:
+    """Nach einem gescheiterten Laden: Reste einsammeln, festgenagelten Speicher und CUDA-Zwischenspeicher frei."""
+    import gc
+    gc.collect()
+    try:
+        import gpuzustand
+        if gpuzustand.kaputt():
+            return
+    except Exception:
+        pass
+    try:
+        import torch
+        from ggufengine.models.common import release_pinned_memory
+        release_pinned_memory()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 @contextlib.contextmanager
 def geliehen(engine):
     """`with geliehen(engine):` – rechnen mit dem geladenen Modell. MotorWeg, wenn es nicht mehr das geladene
@@ -706,11 +754,13 @@ def versucht_geliehen(engine):
 def runde():
     """Eine Runde (Antwort mit Werkzeugen) läuft: das Modell wird in der Zeit nicht wegen Leerlaufs entladen."""
     global _runden
-    _runden += 1
+    with _ZAEHLER_SPERRE:
+        _runden += 1
     try:
         yield
     finally:
-        _runden -= 1
+        with _ZAEHLER_SPERRE:
+            _runden -= 1
 
 
 def _belegt() -> int:
@@ -725,7 +775,12 @@ def entladen(grund: str = "") -> None:
     """Gibt VRAM und RAM des Sprachmodells frei (Modellwechsel, Leerlauf), samt Bildbeschreiber – wie Ollama:
     keine neuen Leihen, laufende Arbeit hört auf (Stopp-Signal) und wird abgewartet (höchstens LEIHE_WARTEN_S),
     dann wird die Engine geleert. Ihr Speicher ist damit frei, auch wenn noch irgendwo jemand sie hält."""
-    global _motor, _entladen_laeuft
+    global _motor, _entladen_laeuft, _abbestellt
+    _abbestellt += 1                                 # auch ohne geladenes Modell: ein laufendes Laden behält es nicht
+    if gpuzustand.kaputt():                          # Freigeben in einer unbrauchbaren CUDA-Sitzung kann abstürzen
+        if _motor is not None:
+            _DBG.ereignis(f"Entladen übersprungen{' (' + grund + ')' if grund else ''}: CUDA-Sitzung unbrauchbar")
+        return
     try:
         import bildbeschreiber
         bildbeschreiber.entladen()
@@ -834,6 +889,7 @@ def _leerlauf_starten() -> None:
 
 
 _bild_tiefe = 0
+_ZAEHLER_SPERRE = threading.Lock()
 
 
 @contextlib.contextmanager
@@ -842,6 +898,7 @@ def gpu_fuer_bild():
     danach zurück auf die GPU. Ein Embedding-Modell auf der GPU wird entladen.
     Verschachtelt zählt nur der äußerste Aufruf."""
     global _bild_tiefe
+    gpuzustand.sicherstellen()
     if _bild_tiefe == 0:
         try:
             import memory
@@ -852,8 +909,10 @@ def gpu_fuer_bild():
     if engine is None:
         yield
         return
-    _bild_tiefe += 1
-    if _bild_tiefe == 1:
+    with _ZAEHLER_SPERRE:                            # Bildserie und Chat-Bild können gleichzeitig malen
+        _bild_tiefe += 1
+        erster = _bild_tiefe == 1
+    if erster:
         with versucht_geliehen(engine) as da, _lock:
             if da:
                 engine.offload()
@@ -862,8 +921,10 @@ def gpu_fuer_bild():
     try:
         yield
     finally:
-        _bild_tiefe -= 1
-        if _bild_tiefe == 0:
+        with _ZAEHLER_SPERRE:
+            _bild_tiefe -= 1
+            letzter = _bild_tiefe == 0
+        if letzter:
             with versucht_geliehen(engine) as da, _lock:
                 if da:                               # inzwischen entladen: nichts zurückzuholen
                     engine.restore()
@@ -956,10 +1017,31 @@ class _Denktrenner:
         return raus
 
 
-def _trenner(engine) -> _Denktrenner:
+class _Kettentrenner:
+    """Erst die eigenen Denk-Marken des Modells, im Antworttext danach <think>…</think> (Denkwerk:
+    erbetenes Nachdenken bei Modellen, deren eigene Marken anders heißen)."""
+
+    def __init__(self, erster: _Denktrenner):
+        self.erster, self.zweiter = erster, _Denktrenner("plain")
+
+    def _weiter(self, teile) -> list[tuple[str, str]]:
+        raus: list[tuple[str, str]] = []
+        for art, text in teile:
+            raus += [(art, text)] if art == "thinking" else self.zweiter(text)
+        return raus
+
+    def __call__(self, stueck: str) -> list[tuple[str, str]]:
+        return self._weiter(self.erster(stueck))
+
+    def ende(self) -> list[tuple[str, str]]:
+        return self._weiter(self.erster.ende()) + self.zweiter.ende()
+
+
+def _trenner(engine):
     fmt = engine.chat_format
     fmt.thinking = denken()
-    return _Denktrenner(fmt.fmt, offen=fmt.opens_thinking)
+    eigen = _Denktrenner(fmt.fmt, offen=fmt.opens_thinking)
+    return eigen if eigen.AUF == "<think>" else _Kettentrenner(eigen)
 
 
 def _ist_ergebnis(inhalt) -> bool:
@@ -1014,7 +1096,14 @@ class GgufChat:
         self._puffer: asyncio.Task | None = None    # laufendes Hintergrund-Aufräumen / Vorlesen
         self._puffer_hinweis = ""
         self._puffer_system = ""                     # Anleitung der letzten Antwort (fürs Vorlesen)
+        self._kompakt_text = ""                      # Bilanz des letzten Aufräumens (/compact)
         self._platz_cache: tuple = (None, (0, 0))
+        self.denk_hinweis = ""                       # Denkwerk: nur mit der nächsten gesendeten Nachricht
+
+    @property
+    def denkt_selbst(self) -> bool:
+        """Eigenes Nachdenken des Modells ist eingeschaltet (Config `gguf_denken`)."""
+        return denken()
 
     async def schliessen(self, warten_s: float = 5.0) -> None:
         """Modellwechsel: die Hintergrund-Arbeit (Doppelpuffer: Vorlesen, Zusammenfassen) anhalten – sie hält das
@@ -1041,23 +1130,9 @@ class GgufChat:
 
     # -- intern ---------------------------------------------------------------
     def _anleitungen_fuer(self, user_text: str) -> str:
-        """Anleitungen, die zu dieser Nachricht passen und im Verlauf noch fehlen:
-        Stichworte des Nutzers und das erste Ergebnis eines Werkzeugs mit eigenem Thema."""
-        import persona
-        if user_text.startswith("Ergebnis von '"):             # Werkzeug-Ergebnisse, kein Nutzertext
-            import re
-            werkzeuge = re.findall(r"(?m)^Ergebnis von '(\w+)'", user_text)
-            themen = [t for t in map(persona.thema_fuer_werkzeug, werkzeuge) if t]
-        else:
-            themen = persona.passende_anleitungen(user_text)
-        gezeigt = {t for m in self.messages if m.get("role") == "user"
-                   for t in persona.ANLEITUNGEN
-                   if ANLEITUNG_MARKE.format(t) in self._zusatz.get(m, "gesendet", "")}
-        teile = []
-        for t in dict.fromkeys(themen):
-            if t not in gezeigt:
-                teile.append(ANLEITUNG_MARKE.format(t) + "\n" + persona.anleitung(t))
-        return "\n\n".join(teile)
+        """Anleitungen, die zu dieser Nachricht passen und im Verlauf noch fehlen (gespraechsstand)."""
+        return GS.anleitungen_fuer(user_text, [self._zusatz.get(m, "gesendet", "") for m in self.messages
+                                               if m.get("role") == "user"])
 
     @staticmethod
     def _letzte_echte(verlauf: list[dict]) -> int:
@@ -1122,48 +1197,33 @@ class GgufChat:
         except Exception:
             pass
 
-    async def _stand_fortschreiben(self, weg: list[dict], n_ctx: int, hintergrund: bool = False) -> bool:
+    async def _stand_fortschreiben(self, weg: list[dict], n_ctx: int, hintergrund: bool = False,
+                                   fehler_melden: bool = False) -> bool:
         """Stand des Gesprächs um die ausgelagerten Nachrichten `weg` ergänzen (eigener Modell-
-        Aufruf ohne Denken). Schlägt er fehl, bleibt der alte Stand. True = fortgeschrieben."""
+        Aufruf ohne Denken). Schlägt er fehl, bleibt der alte Stand. True = fortgeschrieben.
+        `fehler_melden`: Fehler des Modell-Aufrufs weitergeben statt False (/compact)."""
         grenze = max(4000, int((n_ctx - antwort_reserve(n_ctx) - 1000) * 2.5))   # Zeichen Eingabe
-        teile, summe = [], 0
-        for m in weg:
-            inhalt = m.get("content")
-            if not isinstance(inhalt, str):
-                inhalt = " ".join(b.get("text", "") for b in inhalt or [] if isinstance(b, dict))
-            if _ist_ergebnis(inhalt):
-                inhalt = _ergebnis_kurz(inhalt)
-            stueck = ("Gegenüber" if m.get("role") == "user" else "Du") + ": " + inhalt.strip()[:1500]
-            if summe + len(stueck) > grenze:
-                teile.append("… (weitere Nachrichten gekürzt)")
-                break
-            teile.append(stueck)
-            summe += len(stueck)
-        if not teile:
-            return False
-        text = ((f"Bisheriger Stand:\n{self.stand}\n\n" if self.stand else "")
-                + "Diese Nachrichten fallen jetzt aus dem Kontext:\n\n" + "\n\n".join(teile))
+
+        async def fragen(system: str, text: str) -> str:
+            return await self._einmal(system, [{"role": "user", "content": text}], max_tokens=GS.ANTWORT_TOKEN,
+                                      denken_aus=True, hintergrund=hintergrund)
         try:
-            neu = await self._einmal(STAND_SYSTEM, [{"role": "user", "content": text}], max_tokens=900,
-                                     denken_aus=True, hintergrund=hintergrund)
+            neu = await GS.fortschreiben(fragen, self.stand, weg, grenze, kuerzen=_ergebnis_kurz)
         except Exception:
+            if fehler_melden:
+                raise
             return False
-        if not neu.strip():
+        if not neu:
             return False
-        self.stand = neu.strip()[:STAND_MAX]
+        self.stand = neu
         return True
 
     def _behalten_ab(self, budget: int) -> int:
         """Index der ersten Nachricht, die stehen bleibt: die neuesten, zusammen höchstens `budget`
         Token (so wie sie gesendet werden), mindestens die letzten zwei."""
         import pricing
-        summe, n = 0, 0
-        for m in reversed(self.messages):
-            k = pricing.est_tokens(self._zusatz.get(m, "gesendet", m.get("content")))
-            if n >= 2 and summe + k > budget:
-                break
-            summe, n = summe + k, n + 1
-        return len(self.messages) - n
+        return GS.behalten_ab(self.messages, budget,
+                              lambda m: pricing.est_tokens(self._zusatz.get(m, "gesendet", m.get("content"))))
 
     def _naechster_anfang(self, system: str, engine) -> list:
         """Der Anfang des nächsten Prompts – so dargestellt, wie ihn die nächste echte Nachricht
@@ -1177,7 +1237,7 @@ class GgufChat:
 
         def lesen():
             with versucht_geliehen(engine) as da, _lock:
-                if (not da or _stopp.is_set()                                      # entladen / Wechsel
+                if (not da or _stopp.is_set() or gpuzustand.kaputt()               # entladen / Wechsel / GPU-Fehler
                         or _bild_tiefe or engine.offloaded):                       # ein Bild entsteht gerade
                     return 0
                 engine.chat_format.thinking = denken()
@@ -1185,34 +1245,58 @@ class GgufChat:
                     return engine.vorlesen(anfang, abbruch=_stopp.is_set)
         return await asyncio.to_thread(lesen)
 
-    async def _aufraeumen(self, engine, system: str) -> None:
+    async def _aufraeumen(self, engine, system: str, behalten: float = PUFFER_BEHALTEN,
+                          kompakt: bool = False) -> int:
         """Doppelpuffer: Älteres in den Stand des Gesprächs (und über `weggefallen` ins Gedächtnis),
-        die neuesten Nachrichten bleiben, der neue Kontext wird schon vorgelesen."""
+        die neuesten Nachrichten bleiben (`behalten` des Platzes), der neue Kontext wird schon vorgelesen.
+        `kompakt` (/compact): Fehler beim Zusammenfassen gehen an den Aufrufer. Gibt die Zahl der
+        ausgelagerten Nachrichten zurück."""
         import pricing
         t0, vorher = time.time(), engine._pos
         alt = self.messages
-        n = pricing.schnitt(alt, self._behalten_ab(int(PUFFER_BEHALTEN * self._platz(engine, system)[1])))
+        n = pricing.schnitt(alt, self._behalten_ab(int(behalten * self._platz(engine, system)[1])))
         if n <= 0:
-            return
-        _DBG.ereignis(f"Doppelpuffer: {n} Nachrichten in den Stand, {len(alt) - n} bleiben")
+            return 0
+        _DBG.ereignis(f"{'/compact' if kompakt else 'Doppelpuffer'}: {n} Nachrichten in den Stand, "
+                      f"{len(alt) - n} bleiben")
         # erst der Stand, dann der Schnitt: bricht die Zusammenfassung ab (Entladen, Bild), fehlt nichts
-        if not await self._stand_fortschreiben(alt[:n], engine.n_ctx, hintergrund=True) or self.messages is not alt:
-            return
+        if (not await self._stand_fortschreiben(alt[:n], engine.n_ctx, hintergrund=True, fehler_melden=kompakt)
+                or self.messages is not alt):
+            if kompakt:
+                raise RuntimeError("Das Modell hat keine Zusammenfassung geschrieben – der Verlauf bleibt, wie er war.")
+            return 0
         gezaehlt = getattr(self, "aufgeraeumt", 0)
         pricing.abschneiden(self, n)
         self.aufgeraeumt = gezaehlt                  # eigener Hinweis statt „Kontext voll“
         self._zusatz.aufraeumen(self.messages)
         gelesen = await self._vorlesen(engine, system)
         self._kontext_melden()
-        self._puffer_hinweis = (f"📌 Kontext im Hintergrund aufgeräumt: {n} ältere Nachrichten stehen jetzt im Stand "
-                                f"des Gesprächs (und im Gedächtnis), {len(self.messages)} bleiben – "
-                                f"{vorher:,} → {engine._pos:,} Token, {gelesen:,} vorgelesen in "
-                                f"{time.time() - t0:.1f} s.").replace(",", ".")
+        text = (f"{n} ältere Nachrichten stehen jetzt im Stand des Gesprächs (und im Gedächtnis), "
+                f"{len(self.messages)} bleiben – {vorher:,} → {engine._pos:,} Token, {gelesen:,} vorgelesen in "
+                f"{time.time() - t0:.1f} s.").replace(",", ".")
+        self._puffer_hinweis = ("" if kompakt else "📌 Kontext im Hintergrund aufgeräumt: " + text)
+        self._kompakt_text = text
+        return n
+
+    async def kompakt(self) -> str:
+        """/compact: jetzt zusammenfassen – Älteres in den Stand des Gesprächs, nur die neuesten
+        Nachrichten (KOMPAKT_BEHALTEN des Platzes, mindestens zwei) bleiben. "" = nichts zu tun."""
+        import persona
+        async for _ in self._puffer_abwarten():
+            pass
+        if len(self.messages) < 3:
+            return ""
+        with runde():
+            engine = await self._laden()
+            system = await persona.build_system_prompt_async("", kompakt_fuer_lokal=True, mit_gedaechtnis=False)
+            n = await self._aufraeumen(engine, system, behalten=GS.KOMPAKT_BEHALTEN, kompakt=True)
+            self._puffer_system = system
+        return f"📌 Zusammengefasst: {self._kompakt_text}" if n else ""
 
     def _hintergrund(self, engine, system: str, aufraeumen: bool) -> None:
         """Aufräumen (ab PUFFER_AB) oder nur den Gesprächsanfang wieder vorlesen – im Hintergrund,
         hinter einer schon laufenden Arbeit; die nächste Nachricht wartet darauf (`_puffer_abwarten`)."""
-        if not doppelpuffer() or not system or not self.messages:
+        if not doppelpuffer() or not system or not self.messages or gpuzustand.kaputt():
             return
         if aufraeumen:
             anleitung, platz = self._platz(engine, system)
@@ -1223,8 +1307,8 @@ class GgufChat:
             if vorher is not None:
                 with contextlib.suppress(Exception):
                     await vorher
-            if _motor is None or _motor[2] is not engine or _bild_tiefe:   # entladen, gewechselt, Bild: nichts tun
-                return
+            if _motor is None or _motor[2] is not engine or _bild_tiefe or gpuzustand.kaputt():
+                return                                 # entladen, gewechselt, Bild, GPU-Fehler: nichts tun
             try:
                 if aufraeumen:
                     await self._aufraeumen(engine, system)
@@ -1253,7 +1337,8 @@ class GgufChat:
         fortgesetzten Gespräch): Modell im Hintergrund laden und gleich aufräumen wie der Doppelpuffer,
         statt bis zur nächsten Nachricht zu warten. Die nächste Nachricht wartet darauf. `fertig` wird
         danach aufgerufen. True = gestartet."""
-        if not doppelpuffer() or not self.messages or (self._puffer is not None and not self._puffer.done()):
+        if (not doppelpuffer() or not self.messages or gpuzustand.kaputt()
+                or (self._puffer is not None and not self._puffer.done())):
             return False
         try:
             import hintergrund
@@ -1270,7 +1355,7 @@ class GgufChat:
             import persona
             try:
                 engine = await self._laden()
-                system = await persona.build_system_prompt_async("", kompakt_fuer_lokal=True)
+                system = await persona.build_system_prompt_async("", kompakt_fuer_lokal=True, mit_gedaechtnis=False)
                 await self._aufraeumen(engine, system)
                 self._puffer_system = system
             except (asyncio.CancelledError, MotorWeg):
@@ -1359,6 +1444,7 @@ class GgufChat:
 
         def arbeiten():
             try:
+                gpuzustand.sicherstellen()
                 while _bild_tiefe and not abbruch.is_set():   # das Bildmodell hat die GPU allein
                     if hintergrund:
                         raise RuntimeError("Ein Bild entsteht gerade")
@@ -1393,6 +1479,8 @@ class GgufChat:
                             loop.call_soon_threadsafe(schlange.put_nowait, rest)
             except BaseException as exc:                     # an den Aufrufer weiterreichen
                 _DBG.fehler("Erzeugen", exc)
+                if gpuzustand.pruefen(exc):                  # statt der CUDA-Meldung: was jetzt zu tun ist
+                    exc = gpuzustand.GpuKaputt()
                 loop.call_soon_threadsafe(schlange.put_nowait, exc)
             loop.call_soon_threadsafe(schlange.put_nowait, ENDE)
 
@@ -1484,12 +1572,14 @@ class GgufChat:
             # Systemprompt ohne Gedächtnis-Treffer (bleibt gleich -> Präfix-Cache);
             # die Treffer und nachgereichte Anleitungen gehören zu dieser Nachricht.
             t = time.time()
-            system = await persona.build_system_prompt_async("", kompakt_fuer_lokal=True)
+            system = await persona.build_system_prompt_async("", kompakt_fuer_lokal=True, mit_gedaechtnis=False)
             treffer = await asyncio.to_thread(_gedaechtnis, user_text)
             zeiten["vorbereitung"] = time.time() - t
+            denk, self.denk_hinweis = self.denk_hinweis, ""
             vorsatz = [t.strip() for t in (treffer, self._anleitungen_fuer(user_text)) if t and t.strip()]
-            if vorsatz:
-                self._zusatz.von(frage)["gesendet"] = "\n\n".join(vorsatz + [NACHRICHT_MARKE + user_text])
+            if vorsatz or denk:                          # Denkwerk-Hinweis hinter die Nachricht
+                gesendet = "\n\n".join(vorsatz + [NACHRICHT_MARKE + user_text]) if vorsatz else user_text
+                self._zusatz.von(frage)["gesendet"] = f"{gesendet}\n\n{denk}" if denk else gesendet
             zusammengefasst: set[int] = set()
             for _ in range(3):                           # der neue Stand braucht selbst etwas Platz
                 await asyncio.to_thread(self._einpassen, engine, system)
@@ -1652,7 +1742,17 @@ def prefix_laden(name: str, engine, system: str) -> bool:
     if engine._pos != 0 or pfad is None or not pfad.is_file() or not system:
         return False
     ids = engine.chat_format.encode([system_nachricht(system, sprache(engine))], add_generation_prompt=False)
-    return engine.load_prefix(str(pfad), _prefix_kennung(name, engine), ids)
+    # Wie jede Rechnung: geliehen und unter der Sperre – load_prefix setzt KV-Speicher und Ringe zurück.
+    with geliehen(engine), _lock:
+        if engine._pos != 0:
+            return False
+        try:
+            return engine.load_prefix(str(pfad), _prefix_kennung(name, engine), ids)
+        except Exception:
+            # Unpassender oder kaputter Stand: weg damit, sonst scheitert jede Nachricht daran.
+            engine.reset()
+            pfad.unlink(missing_ok=True)
+            return False
 
 
 def prefix_speichern(name: str, engine) -> bool:
@@ -1662,7 +1762,8 @@ def prefix_speichern(name: str, engine) -> bool:
         return False
     try:
         pfad.parent.mkdir(parents=True, exist_ok=True)
-        return engine.save_prefix(str(pfad), _prefix_kennung(name, engine))
+        with geliehen(engine), _lock:
+            return engine.save_prefix(str(pfad), _prefix_kennung(name, engine))
     except Exception:
         return False
 
@@ -1673,14 +1774,15 @@ def werkzeug_block_fertig(text: str) -> bool:
 
 
 def _bild_aus_uri(uri: str):
-    """data:image/…;base64,… -> PIL-Bild."""
+    """data:image/…;base64,… -> PIL-Bild (aufgerichtet, Transparenz auf Weiß)."""
     import base64
     import io
     from PIL import Image
+    import vision
     kopf, _, daten = uri.partition(",")
     if not kopf.startswith("data:image/") or ";base64" not in kopf:
         raise ValueError("kein Bild (data:image/…;base64 erwartet)")
-    return Image.open(io.BytesIO(base64.b64decode(daten))).convert("RGB")
+    return vision.aufrecht(Image.open(io.BytesIO(base64.b64decode(daten))))
 
 
 def _kodieren(engine, uris: list[str]) -> list:
@@ -1690,12 +1792,13 @@ def _kodieren(engine, uris: list[str]) -> list:
 
 
 def _gedaechtnis(frage: str) -> str:
-    """Gedächtnis-Treffer zur Nachricht; bei Kurzem ohne Frage (Gruß, „ok“) keine – die
-    Treffer wären nur ähnlich kurze Nachrichten, und kleine Modelle antworten dann darauf."""
-    if len(frage.split()) < KURZ_OHNE_SUCHE and "?" not in frage:
+    """Gedächtnis-Treffer zur Nachricht aus der Suche der Runde (persona, läuft schon seit dem Absenden im
+    Hintergrund, gewartet wird höchstens GS.TREFFER_WARTEN_S). Bei Kurzem ohne Frage keine, bei Werkzeug-
+    Ergebnissen auch nicht – die Treffer stehen schon an der Nachricht der Runde."""
+    if GS.ohne_treffer(frage) or GS.ist_ergebnis(frage):
         return ""
     try:
-        import indexdb
-        return indexdb.guide_block(frage) or ""
+        import persona
+        return persona.gedaechtnis_treffer(frage, GS.TREFFER_WARTEN_S) or ""
     except Exception:
         return ""

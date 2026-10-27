@@ -150,10 +150,35 @@ def trainieren(name: str | None = None, *, bilder: list[Path] | None = None, sch
     arbeit = _trainieren_krea if motor_ziel(motor) == KREA_ZIEL else _trainieren
     if not _LAEUFT.acquire(blocking=False):
         raise RuntimeError("Es läuft schon ein LoRA-Training")
+    meldung = None
     try:
         return arbeit(name, bilder, schritte, rang, lr, modell, ziel, text, on_status, abbruch)
+    except Exception as e:
+        # Nur den Text behalten: der Traceback hielte DiT, LoRA-Schichten, Optimierer und Latents
+        # (mehrere GB VRAM) fest, bis irgendwann die Speicherbereinigung läuft.
+        meldung = str(e) or type(e).__name__
     finally:
         _LAEUFT.release()
+    gpu_aufraeumen()
+    raise RuntimeError(meldung)
+
+
+def gpu_aufraeumen() -> None:
+    """Nach Abbruch oder Fehler: Python-Reste einsammeln und den CUDA-Zwischenspeicher leeren."""
+    import gc
+    gc.collect()
+    try:
+        import gpuzustand
+        if gpuzustand.kaputt():
+            return
+    except Exception:
+        pass
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
 
 
 def _fortsetzen(stand: Path, schichten: dict, opt, info: dict, on_status) -> int:

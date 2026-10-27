@@ -20,7 +20,7 @@ from torch.utils.checkpoint import checkpoint
 from ggufengine.models.common import rms_norm
 from ggufengine.quant import dequantize
 
-from .adapter import BAUARTEN, schichten
+from .adapter import BAUARTEN, bloecke, schichten
 
 LOGIT_STUECK = 256                       # Positionen je Logit-Rechnung (Wortschatz ist groß)
 
@@ -91,13 +91,18 @@ def _delta_folge(q, k, v, g, beta, C: int = 64):
     return torch.stack(teile, 1).reshape(H, n * C, Dv)[:, :L].transpose(0, 1)
 
 
+def fuer(model, arch: str, **kw) -> "Lernweg":
+    """Der Lernweg zur Bauart des Modells."""
+    return (Gemma4Lernweg if arch == "gemma4" else Lernweg)(model, arch, **kw)
+
+
 class Lernweg:
     """LoRA-Parameter + differenzierbarer Vorwärtsweg für ein geladenes qwen35-Modell."""
 
     def __init__(self, model, arch: str, rang: int = 16, alpha: float | None = None):
         if arch not in BAUARTEN:
             raise ValueError(f"Für die Bauart {arch} gibt es noch keinen Lernweg (vorhanden: {', '.join(BAUARTEN)}).")
-        if any(getattr(b, "moe", False) for b in model.blocks):
+        if any(getattr(b, "moe", False) for b in bloecke(model)):
             raise ValueError("Modelle mit Experten (MoE) werden noch nicht trainiert.")
         self.model = model
         self.rang = int(rang)
@@ -202,17 +207,21 @@ class Lernweg:
                 h = self._block(blk, h, pos3)
         return rms_norm(h, self.model.out_norm, self.eps)
 
-    def logits(self, ids: torch.Tensor) -> torch.Tensor:
-        """Logits aller Positionen (nur für Tests und kurze Folgen)."""
-        h = self.verborgen(ids, sparen=False)
+    def _kopf(self, h: torch.Tensor) -> torch.Tensor:
         return _Gefroren.apply(h, self.model.lm_head).float()
 
-    def verlust(self, ids: torch.Tensor, maske: torch.Tensor) -> torch.Tensor:
-        """Mittlere Kreuzentropie der nächsten Token an den Stellen, wo `maske` (L,) wahr ist."""
+    def logits(self, ids: torch.Tensor) -> torch.Tensor:
+        """Logits aller Positionen (nur für Tests und kurze Folgen)."""
+        return self._kopf(self.verborgen(ids, sparen=False))
+
+    def verlust(self, ids: torch.Tensor, maske: torch.Tensor, gewicht: torch.Tensor | None = None) -> torch.Tensor:
+        """Mittlere Kreuzentropie der nächsten Token an den Stellen, wo `maske` (L,) wahr ist; `gewicht` (L,):
+        wie stark jedes Token zählt (gewichtetes Mittel)."""
         h = self.verborgen(ids)[:-1]             # Zeile i sagt Token i+1 voraus
         ziel = ids[1:]
         zaehlen = maske[1:]
-        n = int(zaehlen.sum())
+        w = gewicht[1:].float() if gewicht is not None else torch.ones(ziel.shape, device=ids.device)
+        n = float(w[zaehlen].sum())
         if n == 0:
             raise ValueError("Beispiel ohne Antwort-Token")
         summe = h.new_zeros(())
@@ -221,9 +230,86 @@ class Lernweg:
             if not bool(teil.any()):
                 continue
             summe = summe + checkpoint(self._stueck_verlust, h[s:s + LOGIT_STUECK][teil], ziel[s:s + LOGIT_STUECK][teil],
-                                       use_reentrant=False)
+                                       w[s:s + LOGIT_STUECK][teil], use_reentrant=False)
         return summe / n
 
-    def _stueck_verlust(self, h: torch.Tensor, ziel: torch.Tensor) -> torch.Tensor:
-        logits = _Gefroren.apply(h, self.model.lm_head).float()
-        return F.cross_entropy(logits, ziel, reduction="sum")
+    def _stueck_verlust(self, h: torch.Tensor, ziel: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        return (F.cross_entropy(self._kopf(h), ziel, reduction="none") * w).sum()
+
+
+class Gemma4Lernweg(Lernweg):
+    """Gemma 4 (E2B/E4B und dicht): wie Gemma4Model._run für eine ganze Folge ab Position 0 – Sliding-Window-
+    und Voll-Schichten, geteilte K/V der letzten Schichten, Einbettung je Schicht (PLE), Logit-Softcap."""
+
+    def _ple_zeilen(self, ids: torch.Tensor) -> torch.Tensor:
+        """Zeilen der Einbettung je Schicht (L, n_layer * n_pl); liegt die Tabelle im RAM, dort gelesen."""
+        m = self.model
+        if m.ple_ram:
+            gepackt = m.pl_embed.rows.index_select(0, ids.cpu()).to(ids.device)
+            return dequantize(gepackt.reshape(-1), m.pl_embed.ggml_type, ids.numel() * m.pl_embed.n_embd,
+                              torch.float32).view(ids.numel(), -1)
+        return m.pl_embed(ids).float()
+
+    def _schicht(self, s, h: torch.Tensor, pos: torch.Tensor, ple, quelle):
+        """Eine Schicht; gibt (h, k, v) zurück – k/v für die Schichten, die sie teilen."""
+        L = h.shape[0]
+        x = rms_norm(h, s.attn_norm, s.eps)
+        if s.qkv is not None:
+            q, k, v = self._lin(s, "qkv", x).split([s.H * s.D, s.Hkv * s.D, s.Hkv * s.D], dim=-1)
+        else:
+            q = self._lin(s, "q", x)
+        q = s.rope(rms_norm(q.reshape(L, s.H, s.D), s.q_norm, s.eps), pos)
+        if s.has_kv:
+            if s.qkv is None:
+                k = self._lin(s, "k", x)
+                v = self._lin(s, "v", x) if s.v is not None else k
+            k = s.rope(rms_norm(k.reshape(L, s.Hkv, s.D), s.k_norm, s.eps), pos)
+            v = rms_norm(v.reshape(L, s.Hkv, s.D), 1.0, s.eps)
+        else:
+            k, v = quelle
+        abstand = pos.unsqueeze(1) - pos.unsqueeze(0)
+        maske = abstand >= 0
+        if s.window > 0:
+            maske = maske & (abstand < s.window)
+        o = F.scaled_dot_product_attention(q.transpose(0, 1)[None], k.transpose(0, 1)[None], v.transpose(0, 1)[None],
+                                           attn_mask=maske, scale=1.0, enable_gqa=s.Hkv != s.H)[0].transpose(0, 1)
+        h = h + rms_norm(self._lin(s, "o", o.reshape(L, -1)), s.post_attn_norm, s.eps)
+        f = rms_norm(h, s.ffn_norm, s.eps)
+        f = self._lin(s, "down", F.gelu(self._lin(s, "gate", f), approximate="tanh") * self._lin(s, "up", f))
+        h = h + rms_norm(f, s.post_ffn_norm, s.eps)
+        if s.ple:
+            g = F.gelu(_Gefroren.apply(h, s.inp_gate), approximate="tanh") * ple
+            h = h + rms_norm(_Gefroren.apply(g, s.proj), s.post_norm, s.eps)
+        if s.out_scale is not None:
+            h = h * s.out_scale
+        return h, k, v
+
+    def verborgen(self, ids: torch.Tensor, sparen: bool = True) -> torch.Tensor:
+        m = self.model
+        L = ids.numel()
+        if L > m.n_ctx:
+            raise ValueError(f"Beispiel mit {L} Token ist länger als das Kontextfenster ({m.n_ctx}).")
+        h = m.embed(ids).float() * m.embd_scale
+        ple = None
+        if m.n_pl > 0:
+            n_layer = m.hp["n_layer"]
+            pl = self._ple_zeilen(ids).view(L, n_layer, m.n_pl) * math.sqrt(m.n_pl)
+            proj = (_Gefroren.apply(h, m.pl_proj) / m.embd_scale).view(L, n_layer, m.n_pl)
+            ple = (rms_norm(proj, m.pl_norm, self.eps) + pl) * (1.0 / math.sqrt(2.0))
+        pos = torch.arange(L, device=ids.device)
+        geteilt: dict[bool, tuple] = {}
+        for i, s in enumerate(m.layers):
+            teil = ple[:, i] if ple is not None else None
+            quelle = geteilt.get(s.is_swa)
+            if sparen and torch.is_grad_enabled():
+                h, k, v = checkpoint(self._schicht, s, h, pos, teil, quelle, use_reentrant=False)
+            else:
+                h, k, v = self._schicht(s, h, pos, teil, quelle)
+            if s.has_kv:
+                geteilt[s.is_swa] = (k, v)
+        return rms_norm(h, m.out_norm, self.eps)
+
+    def _kopf(self, h: torch.Tensor) -> torch.Tensor:
+        logits = super()._kopf(h)
+        cap = self.model.hp["softcap"]
+        return cap * torch.tanh(logits / cap) if cap > 0 else logits

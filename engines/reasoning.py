@@ -58,6 +58,9 @@ OLLAMA_CLOUD: dict[str, dict] = {
     "kimi-k2.6":           {"ctx":   262_144, "think": (False, True), "default": True},
     "kimi-k2.7-code":      {"ctx":   262_144, "think": (False, True), "default": True},
     "kimi-k3":             {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "max"},
+    # Kimi K3.1 Pro: Denken nicht abschaltbar (platform.kimi.ai, Quickstart, 25.10.2026)
+    "kimi-k3.1-pro":       {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
+    "kimi-k3.1-pro-highspeed": {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
     "minimax-m2.7":        {"ctx":   196_608, "think": (True,), "default": True},
     "minimax-m3":          {"ctx":   512_000, "think": None, "default": None},
     "mistral-large-3":     {"ctx":   262_144, "think": None, "default": None},
@@ -123,6 +126,8 @@ def profile(ref: str | None) -> str | None:
             return "ollama_effort"
         if provider == "ollama_cloud" and family in OLLAMA_CLOUD:
             return "ollama_cloud"
+    if provider == "moonshot" and ollama_family(model) in OLLAMA_CLOUD:
+        return "moonshot"            # Kimi direkt beim Hersteller: dieselben Stufen, reasoning_effort oben
     if provider == "openai":
         # Offizielle datierte Snapshots derselben bekannten Modellfamilien.
         base = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)
@@ -139,7 +144,18 @@ def request_options(provider: str, model: str, strength: str | None,
     bezahlt wird nur, was wirklich geschrieben wird."""
     kind = profile(f"{provider}:{model}")
     if kind is None:
+        if provider not in ("ollama", "ollama_cloud"):
+            # Andere Anbieter lehnen einen Deckel über dem Modell-Maximum ab (gpt-4o: 16k → 400);
+            # ohne Angabe gilt ihr eigenes Maximum. Der kleine Helfer-Deckel passt überall.
+            return {"max_tokens": HELPER_BUDGET} if helper else {}
         return {"max_tokens": HELPER_BUDGET if helper else UNKNOWN_BUDGET}
+    if kind == "moonshot":
+        # Ohne Deckel gilt das Maximum des Herstellers (131.072); temperature & Co. sind dort fest.
+        opts = {"max_completion_tokens": CLOUD_HELPER_BUDGET} if helper else {}
+        effort = cloud_effort(ollama_family(model), normalize_strength(strength), helper=helper)
+        if effort:
+            opts["reasoning_effort"] = effort
+        return opts
     if kind == "ollama_cloud":
         # Flatrate-Modelle mit riesigem Fenster: der Haupt-Agent behält den hohen
         # Deckel (Denken zählt mit), Helfer bekommen genug Luft und Stufe niedrig.
@@ -162,7 +178,7 @@ def strength_menu(ref: str | None) -> dict[str, str]:
     kind = profile(ref)
     if kind is None:
         return {}
-    if kind == "ollama_cloud":
+    if kind in ("ollama_cloud", "moonshot"):
         _prov, _, model = (ref or "").partition(":")
         fam = ollama_family(model)
         info = OLLAMA_CLOUD[fam]
@@ -178,7 +194,8 @@ def strength_menu(ref: str | None) -> dict[str, str]:
                 txt = "Denken an (Voreinstellung)"
             else:
                 txt = f"Denkstufe {e}"
-            out[key] = f"{txt} · Kontext {ctx} Tokens · Antwort bis 65.536"
+            antwort = "131.072" if kind == "moonshot" else "65.536"
+            out[key] = f"{txt} · Kontext {ctx} Tokens · Antwort bis {antwort}"
         return out
     if kind == "kimi":
         return {key: "Thinking an · bis zu " + f"{budget:,}".replace(",", ".")
@@ -201,6 +218,8 @@ def strength_note(ref: str | None, strength: str | None) -> str:
         return description + ". Kimi bietet keine getrennten Denkstufen; geändert wird das Budget."
     if kind == "ollama_cloud":
         return description + " (Ollama Cloud, Stand 19.09.2026)."
+    if kind == "moonshot":
+        return description + " (Moonshot, Stand 25.10.2026)."
     if strength == "max":
         return description + " für Denken und Antwort; keine zusätzliche Denkstufe."
     return description + "."

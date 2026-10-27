@@ -1074,8 +1074,8 @@ class WanDiT:
         q, k, v = (t.transpose(0, 1)[None] for t in (q, k, v))                  # (1, Köpfe, S, d), ohne Kopie
         if q.is_cuda and not self._kein_cudnn:
             try:
-                from torch.nn.attention import SDPBackend, sdpa_kernel
-                with sdpa_kernel(SDPBackend.CUDNN_ATTENTION):       # nur cuDNN – eine Liste nähme torch' Reihenfolge
+                from ggufengine.models.common import cudnn_zuerst
+                with cudnn_zuerst():                                # Reihenfolge, kein Ausschluss (gilt prozessweit)
                     out = F.scaled_dot_product_attention(q, k, v)
                 return out[0].transpose(0, 1).flatten(1)
             except Exception:
@@ -1421,10 +1421,12 @@ _TIMER: threading.Timer | None = None
 def _frei():
     import gc
     import torch
+    from krea import gpu_sperre
     gc.collect()
     if torch.cuda.is_available():
-        torch.cuda.synchronize()
-        torch.cuda.empty_cache()
+        with gpu_sperre():
+            torch.cuda.synchronize()
+            torch.cuda.empty_cache()
 
 
 def _kopie(obj, device, pin: bool = False):
@@ -1498,6 +1500,10 @@ def entladen() -> None:
         if _TIMER is not None:
             _TIMER.cancel()
             _TIMER = None
+        zustand = __import__("sys").modules.get("gpuzustand")
+        if zustand is not None and zustand.kaputt():   # gepinnten RAM freizugeben kann dann abstürzen
+            _DBG.ereignis("Videomotor: Entladen übersprungen – CUDA-Sitzung unbrauchbar")
+            return
         _RAM.clear()
         try:
             from trtmotor import video as _tv
@@ -1947,7 +1953,10 @@ def generate(prompt: str, *, sekunden: float = 5.0, startbild: str | None = None
             dauer = time.time() - t0
         except Exception as e:                                         # nur Text: kein Tensor am Traceback
             fehler = f"{type(e).__name__}: {e}"
-        _frei()
+        try:
+            _frei()
+        except Exception:                           # CUDA nach einem Fehler unbrauchbar: die Meldung zählt
+            pass
         _uhr_neu()
         if fehler:
             raise RuntimeError(f"Video: {fehler}")

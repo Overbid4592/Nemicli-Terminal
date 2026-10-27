@@ -45,6 +45,21 @@ def _claude_content(text: str, images: list[str] | None):
     return blocks
 
 
+def _mit_hinweis(verlauf: list[dict], hinweis: str) -> list[dict]:
+    """Denkwerk-Hinweis hinter die letzte Nutzernachricht – nur in der gesendeten Fassung."""
+    if not hinweis or not verlauf or verlauf[-1].get("role") != "user":
+        return verlauf
+    letzte = verlauf[-1]
+    inhalt = letzte.get("content")
+    if isinstance(inhalt, str):
+        neu = f"{inhalt}\n\n{hinweis}"
+    elif any(isinstance(b, dict) and b.get("type") == "tool_result" for b in inhalt or []):
+        return verlauf                             # Werkzeug-Ergebnisse bleiben unberührt
+    else:
+        neu = list(inhalt or []) + [{"type": "text", "text": hinweis}]
+    return verlauf[:-1] + [dict(letzte, content=neu)]
+
+
 _ERGEBNIS = re.compile(r"(?m)^(?=Ergebnis von '\w+' \()")
 INTERLEAVED_BETA = "interleaved-thinking-2025-05-14"     # ältere Claude-4-Modelle; neuere denken so ohnehin
 
@@ -86,7 +101,10 @@ class Chat:
         self.strength = strength
         self.messages: list[dict] = []
         self._tools: list[dict] | None = None
+        self.denk_hinweis = ""                     # Denkwerk: nur mit der nächsten gesendeten Nachricht
         self._kette_leeren()
+
+    denkt_selbst = True                            # adaptives Thinking ist immer an
 
     def reset(self) -> None:
         self.messages = []
@@ -138,7 +156,8 @@ class Chat:
         pricing.kuerzen(self)
         if len(self.messages) < vorher:                # Kette verschoben: diesmal als Text
             self._kette_leeren()
-        api_verlauf = self._api_verlauf(user_text)
+        api_verlauf = _mit_hinweis(self._api_verlauf(user_text), self.denk_hinweis)
+        self.denk_hinweis = ""
         if self._tools is None:
             self._tools = werkzeug_schemas()
         if hinweis := pricing.aufraeum_hinweis(self):
@@ -157,7 +176,7 @@ class Chat:
                 model=self.model,
                 system=system_prompt,
                 messages=api_verlauf,
-                max_tokens=8192,
+                max_tokens=32000,                       # lange Dateien + adaptives Denken
                 tools=self._tools,
                 extra_body=extra_body,
                 extra_headers={"anthropic-beta": INTERLEAVED_BETA},
@@ -197,6 +216,14 @@ class Chat:
         # (z.B. wenn das Modell nur "thinking" lieferte). Platzhalter sichert die
         # gültige user/assistant-Abwechslung im Verlauf.
         aufrufe = [b for b in final.content if getattr(b, "type", "") == "tool_use"]
+        if aufrufe and getattr(final, "stop_reason", "") == "max_tokens":
+            # Am Längenlimit abgerissen: der letzte Aufruf hat womöglich nur halbe Felder (z. B. eine
+            # halbe Datei als Inhalt) – nichts davon ausführen.
+            aufrufe = []
+            hinweis = ("\n\n⚠ Antwort am Längenlimit abgeschnitten – den Werkzeugaufruf habe ich verworfen. "
+                       "Bitte in kleineren Schritten (z. B. Datei in Teilen) weitermachen.")
+            full += hinweis
+            yield {"type": "text", "text": hinweis}
         for a in aufrufe:                              # fürs Hauptprogramm: als ```aktion-Block
             text = als_aktion(a.name, a.input)
             full += text

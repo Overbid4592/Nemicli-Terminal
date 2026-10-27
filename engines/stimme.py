@@ -18,6 +18,7 @@ from __future__ import annotations
 import json
 import queue
 import re
+import sys
 import tempfile
 import threading
 import time
@@ -129,9 +130,19 @@ def _laden():
         _zuletzt = time.time()
         if _modell is not None:
             return _modell
+        if (zustand := sys.modules.get("gpuzustand")) is not None:
+            zustand.sicherstellen()
         if not verfuegbar():
             raise RuntimeError("Kein Stimm-Modell gefunden – ein Ordner unter Vision/ mit dem "
                                "Qwen3-TTS-Talker und dem 12-Hz-Tokenizer (GGUF) fehlt.")
+        try:
+            import hintergrund
+            belegt = hintergrund.gpu_belegt()
+        except Exception:
+            belegt = None
+        if belegt:                                     # Video/Bild-Serie rechnet: nicht danebenladen
+            raise RuntimeError(f"Die Grafikkarte rechnet gerade ({belegt.get('titel') or 'Hintergrundaufgabe'}) – "
+                               "die Stimme spricht wieder, sobald sie fertig ist.")
         import torch
         from ggufengine.gguf import GGUFFile
         from ggufengine.models.qwen3tts import Qwen3TTSCodec, Qwen3TTSTalker
@@ -155,6 +166,8 @@ def freigeben() -> None:
     with _lock:
         if _modell is None:
             return
+        if (zustand := sys.modules.get("gpuzustand")) is not None and zustand.kaputt():
+            return                                   # Freigeben in einer unbrauchbaren CUDA-Sitzung kann abstürzen
         _modell = None
         try:
             import gc
@@ -194,6 +207,9 @@ def nach_dem_sprechen() -> None:
 
 
 def _waechter_starten() -> None:
+    if any(t.name == "stimme-freigabe" and t.is_alive() for t in threading.enumerate()):
+        return                                         # einer genügt, auch nach schnellem Neuladen
+
     def warten():
         while _modell is not None:
             time.sleep(30)

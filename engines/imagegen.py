@@ -4,6 +4,7 @@ imagegen.py - Weiche für den Bild-Motor: wer malt, mit welchen Angaben.
   krea   eigene Krea-2-Pipeline (krea.py) – der Standard
   webui  Forge/A1111 über /sdapi/v1/…    (sdwebui.py)
   comfy  ComfyUI über /prompt + /history  (comfyui.py)
+  cloud  OpenAI, Google, xAI              (videobildcloud.py) – ohne eigene Grafikkarte
 
 Eine externe Stelle gilt nur, wenn sie ausdrücklich gewählt ist UND gerade läuft –
 sonst malt Krea 2. Die frühere eigene SD-1.5/SDXL-Pipeline ist entfernt.
@@ -14,17 +15,49 @@ from __future__ import annotations
 import re
 
 
+def _ollama_freigeben() -> None:
+    """Ein lokales Ollama hält sein Modell nach jeder Antwort minutenlang im Grafikspeicher – daneben passt
+    Krea 2 nicht, und unter WDDM gibt es dann keinen Fehler, sondern stilles Auslagern (Hänger)."""
+    try:
+        import config
+        if not config.load().get("ollama_beim_malen_entladen", True):
+            return
+        import providers
+        namen = providers.ollama_gpu_freigeben()
+    except Exception as e:
+        namen = []
+        try:
+            import debugbericht
+            debugbericht.fehler("Ollama entladen", e)
+        except Exception:
+            pass
+    if namen:
+        try:
+            import debugbericht
+            debugbericht.ereignis(f"Ollama-Modell für die GPU-Arbeit entladen: {', '.join(namen)}")
+        except Exception:
+            pass
+
+
 def _gpu_fuer_bild(fn):
     """Beim Malen hat das Bildmodell die GPU allein: ein geladenes lokales
-    Sprachmodell (gguflokal) wartet solange im RAM."""
+    Sprachmodell (gguflokal) wartet solange im RAM, ein Ollama-Modell wird entladen."""
     import functools
     import sys
 
+    ist_paint = getattr(fn, "__name__", "") == "paint"
+
     @functools.wraps(fn)
     def huelle(*args, **kw):
+        if ist_paint and backend() == CLOUD:
+            return fn(*args, **kw)                 # die Cloud braucht die Grafikkarte nicht
+        zustand = sys.modules.get("gpuzustand")
+        if zustand is not None:
+            zustand.sicherstellen()                # nach einem CUDA-Speicherfehler malt nichts mehr
         st = sys.modules.get("stimme")
         if st is not None:
             st.gpu_freigeben()                     # die Stimme lädt beim nächsten Satz neu
+        _ollama_freigeben()                        # Ollama lädt beim nächsten Chat selbst neu
         lokal = sys.modules.get("gguflokal")
         if lokal is None:
             return fn(*args, **kw)
@@ -33,8 +66,9 @@ def _gpu_fuer_bild(fn):
     return huelle
 
 
-_EXTERN = {"webui": "sdwebui", "comfy": "comfyui"}
+_EXTERN = {"webui": "sdwebui", "comfy": "comfyui", "cloud": "videobildcloud"}
 KREA = "krea"
+CLOUD = "cloud"
 
 
 def _extern_modul(key: str):
@@ -80,7 +114,7 @@ def missing_reason_aktiv() -> str | None:
         grund = krea.missing_reason()
         if grund is None:
             return None                       # Krea 2 springt ein
-        name = "ComfyUI" if gewaehlt == "comfy" else "die WebUI"
+        name = {"comfy": "ComfyUI", "cloud": "die Cloud (kein Schlüssel)"}.get(gewaehlt, "die WebUI")
         try:
             adresse = f" ({_extern_modul(gewaehlt).host()})"
         except Exception:
@@ -93,6 +127,9 @@ def missing_reason_aktiv() -> str | None:
 def active_label() -> str:
     """Menschlicher Name des aktiven Bild-Modells (für Statusausgaben)."""
     art = backend()
+    if art == CLOUD:
+        import videobildcloud
+        return videobildcloud.label("bild")
     if art == "webui":
         import sdwebui
         return f"🌐 WebUI · {sdwebui.chosen_model() or sdwebui.current_model() or '?'}"
@@ -146,8 +183,11 @@ def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
     keinen Negativ-Prompt und keine CFG; die externen Stellen schon. `vorlage`/`staerke`
     (Bild umzeichnen) nur mit Krea 2. `figur`: die Persönlichkeit selbst ist im Bild – Krea nimmt dann
     ihre Charakter-LoRA dazu, falls es eine gibt.
-    Ein geladenes lokales Sprachmodell wartet solange im RAM (gguflokal)."""
+    Ein geladenes lokales Sprachmodell wartet solange im RAM (gguflokal) – nicht bei der Cloud; dort gilt
+    auch kein Modellname (er gehört zu Krea/WebUI/ComfyUI), der Anbieter nimmt sein Modell."""
     art = backend()
+    if art == CLOUD:
+        return _extern_modul(art).generate(prompt, neg=neg, size=size, on_status=on_status)
     if art in _EXTERN:
         return _extern_modul(art).generate(
             prompt, model=model, neg=neg, steps=steps, cfg=cfg,
