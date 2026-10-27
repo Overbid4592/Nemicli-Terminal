@@ -1,6 +1,6 @@
 # Bauplan: Modell-Datenbank und `ausfüll.py`
 
-*Idee von David, 13. Oktober 2026 · Bauplan von Claude · Stand: Phasen 1–4 gebaut (13.10.), Phase 5 offen*
+*Idee von Hoffmann Vibecoder, 13. Oktober 2026 · Bauplan von Claude · Stand: Phasen 1–4 gebaut (13.10.), Phase 5 offen*
 
 ## Die Idee in einem Satz
 
