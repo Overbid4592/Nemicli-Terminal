@@ -14,7 +14,7 @@
 
 **Developed by D. Hoffmann (Vibecoder) · built with Claude Opus 5.5 (Anthropic)**
 
-[Deutsch](README.md) · [Latest alpha release](https://github.com/Overbid4592/Nemicli-Terminal/releases/tag/nemicli)
+[Deutsch](README.md) · [Releases](https://github.com/Overbid4592/Nemicli-Terminal/releases)
 
 </div>
 
@@ -32,7 +32,7 @@ The core is **pure Python — no Node.js, npm, llama.cpp, or transformers depend
 
 ### 🔢 Version history
 
-The German README explains a version-number correction: after 8.9 the project continued with 8.10 through 8.23 even though the major version should have become 9. On October 26, 2026 it was renamed **9.23 Alpha**, without changing historical changelog entries. The [current public GitHub release](https://github.com/Overbid4592/Nemicli-Terminal/releases/tag/nemicli) is named **NemiCLI 9.24 Alpha**.
+After 8.9, versions continued as 8.10–8.23; the project was renamed **9.23 Alpha** on October 26, 2026. Historical changelog entries keep their original version numbers. The [current public GitHub release](https://github.com/Overbid4592/Nemicli-Terminal/releases) is named **NemiCLI 9.24 Alpha**.
 
 ---
 
@@ -70,7 +70,7 @@ Features listed here reflect the project's documentation and may be experimental
 
 **Option 1 — `start.bat`:** Double-click the starter. It checks Python and the environment and offers to install missing packages. Then use `/einrichten` for an isolated Python environment, dependencies and the CUDA-enabled torch installation appropriate for your GPU.
 
-**Option 2 — installer:** Download the Windows installer from the [latest release](https://github.com/Overbid4592/Nemicli-Terminal/releases/tag/nemicli). The alpha release includes `NemicliPublish.exe` and a separate SHA-256 file. Models are not bundled; configure a cloud API key, an external local server or GGUF models using `/einrichten`.
+**Option 2 — Windows setup EXE:** Download `NemicliPublish.exe` from the [releases](https://github.com/Overbid4592/Nemicli-Terminal/releases), along with `NemicliPublish.sha256.txt` to verify the download. The currently published alpha asset is an `.exe`, not an `.msi` file. Models are not bundled; configure a cloud API key, an external local server or GGUF models using `/einrichten`.
 
 **Option 3 — source code:** Use the repository's Python entry point `main.py`, dependencies in `requirements.txt`, and follow the setup instructions in the [German README](README.md). Command names in NemiCLI intentionally remain German.
 
@@ -92,9 +92,9 @@ An optional performance path for supported NVIDIA RTX GPUs is documented in the 
 
 ## ⌨ Commands
 
-Type `/` – a menu with all commands appears (typing also searches the description). `/help`
+Type `/` — a menu with all commands appears (typing also searches the description). `/help`
 shows all of them. Commands with subitems open **a selection without an argument** (↑/↓ or 1–9, Enter, Esc).
-Or simply ask the AI – it knows all commands and opens suitable menus itself.
+Or simply ask the AI — it knows all commands and opens suitable menus itself.
 
 **Chat & models**
 
@@ -103,7 +103,7 @@ Or simply ask the AI – it knows all commands and opens suitable menus itself.
 | `/model [name\|huggingface]` | choose model, enter cloud key, fetch local model from Hugging Face |
 | `/kontext [8k…128k\|max\|8bit\|16bit]` | context of the local model, with VRAM display |
 | `/staerke [stufe]` | reasoning level/budget: `schnell` · `normal` · `stark` · `max` |
-| `/auto [an\|aus]` | Auto Strong (Ollama): use the large Gemma for difficult questions |
+| `/auto [an\|aus]` | Auto Strong (Ollama): Use a larger model for difficult questions |
 | `/persönlichkeiten [name\|neu]` | who speaks? Select or create new (also `/persona`) |
 | `/name [zeigen\|loeschen]` | 👤 About you: name, preferred form of address, what the AI should know |
 | `/resume [#]` · `/reset` · `/clear` | resume chat · new chat · clear screen |
@@ -165,9 +165,9 @@ Or simply ask the AI – it knows all commands and opens suitable menus itself.
 | `/theme` · `/emoji` · `/nemi` · `/statistik [reset]` | colors · emoji shortcuts · mascot · usage |
 | `/help` · `/exit` | help · exit |
 
-**Keys:** `Enter` send · `Strg+J` new line · `Esc` cancel · `F2` reasoning text ·
+**Keys:** `Enter` send · `Ctrl+J` new line · `Esc` cancel · `F2` reasoning text ·
 `F8` approve change · `F12` save entire conversation · `Shift+Tab` mode ·
-`Bild ↑/↓`, mouse wheel scroll · `Strg+C` copy selected text.
+`PgUp/PgDn`, mouse wheel scroll · `Ctrl+C` copy selected text.
 
 **Without interface:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"` ·
 `--auftrag <name>` (scheduled task without a window, answer becomes a report).
@@ -210,7 +210,7 @@ Nemicli-Terminal/
 ├─ einrichtungshelfer/     Setup assistant and bundled helper model files
 ├─ appstore_vorlagen/      Appstore templates
 ├─ chrome-erweiterung/     Chrome extension
-├─ installer/              Installer sources
+├─ installer/              Installer build sources (not a download format)
 ├─ docs/                   Documentation, plans and ideas
 ├─ .github/                GitHub workflows and templates
 ├─ build_exe.py            Executable build helper
