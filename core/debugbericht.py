@@ -1,7 +1,9 @@
 """Debugbericht: zeichnet auf, was ein NemiCLI-Prozess mit dem Grafikspeicher macht –
 Modelle laden/entladen/auslagern, Stimme, Bildbeschreiber, Embedding, Bildmotor, Runden,
 Werkzeuge, Modellwechsel und jeden Fehler (auch aus Threads und Hintergrund-Aufgaben).
-Dazu alle 10 s der Stand des Grafikspeichers, je Prozess (Windows-Leistungszähler über pdh.dll).
+Dazu alle 10 s der Stand des Grafikspeichers, je Prozess (Windows-Leistungszähler über pdh.dll), und der
+Arbeitsspeicher: eigener Prozess (RAM, gemeinsamer GPU-Speicher = festgenagelter RAM) in jeder Zeile,
+die größten RAM-Nutzer aller Programme mit der Prozess-Tabelle.
 
 Eine Datei je Prozess und Start: Debugbericht/<Datum>_<Rolle>_<PID>.log im Datenordner. Läuft immer
 (Konfiguration `debug` false schaltet ab; dann kosten alle Aufrufe nichts); die BEHALTEN neuesten Dateien
@@ -28,6 +30,7 @@ LOKAL = ("", "gguf", "ollama")    # Anbieter, deren Modelle den Bericht nicht le
 TAKT_S = 10                       # Abstand der Speicher-Zeilen
 PROZESSE_ALLE_S = 60              # Abstand der Prozess-Tabelle, wenn sich nichts bewegt
 BEWEGUNG_MB = 100                 # Prozess-Tabelle sofort, wenn ein Prozess so viel gewinnt/verliert
+RAM_NUTZER_MAX = 6                # so viele Programme in der Tabelle der RAM-Nutzer
 
 _lock = threading.Lock()
 _datei: Path | None = None
@@ -35,7 +38,9 @@ _rolle = ""
 _t0 = 0.0
 _takt: threading.Thread | None = None
 _zuletzt_prozesse: dict[int, int] = {}
+_zuletzt_gemeinsam: dict[int, int] = {}
 _zuletzt_tabelle = 0.0
+_nutzer_stand: tuple[list, float] = ([], 0.0)   # (ram_nutzer(), Zeit) – nur der Takt-Faden misst neu
 
 
 # ---------------------------------------------------------------------------
@@ -116,6 +121,7 @@ def neueste(rollen: tuple[str, ...] = ("haupt", "wache"), ordner_pfad: Path | No
 
 _TAKT = "  Takt   ["
 _TABELLE = "Prozesse mit Grafikspeicher"
+_RAM_TABELLE = "Größte Arbeitsspeicher-Nutzer"
 
 
 def verdichten(text: str, grenze: int = LESEN_MAX, tabelle_zeilen: int = 4) -> str:
@@ -149,7 +155,7 @@ def verdichten(text: str, grenze: int = LESEN_MAX, tabelle_zeilen: int = 4) -> s
             in_tabelle = False
             continue
         takt_schliessen()
-        if _TABELLE in zeile:
+        if _TABELLE in zeile or _RAM_TABELLE in zeile:
             in_tabelle, tabelle_n = True, 0
             aus.append(zeile)
             continue
@@ -200,14 +206,14 @@ def _sicht(text: str, was: str, ab: int, grenze: int) -> str:
         return "\n".join(aus) if aus else "(keine Fehler im Bericht)"
     if was == "speicher":
         merk = ("geladen", "entladen", "freigegeben", "in den RAM", "auf die GPU", "Bildmotor", "Modell laden",
-                "Takt", _TABELLE, "Doppelpuffer", "Zwischenspeicher", "Modellwechsel")
+                "Takt", _TABELLE, _RAM_TABELLE, "Doppelpuffer", "Zwischenspeicher", "Modellwechsel")
         aus, in_tabelle = [], False
         for z in zeilen:
             if z.startswith(" " * 20):
                 if in_tabelle:
                     aus.append(z)
                 continue
-            in_tabelle = _TABELLE in z
+            in_tabelle = _TABELLE in z or _RAM_TABELLE in z
             if any(m in z for m in merk):
                 aus.append(z)
         return verdichten("\n".join(aus), grenze, tabelle_zeilen=6)
@@ -243,9 +249,12 @@ def fuer_ki(grenze: int = LESEN_MAX, ordner_pfad: Path | None = None, was: str =
 def torch_speicher() -> dict | None:
     """belegt/reserviert (torch) und frei/gesamt (Treiber) in MB – None ohne CUDA."""
     t = sys.modules.get("torch")
-    if t is None or not t.cuda.is_available() or not t.cuda.is_initialized():
+    # Lädt ein anderer Faden torch gerade erst, steht es halb fertig in sys.modules (ohne .cuda) – nicht anfassen.
+    if t is None or getattr(getattr(t, "__spec__", None), "_initializing", False):
         return None
     try:
+        if not t.cuda.is_available() or not t.cuda.is_initialized():
+            return None
         frei, gesamt = t.cuda.mem_get_info()
         mb = 2 ** 20
         return {"belegt": t.cuda.memory_allocated() // mb, "reserviert": t.cuda.memory_reserved() // mb,
@@ -255,14 +264,15 @@ def torch_speicher() -> dict | None:
 
 
 class _Zaehler:
-    """\\GPU Process Memory(*)\\Dedicated Usage über pdh.dll – VRAM je Prozess, auch unter WDDM."""
+    """\\GPU Process Memory(*)\\<art> über pdh.dll – je Prozess, auch unter WDDM. `Dedicated Usage` ist der
+    VRAM, `Shared Usage` der gemeinsame GPU-Speicher: festgenagelter RAM, den Windows nicht auslagern darf."""
     MEHR_DATEN = 0x800007D2
     FMT_LARGE = 0x00000400
 
     class _Wert(ctypes.Structure):                # PDH_FMT_COUNTERVALUE (Status + größter Zweig)
         _fields_ = [("status", ctypes.c_uint32), ("wert", ctypes.c_longlong)]
 
-    def __init__(self) -> None:
+    def __init__(self, art: str = "Dedicated Usage") -> None:
         self.pdh = ctypes.WinDLL("pdh") if os.name == "nt" else None
         self.abfrage = ctypes.c_void_p()
         self.zaehler = ctypes.c_void_p()
@@ -274,7 +284,7 @@ class _Zaehler:
             getattr(self.pdh, f).restype = ctypes.c_uint32        # PDH_STATUS ist vorzeichenlos
         if self.pdh.PdhOpenQueryW(None, 0, ctypes.byref(self.abfrage)) != 0:
             return
-        pfad = "\\GPU Process Memory(*)\\Dedicated Usage"
+        pfad = f"\\GPU Process Memory(*)\\{art}"
         if self.pdh.PdhAddEnglishCounterW(self.abfrage, pfad, 0, ctypes.byref(self.zaehler)) != 0:
             self.pdh.PdhCloseQuery(self.abfrage)
             return
@@ -319,6 +329,7 @@ class _Zaehler:
 
 
 _zaehler: _Zaehler | None = None
+_zaehler_gemeinsam: _Zaehler | None = None
 
 
 def prozesse() -> list[tuple[str, int, int]]:
@@ -334,6 +345,74 @@ def prozesse() -> list[tuple[str, int, int]]:
     for pid, b in werte.items():
         aus.append((_prozessname(pid), pid, b // 2 ** 20))
     return sorted(aus, key=lambda x: -x[2])
+
+
+def gemeinsam() -> dict[int, int]:
+    """PID → MB gemeinsamer GPU-Speicher (festgenagelter RAM). Leer, wenn der Zähler fehlt."""
+    global _zaehler_gemeinsam
+    try:
+        if _zaehler_gemeinsam is None:
+            _zaehler_gemeinsam = _Zaehler("Shared Usage")
+        return {pid: b // 2 ** 20 for pid, b in _zaehler_gemeinsam.je_prozess().items() if b >= 2 ** 20}
+    except Exception:
+        return {}
+
+
+def ram_eigen() -> dict | None:
+    """Eigener Prozess in MB: ram (Arbeitssatz), privat (zugesagt), gemeinsam (festgenagelt). None ohne psutil."""
+    try:
+        import psutil
+        m = psutil.Process().memory_info()
+    except Exception:
+        return None
+    mb = 2 ** 20
+    return {"ram": m.rss // mb, "privat": getattr(m, "private", m.rss) // mb,
+            "gemeinsam": gemeinsam().get(os.getpid(), 0)}
+
+
+def ram_system() -> tuple[int, int] | None:
+    """(belegt, gesamt) des ganzen Rechners in MB."""
+    try:
+        import psutil
+        v = psutil.virtual_memory()
+    except Exception:
+        return None
+    return (v.total - v.available) // 2 ** 20, v.total // 2 ** 20
+
+
+def ram_nutzer(n: int = RAM_NUTZER_MAX) -> list[tuple[str, int, int]]:
+    """[(Programmname, Anzahl Prozesse, MB privat)] – Prozesse gleichen Namens zusammen
+    (ein Browser hat viele), größte zuerst."""
+    try:
+        import psutil
+    except Exception:
+        return []
+    summen: dict[str, list[int]] = {}
+    for pr in psutil.process_iter(["name", "memory_info"]):
+        info = pr.info
+        m = info.get("memory_info")
+        if m is None:
+            continue
+        name = info.get("name") or "?"
+        s = summen.setdefault(name, [0, 0])
+        s[0] += 1
+        s[1] += getattr(m, "private", m.rss)
+    aus = [(name, anz, b // 2 ** 20) for name, (anz, b) in summen.items()]
+    return sorted(aus, key=lambda x: -x[2])[:n]
+
+
+def _nutzer_jetzt() -> list[tuple[str, int, int]]:
+    """ram_nutzer() kostet einige 100 ms (alle Prozesse öffnen): neu gemessen wird nur außerhalb des
+    Haupt-Fadens und höchstens alle PROZESSE_ALLE_S, sonst gilt die letzte Messung."""
+    global _nutzer_stand
+    liste, zeit = _nutzer_stand
+    if threading.current_thread() is not threading.main_thread() and time.time() - zeit >= PROZESSE_ALLE_S - TAKT_S:
+        _nutzer_stand = liste, zeit = ram_nutzer(), time.time()
+    return liste
+
+
+def _gb(mb: int) -> str:
+    return f"{mb / 1024:.1f} GB".replace(".", ",")
 
 
 def _prozessname(pid: int) -> str:
@@ -363,12 +442,20 @@ def _schreiben(zeile: str) -> None:
             pass
 
 
+def _ram_kurz() -> str:
+    """Auf 0,1 GB gerundet, damit gleiche Takte weiter zu einer Spanne verschmelzen."""
+    r = ram_eigen()
+    if r is None:
+        return ""
+    return f" | RAM {_gb(r['ram'])} · privat {_gb(r['privat'])} · festgenagelt {_gb(r['gemeinsam'])}"
+
+
 def _speicher_kurz() -> str:
     s = torch_speicher()
     if s is None:
-        return "VRAM: torch nicht aktiv"
+        return "VRAM: torch nicht aktiv" + _ram_kurz()
     return (f"VRAM torch belegt {s['belegt']:,} MB, reserviert {s['reserviert']:,} MB | "
-            f"frei {s['frei']:,} / {s['gesamt']:,} MB").replace(",", ".")
+            f"frei {s['frei']:,} / {s['gesamt']:,} MB").replace(",", ".") + _ram_kurz()
 
 
 def ereignis(text: str, speicher: bool = True) -> None:
@@ -382,20 +469,33 @@ def ereignis(text: str, speicher: bool = True) -> None:
 
 
 def tabelle(grund: str = "") -> None:
-    """Alle Prozesse mit Grafikspeicher."""
-    global _zuletzt_prozesse, _zuletzt_tabelle
+    """Alle Prozesse mit Grafikspeicher (VRAM und festgenagelter RAM), danach die größten RAM-Nutzer."""
+    global _zuletzt_prozesse, _zuletzt_gemeinsam, _zuletzt_tabelle
     if _datei is None:
         return
     liste = prozesse()
+    geteilt = gemeinsam()
     _zuletzt_prozesse = {pid: mb for _, pid, mb in liste}
+    _zuletzt_gemeinsam = geteilt
     _zuletzt_tabelle = time.time()
     eigener = os.getpid()
+    vram = {pid: (name, mb) for name, pid, mb in liste}
+    pids = sorted(set(vram) | set(geteilt), key=lambda p: -(vram.get(p, ("", 0))[1] + geteilt.get(p, 0)))
     zeilen = [f"{_zeit()}  Prozesse mit Grafikspeicher{' – ' + grund if grund else ''}:"]
-    for name, pid, mb in liste[:12]:
+    for pid in pids[:12]:
+        name, mb = vram.get(pid) or (_prozessname(pid), 0)
+        fest = f"  + {geteilt[pid]:,} MB festgenagelt" if geteilt.get(pid) else ""
         markierung = "  <- dieser Prozess" if pid == eigener else ""
-        zeilen.append(f"{'':>24}{mb:>8,} MB  {name} ({pid}){markierung}".replace(",", "."))
-    if not liste:
+        zeilen.append(f"{'':>24}{mb:>8,} MB  {name} ({pid}){fest}{markierung}".replace(",", "."))
+    if not pids:
         zeilen.append(f"{'':>24}(Leistungszähler nicht verfügbar)")
+    nutzer = _nutzer_jetzt()
+    if nutzer:
+        system = ram_system()
+        kopf = f" (Rechner: {_gb(system[0])} von {_gb(system[1])} belegt)" if system else ""
+        zeilen.append(f"{_zeit()}  {_RAM_TABELLE}{kopf}:")
+        zeilen += [f"{'':>24}{mb:>8,} MB  {name}{f' ({anz} Prozesse)' if anz > 1 else ''}".replace(",", ".")
+                   for name, anz, mb in nutzer]
     _schreiben("\n".join(zeilen))
 
 
@@ -406,16 +506,23 @@ def _prozesse_bei_bewegung() -> None:
         return
     try:
         jetzt = {pid: mb for _, pid, mb in prozesse()}
+        geteilt = gemeinsam()
     except Exception:
         return
-    for pid in set(jetzt) | set(_zuletzt_prozesse):
-        if abs(jetzt.get(pid, 0) - _zuletzt_prozesse.get(pid, 0)) >= BEWEGUNG_MB:
-            tabelle("Bewegung")
-            return
+    for neu, alt in ((jetzt, _zuletzt_prozesse), (geteilt, _zuletzt_gemeinsam)):
+        for pid in set(neu) | set(alt):
+            if abs(neu.get(pid, 0) - alt.get(pid, 0)) >= BEWEGUNG_MB:
+                tabelle("Bewegung")
+                return
 
 
 def fehler(wo: str, exc: BaseException | None = None) -> None:
     """Fehler mit Rückverfolgung – der gerade behandelte oder `exc`."""
+    try:                                             # CUDA-Speicherfehler sperren die GPU, auch ohne Bericht
+        import gpuzustand
+        gpuzustand.pruefen(exc if exc is not None else traceback.format_exc())
+    except Exception:
+        pass
     if _datei is None:
         return
     if exc is not None:

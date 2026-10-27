@@ -19,9 +19,30 @@ async function einstellungen() {
   return { port: Number(s.port) || STANDARD_PORT, key: String(s.key || "") };
 }
 
+// Wie in background.js: erst prüfen, dass wirklich NemiCLI antwortet (HMAC über eine Zufallszahl),
+// dann Schlüssel und Seiteninhalt senden.
+let geprueft = { port: 0, bis: 0 };
+
+async function echtesNemi(port, key) {
+  if (geprueft.port === port && Date.now() < geprueft.bis) return;
+  const zufall = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  let antwort;
+  try {
+    antwort = await (await fetch(`http://127.0.0.1:${port}/hallo?nonce=${zufall}`)).json();
+  } catch (e) {
+    throw new Error("nicht-erreichbar");
+  }
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(`nemicli:${zufall}`)));
+  const soll = Array.from(sig, (b) => b.toString(16).padStart(2, "0")).join("");
+  if (!antwort || antwort.beweis !== soll) throw new Error("falscher-partner");
+  geprueft = { port, bis: Date.now() + 60000 };
+}
+
 async function anfrage(pfad, daten = {}) {
   const { port, key } = await einstellungen();
   if (!key) throw new Error("ohne-schluessel");
+  await echtesNemi(port, key);
   let r;
   try {
     r = await fetch(`http://127.0.0.1:${port}${pfad}`, {
@@ -55,6 +76,10 @@ function hinweis(fehler) {
     text.textContent = "NemiCLI läuft nicht (oder anderer Port). Starte NemiCLI, dann nochmal versuchen.";
     knopf.textContent = "Nochmal versuchen";
     knopf.onclick = () => laden();
+  } else if (fehler === "falscher-partner") {
+    text.textContent = "Auf diesem Port antwortet nicht NemiCLI (oder der Schlüssel stimmt nicht) – es wurde nichts gesendet. In NemiCLI /chrome tippen und Port und Schlüssel vergleichen.";
+    knopf.textContent = "Einstellungen öffnen";
+    knopf.onclick = () => chrome.runtime.openOptionsPage();
   } else {
     text.textContent = "⚠ " + fehler;
     knopf.textContent = "Nochmal versuchen";

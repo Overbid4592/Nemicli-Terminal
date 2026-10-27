@@ -21,11 +21,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "8.9 Alpha"
-STAND = "2026.10.18"
+VERSION = "9.24 Alpha"
+STAND = "2026.10.27"
 GEBURTSTAG = _dt.date(2026, 6, 19)
-AUTHOR = "VibeCoder (@Overbid4592)"
-BUILT_WITH = "Claude Opus 5 · Anthropic"
+AUTHOR = "D. Hoffmann (Vibecoder)"
+BUILT_WITH = "Claude Opus 5.5 · Anthropic"
 
 try:                                     # exe-Modus: Daten liegen neben der exe
     from paths import ROOT as _ROOT, INSTALL as _INSTALL, FROZEN as _FROZEN, ASSETS as _ASSETS
@@ -79,8 +79,9 @@ def build_nummer() -> str:
         for ort in (_INSTALL, _ASSETS):          # neben der exe, sonst in der exe
             if n:
                 break
-            try:
-                n = (ort / "build.txt").read_text(encoding="utf-8").strip().rsplit(".", 1)[-1]
+            try:                                 # „8.12.641“; ohne Git beim Bau steht dort nur „8.12“
+                teile = (ort / "build.txt").read_text(encoding="utf-8").strip().split(".")
+                n = teile[-1] if len(teile) >= 3 else ""
             except Exception:
                 n = ""
         _BUILD_CACHE = f"{_haupt_neben()}.{n}" if n.isdigit() else _haupt_neben()

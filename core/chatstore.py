@@ -72,7 +72,13 @@ def _name(ort: Path) -> str:
 
 def db_pfad(ort: Path | None = None) -> Path:
     ort = ort or ordner()
-    return ort / f"chat_{_name(ort)}.db"
+    soll = ort / f"chat_{_name(ort)}.db"
+    if not soll.exists() and ort != CHATS_DIR:
+        # Nach dem Umbenennen einer Persönlichkeit heißt die Datei im (mitgezogenen) Ordner noch wie früher.
+        alte = [p for p in ort.glob("chat_*.db") if p.is_file()]
+        if len(alte) == 1:
+            return alte[0]
+    return soll
 
 
 def backup_pfad(ort: Path | None = None) -> Path:
@@ -269,9 +275,14 @@ def zusammenfuehren(alt: list, neu: list) -> list:
     return neu
 
 
-def save(chat_id: int, messages: list, prompts: list[str], model: str) -> None:
+def _stand_schluessel(chat_id: int) -> str:
+    return f"gespraech:{int(chat_id)}"
+
+
+def save(chat_id: int, messages: list, prompts: list[str], model: str, stand: str | None = None) -> None:
     """Speichert den Verlauf. Hat der Kontext aufgeräumt, bleibt der ausgelagerte Anfang in der
-    Datenbank (und damit im Suchindex)."""
+    Datenbank (und damit im Suchindex). `stand`: Stand des Gesprächs (Zusammenfassung des
+    ausgelagerten Teils) – leer lässt den gespeicherten stehen."""
     if not prompts:
         return  # leere Chats nicht anlegen
     c = _verbinden(_ordner_fuer(chat_id))
@@ -280,6 +291,9 @@ def save(chat_id: int, messages: list, prompts: list[str], model: str) -> None:
         zeilen = zusammenfuehren(_gespeichert(c, chat_id), zeilen)        # gleiche Nachricht = gleiche Zeile
         _schreiben(c, chat_id, [], prompts, model, datetime.now().strftime("%Y-%m-%d %H:%M"),
                    zeilen=zeilen, bilder=bilder)
+        if stand:
+            c.execute("INSERT OR REPLACE INTO stand(schluessel, wert) VALUES (?, ?)",
+                      (_stand_schluessel(chat_id), stand))
         c.commit()
     finally:
         c.close()
@@ -307,8 +321,9 @@ def load(chat_id: int) -> dict | None:
             return None
         nachrichten = [_bilder_rein(json.loads(r[0]), lambda h: _bild(c, h)) for r in
                        c.execute("SELECT inhalt FROM nachrichten WHERE chat=? ORDER BY nr", (int(chat_id),))]
+        stand = c.execute("SELECT wert FROM stand WHERE schluessel=?", (_stand_schluessel(chat_id),)).fetchone()
         return {"id": int(chat_id), "title": kopf[0] or "", "model": kopf[1] or "", "updated": kopf[2] or "",
-                "prompts": json.loads(kopf[3] or "[]"), "messages": nachrichten}
+                "prompts": json.loads(kopf[3] or "[]"), "messages": nachrichten, "stand": (stand or [""])[0] or ""}
     except (sqlite3.Error, ValueError):
         return None
     finally:

@@ -41,9 +41,15 @@ class Cmd:
 
 COMMAND_LIST: list[Cmd] = [
     Cmd("/help", "Alle Befehle anzeigen"),
-    Cmd("/model", "KI-Modell wechseln (Cloud oder Lokal) · Modell von Hugging Face holen", "[name · huggingface]",
-        "KI-Modell wechseln (Cloud oder Lokal) – ohne Name: Auswahl-Menü. '/model huggingface' holt ein "
+    Cmd("/model", "KI-Modell wechseln (Cloud oder Lokal) · Modell von Hugging Face holen · Ersatzbank",
+        "[name · huggingface · ersatz]",
+        "KI-Modell wechseln (Cloud oder Lokal) – ohne Name: Auswahl-Menü mit 37 Cloud-Anbietern; lange Listen "
+        "(Anbieter, Modelle) haben oben 🔍 Suchen. '/model huggingface' holt ein "
         "lokales Modell: Größe und MoE wählen, Q4_K_M vorgeschlagen, Prüfung per SHA-256, fortsetzbar. "
+        "'/model ersatz' legt bis zu zwei Cloud-Modelle auf die Ersatzbank: Scheitert das aktive Modell "
+        "innerhalb von 30 Minuten fünfmal an einer Schutzsperre (geschützter Befehl, gesperrter Bereich), "
+        "wird es herausgefiltert und der erste Ersatz "
+        "springt ein – im Terminal, in der Kugel und beim Weckruf der Wache. "
         "Das laufende Gespräch geht weiter – das neue Modell liest den Verlauf als Text neu; "
         "frisch anfangen mit /reset. In der Liste steht auch ✨ Funke Groß, NemiCLIs eigenes kleines Modell "
         "(ohne Schlüssel, ohne Werkzeuge und Bilder; du/Sie, Länge und Emojis wählbar)."),
@@ -64,15 +70,22 @@ COMMAND_LIST: list[Cmd] = [
         "Malt ein Bild mit dem aktiven Motor. '/bild schritte' stellt die Krea-2-Schritte "
         "dauerhaft ein (8 bis 16, Auswahl mit Enter)."),
     Cmd("/video", "Video erzeugen 🎬 (eigener Motor, bis 20 s)",
-        "<beschreibung> [--sekunden 10] [--start bild.png] [--seed 1] [--schaerfe mittel] | modell [name] | ordner",
+        "<beschreibung> [--sekunden 10] [--start bild.png] [--seed 1] [--schaerfe mittel] | modell [name] | "
+        "cloud [google|xai|runway|fal|minimax|luma|aus|neu] | ordner",
         "🎬 Erzeugt ein Video mit dem eigenen Video-Motor (Wan 2.2 TI2V): 24 Bilder/s, Clips à 5 s aneinander "
         "bis 20 s. Ein Startbild (z. B. von /bild) hält die Figur; das letzte Bild liegt als .png daneben – "
         "Startbild für eine Fortsetzung. Modelle in VideoGen/<Name>/ (.gguf + VAE), geteilt: text_encoders/, tokenizer/. "
-        "Ohne Zusatz: Menü (Video 5/10/20 s, Modell wählen, Ordner öffnen)."),
-    Cmd("/bildmodel", "Bild-Modell wählen 🎨 (Krea 2 oder externe WebUI/ComfyUI)", "[name]",
+        "Ohne Zusatz: Menü (Video 5/10/20 s, Modell wählen, Ordner öffnen). `/video cloud google|xai|runway|fal`: "
+        "Videos aus der Cloud statt lokal (Google bis 10 s, xAI bis 15 s, Runway 5/10 s, MiniMax H3 bis 15 s, Luma Ray 3.2 5/10 s, fal.ai je nach Modell; mit "
+        "Startbild; ohne Schlüsselbilder, Seed, Schärfe), `/video cloud neu` richtet einen Anbieter mit Schlüssel ein, "
+        "`/video cloud aus` zurück."),
+    Cmd("/bildmodel", "Bild-Modell wählen 🎨 (Krea 2, externe WebUI/ComfyUI oder Cloud)", "[name|cloud …]",
         "🟣 Krea 2 (eigene Pipeline) ODER 🌐 Modelle einer laufenden Forge/A1111-WebUI bzw. "
-        "🧩 ComfyUI. Ohne Name: Menü. Die Wahl bleibt gespeichert; '/bildmodel webui-adresse' "
-        "ändert den WebUI-Host."),
+        "🧩 ComfyUI ODER ☁ Cloud ohne Grafikkarte (OpenAI, Google, xAI, Together mit dem Schlüssel von /model; "
+        "Black Forest Labs/FLUX.2, Ideogram, Runway, fal.ai, Stability, Recraft, Replicate, Luma mit eigenem Schlüssel – "
+        "'/bildmodel cloud neu' richtet ihn ein; "
+        "'/bildmodel cloud <anbieter>|aus'). Ohne Name: Menü (mit 🔍 Suchen). Die Wahl bleibt gespeichert; "
+        "'/bildmodel webui-adresse' ändert den WebUI-Host."),
     Cmd("/venv", "Fenster mit NemiCLIs venv öffnen 🪟 (torch selbst installieren)", "",
         "Öffnet eine Konsole mit aktiviertem venv und zeigt den torch-Befehl für diese Grafikkarte "
         "(NVIDIA: pip3 install torch torchvision --index-url …/cu132)."),
@@ -92,11 +105,16 @@ COMMAND_LIST: list[Cmd] = [
         "Programm-Ordner getrennt: so darf NemiCLI umziehen oder neu gebaut "
         "werden, ohne dass deine Daten das mitmachen. Es wird nichts gelöscht – "
         "beim Wechsel wird kopiert, das Original bleibt liegen."),
-    Cmd("/einrichten", "Einrichtungs-Assistent 🧰: Funke ✨ führt durchs Einrichten, installiert Fehlendes", "",
+    Cmd("/einrichten", "Einrichtungs-Assistent 🧰: Funke ✨ führt durchs Einrichten, installiert Fehlendes", "[modelle]",
         "🧰 Funke, NemiCLIs eigener kleiner Helfer (von null trainiert, läuft ohne Grafikkarte), fragt im "
         "Gespräch Anrede, Persönlichkeit und Cloud/lokal ab, prüft, was auf dem PC fehlt, und "
         "installiert es auf Wunsch selbst (Python, venv, Pakete). torch installierst du selbst im "
-        "venv-Fenster, das es dir öffnet (/venv). Die Modelle suchst du dir selbst aus"),
+        "venv-Fenster, das es dir öffnet (/venv). `/einrichten modelle` (auch am Ende der Einrichtung): "
+        "die Modelle der Motoren freiwillig nachladen – Gedächtnis, Reranker, Bildbeschreiber, Stimme, Musik, "
+        "Video, Porträt – mit Lizenz und Größe vorab, aus der offiziellen Quelle, SHA-256 geprüft, direkt in "
+        "den richtigen Ordner; Esc hält an, nochmal wählen setzt fort. Krea 2 nur als Hinweis (Ordner und "
+        "Link). Sprach-Modelle: /model. Wer durch die Einrichtung führt, wählst du am Anfang: Funke oder, sobald "
+        "ihr LoRA mitgeliefert ist, Gemma 4 E2B/E4B (Grundmodell Q4_K_M von unsloth, lädt /einrichten; braucht torch)"),
     Cmd("/selbsttest", "Selbsttest 🔧: Module, Ordner, Einrichtung prüfen", "",
         "🔧 Prüft ohne Neustart, ob alle Module laden, die Ordner da sind und die "
         "Einrichtung stimmt – dasselbe wie `NemiCLI.exe --selftest`, nur im Chat."),
@@ -125,8 +143,9 @@ COMMAND_LIST: list[Cmd] = [
         "Seed über den Bild-Motor, stellt sie frei und legt sie in Persoenlichkeiten/<Name>/ ab. "
         "`/kugel malen <beschreibung>` nimmt deine Beschreibung. `/kugel motive` zeigt 20 Bereiche "
         "mit 400 Motiven; `/kugel malen <nummer|bereich>` oder `alle` malt die fehlenden mit derselben "
-        "Figur (10 Schritte je Bild). `/kugel impuls an`: ab und an ein freier Moment – sie entscheidet "
-        "selbst, ob sie etwas sagt, malt oder still bleibt. `/kugel ankommen` (Vorgabe an): kommst du nach "
+        "Figur (10 Schritte je Bild). `/kugel impuls an`: ab und an (alle 1–3 h) ein freier Moment – "
+        "sie entscheidet selbst, ob sie etwas sagt, malt oder still bleibt; das steht auch im NemiCLI-Chat, und schaust "
+        "du nicht hin, kommt ein Hinweis neben der Uhr. Malen nur, wenn mehr als 5 GB Grafikspeicher frei sind. `/kugel ankommen` (Vorgabe an): kommst du nach "
         "mindestens 3 Stunden zurück, gibt es vielleicht eine Begrüßung an der Kugel. `/kugel leben` (Vorgabe an): "
         "sie schläft, wenn du weg bist, gähnt nachts, freut sich übers Streicheln (Maus kreisen) und setzt sich ab "
         "und zu auf die Kante des aktiven Fensters. `/kugel musik` (Vorgabe an): läuft Musik länger, sagt sie ab und zu "
@@ -136,7 +155,7 @@ COMMAND_LIST: list[Cmd] = [
     Cmd("/wache", "Systemwache 🛡: Sensoren, Regeln, lernendes Modell – im Hintergrund",
         "[status · alarme · start · stop · …]",
         "🛡 Die Wache läuft als Hintergrund-Prozess mit Symbol in der Taskleiste: Prozesse, "
-        "Netz und Dateien werden beobachtet, 14 Regeln und ein eigener Isolation Forest "
+        "Netz und Dateien werden beobachtet, 15 Regeln und ein eigener Isolation Forest "
         "bewerten, ab 200 Ereignissen wird trainiert, dann alle 200 von selbst. Dazu ein "
         "Folgen-Netz (GRU), das ungewöhnliche Abläufe in Prozess-Ketten erkennt – zuerst im "
         "Schattenmodus (nur Protokoll); scharf schaltest nur du mit /wache dl warnen. Bei Alarm "
@@ -146,6 +165,8 @@ COMMAND_LIST: list[Cmd] = [
         "trigger <mittel|hoch|kritisch|nie>, trigger <5–20> (ab so vielen ungeprüften Alarmen jeder "
         "Stufe wird sie geweckt und muss jeden bewerten; Standard 5), stumm/laut <R00x>, grenzen, training, selbsttest, "
         "dl [schatten|warnen|aus|an|zurueck|schwelle <x>] (Folgen-Netz: Stand, Schatten-Funde, Version zurückdrehen), "
+        "programm [<name> [tage] · stop <name> · status <name> · erlauben <name> <prozess>] (Programm-Absolvierung: die Wache lernt, welche Hintergrund-Prozesse ein Programm startet, und meldet danach Neues als R015 – oder der KI sagen „pass auf Steam auf“), "
+        "netz [adresse|Meldung einfügen|warnen|schatten|aus|an|zurueck|register an|aus] (Netzwächter: wer steckt hinter einer Adresse – Name, Besitzer laut Adressregister, ob NemiCLI selbst sie nutzt; ohne Zusatz die Verbindungen nach draußen mit Ampel; ML + DL beginnen im Schattenmodus), "
         "ml zurueck (Isolation Forest auf die vorige Version; nach jedem Zurückdrehen lernt das Modell erst nach deinem nächsten Training (Tray oder /wache training) wieder von selbst), "
         "start, stop, an, aus, autostart an|aus, kugel an|aus, reset. "
         "fullscan [status|stop] (höchstens 3 neue Vollscans in 7 Tagen, Fortsetzen zählt nicht): jede Festplatte mit Partitionen und Volumes (auch ohne "
@@ -213,6 +234,14 @@ COMMAND_LIST: list[Cmd] = [
     Cmd("/ml", "ML-Bericht: was mein Ordner-Sinn erkennt & gelernt hat"),
     Cmd("/ordner", "Ordner-Typ per ML einschätzen (aktueller oder [pfad])", "[pfad]",
         "Ordner-Typ per ML einschätzen"),
+    Cmd("/vision", "Bildbeschreiber 👁: Seh-Modell für Modelle, die selbst nicht sehen",
+        "[<ordner>|restart|debug|protokoll|ordner]",
+        "👁 Sieht das aktive Modell (lokal, Ollama oder Cloud) keine Bilder, schaut ein Seh-Modell aus "
+        "Vision/<Ordner>/ (.gguf + mmproj-*.gguf) hin und gibt ihm die Beschreibung als Text – das Bild selbst "
+        "geht nirgendwohin. Je Modell ein eigener Ordner; '/vision <ordner>' wählt dauerhaft, ohne Zusatz: "
+        "Liste und Stand. Nach 2 Minuten ohne Bild wird er ganz entladen. 'restart': entladen und neu laden. "
+        "'debug': Fehlerbericht nach Debugbericht/vision_bericht.txt. 'protokoll': welche Bilder beschrieben "
+        "wurden – je Persönlichkeit; dasselbe Bild mit derselben Frage kommt von dort, ohne neu zu laden."),
     Cmd("/voice", "Stimme 🔊: an (jede Antwort) · knopf (nur auf Anfrage) · aus · jetzt · text",
         "[an|knopf|aus|jetzt|text]",
         "🔊 Stimme der Persönlichkeit (Qwen3-TTS unter Vision/). 'an': jede Antwort wird vorgelesen, auf dem "
@@ -246,6 +275,15 @@ COMMAND_LIST: list[Cmd] = [
         "Ohne Fenster: einfach der KI sagen, welchen Song sie machen oder covern soll."),
     Cmd("/webui", "Browser-Oberfläche öffnen (gut lesbar, mit Vorlesen)"),
     Cmd("/spiel", "Spielen 🎲: Schach · Mühle · Dame · TicTacToe im Browser gegen die Persönlichkeit"),
+    Cmd("/appstore", "Appstore 🛍: Apps aus HTML/CSS/JS, deren Funktionen die KI nutzt · 🐞 debugAI",
+        "[<app> | debug <app> | liste | ordner]",
+        "🛍 Öffnet den Store in NemiView – NemiCLIs eigener Engine (eigenes JavaScript, HTML, CSS, Zeichnen; kein "
+        "Chrome, kein Internet, keine Grafikkarte): Kacheln mit Icon, „Öffnen“ und „🐞 debugAI“. Eine App ist ein "
+        "Ordner unter Apps/ (app.json, index.html, style.css, app.js, icon.svg); ihre Funktionen ruft die KI mit "
+        "app_aufrufen auf, app_pruefen meldet Fehler. In jeder App sitzt unten rechts ein 🐞: debugAI zeigt, welche "
+        "App es ist (ID, Version, Dateien), fragt, was stört, und du tippst auf die Stelle (oder schickst ohne "
+        "Stelle). Die KI ändert sie (Rückfragen im debugAI-Bereich); vorher wird die App gesichert. Danach ⇆ vorher "
+        "→ nachher nebeneinander, ✓ Behalten oder ↶ Zurück. Zwei Beispiel-Apps kommen mit (Würfel, Farbmischer)."),
     Cmd("/chrome", "Chrome-Erweiterung 🐈: Seitenleisten-Chat + Rechtsklick · Port & Schlüssel · 'neu' = Schlüssel neu",
         "[neu]",
         "🐈 Seitenleiste: Klick aufs Symbol in Chrome öffnet einen Chat mit dieser Sitzung (wie /gui im Modus "
@@ -266,18 +304,29 @@ COMMAND_LIST: list[Cmd] = [
         "· 8k … 128k · max",
         "[anzeigen|8k|16k|25k|32k|64k|128k|max]",
         "📊 Zeigt, womit der Kontext gefüllt ist – wie /context bei Claude Code. Beim lokalen Modell "
-        "stellt es außerdem ein, wie viele Token es hält (Vorgabe 25k). Ist er nach einer Antwort über die "
-        "Hälfte voll, räumt NemiCLI im Hintergrund auf (Doppelpuffer, Preview): die KI schreibt einen "
-        "„Stand des Gesprächs“, die ältesten Nachrichten wandern ins Gedächtnis und bleiben auffindbar, "
-        "die neuesten bleiben. "
+        "stellt es außerdem ein, wie viele Token es hält (Vorgabe 25k). Ist er nach einer Antwort zu drei "
+        "Vierteln voll, räumt NemiCLI im Hintergrund auf (Doppelpuffer, Preview; eigener Motor und lokales "
+        "Ollama): die KI schreibt einen „Stand des Gesprächs“ (Ziel, Wünsche, Erledigtes, Fehler, Offenes, "
+        "nächster Schritt, Fakten – dazu deine Nachrichten wörtlich), die ältesten Nachrichten wandern ins "
+        "Gedächtnis und bleiben auffindbar, die neuesten bleiben. Der Stand wird mit dem Chat gespeichert. "
+        "Bei Ollama gilt der Kontext, mit dem Ollama das Modell geladen hat. "
         "Alles andere entscheidet NemiCLI beim Laden selbst, damit der eingestellte Kontext ganz gilt: "
         "passt alles in die Grafikkarte, bleibt es dort; sonst erst der Gesprächsspeicher in 8 Bit (halber "
         "Platz), dann wandern Schichten in den RAM (Hybrid, über PCIe, langsamer) – bei MoE-Modellen bleiben "
         "die meistgebrauchten Experten in der Grafikkarte (Experten-Lager, lernt im Gespräch mit), zuletzt ein "
         "Teil des Gesprächsspeichers. Die Anzeige zeigt, was gewählt wurde."),
+    Cmd("/charaktere", "Charakter-Galerie 🎭: fertige Persönlichkeiten übernehmen oder eigene erschaffen", "",
+        "🎭 Eigenes Fenster: 9 fertige Persönlichkeiten mit Porträt zum Ansehen und Übernehmen – oder eine eigene erschaffen: Geschlecht (weiblich, männlich, nichtbinär), Alter (ab 18), bis zu 8 Eigenschaften; die KI schreibt Vorschläge, Krea malt je ein Porträt. Beim Ansehen hilft ✨ die KI, ein Feld zu verbessern (Wesen, Aussehen, Stil), 🎨 malt neu (gleiches oder neues Gesicht). Übernehmen legt die Persönlichkeit an, dazu im Profil die Charakter-Datei (Aussehen, fester Seed) und das Porträt als Profilbild – und macht sie aktiv. „Meinen Charakter verbessern“ öffnet die Charakter-Datei der aktiven Persönlichkeit. Auch als /galerie."),
+    Cmd("/compact", "Gespräch jetzt zusammenfassen 📌 (Stand des Gesprächs) · zeigen", "[jetzt|zeigen]",
+        "📌 Wie /compact bei Claude Code: die KI fasst das bisherige Gespräch im „Stand des Gesprächs“ zusammen "
+        "(Ziel, Wünsche, Erledigtes, Fehler & Lösungen, Offenes, nächster Schritt, Fakten – deine Nachrichten "
+        "wörtlich dazu), nur die neuesten Nachrichten bleiben im Kontext. Nichts geht verloren: alles bleibt im "
+        "Chat gespeichert und im Gedächtnis auffindbar. Macht NemiCLI bei lokalen Modellen auch selbst, wenn der "
+        "Kontext voll wird. 'zeigen': den aktuellen Stand anzeigen. Auch als /kompakt."),
     Cmd("/debug", "Debugbericht 🐞: läuft immer – die KI liest ihn (Cloud) · aus · an · motor", "aus · an · motor an|aus",
         "🐞 NemiCLI schreibt immer mit, was es mit dem Grafikspeicher macht – Modelle, Stimme, Bildbeschreiber, "
-        "Embedding, Bildmotor, Runden, Werkzeuge, alle Fehler – dazu alle 10 s den Stand je Prozess. Eine Datei je "
+        "Embedding, Bildmotor, Runden, Werkzeuge, alle Fehler – dazu alle 10 s den Stand je Prozess, auch den "
+        "Arbeitsspeicher (eigener RAM, festgenagelter RAM, größte RAM-Nutzer aller Programme). Eine Datei je "
         "Programm-Start unter Debugbericht/ (die 30 neuesten bleiben), auch für die Wache. Mit einem Cloud-Modell "
         "liest die KI ihn selbst: frag einfach „Was sagt der Debug?“ – ihre Auswertung legt sie als Markdown unter "
         "Berichte/ ab. 'aus' schaltet ab; 'motor an' schreibt zusätzlich jeden Prompt des lokalen Motors mit."),
@@ -304,6 +353,9 @@ COMMAND_LIST: list[Cmd] = [
         "große Gemma (12b). Bleibt über Neustarts gespeichert."),
     Cmd("/reset", "Neuen Chat starten"),
     Cmd("/clear", "Bildschirm leeren"),
+    Cmd("/restart", "NemiCLI und Wache neu starten", "",
+        "🔄 Beendet die Wache und startet NemiCLI im selben Fenster neu – nach Updates oder wenn etwas "
+        "hängt. Greift sofort, auch mitten in der Arbeit. Nur über deine eigene Eingabe."),
     Cmd("/exit", "NemiCLI beenden"),
 ]
 
@@ -338,6 +390,7 @@ UNTERMENUES: dict[str, list[tuple[str, str, str | None]]] = {
         ("training", "🧠 Modell neu lernen", None),
         ("ml zurueck", "↶ ML-Modell zurückdrehen", None),
         ("dl", "🔗 Folgen-Netz (Prozess-Ketten)", None),
+        ("netz", "🌐 Netzwächter (Verbindungen)", None),
         ("autostart", "🚀 Autostart", None),
         ("selbsttest", "🧪 Selbsttest", None),
     ],
@@ -537,6 +590,9 @@ Nur der Nutzer selbst – nenne ihm den Weg:
   bild_lora (Vorgabe an) und bild_lora_staerke (Vorgabe 1.0); Bilder mit LoRA laufen ohne TensorRT
 - Mausrad-Tempo im Vollbild: Config-Schlüssel scroll_zeilen (Zeilen je Raste, 1–20, Vorgabe 4),
   gilt ab dem nächsten Start
+- Mitdenken: Config-Schlüssel beobachter (meldet der KI, was sich seit ihrem letzten Blick geändert hat:
+  Dateien, Ordner, Modell, Persönlichkeit, lange Pause) und gegenprobe (prüft die fertige Antwort gegen die
+  Werkzeug-Ergebnisse der Runde, z. B. „Erledigt!“ obwohl etwas scheiterte) – beide Vorgabe an, false schaltet ab
 - Netz-Sperre: Config-Schlüssel netz_sperre – "verlauf" (Vorgabe: gilt, solange Netz-Inhalt im Gespräch
   steht) oder "runde" (nur die Runde mit dem Abruf). Fremdseiten: /web fremdseiten frei|fragen|aus.
   Seiten, die Befehle einschmuggeln wollten, stehen in web_verdaechtig.json im Programm-Ordner
@@ -563,10 +619,13 @@ def auswahl(name: str) -> list[tuple[str, str, str | None]]:
 
 # Werkzeug menue_oeffnen: Die KI öffnet ein Auswahlmenü, der Nutzer wählt selbst.
 # Sicherheit, Modus und Arbeitsordner bleiben beim Nutzer.
+# /compact braucht TURN_LOCK, den der Zug der KI selbst hält (asyncio.Lock ist nicht wiedereintrittsfähig).
 MENUE_GESPERRT = {"/schluessel", "/schlüssel", "/limit", "/whitelist", "/sandbox", "/modus", "/auto",
-                  "/wache", "/code"}
-MENUE_EIGENE = {"/theme", "/staerke", "/kontext", "/embeddings", "/model", "/bildmodel", "/video", "/debug"}
-MENUE_UNTERPUNKTE = {"/bild": {"schritte"}, "/model": {"huggingface"}}   # Zusatz öffnet ein weiteres Menü
+                  "/wache", "/code", "/compact", "/restart", "/neustart"}
+# /appstore öffnet nur das Store-Fenster – Bauen, Entfernen und debugAI löst dort der Nutzer selbst aus.
+MENUE_EIGENE = {"/theme", "/staerke", "/kontext", "/embeddings", "/model", "/bildmodel", "/video", "/debug",
+                "/vision", "/appstore"}
+MENUE_UNTERPUNKTE = {"/bild": {"schritte"}, "/model": {"huggingface", "ersatz"}}   # Zusatz öffnet ein weiteres Menü
 
 
 def menue_befehle() -> list[str]:
@@ -693,7 +752,9 @@ class SlashCompleter(Completer):
         if cmd == "/theme":
             return [(k, v["label"]) for k, v in self._get_themes().items()]
         if cmd == "/model":
-            return [("huggingface", "🤗 Modell von Hugging Face holen")] + list(self._get_models().items())
+            return ([("huggingface", "🤗 Modell von Hugging Face holen"),
+                     ("ersatz", "🪑 Ersatzbank: bis zu 2 Cloud-KIs, die einspringen")]
+                    + list(self._get_models().items()))
         if cmd == "/staerke":
             return list(self._get_strengths().items())
         if cmd == "/bildmodel":

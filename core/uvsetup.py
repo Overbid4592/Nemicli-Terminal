@@ -70,7 +70,12 @@ _NOWIN = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 # ---------------------------------------------------------------------------
 
 def _env() -> dict:
-    e = dict(os.environ)
+    # Ohne API-Schlüssel: uv startet Build-Skripte fremder Pakete, die brauchen sie nicht.
+    try:
+        import config
+        e = config.umgebung_ohne_geheimnisse()
+    except Exception:
+        e = dict(os.environ)
     e["UV_PYTHON_INSTALL_DIR"] = str(PY_INSTALL_DIR)
     e["UV_CACHE_DIR"] = str(CACHE_DIR)
     e["UV_PYTHON_BIN_DIR"] = str(BIN_DIR)

@@ -168,19 +168,29 @@ def start_chrome_bridge(ctx: "Ctx") -> None:
     global CHROME_BRIDGE
     import chromebridge
 
-    async def beantworten(nachricht: str) -> str:
-        """Ein Chat-Zug im NemiCLI-Fenster; zurück kommt nur der gesäuberte Antworttext."""
+    async def beantworten(auftrag: str, fremd: str) -> str:
+        """Rechtsklick: ein Chat-Zug ohne Werkzeuge. Der Seitentext kommt nur als Fremdinhalt
+        dazu – Pfade darin werden nie geöffnet, nichts wird angehängt. Zurück kommt der Antworttext."""
         if ctx.backend is None:
             raise RuntimeError("Kein Modell aktiv – in NemiCLI /model wählen.")
         import kontextmenue
-        n_vorher = len(ctx.backend.messages)
-        if ui.TUI is not None and hasattr(ui.TUI, "_echo_user"):
-            ui.TUI._echo_user(nachricht.split("\n", 1)[0][:160] + " …")
-        await handle_line(ctx, nachricht)
-        neu = ctx.backend.messages[n_vorher:]
-        antworten = [m.get("content") for m in neu
-                     if m.get("role") == "assistant" and isinstance(m.get("content"), str)]
-        return kontextmenue.antwort_text(antworten[-1]) if antworten else ""
+        fertig = {"text": "", "fehler": ""}
+
+        def senden(ev: dict) -> None:
+            if ev.get("t") == "answer_end" and ev.get("clean"):
+                fertig["text"] = ev["clean"]
+            elif ev.get("t") == "error":
+                fertig["fehler"] = ev.get("text") or "Fehler"
+
+        async def fragen(*_a, **_k) -> str:
+            return "no"
+
+        await _fenster_zug(ctx, auftrag, senden, fragen, erlaubt=frozenset(), quelle="chrome",
+                           kopf="🐈 Chrome", zusatz=fremd, fremd=True, anzeige=auftrag.split(".", 1)[0])
+        _gui_spiegeln(ctx)
+        if fertig["fehler"] and not fertig["text"]:
+            raise RuntimeError(fertig["fehler"])
+        return kontextmenue.antwort_text(fertig["text"]) if fertig["text"] else ""
 
     async def chatten(auftrag: dict, senden, fragen) -> None:
         """Seitenleiste: Chat-Zug wie im GUI-Modus „Chat“; danach zieht das GUI-Fenster mit."""
@@ -253,7 +263,7 @@ async def start_webui(ctx: "Ctx") -> "webui.WebBridge":
             bridge.broadcast({"t": "busy", "on": True})
             try:
                 txt = emoji.expand(text or "")
-                dateien = anhang.anhaengen(txt)
+                dateien = await asyncio.to_thread(anhang.anhaengen, txt)
                 txt = dateien["text"]
                 if (h := anhang.hinweis(dateien)):
                     bridge.broadcast({"t": "info", "text": h})
@@ -266,8 +276,9 @@ async def start_webui(ctx: "Ctx") -> "webui.WebBridge":
                 await web_converse(ctx.backend, txt, imgs,
                                    bridge.broadcast, bridge.ask)
                 ctx.current_prompts.append(txt)
-                chatstore.save(ctx.current_chat, ctx.backend.messages,
-                               ctx.current_prompts, ctx.model or "—")
+                await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
+                                        list(ctx.current_prompts), ctx.model or "—",
+                                        stand=getattr(ctx.backend, "stand", None))
                 learn.capture_from_answer(txt, ctx.backend.messages, ctx.current_chat)
                 await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
                 memory.release_encoder()
@@ -313,14 +324,15 @@ async def start_webui(ctx: "Ctx") -> "webui.WebBridge":
                      "group": "Ollama"} for mid in P.ollama_models()]
         out = await asyncio.to_thread(_ollama)
         for pid, p in (await asyncio.to_thread(P.detected)).items():
-            if p.keyless:
+            if pid == "ollama":                             # oben schon, mit Vision-Erkennung
                 continue
             try:
                 ids = await P.list_models(pid)
             except Exception:
                 ids = []
+            gruppe = ("💻 " if p.keyless else "☁ ") + p.label
             for mid in ids:
-                out.append({"ref": M.make_ref(pid, mid), "label": mid, "group": "☁ " + p.label})
+                out.append({"ref": M.make_ref(pid, mid), "label": mid, "group": gruppe})
         return out
 
     def schedule(coro):
@@ -561,7 +573,7 @@ async def _fenster_zug(ctx: "Ctx", text: str, senden, fragen, *, erlaubt, quelle
             senden(ev)
         try:
             txt = emoji.expand(text or "")
-            dateien = anhang.anhaengen(txt)
+            dateien = await asyncio.to_thread(anhang.anhaengen, txt)
             txt = dateien["text"]
             if (h := anhang.hinweis(dateien)):
                 senden({"t": "info", "text": h})
@@ -578,7 +590,10 @@ async def _fenster_zug(ctx: "Ctx", text: str, senden, fragen, *, erlaubt, quelle
             if fertig["text"]:
                 ui.console.print(ui.assistant_panel(fertig["text"]))
             ctx.current_prompts.append(txt)
-            chatstore.save(ctx.current_chat, ctx.backend.messages, ctx.current_prompts, ctx.model or "—")
+            # im Faden: JSON aller Nachrichten + SHA-256 jedes Bildes brauchen bei langen Chats spürbar Zeit
+            await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
+                                    list(ctx.current_prompts), ctx.model or "—",
+                                    stand=getattr(ctx.backend, "stand", None))
             learn.capture_from_answer(eigen, ctx.backend.messages, ctx.current_chat)
             await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
             memory.release_encoder()
@@ -592,6 +607,182 @@ async def _fenster_zug(ctx: "Ctx", text: str, senden, fragen, *, erlaubt, quelle
             ctx.sync_session()
 
 
+async def start_appstore(ctx: "Ctx"):
+    """Brücke für NemiView (einmal je Sitzung): debugAI-Aufträge aus dem App-Fenster als Fenster-Zug.
+
+    debugAI ist ein eigener Qt-Bereich im NemiView-Prozess – das JavaScript einer App erreicht weder ihn noch
+    die Leitung. Der Wunsch kommt vom Nutzer; was aus der App stammt (gezeigtes Element, Texte), geht als
+    Fremdinhalt mit. Vor jeder Änderung wird die App gesichert (Apps/_vorher), danach entscheidet der Nutzer."""
+    import appstore
+    import fremddaten
+    import gui_bruecke
+    loop = asyncio.get_running_loop()
+    bruecke = None
+
+    async def zeigen(a: dict) -> None:
+        name = str(a.get("app") or "").strip().lower()
+        wunsch = str(a.get("wunsch") or "").strip()[:2000]
+        app = appstore.app(name)
+
+        def senden(ev: dict) -> None:
+            bruecke.senden({**ev, "app": name})
+
+        if app is None or not wunsch:
+            senden({"t": "error", "text": "App oder Wunsch fehlt"})
+            senden({"t": "debug", "geaendert": False})
+            return
+        try:
+            neu = await asyncio.to_thread(appstore.sichern, app)
+        except OSError as e:
+            senden({"t": "error", "text": f"Sicherung fehlgeschlagen, nichts geändert: {e}"})
+            senden({"t": "debug", "geaendert": False})
+            return
+        vorher = await asyncio.to_thread(appstore.stand, app)
+        element = a.get("element") if isinstance(a.get("element"), dict) else {}
+        try:
+            await _fenster_zug(ctx, f"🐞 debugAI – Änderungswunsch für meine App „{app.titel}“ (ID {app.name}): "
+                                    f"{wunsch}", senden, bruecke.fragen, erlaubt=APP_WERKZEUGE, quelle="appstore",
+                               kopf="🛍 Appstore", fremd=True, anzeige=f"🐞 {app.titel}: {wunsch[:120]}",
+                               zusatz="\n\n" + fremddaten.rahmen(appstore.auftrag(app, wunsch, element), "ausgabe",
+                                                                   "NemiView – gezeigte Stelle und Dateien"))
+        finally:
+            geaendert = await asyncio.to_thread(appstore.stand, app) != vorher
+            if geaendert:
+                await asyncio.to_thread(appstore.vermerken, app.name, wunsch)
+            elif neu:
+                await asyncio.to_thread(appstore.verwerfen, app.name)
+            senden({"t": "debug", "geaendert": geaendert})
+            _gui_spiegeln(ctx)
+
+    async def neue_app(a: dict) -> None:
+        """➕ Neue App im Store: die KI baut sie aus der kurzen Beschreibung des Nutzers unter Apps/<name>/."""
+        wunsch = str(a.get("wunsch") or "").strip()[:2000]
+
+        def senden(ev: dict) -> None:
+            bruecke.senden({**ev, "app": NEU_APP})
+
+        vorher = set(await asyncio.to_thread(appstore.apps))
+        try:
+            if wunsch:
+                await _fenster_zug(ctx, f"🛍 Neue App für den Appstore: {wunsch}", senden, bruecke.fragen,
+                                   erlaubt=APP_WERKZEUGE, quelle="appstore", kopf="🛍 Appstore",
+                                   anzeige=f"➕ Neue App: {wunsch[:120]}", zusatz="\n\n" + appstore.bauauftrag())
+            else:
+                senden({"t": "error", "text": "Beschreibung fehlt"})
+        finally:
+            neu = sorted(set(await asyncio.to_thread(appstore.apps)) - vorher)
+            senden({"t": "neu_fertig", "neu": neu})
+            _gui_spiegeln(ctx)
+
+    def entscheiden(a: dict, zurueck: bool) -> None:
+        name = str(a.get("app") or "").strip().lower()
+        try:
+            (appstore.zurueckholen if zurueck else appstore.verwerfen)(name)
+        except OSError as e:
+            bruecke.senden({"t": "error", "app": name, "text": f"Das ging nicht: {e}"})
+
+    def entfernen(a: dict) -> None:
+        name = str(a.get("app") or "").strip().lower()
+        try:
+            bruecke.senden({"t": "entfernt", "app": name, "ok": True, "text": appstore.entfernen(name)})
+        except (OSError, ValueError) as e:
+            bruecke.senden({"t": "entfernt", "app": name, "ok": False, "text": str(e)})
+
+    NEU_APP = "__neu__"                                  # gleich nemiview.fenster.NEU_APP
+    handlers = {"zeigen": lambda a: asyncio.run_coroutine_threadsafe(zeigen(a), loop),
+                "entfernen": entfernen,
+                "neue_app": lambda a: asyncio.run_coroutine_threadsafe(neue_app(a), loop),
+                "behalten": lambda a: entscheiden(a, False), "zurueck": lambda a: entscheiden(a, True)}
+    bruecke = gui_bruecke.GuiBruecke(loop, handlers)
+    neu = await asyncio.to_thread(appstore.vorlagen_einrichten)
+    return bruecke, neu
+
+
+# Was die Persönlichkeit im freien Moment von sich aus schrieb: gezeigt, aber noch nicht beantwortet – geht als
+# Vorspann mit der nächsten Nachricht, damit eine Antwort darauf verstanden wird.
+VON_SICH_AUS: list[dict] = []
+
+
+def von_sich_aus_zeigen(eintraege: list[dict]) -> None:
+    for e in eintraege:
+        uhr = time.strftime("%H:%M", time.localtime(float(e.get("zeit") or 0)))
+        ui.info(f"💬 {e.get('name') or 'Die Persönlichkeit'} hat dir um {uhr} von sich aus geschrieben:")
+        if e.get("text"):
+            ui.console.print(ui.assistant_panel(e["text"]))
+        for b in e.get("bilder") or []:
+            if Path(b).is_file():
+                _bild_vorschau(b, title="von sich aus gemalt")
+    VON_SICH_AUS.extend(eintraege)
+    del VON_SICH_AUS[:-vonsichaus.HOECHSTENS]
+
+
+async def von_sich_aus_abholen() -> None:
+    """Läuft neben der Sitzung: holt ab, was die Kugel im freien Moment sagte oder malte."""
+    await asyncio.sleep(3)                         # erst, wenn die Oberfläche steht
+    while True:
+        try:
+            neu = await asyncio.to_thread(vonsichaus.abholen)
+            if neu:
+                von_sich_aus_zeigen(neu)
+        except Exception:
+            pass
+        await asyncio.sleep(3)
+
+
+async def cloud_anbieter_hinzufuegen(art: str) -> None:
+    """☁ Bild- bzw. Video-Anbieter einrichten: wählen (mit 🔍 Suchen), Schlüssel eintragen, gleich einschalten."""
+    import videobildcloud as VC
+    tabelle = VC.BILD if art == "bild" else VC.VIDEO
+    fehlt = VC.ohne_schluessel(art)
+    if not fehlt:
+        ui.info("☁ Alle Cloud-Anbieter haben schon einen Schlüssel.")
+        return
+    opts = [(a, f"☁  {tabelle[a]['titel']}") for a in fehlt] + [("__cancel__", "Abbrechen")]
+    was = "Bilder" if art == "bild" else "Videos"
+    a = await ask_suche(f"Welchen Anbieter für {was} einrichten?", opts)
+    if a == "__cancel__":
+        return
+    if VC.schluessel_url(a, art):
+        ui.info(f"{tabelle[a]['titel']}: Schlüssel holen unter  {VC.schluessel_url(a, art)}")
+    key = await ask_text(f"{tabelle[a]['titel']} API-Key einfügen (leer = abbrechen):", password=True)
+    if not key:
+        ui.warn("Kein Key eingegeben – abgebrochen.")
+        return
+    if not config.set_env(VC.env_name(a, art), key):
+        ui.error("Konnte den Key nicht in die .env schreiben.")
+        return
+    ui.success(f"🔑 {tabelle[a]['titel']}: {keyvault.mask(key)}")
+    try:
+        ui.success(f"{'🖼 Bilder' if art == 'bild' else '🎬 Videos'} jetzt: {VC.waehlen(art, a)}")
+    except ValueError as e:
+        ui.warn(str(e))
+
+
+async def neu_starten_anbieten(grund: str) -> None:
+    """Nach Updates und Installationen: „Jetzt neu starten?“ statt nur eines Hinweises. Die Antwort gibt nur der
+    Nutzer (ohne Fenster, etwa in Zeitplan-Aufträgen, gilt „Später“)."""
+    ui.warn(f"🔄 {grund}")
+    wahl = await ask_confirm("Jetzt neu starten? (NemiCLI und Wache)",
+                             [("ja", "🔄  Ja, jetzt neu starten"), ("spaeter", "⏳  Später – dann /restart tippen")])
+    if wahl == "ja":
+        await neustart.ausfuehren()
+
+
+def nemiview_oeffnen(bruecke, *args: str) -> None:
+    """NemiView (Store oder eine App) als eigenen Prozess starten; er verbindet sich über die Brücke.
+    Ohne API-Schlüssel in der Umgebung – Apps brauchen sie nicht."""
+    import subprocess
+    env = config.umgebung_ohne_geheimnisse(NEMICLI_GUI_PIPE=bruecke.adresse, NEMICLI_GUI_KEY=bruecke.schluessel.hex())
+    if getattr(sys, "frozen", False):
+        befehl = [str(paths.exe_ohne_fenster()), "--nemiview", *args]
+    else:
+        py = Path(sys.executable)
+        fensterlos = py.with_name("pythonw.exe")
+        befehl = [str(fensterlos if fensterlos.is_file() else py), str(Path(__file__).resolve().with_name("main.py")),
+                  "--nemiview", *args]
+    subprocess.Popen(befehl, env=env, cwd=os.getcwd())
+
+
 async def _chat_neu(ctx: "Ctx", kopf: str) -> None:
     """Neuer Chat aus einem Fenster; GUI und Terminal ziehen mit."""
     async with TURN_LOCK:
@@ -599,6 +790,8 @@ async def _chat_neu(ctx: "Ctx", kopf: str) -> None:
             ctx.backend.reset()
         ctx.current_prompts = []
         ctx.current_chat = chatstore.next_id()
+        plan.verwerfen()                          # wie /reset: keine offene Todo-Liste, keine alte Mitschrift
+        mitschrift.leeren()
         ctx.sync_session()
         ui.info(f"{kopf}: neuer Chat")
     _gui_spiegeln(ctx)
@@ -707,7 +900,8 @@ def _fenster_steuern(befehl: str) -> None:
     _STEUER_NR += 1
     try:
         import ctypes
-        ctypes.windll.kernel32.SetConsoleTitleW(f"nemicli-steuer:{befehl}:{_STEUER_NR}")
+        schluessel = os.environ.get("NEMICLI_STEUER_KEY", "")
+        ctypes.windll.kernel32.SetConsoleTitleW(f"nemicli-steuer:{schluessel}:{befehl}:{_STEUER_NR}")
     except Exception:
         pass
 
@@ -820,6 +1014,208 @@ async def start_musik(ctx: "Ctx"):
     }
     bruecke = gui_bruecke.GuiBruecke(loop, handlers)
     return bruecke
+
+async def start_charaktere(ctx: "Ctx"):
+    """Brücke zur Charakter-Galerie (/charaktere): Vorlagen mit Porträt, Vorschläge der KI, Porträts mit Krea,
+    ✨ Verbessern, Übernehmen (Persönlichkeit + Charakter-Datei + Profilbild) und das Bearbeiten der eigenen."""
+    import shutil
+    import charaktergalerie as CG
+    import gui_bruecke
+    loop = asyncio.get_running_loop()
+    bruecke = None
+    malen_lock = asyncio.Lock()
+    auftrag = [0]                                # neue Vorschläge lassen alte Malaufträge fallen
+    vorlagen_gemalt = [False]
+
+    def senden(art: str, **felder) -> None:
+        bruecke.senden({"t": art, **felder})
+
+    def krea_grund() -> str:
+        try:
+            import imagegen
+            return imagegen.missing_reason_aktiv() or ""
+        except Exception as e:
+            return str(e)
+
+    async def malen(prompt: str, seed, ziel: Path) -> str:
+        """Ein Porträt mit dem Bild-Motor – danach aus dem Bilder-Ordner der Persönlichkeit in die Galerie."""
+        import imagegen
+        async with malen_lock:
+            pfad = await asyncio.to_thread(imagegen.paint, prompt, seed=int(seed) if seed else None)
+        ziel.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(pfad, ziel)
+        return str(ziel)
+
+    def ki_bereit() -> bool:
+        if ctx.backend is None or not hasattr(ctx.backend, "ask_once"):
+            senden("fehler", text="Kein Modell aktiv – im Terminal mit /model eins wählen.")
+            return False
+        return True
+
+    async def vorlagen_malen() -> None:
+        fehlen = [v for v in CG.VORLAGEN if not CG.vorlagen_bild(v["key"]).is_file()]
+        if vorlagen_gemalt[0] or not fehlen:
+            return
+        vorlagen_gemalt[0] = True
+        if (grund := krea_grund()):
+            senden("status", text=f"🎨 Porträts gehen gerade nicht: {grund}", laeuft=False)
+            return
+        for i, v in enumerate(fehlen, 1):
+            senden("status", text=f"🎨 Krea malt die Vorlagen ({i}/{len(fehlen)}): {v['name']} …", laeuft=True)
+            try:
+                pfad = await malen(CG.portraet_prompt(v["geschlecht"], v["alter"], v["kern"], v["stil"]), v["seed"],
+                                   CG.vorlagen_bild(v["key"]))
+            except Exception as e:
+                senden("fehler", text=f"Porträt {v['name']}: {e}")
+                continue
+            senden("vorlage_bild", key=v["key"], pfad=pfad)
+        senden("status", text="✅ Alle Vorlagen gemalt – klick eine an oder erschaffe eine eigene.", laeuft=False)
+
+    def start(_a: dict) -> None:
+        liste = [{**v, "bild": str(CG.vorlagen_bild(v["key"])) if CG.vorlagen_bild(v["key"]).is_file() else ""}
+                 for v in CG.VORLAGEN]
+        senden("start", vorlagen=liste, kategorien=CG.KATEGORIEN, max_eigenschaften=CG.MAX_EIGENSCHAFTEN,
+               alter_min=CG.ALTER_MIN, alter_max=CG.ALTER_MAX, aktiv=PS.active().name)
+        asyncio.run_coroutine_threadsafe(vorlagen_malen(), loop)
+
+    async def vorschlaege(a: dict) -> None:
+        auftrag[0] += 1
+        nr = auftrag[0]
+        try:
+            g, alter, eig = CG.auswahl(a.get("geschlecht"), a.get("alter"), a.get("eigenschaften"))
+        except ValueError as e:
+            senden("fehler", text=str(e))
+            return
+        if not ki_bereit():
+            return
+        senden("status", text="✨ Die KI erfindet Charaktere …", laeuft=True)
+        try:
+            antwort = await ctx.backend.ask_once(CG.vorschlag_auftrag(g, alter, eig), CG.VORSCHLAG_SYSTEM)
+            liste = CG.vorschlaege_lesen(antwort, g, alter, eig)
+        except Exception as e:
+            senden("fehler", text=f"Vorschläge: {e}")
+            return
+        senden("vorschlaege", liste=liste, nr=nr)
+        if (grund := krea_grund()):
+            senden("status", text=f"🎨 Porträts gehen gerade nicht: {grund}", laeuft=False)
+            return
+        for i, v in enumerate(liste):
+            if nr != auftrag[0]:
+                return
+            senden("status", text=f"🎨 Krea malt {v['name']} ({i + 1}/{len(liste)}) …", laeuft=True)
+            try:
+                pfad = await malen(CG.portraet_prompt(g, alter, v["kern"], v["stil"]), v["seed"],
+                                   CG.ordner() / "Entwuerfe" / f"{int(time.time())}_{nr}_{i}.png")
+            except Exception as e:
+                senden("fehler", text=f"Porträt {v['name']}: {e}")
+                continue
+            senden("vorschlag_bild", index=i, pfad=pfad, nr=nr)
+        if nr == auftrag[0]:
+            senden("status", text="✅ Fertig – klick einen an, um ihn anzusehen und zu verbessern.", laeuft=False)
+
+    async def verbessern(a: dict) -> None:
+        feld, entwurf = str(a.get("feld") or ""), a.get("entwurf") or {}
+        if not ki_bereit():
+            return
+        try:
+            frage = CG.verbessern_auftrag(feld, str(entwurf.get(feld) or ""), entwurf, str(a.get("wunsch") or ""))
+            text = CG.verbessert_lesen(await ctx.backend.ask_once(frage, CG.VERBESSERN_SYSTEM), feld)
+        except Exception as e:
+            senden("fehler", text=f"✨ {e}")
+            return
+        senden("verbessert", feld=feld, text=text)
+
+    async def neu_malen(a: dict) -> None:
+        entwurf = a.get("entwurf") or {}
+        if (grund := krea_grund()):
+            senden("fehler", text=f"Porträt geht gerade nicht: {grund}")
+            return
+        seed = CG.neuer_seed() if a.get("neues_gesicht") or not entwurf.get("seed") else entwurf["seed"]
+        if entwurf.get("bestehend"):             # eigene Charakter-Datei: der Kern sagt schon „adult …“
+            prompt = (f"Portrait of a single adult, alone, upper body, looking at the viewer. "
+                      f"{entwurf.get('kern', '').rstrip('.')}. {(entwurf.get('stil') or CG.STIL_STANDARD).rstrip('.')}.")
+        else:
+            try:
+                g, alter, _ = CG.auswahl(entwurf.get("geschlecht"), entwurf.get("alter"),
+                                         entwurf.get("eigenschaften") or ["ruhig"])
+            except ValueError as e:
+                senden("fehler", text=str(e))
+                return
+            prompt = CG.portraet_prompt(g, alter, entwurf.get("kern", ""), entwurf.get("stil", ""))
+        senden("status", text="🎨 Krea malt neu …", laeuft=True)
+        try:
+            pfad = await malen(prompt, seed, CG.ordner() / "Entwuerfe" / f"{int(time.time())}_neu.png")
+        except Exception as e:
+            senden("fehler", text=f"Porträt: {e}")
+            return
+        senden("bild", pfad=pfad, seed=seed)
+        senden("status", text="✅ Neu gemalt.", laeuft=False)
+
+    async def uebernehmen(a: dict) -> None:
+        try:
+            async with TURN_LOCK:                 # nie mitten in einem Zug die Persönlichkeit wechseln
+                erg = await asyncio.to_thread(CG.uebernehmen, a.get("entwurf") or {}, a.get("bild") or None)
+                PS.set_active(erg["key"])
+                _sprueche_im_hintergrund(ctx)
+                _neuer_chat_nach_wechsel(ctx)
+                if erg["bild"]:
+                    _profilbild_setzen(erg["bild"])
+        except Exception as e:
+            senden("fehler", text=f"Übernehmen: {e}")
+            return
+        ui.success(f"🎭 {erg['name']} aus der Charakter-Galerie angelegt und aktiv – Datei {erg['pfad']}")
+        senden("uebernommen", **erg)
+
+    def laden(_a: dict) -> None:
+        name = PS.active().name
+        daten = CG.bearbeiten_laden(name)
+        try:
+            import profilbild
+            bild = str(profilbild.pfad() or "")
+        except Exception:
+            bild = ""
+        senden("bearbeiten", name=name, daten=daten, bild=bild)
+
+    async def speichern(a: dict) -> None:
+        import profilordner
+        name = PS.active().name
+        try:
+            p = await asyncio.to_thread(CG.bearbeitung_speichern, name, a.get("kern"), a.get("stil"), a.get("seed"))
+            bild = a.get("bild") or ""
+            if bild and Path(bild).is_file() and not Path(bild).is_relative_to(profilordner.ordner(anlegen=False)):
+                ziel = profilordner.ordner("Bilder") / f"portraet_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                shutil.copy2(bild, ziel)
+                _profilbild_setzen(str(ziel))
+        except Exception as e:
+            senden("fehler", text=f"Speichern: {e}")
+            return
+        ui.info(f"🎭 Charakter von {name} verbessert: {p}")
+        senden("gespeichert", name=name, pfad=str(p))
+
+    plane = lambda coro: asyncio.run_coroutine_threadsafe(coro, loop)     # noqa: E731
+    handlers = {
+        "start": lambda a: loop.call_soon_threadsafe(start, a),
+        "vorschlaege": lambda a: plane(vorschlaege(a)),
+        "verbessern": lambda a: plane(verbessern(a)),
+        "neu_malen": lambda a: plane(neu_malen(a)),
+        "uebernehmen": lambda a: plane(uebernehmen(a)),
+        "laden": lambda a: loop.call_soon_threadsafe(laden, a),
+        "speichern": lambda a: plane(speichern(a)),
+    }
+    bruecke = gui_bruecke.GuiBruecke(loop, handlers)
+    return bruecke
+
+
+def _profilbild_setzen(pfad: str) -> None:
+    """Profilbild der aktiven Persönlichkeit setzen und Startseite/Leiste auffrischen."""
+    try:
+        import profilbild
+        profilbild.setzen(pfad)
+        import startseite
+        startseite.STAND["bild"] = profilbild.pfad()
+        startseite.auffrischen()
+    except Exception:
+        pass
 
 
 AKTIVER_CTX = None              # die laufende Sitzung – für Stellen ohne ctx-Parameter
@@ -935,6 +1331,8 @@ async def make_backend(ref: str, carry: list | None, strength: str = M.DEFAULT_S
             raise RuntimeError(f"Kein lokales Modell '{model_id}' in {gguflokal.ORDNER}.")
         backend = gguflokal.GgufChat(model_id)
     elif provider == "funke":
+        if not funke_da():
+            raise RuntimeError(FUNKE_FEHLT)
         from einrichtungshelfer import funkechat
         if model_id != funkechat.MODELL or not funkechat.verfuegbar():
             raise RuntimeError(f"Kein lokales Modell '{model_id}' – Funke Groß ist nicht mitgeliefert.")
@@ -1611,17 +2009,30 @@ async def run_reich(erststart: bool = False) -> None:
     if kopiert:
         ui.info(f"Die alten Dateien liegen weiter in {paths.DATEN} – "
                 "die kannst du wegräumen, wenn du dich überzeugt hast.")
-    ui.warn("Bitte NemiCLI einmal neu starten, damit der neue Ordner überall gilt.")
+    await neu_starten_anbieten("Der neue Ordner gilt überall erst nach einem Neustart.")
 
 
 _FUNKE = None                    # einmal geladen, bleibt Funke für die Sitzung
+FUNKE_FEHLT = "Funke (Einrichtungs-Helfer) ist in dieser Fassung nicht enthalten."
+
+
+def funke_da() -> bool:
+    """Ist das Paket einrichtungshelfer/ in dieser Fassung enthalten? (Ob die Gewichte da sind, sagt verfuegbar().)"""
+    try:
+        import einrichtungshelfer  # noqa: F401
+    except ImportError:
+        return False
+    return True
 
 
 async def _funke_holen():
     """Funke laden (einmal je Sitzung). None, wenn sie nicht mitgeliefert ist oder nicht lädt."""
     global _FUNKE  # noqa: PLW0603
     if _FUNKE is None:
-        from einrichtungshelfer import gespraech as G
+        try:
+            from einrichtungshelfer import gespraech as G
+        except ImportError:
+            return None
         if not G.verfuegbar():
             return None
         try:
@@ -1657,17 +2068,97 @@ async def _funke_runde(funke, schritt: str, nutzer: str = "", **felder):
     return antwort
 
 
+def _einrichtung_melden(text: str) -> None:
+    """Schritt der Einrichtung in den Debugbericht – ohne Namen und Anrede."""
+    try:
+        import debugbericht as _DBG
+        _DBG.ereignis(f"Einrichtung: {text}", speicher=False)
+    except Exception:
+        pass
+
+
+async def _funke_ohne_folgen(funke, schritt: str, text: str, **felder):
+    """Funke antworten lassen, ohne dass sich Anrede oder Persönlichkeit ändern (die setzt das Menü).
+    None, wenn Funke stolpert."""
+    from einrichtungshelfer import gespraech as G
+    name, pers = funke.name, funke.pers
+    try:
+        with ui.live_view(ui.helfer_zeile(G.NAME, "…")):
+            return await asyncio.to_thread(funke.sagen, schritt, text, **felder)
+    except Exception:
+        return None
+    finally:
+        funke.name, funke.pers = name, pers
+
+
+def _funke_wahl(funke, schritt: str) -> list[tuple[str, str]]:
+    """Feste Antworten eines Schritts als (Wert, Anzeige) – leer: freie Eingabe (Anrede)."""
+    if schritt == "pers":
+        return ([(p, p) for p in funke.personen]
+                + [("neu", "Eine eigene anlegen"), ("egal", f"Egal – {funke.standard or 'die Standard-Persönlichkeit'}")])
+    return {"modell": [("cloud", "☁ Cloud-Modell (mit Schlüssel)"), ("lokal", "💻 Lokal auf meinem PC"),
+                       ("spaeter", "Später")],
+            "pruefung": [("ja", "Ja, bitte installieren"), ("nein", "Nein, später")],
+            "torch": [("ja", "Ja, Fenster öffnen"), ("nein", "Nein, später")]}.get(schritt, [])
+
+
 async def _funke_frage(funke, schritt: str, esc_hinweis: str = "Abgebrochen – /einrichten führt dich jederzeit "
                        "wieder hierher.", **felder):
-    """Frage stellen und Antworten holen, bis eine Aktion feststeht. None: nach mehreren Versuchen weiter."""
+    """Frage stellen und Antwort holen. Feste Antworten über ein Menü (Funke kann sie nicht missverstehen),
+    die Anrede als Text, bis eine Aktion feststeht. None: nach mehreren Versuchen weiter."""
     from einrichtungshelfer import gespraech as G
+    from einrichtungshelfer.schema import SCHRITTE
     await _funke_runde(funke, schritt, **felder)
-    for _ in range(G.MAX_VERSUCHE):
+    if wahl := _funke_wahl(funke, schritt):
+        while True:
+            wert = await ask_confirm("Deine Antwort", wahl + [("__frage__", "❓ Frage stellen"),
+                                                             ("__abbruch__", "Abbrechen")])
+            if wert != "__frage__":
+                break
+            frage = (await ask_text(f"Deine Frage an {G.NAME}")).strip()
+            if not frage:
+                continue
+            ui.nutzer_sagt(frage)
+            antwort = await _funke_ohne_folgen(funke, schritt, frage, **felder)
+            if antwort is not None and antwort.art == "-":
+                ui.helfer_sagt(G.NAME, antwort.text)
+            else:                                         # als Antwort verstanden: gilt nicht, gewählt wird im Menü
+                ui.info(f"{G.NAME} hat die Frage nicht sicher verstanden – frag anders oder wähle im Menü.")
+            _einrichtung_melden(f"{schritt}: Frage gestellt")
+        if wert == "__abbruch__":
+            if esc_hinweis:
+                ui.info(esc_hinweis)
+            _einrichtung_melden(f"{schritt} abgebrochen")
+            return G.Antwort("abbruch", "", "")
+        ui.nutzer_sagt(dict(wahl)[wert])
+        art = SCHRITTE[schritt][0]
+        if schritt != "pers":
+            _einrichtung_melden(f"{schritt} = {wert}")
+        antwort = await _funke_ohne_folgen(funke, schritt, {"spaeter": "später", "neu": "eine eigene"}.get(wert, wert),
+                                           **felder)
+        if art == "pers":
+            funke.pers = funke.standard if wert in ("neu", "egal") else wert
+        if antwort is not None and antwort.art == art and antwort.wert.lower() == wert.lower():
+            ui.helfer_sagt(G.NAME, antwort.text)          # Funkes Reaktion – nur, wenn sie zur Wahl passt
+        return G.Antwort(art, wert, "")
+    versuche = fragen = 0
+    while versuche < G.MAX_VERSUCHE:
         eingabe = (await ask_text(f"Deine Antwort an {G.NAME}")).strip()
         if not eingabe:                                   # Esc/leer: abbrechen
             if esc_hinweis:
                 ui.info(esc_hinweis)
             return G.Antwort("abbruch", "", "")
+        ui.nutzer_sagt(eingabe)
+        if "?" in eingabe and fragen < G.MAX_VERSUCHE:    # eine Frage ist keine Antwort: beantworten, nichts setzen
+            fragen += 1
+            antwort = await _funke_ohne_folgen(funke, schritt, eingabe, **felder)
+            if antwort is not None and antwort.art == "-":
+                ui.helfer_sagt(G.NAME, antwort.text)
+            else:
+                ui.info(f"{G.NAME} hat die Frage nicht sicher verstanden – frag anders oder antworte einfach.")
+            _einrichtung_melden(f"{schritt}: Frage gestellt")
+            continue
+        versuche += 1
         antwort = await _funke_runde(funke, schritt, eingabe, **felder)
         if antwort.art != "-":
             return antwort
@@ -1696,7 +2187,9 @@ async def _funke_einrichten(funke) -> list[str]:
         if a and a.wert == "neu":
             danach.append("/persönlichkeiten neu")
         elif a and a.wert != "egal" and (p := PS.resolve(a.wert)) is not None:
-            PS.set_active(p.key)
+            if PS.active().key != p.key:
+                PS.set_active(p.key)
+                _neuer_chat_nach_wechsel()        # sonst landete der laufende Verlauf in ihrer Chat-Datenbank
     if neu:
         a = await _funke_frage(funke, "modell")
         if a and a.art == "abbruch":
@@ -1710,6 +2203,7 @@ async def _funke_einrichten(funke) -> list[str]:
     if modell == "lokal" and not next((s["ok"] for s in schritte if s["id"] == "ollama"), True):
         fehlt.append("ollama")
     felder = {"offen": [s["id"] for s in offen], "fehlt": fehlt}
+    _einrichtung_melden(f"Stand – offen: {', '.join(felder['offen']) or '–'} · fehlt: {', '.join(fehlt) or '–'}")
     installiert = False
     if offen:
         a = await _funke_frage(funke, "pruefung", **felder)
@@ -1720,9 +2214,11 @@ async def _funke_einrichten(funke) -> list[str]:
                 try:
                     ergebnis = await _run_with_status(s["titel"], lambda on_status, _id=s["id"]: W.erledige(_id, on_status))
                     ui.success(f"✅ {ergebnis}")
+                    _einrichtung_melden(f"{s['id']} erledigt")
                     installiert = True
                 except Exception as e:
                     ui.error(f"Hat nicht geklappt: {e}")
+                    _einrichtung_melden(f"{s['id']} fehlgeschlagen: {type(e).__name__}")
     else:
         await _funke_runde(funke, "pruefung", **felder)
 
@@ -1736,10 +2232,11 @@ async def _funke_einrichten(funke) -> list[str]:
             except Exception as e:
                 ui.error(f"Fenster ließ sich nicht öffnen: {e}")
 
+    await _modelle_anbieten()
     await _funke_runde(funke, "ende", modell=modell, fehlt=fehlt)
     if installiert and getattr(sys, "frozen", False):
-        ui.warn("🔄 Bitte NemiCLI einmal neu starten – erst dann nutzen Gedächtnis, "
-                "Krea und Wache das neue venv neben der exe.")
+        await neu_starten_anbieten("Erst nach einem Neustart nutzen Gedächtnis, Krea und Wache das neue venv "
+                                   "neben der exe.")
     if modell in ("cloud", "lokal"):
         danach.insert(0, "/model")
     return danach
@@ -1748,10 +2245,10 @@ async def _funke_einrichten(funke) -> list[str]:
 async def funke_notfall(ctx: "Ctx", exc: BaseException) -> None:
     """Das große Modell ist ausgefallen: Funke erklärt die Fehler-Art und öffnet auf Wunsch das passende Menü.
     Funke bekommt nur die Art des Fehlers, nie dessen Text (der kann Schlüssel oder Pfade enthalten)."""
-    from einrichtungshelfer import fehlerart as FA
     funke = await _funke_holen()
     if funke is None:
         return
+    from einrichtungshelfer import fehlerart as FA      # erst hier: ohne das Paket ist funke None
     anbieter = getattr(ctx.backend, "provider_id", "") or (ctx.model or "").split(":")[0]
     fehler = FA.einordnen(exc, anbieter)
     try:
@@ -1778,21 +2275,152 @@ async def funke_plaudern(ctx: "Ctx", text: str) -> bool:
     return True
 
 
+async def modelle_einrichten() -> None:
+    """/einrichten modelle: die Modelle der Motoren freiwillig nachladen – Liste, Lizenz und Größe lesen,
+    laden aus der offiziellen Quelle (feste Revision, SHA-256 geprüft). Krea 2 nur als Hinweis."""
+    import hfladen as H
+    import modellkatalog as K
+    while True:
+        stand = await asyncio.to_thread(K.stand)
+        optionen = [(t.id, f"{'✅' if da else '⬜'} {t.titel}  ·  "
+                           f"{H.gb(t.groesse) if t.ladbar else 'Hinweis'}  ·  {t.lizenz}") for t, da in stand]
+        wahl = await ask_confirm("Modelle für die Motoren – alles freiwillig, ✅ = schon eingerichtet",
+                                 optionen + [("__fertig__", "Fertig  ·  später wieder mit /einrichten modelle")])
+        t = K.teil(wahl)
+        if t is None:
+            return
+        da = dict((x.id, d) for x, d in stand).get(t.id, False)
+        ui.info(f"{t.titel}: {t.wozu}")
+        ui.info(f"📜 Lizenz: {t.lizenz} – {t.lizenz_link}")
+        ziel = t.ziel()
+        if not t.ladbar:
+            ui.info(f"📁 Ordner: {ziel}")
+            ui.info(f"🔗 Selbst laden: {t.link}")
+            if da:
+                ui.success("Ist schon eingerichtet.")
+            continue
+        for d in t.dateien:
+            ui.info(f"   {d.name}  ·  {H.gb(d.groesse)}  ·  {K.quelle(d)}")
+        ui.info(f"📁 Ziel: {ziel}")
+        if da:
+            ui.info("Ist schon eingerichtet – nochmal laden legt diese Fassung zusätzlich in den Zielordner.")
+        frei = H.frei_auf_platte(ziel)
+        if frei < t.groesse + 2**30:
+            ui.error(f"Nicht genug Platz: gebraucht {H.gb(t.groesse)}, frei {H.gb(frei)}.")
+            continue
+        los = await ask_confirm(f"{H.gb(t.groesse)} herunterladen?",
+                                [("ja", "⬇  Ja, Lizenz gelesen – herunterladen"), ("nein", "Zurück zur Liste")])
+        if los == "ja":
+            await _modell_teil_laden(t)
+
+
+async def _modell_teil_laden(t) -> bool:
+    """Alle Dateien eines Katalog-Teils laden (feste Revision, SHA-256 geprüft). True, wenn alles da ist."""
+    import hfladen as H
+    import modellkatalog as K
+    _einrichtung_melden(f"Modell {t.id} wird geladen")
+    try:
+        for nr, d in enumerate(t.dateien, 1):
+            await _hf_datei_laden(H, d.repo, K.als_hf_datei(d), K.ziel_ordner(t, d), nr, len(t.dateien),
+                                  revision=d.revision)
+    except H.Abbruch:
+        ui.info("⏸ Angehalten. Nochmal wählen setzt an derselben Stelle fort.")
+        _einrichtung_melden(f"Modell {t.id} angehalten")
+        return False
+    except H.PruefFehler as e:
+        ui.error(f"🔐 {e}")
+        _einrichtung_melden(f"Modell {t.id}: Prüfsumme falsch")
+        return False
+    except Exception as e:
+        ui.error(f"Download fehlgeschlagen: {e} – nochmal wählen setzt fort.")
+        _einrichtung_melden(f"Modell {t.id} fehlgeschlagen: {type(e).__name__}")
+        return False
+    ui.success(f"✅ {t.titel} ist da – SHA-256 aller {len(t.dateien)} Datei(en) geprüft.")
+    _einrichtung_melden(f"Modell {t.id} geladen")
+    return True
+
+
+async def _modelle_anbieten() -> None:
+    """Am Ende der Einrichtung: die freiwilligen Modelle anbieten."""
+    wahl = await ask_confirm("Modelle für Gedächtnis, Bilder, Stimme, Musik, Video … jetzt ansehen? Alles freiwillig.",
+                             [("ja", "Ja, Liste zeigen"), ("spaeter", "Später  ·  /einrichten modelle")])
+    if wahl == "ja":
+        await modelle_einrichten()
+
+
+_HELFER_TEXT = {"funke": "✨ Funke – klein, läuft auf jedem PC, auch ohne Grafikkarte",
+                "gemma4-e2b": "Gemma 4 E2B – versteht freie Sätze besser · für kleinere Grafikkarten",
+                "gemma4-e4b": "Gemma 4 E4B – versteht am meisten · ab etwa 8 GB Grafikspeicher"}
+
+
+async def _helfer_waehlen() -> str | None:
+    """Wer führt durch die Einrichtung? Funke immer; Gemma nur mit ausgeliefertem LoRA und torch. Fehlt das
+    Grundmodell, wird es auf Wunsch geladen (unsloth Q4_K_M). None: abgebrochen."""
+    try:
+        from einrichtungshelfer import gemmahelfer as GH
+    except ImportError:                           # ältere Fassung des Helfers: nur Funke
+        return "funke"
+    import hfladen as H
+    import modellkatalog as K
+    angebot = GH.angeboten()
+    if len(angebot) == 1:
+        return "funke"
+    optionen = []
+    for w in angebot:
+        t = K.HELFER.get(w)
+        zusatz = "" if t is None else ("  ·  ✅ da" if GH.grundmodell(w) else f"  ·  {H.gb(t.groesse)} laden")
+        optionen.append((w, _HELFER_TEXT.get(w, w) + zusatz))
+    wahl = await ask_confirm("Wer soll dich durch die Einrichtung führen?", optionen + [("__abbruch__", "Abbrechen")])
+    if wahl == "__abbruch__":
+        ui.info("Abgebrochen – /einrichten führt dich jederzeit wieder hierher.")
+        return None
+    if wahl != "funke":
+        import extlibs
+        if not await asyncio.to_thread(lambda: bool(extlibs.enable().get("aktiv"))):
+            ui.info("Gemma braucht torch, das fehlt noch – Funke richtet es mit dir ein, danach kannst du wechseln.")
+            return "funke"
+        if GH.grundmodell(wahl) is None:
+            t = K.HELFER[wahl]
+            ui.info(f"📜 {t.titel}: Lizenz {t.lizenz} – {t.lizenz_link}")
+            ui.info(f"   {t.dateien[0].name}  ·  {H.gb(t.groesse)}  ·  {K.quelle(t.dateien[0])}")
+            los = await ask_confirm(f"{H.gb(t.groesse)} herunterladen?",
+                                    [("ja", "⬇  Ja, Lizenz gelesen – herunterladen"), ("nein", "Nein – Funke nehmen")])
+            if los != "ja" or not await _modell_teil_laden(t):
+                return "funke"
+    import config
+    config.update(einrichtungs_helfer=wahl)
+    _einrichtung_melden(f"Helfer = {wahl}")
+    return wahl
+
+
 async def run_wizard(nur_offene: bool = False) -> list[str]:
     """Einrichtungs-Assistent (/einrichten): prüft, fragt, installiert. Rückgabe: Befehle, die danach laufen sollen.
 
     Ist der Einrichtungs-Helfer Funke mitgeliefert, führt er durch das Gespräch; sonst (oder wenn er nicht
-    lädt) der klassische Ablauf. Modelle werden NICHT geladen – nur gezeigt, wo man sie herbekommt."""
+    lädt) der klassische Ablauf. Am Ende werden die Modelle der Motoren angeboten (freiwillig)."""
     import wizard as W
 
-    if not nur_offene:
+    if not nur_offene and not funke_da():
+        ui.info(f"{FUNKE_FEHLT} Die Einrichtung läuft klassisch.")
+    elif not nur_offene:
         from einrichtungshelfer import gespraech as G
         if G.verfuegbar():
             try:
-                funke = await _run_with_status(f"✨ {G.NAME} wacht auf", lambda _s: G.Funke())
+                from einrichtungshelfer import gemmahelfer as GH
+                bauen = GH.funke_bauen
+            except ImportError:                   # ältere Fassung des Helfers ohne Gemma: Funke allein
+                def bauen(_wahl):
+                    return G.Funke(), "funke"
+            wahl = await _helfer_waehlen()
+            if wahl is None:
+                return []
+            try:
+                funke, ist = await _run_with_status(f"✨ {G.NAME} wacht auf", lambda _s: bauen(wahl))
             except Exception as e:
                 ui.warn(f"{G.NAME} ließ sich nicht laden ({e}) – es geht ohne ihn weiter.")
             else:
+                if ist != wahl:
+                    ui.warn("Gemma ließ sich nicht laden – Funke hilft dir weiter.")
                 try:
                     return await _funke_einrichten(funke)
                 except Exception as e:
@@ -1834,24 +2462,28 @@ async def run_wizard(nur_offene: bool = False) -> list[str]:
         if wahl == "ja":
             try:
                 ui.info(f"🪟 venv-Fenster offen – dort eingeben:  {W.venv_fenster()}")
-                ui.info("Danach NemiCLI neu starten.")
+                ui.info("Danach /restart tippen – NemiCLI und Wache starten neu.")
             except Exception as e:
                 ui.error(f"Fenster ließ sich nicht öffnen: {e}")
     elif torch_schritt:
         ui.info(f"torch: erst das venv anlegen lassen, dann /venv – dort {torch_schritt['befehl']}")
 
-    # Modelle: nur erklären – die sucht sich jeder selbst aus.
+    # Sprach-Modell und Krea: Wege zeigen; die Modelle der Motoren auf Wunsch laden.
     fehlt_modell = [s for s in schritte
                     if s["id"] in ("sprachmodell", "bildmodell") and not s["ok"]]
     if fehlt_modell or nur_offene is False:
         ui.wizard_models_panel(W.MODELL_HINWEISE, W.modell_ordner())
+    if nur_offene is False:
+        await _modelle_anbieten()
     if todo:
         if getattr(sys, "frozen", False) and any(s["id"] in ("venv", "torch", "pakete") for s in todo):
             # torch & Co. aus dem neuen venv greifen erst nach einem Neustart: das bisher
             # eingebundene Python ist in diesem Prozess schon geladen.
-            ui.warn("🔄 Bitte NemiCLI einmal neu starten – erst dann nutzen Gedächtnis, "
-                    "Krea und Wache das neue venv neben der exe.")
-        ui.info("Zum Nachsehen, was jetzt läuft:  /systemcheck")
+            ui.info("Zum Nachsehen danach:  /systemcheck")
+            await neu_starten_anbieten("Erst nach einem Neustart nutzen Gedächtnis, Krea und Wache das neue venv "
+                                       "neben der exe.")
+        else:
+            ui.info("Zum Nachsehen, was jetzt läuft:  /systemcheck")
     return []
 
 
@@ -1895,9 +2527,10 @@ async def code_befehl(ctx: "Ctx | None" = None, arg: str = "") -> None:
         ui.warn("Kein Modell aktiv – wähle eins mit /model.")
         return
     mitschrift.notiz("Coding-Assistent per /code angefordert.")
-    await converse(ctx.backend, "[System] Der Nutzer hat den Coding-Assistenten mit /code "
-                   f"angefordert. Aufgabe: {unter}\nStarte ihn mit coding_start (Projektordner "
-                   "absolut; ist er unklar, frag nach).")
+    async with TURN_LOCK:                # nur ein Zug gleichzeitig – auch neben dem Fenster (/gui)
+        await converse(ctx.backend, "[System] Der Nutzer hat den Coding-Assistenten mit /code "
+                       f"angefordert. Aufgabe: {unter}\nStarte ihn mit coding_start (Projektordner "
+                       "absolut; ist er unklar, frag nach).")
 
 
 def _do_ollama_pull(name: str, on_status) -> str:
@@ -1925,7 +2558,7 @@ async def _ollama_pull_and_done(name: str) -> None:
     ui.success(f"🦙 {name} ist da. Wähle es jetzt über /model → Ollama.")
 
 
-async def _hf_datei_laden(H, repo: str, datei, ordner: Path, nr: int, von: int) -> Path:
+async def _hf_datei_laden(H, repo: str, datei, ordner: Path, nr: int, von: int, revision: str = "main") -> Path:
     """Eine Datei mit Live-Balken laden; Esc hält an (H.Abbruch, die .part-Datei bleibt)."""
     import threading
     stopp = threading.Event()
@@ -1945,7 +2578,8 @@ async def _hf_datei_laden(H, repo: str, datei, ordner: Path, nr: int, von: int) 
     def panel():
         return ui.hf_fortschritt(datei.name, st["phase"], st["erledigt"], datei.groesse, st["tempo"], nr, von)
 
-    task = asyncio.create_task(asyncio.to_thread(H.laden, repo, datei, ordner, fortschritt, stopp))
+    task = asyncio.create_task(asyncio.to_thread(H.laden, repo, datei, ordner, fortschritt, stopp,
+                                                 revision=revision))
     try:
         with ui.live_view(panel()) as live:
             while not task.done():

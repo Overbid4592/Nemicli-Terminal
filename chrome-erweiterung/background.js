@@ -30,9 +30,33 @@ async function einstellungen() {
   return { port: Number(s.port) || STANDARD_PORT, key: String(s.key || "") };
 }
 
+// Antwortet auf dem Port wirklich NemiCLI? Erst dann gehen Schlüssel und Seiteninhalt hinaus – sonst
+// bekäme sie jedes Programm, das gerade auf dem Port lauscht. NemiCLI unterschreibt eine Zufallszahl
+// mit dem Schlüssel (HMAC-SHA256); das Ergebnis gilt eine Minute.
+let geprueft = { port: 0, bis: 0 };
+
+async function echtesNemi(port, key) {
+  if (geprueft.port === port && Date.now() < geprueft.bis) return;
+  const zufall = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+  let antwort;
+  try {
+    antwort = await (await fetch(`http://127.0.0.1:${port}/hallo?nonce=${zufall}`)).json();
+  } catch (e) {
+    throw new Error("NemiCLI läuft nicht (oder anderer Port). NemiCLI starten und nochmal versuchen.");
+  }
+  const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+  const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(`nemicli:${zufall}`)));
+  const soll = Array.from(sig, (b) => b.toString(16).padStart(2, "0")).join("");
+  if (!antwort || antwort.beweis !== soll) {
+    throw new Error(`Auf Port ${port} antwortet nicht NemiCLI (oder der Schlüssel stimmt nicht) – nichts gesendet.`);
+  }
+  geprueft = { port, bis: Date.now() + 60000 };
+}
+
 async function anNemi(pfad, daten) {
   const { port, key } = await einstellungen();
   if (!key) throw new Error("Kein Geheimschlüssel eingetragen – in NemiCLI /chrome tippen und den Schlüssel in den Erweiterungs-Einstellungen eintragen.");
+  await echtesNemi(port, key);
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 240000);
   let r;

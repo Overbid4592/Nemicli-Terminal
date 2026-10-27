@@ -37,7 +37,8 @@ STOP_RUNDE = (
 
 GESPERRT_TEXT = "Nicht ausgeführt – Not-Stopp: In dieser Runde laufen keine Werkzeuge."
 
-_zustand = {"ausgeloest": False, "nachwirken": False, "stop_runde": False, "geaendert": [], "start": 0.0}
+_zustand = {"ausgeloest": False, "nachwirken": False, "stop_runde": False, "geaendert": [], "start": 0.0,
+           "laufend": 0}
 
 
 def ist_stop(text: str) -> bool:
@@ -50,6 +51,15 @@ def runde_beginnt(stop_runde: bool = False) -> None:
     _zustand.update(ausgeloest=False, stop_runde=stop_runde, geaendert=[], start=time.time())
 
 
+def runde_aktiv(an: bool) -> None:
+    """Runde läuft (an=True) oder ist vorbei (an=False); gepaart in try/finally aufrufen."""
+    _zustand["laufend"] = max(0, _zustand["laufend"] + (1 if an else -1))
+
+
+def runde_laeuft() -> bool:
+    return _zustand["laufend"] > 0
+
+
 def ausloesen() -> None:
     """ESC/STOP während der Runde: ab jetzt startet nichts mehr, die nächste Runde bekommt den Hinweis."""
     _zustand["ausgeloest"] = True
@@ -57,8 +67,14 @@ def ausloesen() -> None:
     try:
         import actions
         actions.befehl_stoppen()                  # ein laufender Befehl endet sofort
-    except Exception:
-        pass
+    except Exception as e:                        # sonst liefe er still weiter
+        try:
+            import debugbericht
+            debugbericht.fehler("Not-Stopp: Befehl beenden", e)
+            import ui
+            ui.warn(f"⏹ Der laufende Befehl ließ sich nicht beenden: {e}")
+        except Exception:
+            pass
     try:
         import plan
         plan.verwerfen()                          # vorbereitete Schritte gelten nicht mehr

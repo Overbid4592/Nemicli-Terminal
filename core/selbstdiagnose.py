@@ -74,13 +74,38 @@ def _grafikspeicher() -> list[str]:
     else:
         zeilen.append("- Dieser Prozess hat CUDA noch nicht benutzt (kein Modell auf der Grafikkarte).")
     liste = D.prozesse()
+    geteilt = D.gemeinsam()
     if liste:
         zeilen.append("- Je Prozess (Windows-Zähler; dwm.exe und andere Windows-Prozesse belegen immer einen "
                       "Grundstock):")
-        zeilen += [f"  - {name} (PID {pid}): {mb} MB" for name, pid, mb in liste[:PROZESSE_MAX]]
+        zeilen += [f"  - {name} (PID {pid}): {mb} MB"
+                   + (f" + {geteilt[pid]} MB festgenagelter RAM" if geteilt.get(pid) else "")
+                   for name, pid, mb in liste[:PROZESSE_MAX]]
     else:
         zeilen.append("- Je Prozess: Zähler nicht verfügbar.")
     return zeilen
+
+
+def _arbeitsspeicher() -> list[str]:
+    import debugbericht as D
+    zeilen = []
+    system = D.ram_system()
+    if system:
+        zeilen.append(f"- Rechner: {_gb(system[0])} von {_gb(system[1])} belegt")
+    r = D.ram_eigen()
+    if r:
+        zeilen.append(f"- Dieser Prozess: {_gb(r['ram'])} im RAM, {_gb(r['privat'])} zugesagt, "
+                      f"{_gb(r['gemeinsam'])} festgenagelt (gemeinsamer GPU-Speicher: darf Windows nicht auslagern)")
+    geteilt = sorted(D.gemeinsam().items(), key=lambda x: -x[1])
+    if geteilt:
+        zeilen.append("- Festgenagelter RAM je Prozess (gemeinsamer GPU-Speicher, auch andere Programme wie "
+                      "ein Browser mit WebGPU):")
+        zeilen += [f"  - {D._prozessname(pid)} (PID {pid}): {mb} MB" for pid, mb in geteilt[:PROZESSE_MAX]]
+    nutzer = D.ram_nutzer()
+    if nutzer:
+        zeilen.append("- Größte RAM-Nutzer (Prozesse gleichen Namens zusammen):")
+        zeilen += [f"  - {name}{f' ({anz} Prozesse)' if anz > 1 else ''}: {_gb(mb)}" for name, anz, mb in nutzer]
+    return zeilen or ["- nicht ermittelbar (psutil fehlt)"]
 
 
 def _systemcheck() -> list[str]:
@@ -135,6 +160,7 @@ def _fehler() -> list[str]:
 
 ABSCHNITTE = (("Programm", _programm), ("Auffälligkeiten (Fehler-Wächter, auch frühere Starts)", _auffaelligkeiten),
               ("Rechner", _rechner), ("Grafikspeicher jetzt", _grafikspeicher),
+              ("Arbeitsspeicher jetzt", _arbeitsspeicher),
               ("Systemcheck", _systemcheck), ("Fehler aus dem Debugbericht", _fehler))
 
 

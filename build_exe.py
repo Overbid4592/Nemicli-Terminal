@@ -25,6 +25,7 @@ Die großen Modelle kommen NICHT mit – jeder sucht sich selbst aus, welche.
 from __future__ import annotations
 
 import hashlib
+import re
 import shutil
 import subprocess
 import sys
@@ -174,6 +175,9 @@ def setup_bauen() -> Path | None:
     Sie packt sich nur zum Installieren aus, NemiCLI selbst startet weiter aus seinem Ordner."""
     import zipfile
     _step("Setup-Datei")
+    if (daten := eigene_daten_im_ziel()):
+        print(f"  ABBRUCH: In {ZIEL} liegen eigene Daten ({', '.join(daten)}) – die kämen sonst ins Setup.")
+        return None
     try:
         build = (ZIEL / "NemiCLIT2" / "build.txt").read_text(encoding="utf-8").strip()
     except OSError:
@@ -206,7 +210,29 @@ def setup_bauen() -> Path | None:
     (DIST / f"{datei.name}.sha256").write_text(f"{h}  {datei.name}\n", encoding="utf-8")
     print(f"  {datei}")
     print(f"  SHA-256: {h}")
+    for weg in alte_setups_weg(DIST):
+        print(f"  alte Setup-Datei entfernt: {weg}")
     return datei
+
+
+SETUPS_BEHALTEN = 3
+
+
+def _setup_version(p: Path) -> tuple[int, ...]:
+    m = re.fullmatch(r"NemiCLI-Setup-([\d.]+)\.exe", p.name)
+    return tuple(int(x) for x in m.group(1).split(".") if x) if m else ()
+
+
+def alte_setups_weg(ordner: Path, behalten: int = SETUPS_BEHALTEN) -> list[str]:
+    """Nur die neuesten Setup-Dateien (nach Versionsnummer) samt .sha256 behalten – ältere sind Ballast."""
+    setups = sorted((p for p in ordner.glob("NemiCLI-Setup-*.exe") if _setup_version(p)), key=_setup_version)
+    weg = []
+    for p in setups[:-behalten] if behalten > 0 else []:
+        for f in (p, p.with_name(p.name + ".sha256")):
+            if f.is_file():
+                f.unlink()
+                weg.append(f.name)
+    return weg
 
 
 def main() -> int:

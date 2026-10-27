@@ -19,6 +19,8 @@ def _gespraech_fortsetzen(ctx: "Ctx") -> dict | None:
     if not data:
         return None
     ctx.backend.messages = pricing.gespraechsende(data.get("messages", []))
+    if hasattr(ctx.backend, "stand"):                 # Zusammenfassung des Teils davor
+        ctx.backend.stand = data.get("stand") or ""
     ctx.current_prompts = data.get("prompts", [])
     ctx.current_chat = zuletzt["id"]
     chatstore.im_kontext_setzen(ctx.backend.messages)
@@ -194,6 +196,43 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             else:
                 ui.info("🔒 Programm-Ordner ist zu. /schluessel <minuten> [aufgabe] gibt ihn auf Zeit frei "
                         "(jede Änderung fragt trotzdem), /schluessel aus schließt wieder.")
+    elif cmd == "/appstore":
+        global APPSTORE_SERVER
+        import appstore
+        teile = arg.strip().split(None, 1)
+        was = teile[0].lower() if teile else ""
+        if was == "liste":
+            ui.info(appstore.liste_text())
+            return None
+        if was == "ordner":
+            appstore.ORDNER.mkdir(parents=True, exist_ok=True)
+            try:
+                os.startfile(str(appstore.ORDNER))
+            except Exception:
+                ui.info(str(appstore.ORDNER))
+            return None
+        if APPSTORE_SERVER is None:
+            try:
+                APPSTORE_SERVER, neu = await start_appstore(ctx)
+            except Exception as e:
+                ui.error(f"Appstore-Start fehlgeschlagen: {e}")
+                return None
+            if neu:
+                ui.info(f"🛍 {neu} Beispiel-App(s) eingerichtet in {appstore.ORDNER}")
+        zusatz = ["--speicher", str(appstore.SPEICHER)]
+        debug = was in ("debug", "debugai", "bearbeiten", "edit")
+        if debug or (was and was not in ("oeffnen", "öffnen")):
+            name = teile[1].strip().lower() if debug and len(teile) > 1 else was
+            a = appstore.app(name)
+            if a is None:
+                ui.warn(f"Keine App „{name}“. Vorhanden: {', '.join(appstore.apps()) or 'keine'} · /appstore liste")
+                return None
+            zusatz += ["--app", a.name] + (["--debug"] if debug else [])
+        nemiview_oeffnen(APPSTORE_SERVER, str(appstore.ORDNER), *zusatz)
+        ui.success(f"🛍 Appstore in NemiView (eigene Engine) · {len(appstore.apps())} App(s) · Apps-Ordner: "
+                   f"{appstore.ORDNER}")
+        ui.info("🐞 debugAI in jeder App: sagen, was stört, auf die Stelle tippen – die KI ändert es; "
+                "danach vorher → nachher mit Behalten oder Zurück.")
     elif cmd in ("/spiel", "/spiele"):
         global SPIELE_SERVER
         if SPIELE_SERVER is None:
@@ -245,7 +284,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
         import wizard
         try:
             ui.info(f"🪟 venv-Fenster offen – torch für diese Grafikkarte:  {wizard.venv_fenster()}")
-            ui.info("Nach der Installation NemiCLI neu starten.")
+            ui.info("Nach der Installation /restart tippen – NemiCLI und Wache starten neu.")
         except Exception as e:
             ui.warn(str(e))
     elif cmd == "/theme":
@@ -271,6 +310,8 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             head = tokens[0].lower()
             if head in ("huggingface", "hf"):
                 ref = await hf_downloader()
+            elif head == "ersatz":
+                await ersatzbank_waehlen(ctx)
             elif ":" in arg:                     # direkte Referenz: anbieter:modell
                 ref = arg.strip()
             elif len(tokens) > 1 and P.get(head):   # "openai gpt-4o"
@@ -376,6 +417,38 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             ui.error(f"Bild fehlgeschlagen: {e}")
     elif cmd == "/video":
         import video
+        import videobildcloud as VC
+        if re.fullmatch(r"(?i)cloud(\s+\S+)?", arg.strip()):
+            wahl = arg.split(None, 1)[1].strip().lower() if len(arg.split(None, 1)) > 1 else ""
+            if not wahl:
+                ui.info(f"🎬 Videos: {VC.label('video') if VC.video_aktiv() else 'lokal (Wan 2.2)'} · mit Schlüssel: "
+                        + (", ".join(VC.VIDEO[a]["titel"] for a in VC.bereit("video")) or "keiner"))
+                ui.info(f"Wählen: /video cloud {'|'.join(VC.VIDEO)}|aus · neuer Anbieter: /video cloud neu")
+                return None
+            if wahl in ("neu", "hinzufuegen", "hinzufügen"):
+                await cloud_anbieter_hinzufuegen("video")
+                return None
+            try:
+                ui.success(f"🎬 Videos jetzt: {VC.waehlen('video', None if wahl in ('aus', 'lokal') else wahl)}")
+            except ValueError as e:
+                ui.warn(str(e))
+            return None
+        if VC.video_aktiv() and not re.fullmatch(r"(?i)(modell(\s+\S.*)?|ordner|oeffnen|öffnen)", arg.strip()):
+            opts = _video_opts(arg)
+            if not opts["prompt"]:
+                ui.info(f"🎬 Videos aus der Cloud: {VC.label('video')} · zurück auf lokal: /video cloud aus")
+                return None
+            try:
+                path = await _run_with_status("🎬 erzeuge dein Video (Cloud)", lambda on_status: VC.video_generate(
+                    opts["prompt"], sekunden=opts.get("sekunden", 5.0), startbild=opts.get("start"), on_status=on_status))
+                ui.success(f"🎬 Fertig: {path}")
+                try:
+                    os.startfile(path)
+                except Exception:
+                    pass
+            except Exception as e:
+                ui.error(f"Video fehlgeschlagen: {e}")
+            return None
         if re.fullmatch(r"(?i)modell(\s+\S.*)?", arg.strip()):
             alle = video.modelle()
             name = arg.split(None, 1)[1].strip() if len(arg.split(None, 1)) > 1 else ""
@@ -459,6 +532,22 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
         krea_models = krea.discover()
         krea_aktiv = krea.chosen_model() if akt_backend == "krea" else None
         if arg:                                  # direkt gesetzt: /bildmodel <name>
+            teile = arg.strip().lower().split()
+            if teile and teile[0] == "cloud":
+                import videobildcloud as VC
+                if len(teile) > 1 and teile[1] in ("neu", "hinzufuegen", "hinzufügen"):
+                    await cloud_anbieter_hinzufuegen("bild")
+                    return None
+                try:
+                    if len(teile) == 1:
+                        ui.info(f"☁ Bilder-Cloud mit Schlüssel: "
+                                + (", ".join(VC.BILD[a]["titel"] for a in VC.bereit("bild")) or "keiner")
+                                + f"  ·  /bildmodel cloud {'|'.join(VC.BILD)}|aus · /bildmodel cloud neu")
+                    else:
+                        ui.success(f"🖼 Bilder jetzt: {VC.waehlen('bild', None if teile[1] in ('aus', 'lokal') else teile[1])}")
+                except ValueError as e:
+                    ui.warn(str(e))
+                return None
             if arg.strip().lower() in ("comfy-adresse", "comfyui-adresse", "comfy"):
                 neu_adr = await ask_text(f"ComfyUI-Adresse (jetzt: {comfyui.host()}):")
                 if neu_adr:
@@ -505,6 +594,14 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             # dazu gehören CLIP und VAE als eigene Dateien.
             zusatz = "ComfyUI · geteilt" if art == "diffusion" else "ComfyUI"
             opts.append((f"comfy::{name}", f"{mark}🧩 {name}  ({zusatz})"))
+        import videobildcloud as VC
+        wolke = VC.gewaehlt("bild") if akt_backend == "cloud" else None
+        for a in VC.bereit("bild"):
+            mark = "✓  " if a == wolke else "   "
+            opts.append((f"cloud::{a}", f"{mark}☁ {VC.BILD[a]['titel']} · {VC.modell(a)}  (Cloud)"))
+        if VC.ohne_schluessel("bild"):
+            opts.append(("__cloudneu__", f"☁  Cloud-Anbieter hinzufügen  ·  Key eintragen "
+                                         f"({len(VC.ohne_schluessel('bild'))})"))
         opts.append(("__ordner__", "📂  Krea-2-Ordner öffnen (Modelldateien ablegen)"))
         opts.append(("__host__", f"🌐  WebUI-Adresse ändern  ({sdwebui.host()})"))
         opts.append(("__chost__", f"🧩  ComfyUI-Adresse ändern  ({comfyui.host()})"
@@ -518,9 +615,12 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             ui.warn(f"Noch kein Bild-Modell da. Krea-2-Dateien gehören nach:  {krea.krea_dir()}")
             ui.info("… oder eine Forge/A1111-WebUI mit --api starten "
                     f"(erwartet unter {sdwebui.host()}).")
-        wahl = await ask_confirm("Welches Modell zum Bildermalen?  "
+        wahl = await ask_suche("Welches Modell zum Bildermalen?  "
                                  "(🟣 Krea 2 · 🌐 Forge/A1111 · 🧩 ComfyUI)", opts)
         if wahl == "__cancel__":
+            return None
+        if wahl == "__cloudneu__":
+            await cloud_anbieter_hinzufuegen("bild")
             return None
         if wahl == "__ordner__":
             krea.krea_dir().mkdir(parents=True, exist_ok=True)
@@ -545,7 +645,12 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                            f"({'erreichbar' if comfyui.available() else 'nicht erreichbar'})")
             return None
         art, _, name = wahl.partition("::")
-        if art == "krea":
+        if art == "cloud":
+            try:
+                ui.success(f"☁ Bilder jetzt aus der Cloud: {VC.waehlen('bild', name)}  ·  zurück: ein Krea-Modell wählen")
+            except ValueError as e:
+                ui.warn(str(e))
+        elif art == "krea":
             krea.set_chosen_model(name)
             ui.success(f"🟣 Bild-Modell (Krea 2): {name}  ·  kein Negativ-Prompt, CFG 1, "
                        f"{krea.schritte()} Schritte, "
@@ -730,27 +835,32 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
         st = sp.alarm_statistik()
         inv = sp.inventar_zaehlung()
         ui.kv_panel("🛡 Systemwache", [
-            ("Hintergrund-Prozess", f"läuft (PID {info['pid']})" if info else "läuft NICHT – /wache start"),
+            ("Hintergrund-Prozess", f"läuft (PID {info['pid']}){Z.still_hinweis(info)}" if info
+             else "läuft NICHT – /wache start"),
             ("Autostart mit NemiCLI", "an" if e.get("aktiv", True) else "aus"),
             ("Autostart mit Windows", "an" if Z.autostart_aktiv() else "aus"),
             ("Ereignisse gespeichert", str(sp.anzahl_ereignisse())),
             ("Prozess-Profile", str(sp.anzahl_profile())),
             ("Inventar", ", ".join(f"{n} {k}" for k, n in sorted(inv.items())) or "noch keins"),
             ("Alarme", f"{st.get('offen', 0)} offen · {st.get('gesehen', 0)} gesehen · "
-                       f"{st.get('harmlos', 0)} harmlos · {st.get('echt', 0)} ECHT · {st.get('erledigt', 0)} erledigt"),
+                       f"{st.get('harmlos', 0)} harmlos · {st.get('unpruefbar', 0)} nicht voll prüfbar · "
+                       f"{st.get('echt', 0)} ECHT · {st.get('erledigt', 0)} erledigt"),
             ("ML-Schwelle", f"{e['schwelle']}  (Grenzen {e['grenzen']['schwelle_min']}–{e['grenzen']['schwelle_max']})"),
             ("Training", f"erstes ab {e['min_training']} Ereignissen, dann alle {e['training_alle']}; "
                          f"lernt nur aus Ereignissen älter als {e.get('ml_karenz_h', 24)} h"),
             ("Wecken ab", f"{e['trigger_ab']}" + (" + ML-Anomalien" if e.get("trigger_ml") else "")),
             ("Prüfen ab", f"{J.pruefen_ab(e)} ungeprüften Alarmen (jede Stufe; {J.PRUEFEN_MIN}–{J.PRUEFEN_MAX})"),
             ("Stumme Regeln", ", ".join(e.get("stumme_regeln") or []) or "keine"),
+            ("Netzwächter", "aus" if not e.get("netz", True) else
+             "warnt (ML-002/DL-002)" if e.get("netz_alarm") else "Schattenmodus – nur Protokoll (/wache netz)"),
             ("Folgen-Netz", "aus" if not e.get("dl", True) else
              "warnt (DL-001)" if e.get("dl_alarm") else "Schattenmodus – nur Protokoll (/wache dl)"),
             ("Daten", str(Z.DB_PFAD)),
         ])
         ui.info("/wache alarme · ereignisse · regeln · justierungen · inventar · training · fullscan · "
                 "schwelle <x> · trigger <stufe|5–20> · stumm <R00x> · laut <R00x> · start · stop · "
-                "an · aus · autostart an|aus · kugel an|aus · dl · ml zurueck · erledigt <id> · reset · rueckgaengig")
+                "an · aus · autostart an|aus · kugel an|aus · dl · netz [adresse] · ml zurueck · erledigt <id> · reset · "
+                "rueckgaengig")
     elif sub == "start":
         ui.info(Z.starten(paths.INSTALL))
     elif sub == "stop":
@@ -854,6 +964,19 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
         else:
             ui.info("Training läuft im Hintergrund-Prozess: Tray-Menü → „Modell jetzt trainieren“. "
                     "Ohne laufende Wache trainiert der Selbsttest (/wache selbsttest).")
+    elif sub == "netz":
+        _netz_befehl(rest)
+    elif sub in ("programm", "programme", "absolvierung"):
+        # /wache programm [liste] · <name> [tage] · stop <name> · erlauben <name> <prozess>
+        worte = rest.split()
+        was = worte[0].lower() if worte else "liste"
+        if was in ("stop", "stoppen", "aus", "status", "erlauben") and len(worte) > 1:
+            auftrag = {"aktion": was, "programm": worte[1], "prozess": " ".join(worte[2:])}
+        elif was == "liste" or not worte:
+            auftrag = {"aktion": "liste"}
+        else:
+            auftrag = {"aktion": "start", "programm": worte[0], **({"tage": worte[1]} if len(worte) > 1 else {})}
+        ui.text_panel("🔍 Programm-Absolvierung", W.programm(auftrag, wer="Nutzer"))
     elif sub in ("dl", "folgen", "folgennetz"):
         _folgen_befehl(rest.lower(), e)
     elif sub in ("fullscan", "vollscan"):
@@ -870,13 +993,49 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
             else:
                 Z.speicher().lernen_zuruecksetzen()
                 from wache import MODELL_ORDNER
-                for p in [*MODELL_ORDNER.glob("*.json"), *(MODELL_ORDNER / "folgen").glob("*.json"),
-                          MODELL_ORDNER / "folgen" / "aktuell.txt"]:
+                for p in [*MODELL_ORDNER.glob("*.json"), *MODELL_ORDNER.glob("*.pause")]:
                     p.unlink(missing_ok=True)
+                for unter in ("folgen", "netzfolgen"):
+                    for p in [*(MODELL_ORDNER / unter).glob("*.json"), MODELL_ORDNER / unter / "aktuell.txt",
+                              MODELL_ORDNER / unter / "auto.pause"]:
+                        p.unlink(missing_ok=True)
             ui.success("Wache lernt von null – Inventar beim nächsten Start neu.")
             protokoll.schreibe("wache", "Lernen zurückgesetzt (Nutzer)", "success", veraendernd=True, wer="Nutzer")
     else:
         ui.warn("Unbekannt. /wache zeigt die Möglichkeiten.")
+
+
+def _netz_befehl(rest: str) -> None:
+    """/wache netz [<adresse oder Meldung>|warnen|schatten|aus|an|zurueck|register an|aus]: Netzwächter.
+    Scharf schaltet nur der Nutzer – die Persönlichkeit kann das nicht."""
+    from wache import MODELL_ORDNER, detektor as DT, folgen as F, justierung as J, werkzeuge as W
+    teile = rest.split()
+    wahl = teile[0].lower() if teile else ""
+
+    def _setzen(neu: dict, text: str) -> None:
+        if not J.speichern(neu):
+            ui.warn("Nicht gespeichert – der Netzwächter bleibt, wie er war.")
+            return
+        protokoll.schreibe("wache_justieren", f"Netzwächter: {neu}", "success", veraendernd=True, wer="Nutzer")
+        ui.success(text + " Die laufende Wache übernimmt es in etwa 10 Sekunden.")
+
+    if wahl == "schatten":
+        _setzen({"netz": True, "netz_alarm": False}, "Netzwächter im Schattenmodus: Funde nur ins Protokoll.")
+    elif wahl in ("warnen", "scharf"):
+        _setzen({"netz": True, "netz_alarm": True},
+                "Netzwächter warnt: auffällige Verbindungen werden Alarme ML-002/DL-002.")
+    elif wahl == "aus":
+        _setzen({"netz": False}, "Netzwächter aus: Verbindungen werden nicht mehr bewertet und nicht gelernt.")
+    elif wahl == "an":
+        _setzen({"netz": True}, "Netzwächter an.")
+    elif wahl == "register" and len(teile) > 1:
+        an = teile[1].lower() in ("an", "on", "ein", "ja")
+        _setzen({"netz_besitzer": an}, "Besitzer-Abfrage beim Adressregister " + ("an." if an else "aus."))
+    elif wahl in ("zurueck", "zurück"):
+        ui.info(DT.zurueckdrehen(MODELL_ORDNER / "netz.json"))
+        ui.info(F.zurueckdrehen(MODELL_ORDNER / "netzfolgen").replace("Folgen-Netz", "Netz-Folgen"))
+    else:
+        ui.text_panel("🌐 Netzwächter", W.netz({"text": rest} if rest else {}))
 
 
 def _folgen_befehl(rest: str, e: dict) -> None:
@@ -1119,7 +1278,8 @@ def wache_lauf() -> int:
         try:
             datei = _gespraech_datei()
             datei.parent.mkdir(parents=True, exist_ok=True)
-            datei.write_text(json.dumps(raus, ensure_ascii=False), encoding="utf-8")
+            from atomar import text_schreiben
+            text_schreiben(datei, json.dumps(raus, ensure_ascii=False))
         except OSError:
             pass
 
@@ -1150,27 +1310,39 @@ def wache_lauf() -> int:
                 await asyncio.to_thread(_lokales_modell_freigeben)
 
     async def _wecken(alarme, nachhaken: bool = False) -> str:
-        try:
-            ref, backend = await _backend_neu()
-        except Exception as e:
-            return f"❌ Die Wache kann niemanden wecken: {e}"
         name = PS.active().name
-        mitschrift.leeren()
-        mitschrift.setze_quelle(lambda: {"chat": "Wache", "model": ref, "persona": name,
-                                         "modus": modes.label(), "ordner": str(Path.cwd())})
         text = _wecker.auftrag_text(alarme, _zugang.speicher(), name, nachhaken)
-        fehler = ""
-        try:
-            await asyncio.wait_for(converse(backend, text), timeout=15 * 60)
-        except asyncio.TimeoutError:
-            fehler = "Abgebrochen: der Weckruf lief länger als 15 Minuten."
-        except Exception as e:
-            fehler = f"Abgebrochen mit Fehler: {e}"
-        antwort = mitschrift.letzte_antwort() or ""
+        raus_hinweis = ""
+        for _ in range(1 + ersatzbank.MAX_ERSATZ):      # herausgefiltert: der Ersatz übernimmt den Weckruf
+            try:
+                ref, backend = await _backend_neu()
+            except Exception as e:
+                return raus_hinweis + f"❌ Die Wache kann niemanden wecken: {e}"
+            mitschrift.leeren()
+            mitschrift.setze_quelle(lambda: {"chat": "Wache", "model": ref, "persona": name,
+                                             "modus": modes.label(), "ordner": str(Path.cwd())})
+            fehler = ""
+            try:
+                await asyncio.wait_for(converse(backend, text), timeout=15 * 60)
+            except asyncio.TimeoutError:
+                fehler = "Abgebrochen: der Weckruf lief länger als 15 Minuten."
+            except Exception as e:
+                fehler = f"Abgebrochen mit Fehler: {e}"
+            if (raus := ersatzbank.abholen()) is None:
+                break
+            raus_hinweis += f"⚠️ {ersatzbank.meldung(raus['neu'])} ({raus['alt']})\n\n"
+            if not raus["neu"]:
+                return raus_hinweis.strip()
+        antwort = raus_hinweis + (mitschrift.letzte_antwort() or "")
         if not antwort:
             antwort = "❌ Kein Bericht – " + (fehler or "die Persönlichkeit hat nichts geantwortet.")
         elif fehler:
             antwort = f"⚠️ {fehler}\n\n{antwort}"
+        try:                                     # Stand NACH den Urteilen, nicht der vom Weckruf
+            sp = _zugang.speicher()
+            alarme = [sp.alarm(a.id) or a for a in alarme]
+        except Exception:
+            pass
         pfad = _ZP.bericht_pfad("Wache")
         pfad.write_text(
             f"<!-- NemiCLI-Bericht: Wache · {time.strftime('%d.%m.%Y %H:%M')} · {ref} · {name} -->\n\n"
@@ -1209,6 +1381,9 @@ def wache_lauf() -> int:
     async def _kugel_gespraech(text: str, bilder: list) -> tuple[str, list[str], str]:
         if gespraech["persona"] != PS.active().key:      # Persönlichkeit gewechselt: ihr eigenes Gespräch
             gespraech["kugel_backend"], gespraech["persona"] = None, PS.active().key
+        if (gespraech["kugel_backend"] is not None
+                and gespraech["kugel_backend"][0] != _migrate_ref(config.load().get("model"))):
+            gespraech["kugel_backend"] = None            # Modell gewechselt, auch durch die Ersatzbank
         if gespraech["kugel_backend"] is None:
             try:
                 ref, backend = await _backend_neu()
@@ -1228,12 +1403,19 @@ def wache_lauf() -> int:
             except Exception:
                 pass
         start = time.time()
+        modes.kugel_runde(True)
         try:
             await asyncio.wait_for(converse(backend, text, images=uris or None), timeout=10 * 60)
         except Exception as e:
             return f"(abgebrochen: {e})", [], plan.text_fuer_modell()
+        finally:
+            abgelehnt = modes.kugel_abgelehnt()
+            modes.kugel_runde(False)
         _gespraech_speichern(backend.messages)
-        antwort = mitschrift.letzte_antwort() or ""
+        antwort = modes.KUGEL_TERMINAL_SATZ if abgelehnt else (mitschrift.letzte_antwort() or "")
+        if (raus := ersatzbank.abholen()) is not None:
+            gespraech["kugel_backend"] = None
+            antwort = ersatzbank.meldung(raus["neu"])
         neue = []
         import profilordner
         for ordner in profilordner.bilder_ordner_alle():
@@ -1273,8 +1455,57 @@ async def run_classic(ctx: Ctx) -> None:
         except (KeyboardInterrupt, EOFError):
             break
         ui.console.print(ui.input_divider())   # zweite Linie -> Eingabe eingerahmt
-        if await handle_line(ctx, text) == "exit":
+        if neustart.ist_befehl(text):
+            await neustart.ausfuehren()
             break
+        if await handle_line(ctx, text) == "exit" or neustart.ANGEFORDERT:
+            break
+
+
+class _Start:
+    """Der Start mit Stoppuhr und Schutz: jeder Schritt wird gemessen; scheitert ein verzichtbarer Schritt, steht
+    er im Debugbericht und als kurze Warnung da, und NemiCLI startet weiter. Sicherheitsschritte laufen ungeschützt."""
+    LANGSAM_S = 0.3
+
+    def __init__(self) -> None:
+        self.t0 = time.monotonic()
+        self.zeiten: list[tuple[str, float]] = []
+        self.fehler: list[str] = []
+
+    def schritt(self, name: str):
+        import contextlib
+
+        @contextlib.contextmanager
+        def uhr():
+            t = time.monotonic()
+            try:
+                yield
+            except Exception as exc:
+                self.fehler.append(name)
+                try:
+                    import debugbericht
+                    debugbericht.fehler(f"Start: {name}", exc)
+                except Exception:
+                    pass
+                ui.warn(f"⚠ Beim Start ging „{name}“ schief ({exc}) – NemiCLI startet trotzdem.")
+            finally:
+                self.zeiten.append((name, time.monotonic() - t))
+        return uhr()
+
+    def bericht(self) -> str:
+        gesamt = time.monotonic() - self.t0
+        teile = [f"Start fertig: {gesamt:.1f} s"]
+        try:
+            import psutil
+            teile[0] += f" ({time.time() - psutil.Process().create_time():.1f} s seit dem Programmstart)"
+        except Exception:
+            pass
+        langsam = sorted((z for z in self.zeiten if z[1] >= self.LANGSAM_S), key=lambda z: -z[1])
+        if langsam:
+            teile.append("langsam: " + ", ".join(f"{n} {s:.1f} s" for n, s in langsam[:6]))
+        if self.fehler:
+            teile.append("gescheitert: " + ", ".join(self.fehler))
+        return " · ".join(teile)
 
 
 async def main():
@@ -1282,6 +1513,7 @@ async def main():
     import debugbericht as _DBG
     _DBG.starten("haupt")
     _DBG.schleife(asyncio.get_running_loop())
+    start = _Start()
 
     # Sicherheitsnetz: Maus-Tracking beim Programm-Ende IMMER zurücksetzen – auch
     # wenn NemiCLI unerwartet endet. Sonst flutet das Terminal die Shell danach mit
@@ -1294,10 +1526,12 @@ async def main():
         pass
 
     # Noch im Klartext liegende API-Keys in den Windows-Umschlag packen (einmalig).
-    secured_keys = config.secure_existing_keys()
+    secured_keys = 0
+    with start.schritt("API-Keys schützen"):
+        secured_keys = config.secure_existing_keys()
 
     # Gemerktes Theme wiederherstellen (vor dem Banner, damit es passt)
-    if cfg.get("theme") in ui.THEMES:
+    if isinstance(cfg.get("theme"), str) and cfg["theme"] in ui.THEMES:     # kaputte Konfig: kein Absturz
         ui.set_theme(cfg["theme"])
 
     # Vollbild-TUI (Standard) oder klassischer Loop (NEMICLI_CLASSIC=1 als Fallback)
@@ -1319,11 +1553,10 @@ async def main():
 
     import startseite
     startseite.STEUERN = _fenster_steuern          # eigenes Fenster: echte Bilder statt Zeichen-Blöcke
-    try:
+    with start.schritt("Startseite sammeln"):
         startseite.sammeln(seit=startseite.letzter_start())
-    except Exception:
-        pass
-    ui.banner(animate=(tui is None))   # klassisch animiert, im TUI statisch in den Puffer
+    with start.schritt("Banner"):
+        ui.banner(animate=(tui is None))   # klassisch animiert, im TUI statisch in den Puffer
 
     backend = None
     model = None
@@ -1332,13 +1565,16 @@ async def main():
         strength = M.DEFAULT_STRENGTH
 
     # 1) Gemerktes Modell vom letzten Mal wiederherstellen (ins neue Schema heben)
-    gemerkt = _migrate_ref(cfg.get("model"))
+    gemerkt = None
+    with start.schritt("Gemerktes Modell lesen"):
+        gemerkt = _migrate_ref(cfg.get("model"))
     if gemerkt:
-        try:
-            backend = await make_backend(gemerkt, None, strength)
-            model = gemerkt
-        except Exception as e:
-            ui.error(f"Gemerktes Modell '{gemerkt}' ließ sich nicht laden: {e}")
+        with start.schritt("Modell verbinden"):
+            try:
+                backend = await make_backend(gemerkt, None, strength)
+                model = gemerkt
+            except Exception as e:
+                ui.error(f"Gemerktes Modell '{gemerkt}' ließ sich nicht laden: {e}")
 
     # 2) Sonst: mit Cloud-Sonnet starten, wenn ein Anthropic-Key da ist
     if backend is None and os.getenv("ANTHROPIC_API_KEY"):
@@ -1351,19 +1587,21 @@ async def main():
 
     ctx = Ctx(backend=backend, model=model, strength=strength,
               current_chat=chatstore.next_id(), current_prompts=[])
-    _weiter = _gespraech_fortsetzen(ctx)
+    _weiter = None
+    with start.schritt("Gespräch fortsetzen"):
+        _weiter = _gespraech_fortsetzen(ctx)
     _FORTSETZEN_NACH_MODELL[0] = ctx.backend is None
-    _kontext_neu_zaehlen(ctx)
+    with start.schritt("Kontext zählen"):
+        _kontext_neu_zaehlen(ctx)
     import commands as _befehle                  # die KI sieht dieselbe Auswahl wie das Menü
     _befehle.AUSWAHL_JETZT = lambda cmd: _untermenue_eintraege(ctx, cmd)
-    stats.start_session(model)
-    sicherheit.sitzung_zuruecksetzen()
-    try:                                     # Papierkorb: Sicherungen älter als 30 Tage weg
+    with start.schritt("Statistik"):
+        stats.start_session(model)
+    sicherheit.sitzung_zuruecksetzen()       # bewusst ungeschützt: ohne frische Freigaben kein Start
+    with start.schritt("Papierkorb aufräumen"):  # Sicherungen älter als 30 Tage weg
         weg = snapshot.aufraeumen()
         if weg:
             ui.info(f"🗑 Papierkorb: {weg} alte Sicherung(en) entfernt.")
-    except Exception:
-        pass
 
     # F12 sichert das ganze Gespraech - der Mitschnitt holt sich die Kopfdaten
     # hier ab, damit er nichts ueber main wissen muss.
@@ -1375,23 +1613,22 @@ async def main():
         "ordner": str(Path.cwd()),
     })
 
-    startseite.setzen(status="bereit" if ctx.backend is not None else "ohne")
-    ui.welcome(model=ctx.model or "—", mode="Chat",
-               strength=ctx.strength if ctx.strength_active() else None)
+    with start.schritt("Begrüßung"):
+        startseite.setzen(status="bereit" if ctx.backend is not None else "ohne")
+        ui.welcome(model=ctx.model or "—", mode="Chat",
+                   strength=ctx.strength if ctx.strength_active() else None)
     if tui is None and _weiter:
         ui.info(f"📒 Euer Gespräch geht weiter: „{_weiter['title']}“")
     # Berichte aus dem Zeitplan, die seit dem letzten Start dazukamen: erste Zeile zeigen
-    try:
+    with start.schritt("Zeitplan-Berichte"):
         import zeitplan as _ZP
         for _p in _ZP.neue_berichte()[-3:]:
             if tui is None:
                 ui.info(f"📋 Bericht „{_p.stem}“: {_ZP.bericht_kopfzeile(_p) or '(leer)'}  →  {_p}")
             else:
                 startseite.offen_dazu(f"📋 Bericht „{_p.stem}“")
-    except Exception:
-        pass
     # Systemwache: läuft sie? Wenn gewünscht und nicht da → im Hintergrund starten.
-    try:
+    with start.schritt("Wache"):
         from wache import zugang as _WZ, justierung as _WJ
         _we = _WJ.einstellungen()
         _alt = _WZ.laeuft()
@@ -1408,6 +1645,8 @@ async def main():
             _lage = f"{_st.get('offen', 0)} offen"
             if _st.get("echt"):
                 _lage = f"⚠ {_st['echt']} ECHT · " + _lage
+            if (_still := _WZ.still_hinweis(_wi)):
+                ui.warn("🛡 Wache:" + _still)
             if tui is None:
                 ui.info(f"🛡 Wache läuft (PID {_wi['pid']}) · Alarme: {_lage} · /wache zeigt mehr")
             else:
@@ -1417,29 +1656,25 @@ async def main():
                 ui.info("🛡 Wache ist aus (/wache start · /wache an schaltet den Autostart wieder ein)")
             else:
                 startseite.setzen(wache=startseite.wache_text(False, {}))
-    except Exception:
-        pass
-    vollscan_beobachten()
-    try:
+    with start.schritt("Vollscan beobachten"):
+        vollscan_beobachten()
+    with start.schritt("Chats prüfen"):
         if (meldung := chatstore.beim_start()):
             ui.warn("🛟 " + meldung)
-    except Exception:
-        pass
-    try:
+    with start.schritt("Auto-Backup"):
         import autobackup
         if (meldung := autobackup.beim_start()):
             ui.warn(meldung)
-    except Exception:
-        pass
     if ctx.backend is None:
         ui.warn("Noch kein Modell aktiv – tippe /model zum Wählen.")
-        provs = {pid: p for pid, p in P.detected().items() if not p.keyless}
-        if provs:
-            ui.info(f"☁ Cloud-Anbieter erkannt: {', '.join(p.label for p in provs.values())}")
-        if P.get("ollama").available():
-            ui.info(f"🦙 Ollama läuft: {len(P.ollama_models())} Modell(e) – lokal, kein Key")
-        if not provs and not P.get("ollama").available():
-            ui.info("Cloud: API-Key eintragen · Lokal: Modell von Hugging Face holen – beides unter /model.")
+        with start.schritt("Anbieter suchen"):
+            provs = {pid: p for pid, p in P.detected().items() if not p.keyless}
+            if provs:
+                ui.info(f"☁ Cloud-Anbieter erkannt: {', '.join(p.label for p in provs.values())}")
+            if P.get("ollama").available():
+                ui.info(f"🦙 Ollama läuft: {len(P.ollama_models())} Modell(e) – lokal, kein Key")
+            if not provs and not P.get("ollama").available():
+                ui.info("Cloud: API-Key eintragen · Lokal: Modell von Hugging Face holen – beides unter /model.")
     # Key-Schutz nur als einmaliges Ereignis melden (wenn gerade verschlüsselt wurde).
     # Der dauerhafte „geschützt"-Hinweis steht jetzt unter /help (sauberer Start).
     try:
@@ -1474,24 +1709,30 @@ async def main():
     try:
         import wizard as _W
         if _W.erster_start():
-            ui.info("👋 Zum ersten Mal hier? Tippe  /einrichten  – Funke ✨, der kleine Einrichtungs-Helfer, "
-                    "führt dich durch alles Nötige.")
+            ui.info("👋 Zum ersten Mal hier? Tippe  /einrichten  – " +
+                    ("Funke ✨, der kleine Einrichtungs-Helfer, führt dich" if funke_da() else "der Assistent führt dich")
+                    + " durch alles Nötige.")
     except Exception:
         pass
 
     # Tipps stehen jetzt unter /help – Start bleibt sauber. Im Vollbild grüßt die Persönlichkeit
     # auf der Startseite selbst.
-    if tui is None:
-        mascot.greet()
-        ui.console.print()
-    else:
-        _start_gruss(ctx)
+    with start.schritt("Gruß"):
+        if tui is None:
+            mascot.greet()
+            ui.console.print()
+        else:
+            _start_gruss(ctx)
     global AKTIVER_CTX
     AKTIVER_CTX = ctx
-    _sprueche_im_hintergrund(ctx)
-
-    start_chrome_bridge(ctx)     # Chrome-Erweiterung: Empfang auf 127.0.0.1:9000
-    waechter_verbinden(ctx)      # Skill-Wächter: Zweitmeinung über das aktive Modell
+    asyncio.get_running_loop().create_task(von_sich_aus_abholen())   # Nachrichten aus dem freien Moment
+    with start.schritt("Sprüche"):
+        _sprueche_im_hintergrund(ctx)
+    with start.schritt("Chrome-Brücke"):
+        start_chrome_bridge(ctx)     # Chrome-Erweiterung: Empfang auf 127.0.0.1:9000
+    with start.schritt("Skill-Wächter"):
+        waechter_verbinden(ctx)      # Skill-Wächter: Zweitmeinung über das aktive Modell
+    _DBG.ereignis(start.bericht(), speicher=False)
 
     # --sag "<text>": erste Nachricht gleich abschicken (z.B. aus dem Rechtsklick-Menü)
     start_text = _start_nachricht()
@@ -1524,6 +1765,8 @@ async def main():
     if tui is not None:
         tui.uninstall()
     ui.goodbye()
+    if neustart.ANGEFORDERT:
+        neustart.beenden()
 
 
 def selftest(out=print) -> int:
@@ -1570,30 +1813,33 @@ def selftest(out=print) -> int:
     except Exception as e:
         fehler += 1
         print(f"  FEHLT Allowlist: {e}")
-    try:                                   # Einrichtungs-Helfer: lädt er und antwortet er (reines Python)?
-        from einrichtungshelfer import gespraech as G
-        if G.verfuegbar():
-            t0 = time.perf_counter()
-            probe = G.Funke().sagen("modell", "lokal bitte")
-            ok = probe.art == "modell" and probe.wert == "lokal"
-            fehler += 0 if ok else 1
-            print(f"  {'ok  ' if ok else 'FEHLT'} {G.NAME} antwortet ({probe.art}={probe.wert}, "
-                  f"{time.perf_counter() - t0:.1f} s)")
-        else:
-            print(f"  info {G.NAME} ist nicht mitgeliefert – /einrichten läuft klassisch")
-    except Exception as e:
-        fehler += 1
-        print(f"  FEHLT Einrichtungs-Helfer: {e}")
-    try:                                   # Funke Groß (/model): Datei vollständig? Antworten wäre ohne torch zu langsam
-        from einrichtungshelfer import funkechat as FC
-        if FC.verfuegbar():
-            k = FC.kopf()
-            print(f"  ok   Funke Groß in /model ({k['parameter'] / 1e6:.1f} Mio. Parameter, {k['typ']})")
-        else:
-            print("  info Funke Groß ist nicht mitgeliefert")
-    except Exception as e:
-        fehler += 1
-        print(f"  FEHLT Funke Groß: {e}")
+    if not funke_da():                     # Fassung ohne einrichtungshelfer/: kein Fehler
+        print(f"  info {FUNKE_FEHLT} /einrichten läuft klassisch")
+    else:
+        try:                               # Einrichtungs-Helfer: lädt er und antwortet er (reines Python)?
+            from einrichtungshelfer import gespraech as G
+            if G.verfuegbar():
+                t0 = time.perf_counter()
+                probe = G.Funke().sagen("modell", "lokal bitte")
+                ok = probe.art == "modell" and probe.wert == "lokal"
+                fehler += 0 if ok else 1
+                print(f"  {'ok  ' if ok else 'FEHLT'} {G.NAME} antwortet ({probe.art}={probe.wert}, "
+                      f"{time.perf_counter() - t0:.1f} s)")
+            else:
+                print(f"  info {G.NAME} ist nicht mitgeliefert – /einrichten läuft klassisch")
+        except Exception as e:
+            fehler += 1
+            print(f"  FEHLT Einrichtungs-Helfer: {e}")
+        try:                               # Funke Groß (/model): Datei vollständig? Antworten wäre ohne torch zu langsam
+            from einrichtungshelfer import funkechat as FC
+            if FC.verfuegbar():
+                k = FC.kopf()
+                print(f"  ok   Funke Groß in /model ({k['parameter'] / 1e6:.1f} Mio. Parameter, {k['typ']})")
+            else:
+                print("  info Funke Groß ist nicht mitgeliefert")
+        except Exception as e:
+            fehler += 1
+            print(f"  FEHLT Funke Groß: {e}")
     import imagegen
     grund = imagegen.missing_reason_aktiv()
     motor = imagegen.active_label()
@@ -1654,6 +1900,11 @@ if __name__ == "__main__":
         for k, v in VER.report():
             print(f"{k:<14} {v}")
         raise SystemExit(0)
+    try:                                 # eigene Namensauflösungen mitschreiben (Netz-Auskunft der Wache)
+        from wache import netzspur as _NS
+        _NS.installieren()
+    except Exception:
+        pass
     # Eigenes Terminal-Fenster: mit --fenster, oder NemiCLI.exe (Fenster-App) ohne Hintergrund-Auftrag.
     # Das Fenster startet NemiCLI selbst in einer Pseudokonsole – ohne Windows Terminal.
     _HINTERGRUND = ("--wache", "--vollscan", "--auftrag", "--sag", "--selftest", "--bild",
@@ -1664,9 +1915,18 @@ if __name__ == "__main__":
     if "--gui" in sys.argv:              # GUI-Fenster (verbindet sich mit einer laufenden Sitzung)
         import gui_fenster
         raise SystemExit(gui_fenster.starten())
+    if "--nemiview" in sys.argv:         # NemiView: Appstore und Apps mit eigener Engine (/appstore)
+        from nemiview.fenster import starten as nemiview_starten
+        raise SystemExit(nemiview_starten(sys.argv[sys.argv.index("--nemiview") + 1:]))
+    if "--seitenbild" in sys.argv:       # seite_ansehen: lokale Seite unsichtbar mit NemiView laden
+        from nemiview.bild import main as seitenbild
+        raise SystemExit(seitenbild(sys.argv[sys.argv.index("--seitenbild") + 1:]))
     if "--musik" in sys.argv:            # Musik-Fenster (/musik, verbindet sich mit einer laufenden Sitzung)
         import musik_fenster
         raise SystemExit(musik_fenster.starten())
+    if "--charaktere" in sys.argv:       # Charakter-Galerie (/charaktere, verbindet sich mit einer laufenden Sitzung)
+        import charakter_fenster
+        raise SystemExit(charakter_fenster.starten())
     if "--vorschau" in sys.argv:         # kleines Fenster mit bewegtem Porträt (portraet_bewegen)
         import vorschau_fenster
         _i = sys.argv.index("--vorschau")
@@ -1767,4 +2027,5 @@ if __name__ == "__main__":
         _ST.AKTIV = True                 # nur das große NemiCLI spricht, nicht Wache oder Aufträge
     except Exception:
         pass
+    neustart.warten(sys.argv)            # /restart außerhalb des eigenen Fensters: erst nach dem alten Prozess
     asyncio.run(main())

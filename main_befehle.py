@@ -130,7 +130,16 @@ def _cloud_modell(ctx) -> bool:
 async def update_befehl(ctx) -> str | None:
     """/update: Programm per Git (nur Quelltext mit Remote), dann das venv prüfen und auf Stand
     bringen – Nötiges (Lücken, Schadpakete, fehlt, Version passt nicht, torch-Bau) und erlaubte
-    Updates. Gibt eine Nachricht an die KI zurück, wenn sie die Lücken erklären soll."""
+    Updates. Gibt eine Nachricht an die KI zurück, wenn sie die Lücken erklären soll. Braucht etwas
+    einen Neustart, kommt am Ende die Frage danach."""
+    gruende: list[str] = []
+    antwort = await _update_ablauf(ctx, gruende)
+    if gruende and antwort is None:
+        await neu_starten_anbieten(" ".join(gruende))
+    return antwort
+
+
+async def _update_ablauf(ctx, gruende: list[str]) -> str | None:
     import venvpflege as V
     grund = updater.why_not()
     if grund is None:
@@ -142,8 +151,8 @@ async def update_befehl(ctx) -> str | None:
             ui.warn("⬇ Programm-Update nicht durchgeführt.")
             ui.text_panel("Git sagt", res["output"] or "(keine Ausgabe)")
         elif res["changed"]:
-            ui.success(f"⬇ Programm: {res['before']} → {res['after']}  ({len(res['files'])} Datei(en)) – "
-                       "Neustart nötig, damit der neue Code läuft.")
+            ui.success(f"⬇ Programm: {res['before']} → {res['after']}  ({len(res['files'])} Datei(en)).")
+            gruende.append("Der neue Programmcode läuft erst nach einem Neustart.")
         else:
             ui.info(f"⬇ Programm ist aktuell ({res['before']}).")
     else:
@@ -199,7 +208,8 @@ async def update_befehl(ctx) -> str | None:
         ui.error(f"📦 Update fehlgeschlagen: {e}")
         return None
     if res["jetzt"]:
-        ui.success(f"📦 Aktualisiert und geprüft (lädt): {', '.join(res['jetzt'])}. Ein Neustart nimmt die neuen Fassungen.")
+        ui.success(f"📦 Aktualisiert und geprüft (lädt): {', '.join(res['jetzt'])}.")
+        gruende.append("Ein Neustart nimmt die neuen Fassungen.")
     if res["entfernt"]:
         ui.success(f"🚫 Schadpaket entfernt: {', '.join(res['entfernt'])}.")
     if res["aufgeraeumt"]:
@@ -209,7 +219,7 @@ async def update_befehl(ctx) -> str | None:
     if res["spaeter"]:
         ui.info(f"⏳ Gerade in Benutzung, kommt beim nächsten Start: {', '.join(res['spaeter'])}.")
     if res["neustart"]:
-        ui.warn(f"⚙ {', '.join(res['neustart'])} ist geladen – NemiCLI neu starten und gleich /update tippen.")
+        gruende.append(f"{', '.join(res['neustart'])} ist geladen – nach dem Neustart gleich /update tippen.")
     for name, grund in res["abgelehnt"]:
         ui.warn(f"⏭ {name} übersprungen, nichts verändert: {grund}")
     if offen:
@@ -363,9 +373,16 @@ async def pick_model(current: str | None) -> str | None:
     if lokale:                              # eigener GGUF-Motor: Modelle aus ModelGGUF/
         stufe1.insert(0, ("gguf", f"🧠  Lokal (eigener Motor)  ·  {len(lokale)} Modell(e)  ·  "
                                   "ohne Server, kein Key"))
-    from einrichtungshelfer import funkechat
-    if funkechat.verfuegbar():              # Funke Groß: NemiCLIs eigenes kleines Modell, immer dabei
-        stufe1.append((funkechat.REF, f"{funkechat.beschreibung()}  ·  kein Key"))
+    funke_ref = None
+    if funke_da():                          # Funke Groß: NemiCLIs eigenes kleines Modell, wenn mitgeliefert
+        from einrichtungshelfer import funkechat
+        if funkechat.verfuegbar():
+            funke_ref = funkechat.REF
+            stufe1.append((funke_ref, f"{funkechat.beschreibung()}  ·  kein Key"))
+    P.lokale_vorpruefen()
+    for pid, p in P.PROVIDERS.items():      # weitere lokale Server (LM Studio, Jan, llama.cpp, vLLM), wenn sie laufen
+        if p.keyless and pid != "ollama" and p.available():
+            stufe1.append((f"cloud:{pid}", f"💻  {p.label}  ·  {p.note}"))
     if ollama_on:                           # lokales Ollama läuft -> eigener Zweig
         n = len(P.ollama_models())
         stufe1.append(("ollama", f"🦙  Ollama  ·  {n} Modell(e)  ·  lokal, kein Key"))
@@ -384,10 +401,10 @@ async def pick_model(current: str | None) -> str | None:
         frage = ("👋 Willkommen! Womit soll NemiCLI denken?  Cloud: API-Key eintragen · "
                  "Lokal: ein Modell auf diesen PC holen")
 
-    wahl = await ask_confirm(frage, stufe1)
+    wahl = await ask_suche(frage, stufe1)
     if wahl == "__cancel__":
         return None
-    if wahl == funkechat.REF:
+    if funke_ref and wahl == funke_ref:
         await _funke_vorgaben_waehlen()
         return wahl
 
@@ -399,11 +416,11 @@ async def pick_model(current: str | None) -> str | None:
         return None
     # Neuen Anbieter einrichten: auswählen -> Key eintippen -> speichern -> weiter
     if wahl == "cloudadd":
-        opts = [(pid, f"☁  {p.label}  ·  {p.env}")
+        opts = [(pid, f"☁  {p.label}" + (f"  ·  {p.note}" if p.note else ""))
                 for pid, p in P.PROVIDERS.items()
                 if not p.available() and not p.keyless]
         opts.append(("__cancel__", "Abbrechen"))
-        pid = await ask_confirm("Welchen Anbieter möchtest du einrichten?", opts)
+        pid = await ask_suche("Welchen Anbieter möchtest du einrichten?", opts)
         if pid == "__cancel__":
             return None
         prov = P.get(pid)
@@ -423,8 +440,8 @@ async def pick_model(current: str | None) -> str | None:
     if wahl == "gguf":
         opts = [(M.make_ref("gguf", name), gguflokal.beschreibung(name)) for name in lokale]
         opts.append(("__cancel__", "Zurück / Abbrechen"))
-        ref = await ask_confirm(f"Welches lokale Modell?  (Kontext {gguflokal.kontext():,} Token, "
-                                f"höchstens {gguflokal.tok_s() or '∞'} Token/s)".replace(",", "."), opts)
+        ref = await ask_suche(f"Welches lokale Modell?  (Kontext {gguflokal.kontext():,} Token, "
+                              f"höchstens {gguflokal.tok_s() or '∞'} Token/s)".replace(",", "."), opts)
         return None if ref == "__cancel__" else ref
     if wahl == "ollama":
         ids = P.ollama_models()
@@ -436,14 +453,14 @@ async def pick_model(current: str | None) -> str | None:
                  mid + ("  👁 Vision" if P.ollama_is_vision(mid) else ""))
                 for mid in ids]
         opts.append(("__cancel__", "Zurück / Abbrechen"))
-        ref = await ask_confirm("Welches Ollama-Modell?", opts)
+        ref = await ask_suche("Welches Ollama-Modell?", opts)
         return None if ref == "__cancel__" else ref
 
     pid = wahl.split(":", 1)[1]
     prov = P.get(pid)
     try:
         with ui.thinking(f"frage {prov.label} nach verfügbaren Modellen"):
-            ids = await P.list_models(pid)
+            ids = await P.list_models(pid, limit=P.LISTE_MAX)
     except Exception as e:
         ui.error(f"Modell-Liste von {prov.label} fehlgeschlagen: {e}")
         return None
@@ -453,7 +470,7 @@ async def pick_model(current: str | None) -> str | None:
 
     opts = [(M.make_ref(pid, mid), mid) for mid in ids]
     opts.append(("__cancel__", "Zurück / Abbrechen"))
-    ref = await ask_confirm(f"Welches Modell von {prov.label}?", opts)
+    ref = await ask_suche(f"Welches Modell von {prov.label}?", opts)
     return None if ref == "__cancel__" else ref
 
 
@@ -490,6 +507,57 @@ async def _funke_vorgaben_waehlen() -> None:
     ui.success("✨ Gemerkt – gilt ab der nächsten Antwort.")
 
 
+async def ersatzbank_waehlen(ctx) -> None:
+    """/model ersatz: bis zu zwei Cloud-Modelle, die einspringen, wenn das aktive herausgefiltert wird."""
+    bank = ersatzbank.liste()
+    zeilen = [f"  1. aktiv:  {ctx.model or '—'}"] + [f"  {i}. Ersatz: {r}" for i, r in enumerate(bank, 2)]
+    ui.info("🪑 Ersatzbank\n" + "\n".join(zeilen))
+    opts = []
+    if len(bank) < ersatzbank.MAX_ERSATZ:
+        opts.append(("dazu", "➕ Ersatz hinzufügen (nur Cloud)"))
+    if bank:
+        opts.append(("leeren", "🗑 Ersatzbank leeren"))
+    opts.append(("__cancel__", "Fertig"))
+    wahl = await ask_confirm("Ersatzbank – was tun?", opts)
+    if wahl == "leeren":
+        ersatzbank.setzen([])
+        ui.success("Ersatzbank geleert.")
+        return
+    while wahl == "dazu" and len(bank) < ersatzbank.MAX_ERSATZ:
+        ref = await pick_model(ctx.model)
+        if not ref:
+            return
+        if not ersatzbank.ist_cloud(ref):
+            ui.warn("Auf die Ersatzbank kommen nur Cloud-Modelle – lokale belegen die Grafikkarte.")
+        elif ref == ctx.model or ref in bank:
+            ui.warn("Das Modell ist schon dabei.")
+        else:
+            bank = ersatzbank.setzen(bank + [ref])
+            ui.success(f"🪑 Auf der Bank: {', '.join(bank)}")
+        if len(bank) >= ersatzbank.MAX_ERSATZ:
+            break
+        wahl = await ask_confirm("Noch einen Ersatz?", [("dazu", "Ja"), ("__cancel__", "Nein, fertig")])
+
+
+async def _rauswurf_uebernehmen(ctx) -> None:
+    """Herausgefiltertes Modell – auch von einem anderen Prozess: Ersatz übernehmen oder ohne Modell weiter."""
+    ersatzbank.abholen()
+    if not ctx.model or ctx.model not in ersatzbank.rausgeflogen():
+        return
+    neu = config.load().get("model")
+    if neu and neu != ctx.model:
+        ui.info(f"🔄 Ersatz springt ein: {neu}")
+        ctx.backend, ctx.model = await switch_model(neu, ctx.backend, ctx.model, ctx.strength)
+        if ctx.model == neu:
+            ctx.sync_session()
+            return
+    if (schliessen := getattr(ctx.backend, "schliessen", None)) is not None:
+        await schliessen()
+    ctx.backend, ctx.model = None, None
+    ctx.sync_session()
+    ui.warn("Kein Ersatz auf der Bank. Wähle ein neues Modell mit /model.")
+
+
 async def switch_model(ref: str, backend, model, strength):
     """Wechselt das aktive Modell. Gibt (backend, model) zurück (alt bei Fehler)."""
     carry = backend.messages if backend else None
@@ -500,7 +568,11 @@ async def switch_model(ref: str, backend, model, strength):
     except Exception as e:
         ui.error(str(e))
         return backend, model
+    if getattr(backend, "stand", "") and hasattr(new_backend, "stand"):
+        new_backend.stand = backend.stand        # der Stand des Gesprächs geht mit
     config.update(model=ref)
+    ersatzbank.begnadigen(ref)                   # selbst gewählt: zählt wieder als gutes Modell
+    ersatzbank.setzen(ersatzbank.liste())        # das aktive Modell sitzt nicht zugleich auf der Bank
     if M.split_ref(ref)[0] == "ollama":
         where = "lokal über Ollama"
     elif M.split_ref(ref)[0] == "gguf":
@@ -585,6 +657,15 @@ async def _ps_bearbeiten(p: "PS.Persoenlichkeit") -> None:
                     import profilordner
                     alt_ordner = profilordner.wurzel() / profilordner.ordnername(p.name)
                     neu_ordner = profilordner.wurzel() / profilordner.ordnername(neu)
+                    # Der Profil-Ordner hängt am Namen: ein Name, dessen Ordner schon einer anderen gehört
+                    # (auch „Lüna“/„Luena“), würde ihre Chats, Bilder und Skills teilen.
+                    belegt = neu_ordner != alt_ordner and (neu_ordner.exists() or any(
+                        profilordner.ordnername(q.name) == neu_ordner.name
+                        for k, q in PS.list_all().items() if k != p.key))
+                    if belegt:
+                        ui.warn(f"„{neu.strip()}“ geht nicht – der Profil-Ordner {neu_ordner.name} gehört schon "
+                                "einer anderen Persönlichkeit. Bitte einen anderen Namen.")
+                        return None
                     if alt_ordner.is_dir() and not neu_ordner.exists():
                         alt_ordner.rename(neu_ordner)               # Chats, Bilder … ziehen mit
                     PS.set_name(p, neu)
@@ -742,10 +823,18 @@ class Ctx:
         """Statusleisten-Daten (SESSION) an den aktuellen Stand angleichen."""
         import persona
         persona.chat_gewechselt(self.current_chat)          # Kern-Gedächtnis: neue Momentaufnahme je Chat
+        # Die Oberfläche ruft das 5× je Sekunde; beim eigenen Motor kostet die Kontextgröße einen Ordnerscan.
+        jetzt = time.monotonic()
+        merk = getattr(self, "_ctx_merk", None)
+        if merk is not None and merk[0] == self.model and jetzt - merk[1] < 2.0:
+            ctx_max = merk[2]
+        else:
+            ctx_max = pricing.context_window(self.model)
+            self._ctx_merk = (self.model, jetzt, ctx_max)
         SESSION.update(model=self.model or "—",
                        strength=self.strength if self.strength_active() else None,
                        chat=self.current_chat,
-                       ctx_max=pricing.context_window(self.model))
+                       ctx_max=ctx_max)
 
 
 def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None]]:
@@ -795,7 +884,30 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
             eintraege += [(f"modell {n}", f"{haken(n == akt)}🎞 Modell: {n}", None) for n in video.modelle()]
         except Exception:
             pass
+        try:
+            import videobildcloud as VC
+            wolke = VC.gewaehlt("video") if VC.video_aktiv() else None
+            eintraege += [(f"cloud {a}", f"{haken(a == wolke)}☁ Cloud: {VC.VIDEO[a]['titel']}", None)
+                          for a in VC.bereit("video")]
+            if wolke:
+                eintraege.append(("cloud aus", "   💻 Zurück auf lokal (Wan 2.2)", None))
+            if VC.ohne_schluessel("video"):
+                eintraege.append(("cloud neu", "   ☁ Cloud-Anbieter hinzufügen · Key eintragen", None))
+        except Exception:
+            pass
         return eintraege + [("ordner", "   📂 Video-Ordner öffnen", None)]
+    if cmd == "/vision":
+        import bildbeschreiber as BB
+        akt = BB.aktiv()
+        return ([("", "   👁 Stand anzeigen", None)]
+                + [(n, f"{haken(n == akt)}{n}", None) for n, _, _ in BB.kandidaten()]
+                + [("restart", "   🔄 Neu laden (entladen und wieder laden)", None),
+                   ("protokoll", "   📜 Seh-Protokoll – welche Bilder beschrieben wurden", None),
+                   ("debug", "   🐞 Fehlerbericht schreiben (Debugbericht/vision_bericht.txt)", None),
+                   ("ordner", "   📂 Vision-Ordner öffnen", None)])
+    if cmd in ("/compact", "/kompakt"):
+        return [("jetzt", "   📌 Jetzt zusammenfassen – Älteres in den Stand des Gesprächs", None),
+                ("zeigen", "   📜 Stand des Gesprächs zeigen", None)]
     if cmd == "/debug":
         import debugbericht as _DBG
         an, motor = _DBG.an(), _DBG.motor_log_an()
@@ -829,7 +941,8 @@ def _kontext_teile(ctx: "Ctx") -> tuple[list, int, int, bool]:
         if motor is not None and motor[0] == gguflokal.modelle().get(name):    # nur der Motor DIESES Modells
             tok = motor[2].tokenizer
             zaehlen, genau = (lambda t: len(tok.encode(t)) if t else 0), True
-    teile = [(n, zaehlen(t)) for n, t in persona.prompt_bilanz(lokal)]
+    kompakt = lokal or bool(getattr(ctx.backend, "kompakter_prompt", False))     # lokales Ollama: wie der Motor
+    teile = [(n, zaehlen(t)) for n, t in persona.prompt_bilanz(kompakt)]
     sichtbar = getattr(ctx.backend, "sichtbar", None)
     verlauf = list(sichtbar() if callable(sichtbar) else (getattr(ctx.backend, "messages", None) or []))
     if (stand := getattr(ctx.backend, "stand", "")):
@@ -907,9 +1020,14 @@ def _kontext_anzeige(ctx: "Ctx") -> None:
         ui.info(f"🧱 Modell: {gguflokal.modell_ort(M.split_ref(ctx.model)[1])}")
         ui.info("Wird es voll, wandern die ältesten Nachrichten ins Gedächtnis (vektorisiert, auffindbar); "
                 f"die KI holt sich zurück, was zur Frage passt. Größe einstellen: /kontext (jetzt {fmt(fenster)}).")
+    elif M.split_ref(ctx.model or "")[0] == "ollama":
+        import gespraechsstand as GS
+        budget = int(fenster * pricing.HISTORY_SHARE)
+        ui.info(f"Ab etwa {fmt(int(budget * GS.PUFFER_AB))} Token Verlauf schreibt die KI im Hintergrund den Stand des "
+                "Gesprächs, die ältesten Nachrichten wandern ins Gedächtnis (auffindbar). Jetzt gleich: /compact.")
     else:
         ui.info(f"Der Verlauf wird aufgeräumt ab etwa {fmt(int(fenster * pricing.HISTORY_SHARE))} Token – "
-                "das Wichtigste geht ins Gedächtnis.")
+                "das Wichtigste geht ins Gedächtnis. Vorher zusammenfassen: /compact.")
 
 
 HF_EMBEDDINGS = "https://huggingface.co/models?library=gguf&pipeline_tag=feature-extraction&sort=trending"
@@ -981,6 +1099,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
     # --- Normaler Chat ----------------------------------------------------
     if not text.strip():
         return None
+    await _rauswurf_uebernehmen(ctx)
     if ctx.backend is None:
         if not await funke_plaudern(ctx, text):
             ui.warn("Kein Modell aktiv. Wähle eins mit /model (z.B. /model gemma-12b).")
@@ -992,7 +1111,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
     # Drag & Drop: Windows Terminal setzt nur den PFAD in die Eingabe. Text,
     # Markdown, Quelltext, PDF haengen wir als Daten an; Bilder holt sich
     # vision gleich danach; Binaeres (exe, zip, safetensors) bleibt liegen.
-    dateien = anhang.anhaengen(text)
+    dateien = await asyncio.to_thread(anhang.anhaengen, text)     # PDF lesen kann dauern
     text = dateien["text"]
     if (h := anhang.hinweis(dateien)):
         for zeile in h.splitlines():
@@ -1005,15 +1124,23 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
     for _p in angehaengt[:3]:
         _bild_vorschau(str(_p), title=f"angehängt: {_p.name}")
 
+    if VON_SICH_AUS:                 # Antwort auf etwas, das sie von sich aus schrieb
+        text = vonsichaus.kontext(VON_SICH_AUS) + text
+        VON_SICH_AUS.clear()
     try:
         async with TURN_LOCK:        # nur ein Zug gleichzeitig (Terminal oder Browser)
             if GUI_BRUECKE is not None:
                 GUI_BRUECKE.senden({"t": "nutzer", "text": getippt, "quelle": "terminal"})
                 GUI_BRUECKE.senden({"t": "busy", "on": True})
             records = await converse(ctx.backend, text, images=imgs)
+            if ersatzbank.wechsel_offen():
+                await _rauswurf_uebernehmen(ctx)
             aus_dem_netz = actions.web_tainted()
             ctx.current_prompts.append(text)
-            chatstore.save(ctx.current_chat, ctx.backend.messages, ctx.current_prompts, ctx.model or "—")
+            # im Faden: JSON aller Nachrichten + SHA-256 jedes Bildes brauchen bei langen Chats spürbar Zeit
+            await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
+                                    list(ctx.current_prompts), ctx.model or "—",
+                                    stand=getattr(ctx.backend, "stand", None))
             n_code = learn.capture_from_answer(text, ctx.backend.messages, ctx.current_chat)
             await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
             memory.release_encoder()
@@ -1042,6 +1169,9 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
     Rückgabe wie handle_line – oder (cmd, text), wenn es danach normal weitergeht."""
     if cmd in ("/exit", "/quit"):
         return "exit"
+    elif neustart.ist_befehl(cmd):
+        # Nur die Eingabe des Nutzers startet neu (abgefangen vor handle_line); hier landen Menüs, Inbox, KI.
+        ui.info("🔄 /restart geht nur über deine eigene Eingabe im NemiCLI-Fenster.")
     elif cmd == "/help":
         ui.help_panel()
     elif cmd == "/clear":
@@ -1098,7 +1228,10 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             try:
                 o = indexdb.offen()
                 ui.info(f"📚 Vektor-DB: {o['brocken']} Brocken · {o['ohne_vektor']} ohne Vektor · "
-                        f"{o['berichte_offen']} Berichte offen  →  /gedaechtnis indexieren holt alles nach")
+                        f"{o['berichte_offen']} Berichte offen"
+                        + (f" · {o['alt_geschnitten']} Quellen werden noch neu geschnitten"
+                           if o.get("alt_geschnitten") else "")
+                        + "  →  /gedaechtnis indexieren holt alles nach")
             except Exception:
                 pass
     elif cmd == "/aufraeumen":
@@ -1136,6 +1269,8 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                 ui.info("🪞 Nichts Bleibendes zum Lernen gefunden – alles gut.")
     elif cmd == "/start":
         await run_reich()
+    elif cmd == "/einrichten" and arg.strip().lower() in ("modelle", "models", "modell"):
+        await modelle_einrichten()
     elif cmd == "/einrichten":
         for befehl in await run_wizard():                 # z. B. /model nach der Wahl Cloud/lokal
             await handle_line(ctx, befehl)
@@ -1191,6 +1326,17 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
         else:
             gui_oeffnen(MUSIK_BRUECKE, "--musik")
             ui.success("🎵 Das Musik-Fenster öffnet sich: Wunsch eintippen, ausarbeiten lassen, komponieren.")
+    elif cmd in ("/charaktere", "/charakter", "/galerie"):
+        global CHARAKTER_BRUECKE  # noqa: PLW0603
+        if CHARAKTER_BRUECKE is None:
+            CHARAKTER_BRUECKE = await start_charaktere(ctx)
+        if CHARAKTER_BRUECKE.verbunden():
+            CHARAKTER_BRUECKE.senden({"t": "vorne"})
+            ui.info("🎭 Die Charakter-Galerie ist schon offen.")
+        else:
+            gui_oeffnen(CHARAKTER_BRUECKE, "--charaktere")
+            ui.success("🎭 Die Charakter-Galerie öffnet sich: fertige Persönlichkeiten ansehen oder eine eigene "
+                       "erschaffen.")
     elif cmd == "/web":
         import webfetch
         if arg.strip().lower() == "key":      # /web key -> Ollama-API-Key (Cloud + Suche)
@@ -1240,6 +1386,64 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             else:
                 ui.info(f"{len(eintraege)} Domains · Filter: /web <wort>  (z.B. /web python, /web presse)")
             ui.web_menu(eintraege)
+    elif cmd == "/vision":
+        import bildbeschreiber as BB
+        sub = arg.strip().lstrip("-")
+        wort = sub.split(None, 1)[0].lower() if sub else ""
+        if wort in ("restart", "neustart", "neu"):
+            if BB.finden() is None:
+                ui.warn(f"Kein Seh-Modell unter {BB.ORDNER} – nichts zu laden.")
+            else:
+                ui.info("👁 Bildbeschreiber wird entladen und neu geladen …")
+                try:
+                    name, sek = await asyncio.to_thread(BB.neustart)
+                    ui.success(f"👁 {name} neu geladen in {sek:.1f} s – wartet im RAM, ganz entladen nach "
+                               f"{BB.NACHLAUF_S // 60} Min. ohne Bild.")
+                except Exception as e:
+                    ui.error(f"Neu laden fehlgeschlagen: {e} – /vision debug schreibt einen Bericht.")
+        elif wort == "debug":
+            try:
+                pfad = BB.bericht_schreiben(ctx.model, _modell_sieht(ctx.model))
+                ui.success(f"🐞 Vision-Bericht geschrieben: {pfad}")
+            except Exception as e:
+                ui.error(f"Vision-Bericht nicht geschrieben: {e}")
+        elif wort == "protokoll":
+            import sehprotokoll as SP
+            eintraege = SP.lesen()
+            if not eintraege:
+                ui.info("👁 Seh-Protokoll leer – für diese Persönlichkeit wurde noch kein Bild beschrieben.")
+            else:
+                for zeile in SP.zeilen(eintraege[-15:]):
+                    ui.console.print(zeile, markup=False, highlight=False)
+                ui.info(f"👁 {len(eintraege)} Einträge (neueste oben, gezeigt höchstens 15) · {SP.datei(anlegen=False)}")
+        elif sub.lower() in ("ordner", "oeffnen", "öffnen"):
+            try:
+                BB.ORDNER.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(BB.ORDNER))
+            except Exception as e:
+                ui.warn(f"Konnte den Vision-Ordner nicht öffnen: {e}")
+        elif sub:
+            try:
+                name = BB.waehlen(sub)
+            except OSError as e:
+                ui.warn(f"Nicht gespeichert: {e}")
+            else:
+                if name:
+                    ui.success(f"👁 Bildbeschreiber: {name} – dauerhaft gespeichert. Er hilft jedem Modell, "
+                               "das selbst nicht sieht.")
+                else:
+                    ui.warn(f"Kein Seh-Modell „{sub}“ unter {BB.ORDNER} (Ordner mit .gguf + mmproj-*.gguf).")
+        else:
+            alle, akt = BB.kandidaten(), BB.aktiv()
+            if not alle:
+                ui.info(f"👁 Kein Bildbeschreiber – leg ein Seh-Modell (.gguf + mmproj-*.gguf) in einen "
+                        f"eigenen Ordner unter {BB.ORDNER}.")
+            else:
+                for n, _, _ in alle:
+                    ui.info(f"{'✓ ' if n == akt else '  '}{n}")
+                zustand = "im Speicher" if BB.geladen() else "nicht geladen"
+                ui.info(f"👁 Bildbeschreiber: {akt} ({zustand}, ganz entladen nach {BB.NACHLAUF_S // 60} Min. "
+                        "ohne Bild) · wählen: /vision <ordner> · restart · debug · protokoll · ordner")
     elif cmd == "/voice":
         import stimme
         sub = arg.strip().lower()
@@ -1427,6 +1631,39 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
         neu = gguflokal.kontext(name)
         ui.success(f"📏 Kontext: {neu:,} Token".replace(",", ".") +
                    ("  ·  das Modell wird beim nächsten Senden neu geladen." if gguflokal.geladen() else ""))
+    elif cmd in ("/compact", "/kompakt"):
+        sub = arg.strip().lower()
+        kompakt = getattr(ctx.backend, "kompakt", None)
+        if sub in ("zeigen", "anzeigen", "stand"):
+            stand = getattr(ctx.backend, "stand", "")
+            if stand:
+                ui.info("📜 Stand des Gesprächs (steht vor der ersten Nachricht im Kontext):")
+                ui.console.print(stand, markup=False, highlight=False)
+            else:
+                ui.info("📜 Noch kein Stand des Gesprächs – bisher wurde nichts zusammengefasst.")
+        elif sub not in ("", "jetzt"):
+            ui.warn("/compact jetzt · /compact zeigen")
+        elif ctx.backend is None:
+            ui.warn("Kein Modell aktiv – /model wählt eins.")
+        elif not callable(kompakt):
+            ui.warn("Mit diesem Modell geht /compact nicht – mit dem eigenen Motor, Ollama und "
+                    "OpenAI-kompatiblen Anbietern schon.")
+        else:
+            ui.info("📌 Ich fasse das Gespräch zusammen …")
+            try:
+                async with TURN_LOCK:
+                    ergebnis = await kompakt()
+            except Exception as e:
+                ui.error(f"Zusammenfassen ging nicht: {e}")
+            else:
+                if ergebnis:
+                    ui.success(ergebnis)
+                    await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
+                                            list(ctx.current_prompts), ctx.model or "—",
+                                            stand=getattr(ctx.backend, "stand", None))
+                    _kontext_neu_zaehlen(ctx, vorbereiten=False)
+                else:
+                    ui.info("📌 Noch nichts zusammenzufassen – das Gespräch ist kurz genug.")
     elif cmd == "/kontextmenue":
         sub = arg.strip().lower()
         import kontextmenue

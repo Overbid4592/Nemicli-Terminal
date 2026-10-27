@@ -60,16 +60,18 @@ MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbi
 # schreibende Werkzeuge haben confirm=False (bild_malen → Bilder/, merken/
 # skill_merken → learned/, ordner_lernen → learned/); die gehören NICHT hierher.
 READ_TOOLS = {
-    "datei_lesen", "bild_ansehen", "bild_fragen", "anleitung_lesen", "ordner_auflisten", "ordner_erkennen",
+    "datei_lesen", "bild_ansehen", "bild_fragen", "bild_protokoll", "anleitung_lesen", "ordner_auflisten", "ordner_erkennen",
     "charakter_zeigen",
-    "api_nachschlagen", "code_pruefen", "paket_info", "seite_ansehen", "doku_suchen",
+    "api_nachschlagen", "code_pruefen", "paket_info", "seite_ansehen", "doku_suchen", "app_liste", "app_pruefen",
     "dateien_suchen", "inhalt_suchen",
     "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
     "gedaechtnis_suchen", "gedaechtnis_lesen", "skill_laden",
     # feste Systemabfragen (systemabfrage.py) + Zeitplan ansehen
     "abfragen", "zeitplan_anzeigen",
+    # nachsehen, welche Programme ein Update haben (winget, nichts wird installiert)
+    "updates_suchen",
     # Systemwache: nachsehen ist lesen
-    "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar",
+    "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar", "wache_netz",
     # Sicherungen ansehen und Prüfsummen nachrechnen
     "backup_liste",
     # Entwicklung: den laufenden Debugbericht lesen, sich selbst prüfen
@@ -84,15 +86,36 @@ READ_TOOLS = {
 # nur in die Wache-Datenbank; Merken schreibt nach learned/; bild_malen malt
 # nach Bilder/ – das Kugel-Fenster soll Bilder liefern können. Dateien, Befehle,
 # Löschen bleiben gesperrt: dafür gibt es das große NemiCLI.
-WACHE_URTEIL_TOOLS = {"wache_bewerten", "wache_justieren", "merken", "skill_merken", "bild_malen",
+WACHE_URTEIL_TOOLS = {"wache_bewerten", "wache_justieren", "wache_programm", "merken", "skill_merken", "bild_malen",
                       "bildschirm_ansehen", "kugel", "tagebuch", "lieblingsbild", "profilbild", "portraet_bewegen",
                       "vorschau_schliessen", "erinnern", "kugel_anziehen"}
+# Nach Inhalt aus dem Netz zusätzlich gesperrt: die Erkennung verstellen oder dem Nutzer
+# etwas ausrichten. Im Hintergrund fragt niemand nach – deshalb Sperre statt Rückfrage.
+WACHE_NACH_NETZ_GESPERRT = {"wache_justieren", "wache_programm", "erinnern"}
 _wache_dienst = False
+
+# Im Kugel-Gespräch gesperrt: Suchläufe ohne Größengrenze lesen ganze Dateibäume in
+# den Speicher des Wache-Prozesses. Der Weckruf ist davon nicht betroffen.
+KUGEL_NUR_TERMINAL = {"inhalt_suchen", "dateien_suchen"}
+KUGEL_TERMINAL_SATZ = "Tut mir leid, dazu musst du – um die Stabilität zu bewahren – ins Terminal."
+_kugel_runde = False
+_kugel_abgelehnt = False
 
 
 def wache_dienst(an: bool) -> None:
     global _wache_dienst
     _wache_dienst = bool(an)
+
+
+def kugel_runde(an: bool) -> None:
+    """Markiert eine laufende Kugel-Runde; setzt die Ablehnung zurück."""
+    global _kugel_runde, _kugel_abgelehnt
+    _kugel_runde, _kugel_abgelehnt = bool(an), False
+
+
+def kugel_abgelehnt() -> bool:
+    """Wurde in der laufenden Kugel-Runde ein Werkzeug aus KUGEL_NUR_TERMINAL abgelehnt?"""
+    return _kugel_abgelehnt
 # Pfad-Felder verändernder Werkzeuge, für die Ordner-Grenze im Auto-Modus.
 _PATH_FIELDS = ("pfad", "von", "nach", "ziel", "quelle", "path")
 
@@ -213,10 +236,16 @@ def decide(action: dict, needs_confirm: bool) -> str:
     needs_confirm ist das Urteil aus actions.needs_confirm (inkl. Netz-Taint);
     es kann nur VERSCHÄRFEN, nie lockern – ein getaintetes merken fragt in
     jedem Modus."""
+    global _kugel_abgelehnt
     mode = current()
     tool = action.get("tool", "")
+    if _kugel_runde and tool in KUGEL_NUR_TERMINAL:
+        _kugel_abgelehnt = True
+        return "block"
     if tool == "plan":                 # die Todo-Liste liegt nur im Speicher – in jedem Modus frei
         return "run"
+    if _spontan_gesperrt(tool):        # freier Moment: Grafikkarte nur für ein Bild, und nur mit genug Speicher
+        return "block"
     if tool == "menue_oeffnen":        # das Menü IST die Rückfrage: der Nutzer wählt selbst
         return "run"
     # Coding-Assistent an: Dateiaktionen außerhalb des Projekts sieht der Nutzer
@@ -228,7 +257,7 @@ def decide(action: dict, needs_confirm: bool) -> str:
         # was irgendwo schreibt (auch confirm=False wie bild_malen, merken,
         # skill_merken, ordner_lernen, subagenten), wird blockiert: „nix anrühren".
         if tool in WACHE_URTEIL_TOOLS and _wache_dienst:
-            return "run"
+            return "block" if _wache_netz_sperre(action) else "run"
         if tool not in READ_TOOLS:
             return "block"
         return "ask" if needs_confirm or draussen else "run"   # Netz-Taint kann selbst Lesen bremsen
@@ -278,7 +307,44 @@ def _nach_netz_inhalt(action: dict) -> bool:
         return False
 
 
+def _wache_netz_sperre(action: dict) -> bool:
+    """Wache-Prozess nach Inhalt aus dem Netz: Notizen, Erkennung verstellen, Botschaften an den Nutzer."""
+    try:
+        import actions
+    except ImportError:
+        return False
+    if not actions.web_tainted():
+        return False
+    tool = action.get("tool", "")
+    sagt_etwas = tool == "kugel" and bool(str(action.get("sagen") or "").strip())
+    return (actions.fremd_grund(action) is not None or tool in WACHE_NACH_NETZ_GESPERRT or sagt_etwas)
+
+
+def _spontan_gesperrt(tool: str) -> bool:
+    try:
+        import vonsichaus
+        if not vonsichaus.in_runde():
+            return False
+        import hintergrund
+    except ImportError:
+        return False
+    if tool not in hintergrund.GPU_WERKZEUGE:
+        return False
+    return tool != "bild_malen" or not vonsichaus.bild_erlaubt()[0]
+
+
 def block_message(action: dict) -> str:
+    if _wache_dienst and action.get("tool") in WACHE_URTEIL_TOOLS:
+        return (f"Gesperrt: '{action.get('tool')}' – in diesem Gespräch kam Inhalt aus dem Netz, und im "
+                "Hintergrund kann niemand nachfragen. Sag dem Nutzer, was du tun wolltest; er macht es im Terminal.")
+    if _spontan_gesperrt(action.get("tool", "")):
+        import vonsichaus
+        grund = (vonsichaus.bild_erlaubt()[1] if action.get("tool") == "bild_malen"
+                 else "im freien Moment gibt es nur ein einzelnes Bild, keine andere Grafikkarten-Arbeit")
+        return f"Gerade nicht: {grund}. Nicht erneut versuchen – sag dem Nutzer lieber etwas oder bleib still."
+    if _kugel_runde and action.get("tool") in KUGEL_NUR_TERMINAL:
+        return (f"Abgelehnt: '{action.get('tool')}' läuft in der Kugel nicht, nur im Terminal. "
+                "Nicht erneut versuchen und kein anderes Werkzeug als Ersatz nehmen.")
     return (f"Im Modus {label('lesen')} ist '{action.get('tool', '?')}' gesperrt – "
             "hier wird nur gelesen, nichts angerührt. Schlag dem Nutzer vor, was du tun "
             "würdest; zum Ausführen schaltet er mit Shift+Tab auf Normal oder Auto.")

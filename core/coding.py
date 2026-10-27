@@ -185,9 +185,10 @@ def _speichern(daten: dict) -> None:
     if a is None:
         raise ValueError("Der Coding-Assistent ist nicht an.")
     a.mkdir(parents=True, exist_ok=True)
-    (a / TODO_JSON).write_text(json.dumps(daten, ensure_ascii=False, indent=2), encoding="utf-8")
-    (a / TODO_MD).write_text(_todo_markdown(daten), encoding="utf-8")
-    (a / AUFTRAG_MD).write_text(_auftrag_markdown(daten), encoding="utf-8")
+    from atomar import text_schreiben                  # halb geschrieben hieße: Liste weg
+    text_schreiben(a / TODO_JSON, json.dumps(daten, ensure_ascii=False, indent=2))
+    text_schreiben(a / TODO_MD, _todo_markdown(daten))
+    text_schreiben(a / AUFTRAG_MD, _auftrag_markdown(daten))
 
 
 def _liste(wert) -> list[str]:
@@ -213,7 +214,37 @@ def _punkt(roh, nr: int) -> dict:
     return {"nr": nr, "text": text, "pruefung": pruefung,
             "befehl": str(roh.get("befehl") or "").strip(),
             "erwartet": str(roh.get("erwartet") or "").strip(),
+            "seite": str(roh.get("seite") or "").strip(),
             "status": OFFEN, "frage": "", "notiz": "", "geprueft": ""}
+
+
+_NUR_DA = re.compile(r"test-path\s+(\"[^\"]*\"|'[^']*'|\S+)", re.I)
+_RAHMEN = re.compile(r"\"[^\"]*\"|'[^']*'|\b(if|else|exit\s+\d+)\b|-(and|or|not)\b|[(){};!]", re.I)
+
+
+def nur_vorhanden(befehl: str) -> bool:
+    """Prüft der Befehl nur, ob Dateien da sind (Test-Path ohne sonst etwas)?"""
+    if not _NUR_DA.search(befehl or ""):
+        return False
+    return not _RAHMEN.sub(" ", _NUR_DA.sub(" ", befehl)).strip()
+
+
+def _schwache(daten: dict) -> list[int]:
+    """Punkte, deren einzige Prüfung „Datei vorhanden“ ist."""
+    return [p["nr"] for p in daten["punkte"] if not p.get("seite") and nur_vorhanden(p["befehl"])]
+
+
+def _offen_text(daten: dict) -> str:
+    """„Noch offen: …“ – bearbeitete, aber ungeprüfte Punkte zuerst."""
+    offen = [p for p in daten["punkte"] if p["status"] in (OFFEN, FRAGE)]
+    if not offen:
+        return "Alle Punkte geprüft."
+    liegen = [p["nr"] for p in offen if p.get("bearbeitet") and p["nr"] != daten.get("aktuell")]
+    z = "Noch offen: " + ", ".join(str(p["nr"]) for p in offen) + "."
+    if liegen:
+        z += (f" ⚠ Schon bearbeitet, aber nie geprüft: {', '.join(map(str, liegen))} – "
+              "todo \"pruefen\", sonst bleibt der Punkt rot.")
+    return z
 
 
 def neue_liste(a: dict) -> dict:
@@ -279,8 +310,32 @@ def braucht_bestaetigung(a: dict) -> bool:
     if aktion in _NUTZER_ENTSCHEIDET:
         return True
     if aktion == "pruefen":
-        return True       # mit Prüfbefehl wie `befehl`, ohne: der Nutzer urteilt
+        # mit Prüfbefehl wie `befehl`; nur Seite: liest bloß (wie seite_ansehen); ohne beides urteilt der Nutzer
+        return not pruefseite(a)
     return False
+
+
+def pruefseite(a: dict) -> str:
+    """Die Seite des Punktes, die `todo pruefen` lädt – sonst ''."""
+    if a.get("tool", "todo") != "todo" or str(a.get("aktion") or "").lower() != "pruefen":
+        return ""
+    try:
+        return _finde(_brauche_liste(), a.get("nr")).get("seite", "")
+    except ValueError:
+        return ""
+
+
+def seite_pruefen(seite: str) -> tuple[bool, str]:
+    """Seite des Punktes (relativ zum Projekt) laden: (bestanden, Text). Nur Dateien im Projekt."""
+    import seite as S
+    ziel = seite.strip()
+    if not re.match(r"^https?://", ziel, re.I):              # Adressen lehnt seite.adresse mit Begründung ab
+        p = Path(os.path.expandvars(ziel)).expanduser()
+        p = p if p.is_absolute() else (projekt() or Path.cwd()) / p
+        if not drin(p):
+            return False, f"Die Seite {ziel} liegt nicht im Projektordner."
+        ziel = str(p)
+    return S.pruefen(ziel)
 
 
 def pruefbefehl(a: dict) -> str:
@@ -301,8 +356,14 @@ def ausfuehren(a: dict, befehl_ausfuehren) -> str:
             raise ValueError("Der Coding-Assistent ist nicht an. Erst coding_start.")
         daten = neue_liste(a)
         _speichern(daten)
-        return (f"Todo-Liste angelegt ({len(daten['punkte'])} Punkte) in {ablage()}. "
+        text = (f"Todo-Liste angelegt ({len(daten['punkte'])} Punkte) in {ablage()}. "
                 "Setz jetzt den ersten Punkt mit todo \"arbeiten\" in Arbeit.")
+        if schwach := _schwache(daten):
+            text += (f"\n⚠ Punkt {', '.join(map(str, schwach))}: Der Prüfbefehl sieht nur nach, ob die Datei da ist – "
+                     "das Kriterium prüft er nicht, grün hieße nur „Datei vorhanden“. Besser ein Befehl, der das "
+                     "Verhalten testet; bei Webseiten das Feld `seite` (lädt die Seite, grün nur ohne Konsolenfehler "
+                     "und ohne fehlende Dateien). Ändern: todo \"aendern\".")
+        return text
     if aktion == "zeigen":
         return text_fuer_modell(_brauche_liste())
 
@@ -321,9 +382,16 @@ def ausfuehren(a: dict, befehl_ausfuehren) -> str:
         if punkt["status"] == FRAGE:
             raise ValueError(f"Punkt {nr} wartet auf eine Antwort. Erst klären, dann "
                              "todo \"geklaert\".")
+        vorher = daten.get("aktuell")
         daten["aktuell"] = nr
+        punkt["bearbeitet"] = True
         _speichern(daten)
-        return f"▶ Punkt {nr} in Arbeit: {punkt['text']}\nPrüfung: {punkt['pruefung']}"
+        text = f"▶ Punkt {nr} in Arbeit: {punkt['text']}\nPrüfung: {punkt['pruefung']}"
+        alt = next((p for p in daten["punkte"] if p["nr"] == vorher), None) if vorher != nr else None
+        if alt is not None and alt["status"] == OFFEN:
+            text += (f"\n⚠ Punkt {alt['nr']} war in Arbeit und ist noch nicht geprüft (🔴). Immer nur ein Punkt: "
+                     f"ist er fertig, erst todo \"pruefen\" ({alt['nr']}).")
+        return text
     if aktion == "frage":
         frage = str(a.get("frage") or "").strip()
         if not frage:
@@ -343,7 +411,7 @@ def ausfuehren(a: dict, befehl_ausfuehren) -> str:
         _speichern(daten)
         return f"Punkt {nr} ist wieder offen. Antwort notiert: {notiz or '–'}"
     if aktion == "aendern":
-        for feld in ("text", "pruefung", "befehl", "erwartet"):
+        for feld in ("text", "pruefung", "befehl", "erwartet", "seite"):
             if feld in a:
                 punkt[feld] = str(a.get(feld) or "").strip()
         if not punkt["text"] or not punkt["pruefung"]:
@@ -363,21 +431,32 @@ def ausfuehren(a: dict, befehl_ausfuehren) -> str:
     if aktion == "pruefen":
         if punkt["status"] == GESTRICHEN:
             raise ValueError(f"Punkt {nr} ist gestrichen.")
-        if punkt["befehl"]:
-            ok, ausgabe = befehl_ausfuehren(punkt["befehl"])
-            fehlt = punkt["erwartet"] and punkt["erwartet"] not in ausgabe
-            if ok and not fehlt:
-                _gruen(daten, punkt, "Prüfbefehl")
-                return f"🟢 Punkt {nr} geprüft: Prüfbefehl erfolgreich.\n{ausgabe}"
-            grund = (f"erwarteter Text '{punkt['erwartet']}' fehlt in der Ausgabe" if ok
-                     else "Prüfbefehl fehlgeschlagen")
+        if punkt["befehl"] or punkt.get("seite"):
+            ausgaben, grund = [], ""
+            if punkt["befehl"]:
+                ok, ausgabe = befehl_ausfuehren(punkt["befehl"])
+                ausgaben.append(ausgabe)
+                if not ok:
+                    grund = "Prüfbefehl fehlgeschlagen"
+                elif punkt["erwartet"] and punkt["erwartet"] not in ausgabe:
+                    grund = f"erwarteter Text '{punkt['erwartet']}' fehlt in der Ausgabe"
+            if punkt.get("seite") and not grund:
+                ok, ausgabe = seite_pruefen(punkt["seite"])
+                ausgaben.append(ausgabe)
+                if not ok:
+                    grund = "Seitenprüfung nicht bestanden"
+            ausgabe = "\n".join(ausgaben)
+            if not grund:
+                durch = " + ".join(w for w, da in (("Prüfbefehl", punkt["befehl"]), ("Seite", punkt.get("seite"))) if da)
+                _gruen(daten, punkt, durch)
+                return f"🟢 Punkt {nr} geprüft: {durch} erfolgreich. {_offen_text(daten)}\n{ausgabe}"
             punkt["status"] = OFFEN
             _speichern(daten)
             return (f"🔴 Punkt {nr} NICHT bestanden: {grund}. Finde die Ursache, "
                     f"behebe sie und prüfe erneut.\n{ausgabe}")
         # Ohne Prüfbefehl: diese Aktion läuft nur, wenn der Nutzer Ja gesagt hat.
         _gruen(daten, punkt, "Nutzer")
-        return f"🟢 Punkt {nr} geprüft: vom Nutzer bestätigt."
+        return f"🟢 Punkt {nr} geprüft: vom Nutzer bestätigt. {_offen_text(daten)}"
     raise ValueError(f"Unbekannte aktion '{aktion}'. Erlaubt: anlegen, neu, arbeiten, frage, "
                      "geklaert, aendern, streichen, pruefen, zeigen.")
 
@@ -423,13 +502,16 @@ def beschreibung(a: dict) -> str:
             p = _finde(_brauche_liste(), nr)
         except ValueError:
             return f"Todo-Punkt {nr} prüfen"
-        if p["befehl"]:
-            return (f"Todo-Punkt {nr} prüfen: {p['text']}\n    Prüfbefehl: {p['befehl']}"
-                    + (f"\n    erwartet: {p['erwartet']}" if p["erwartet"] else ""))
+        if p["befehl"] or p.get("seite"):
+            return (f"Todo-Punkt {nr} prüfen: {p['text']}"
+                    + (f"\n    Prüfbefehl: {p['befehl']}" if p["befehl"] else "")
+                    + (f"\n    erwartet: {p['erwartet']}" if p["erwartet"] else "")
+                    + (f"\n    Seite: {p['seite']} (Konsole ohne Fehler, keine fehlenden Dateien)"
+                       if p.get("seite") else ""))
         return (f"Todo-Punkt {nr} prüfen: {p['text']}\n    Kriterium: {p['pruefung']}\n"
                 "    Es gibt keinen Prüfbefehl – nur du kannst den Punkt grün machen.")
     if aktion == "aendern":
-        felder = ", ".join(f"{k}={a[k]!r}" for k in ("text", "pruefung", "befehl", "erwartet") if k in a)
+        felder = ", ".join(f"{k}={a[k]!r}" for k in ("text", "pruefung", "befehl", "erwartet", "seite") if k in a)
         return f"Todo-Punkt {nr} ändern (wird wieder 🔴): {felder}"
     if aktion == "streichen":
         return f"Todo-Punkt {nr} streichen – Grund: {a.get('grund', '?')}"
@@ -461,9 +543,14 @@ def _zeile(p: dict, aktuell) -> str:
     elif p["status"] == GESTRICHEN:
         z += f"\n       gestrichen: {p['notiz']}"
     else:
-        z += f"\n       ✓ {p['pruefung']}" + (f"  [{p['befehl']}]" if p["befehl"] else "")
+        z += (f"\n       ✓ {p['pruefung']}" + (f"  [{p['befehl']}]" if p["befehl"] else "")
+              + (f"  [Seite {p['seite']}]" if p.get("seite") else ""))
+        if not p.get("seite") and nur_vorhanden(p["befehl"]):
+            z += "  (prüft nur: Datei vorhanden)"
         if p["status"] == FERTIG and p["geprueft"]:
             z += f"  – geprüft ({p['geprueft']})"
+        elif p["status"] == OFFEN and p.get("bearbeitet") and p["nr"] != aktuell:
+            z += "  – bearbeitet, nie geprüft"
     return z
 
 
@@ -544,6 +631,8 @@ _WEG = """\
 - Nach dem Schreiben meldet NemiCLI Syntax- und Strukturfehler sofort. Vor todo "pruefen" eines
   Python-Punktes: code_pruefen (ruff: undefinierte Namen, veralteter Stil, typische Fehler).
 - Web-Punkte (HTML/CSS/JS): seite_ansehen zeigt dir die Seite als Bild – prüf, ob sie aussieht wie verlangt.
+  Als Prüfung des Punktes das Feld `seite` (z. B. "chat.html"): todo "pruefen" lädt sie und wird nur grün
+  ohne Konsolenfehler und ohne fehlende Dateien. `Test-Path` allein beweist nur, dass die Datei da ist.
 - Meldet etwas „⚠️ Veraltet“ oder stellst du fest, dass sich eine API geändert hat: modernisieren und mit
   skill_merken festhalten, Name „<Paket> <Version>: <Thema>“, Inhalt: was alt war, was jetzt gilt.
 """
@@ -619,8 +708,23 @@ def status_text() -> str:
     p = projekt()
     if p is None:
         return ""
+    # Die Statusleiste fragt 5× je Sekunde: todo.json nur neu lesen, wenn sie sich geändert hat.
+    a = ablage(p)
+    try:
+        st = (a / TODO_JSON).stat() if a is not None else None
+        stand = (str(p), st.st_mtime_ns, st.st_size) if st else (str(p), None, None)
+    except OSError:
+        stand = (str(p), None, None)
+    if _STATUS["stand"] == stand:
+        return _STATUS["text"]
     daten = laden(p)
     if daten is None:
-        return f"Coding · {p.name}"
-    gepr, gesamt = zaehlen(daten)
-    return f"Coding · {p.name} · {gepr}/{gesamt}"
+        text = f"Coding · {p.name}"
+    else:
+        gepr, gesamt = zaehlen(daten)
+        text = f"Coding · {p.name} · {gepr}/{gesamt}"
+    _STATUS.update(stand=stand, text=text)
+    return text
+
+
+_STATUS: dict = {"stand": None, "text": ""}

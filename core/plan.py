@@ -30,28 +30,33 @@ MAX_TEXT = 160
 # Werkzeuge, die keine Liste brauchen: die Liste selbst und der Coding-Assistent.
 # Ohne Liste frei: die Liste selbst und Bedienhilfe (Anleitung lesen, Menü für den Nutzer öffnen).
 FREI = {"plan", "coding_start", "todo", "anleitung_lesen", "menue_oeffnen"}
-# Begleiten im Gespräch: kein Arbeitsschritt, also auch ohne Liste frei.
+# Begleiten im Gespräch: kein Arbeitsschritt, also auch ohne Liste frei. wache_bewerten ist ein Urteil
+# in der Antwort (oft mehrere hintereinander), kein Projektschritt.
 BEGLEITEN = {"merken", "kugel", "erinnern", "vorlesen", "stimme_schalter", "modell_schalter", "aufgaben", "lora", "coding_lora",
-             "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen"}
-EINZELN = 1                   # so viele Arbeitsschritte je Runde laufen ohne Liste
+             "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen", "wache_bewerten"}
+EINZELN = 1                   # so viele Arbeitsschritte je Nachricht laufen ohne Liste
 
 SPERR_TEXT = (
-    "Nicht ausgeführt: {tools}. Das ist mehr als ein Arbeitsschritt – dafür steht vorher die "
-    "Todo-Liste. Schreib zuerst auf, was du vorhast, z. B. {{\"tool\": \"plan\", \"punkte\": [\"Ordner ansehen\", \"Datei anlegen\"]}} – "
-    "im selben Zug darfst du direkt danach die Aktion schicken. Hake Punkte mit "
-    "{{\"tool\": \"plan\", \"erledigt\": 1}} ab.")
+    "Nicht ausgeführt: {tools}. Regel: Pro Nachricht des Nutzers ist ein Arbeitsschritt ohne Todo-Liste frei – "
+    "diesmal war das schon: {schon}. Frei bleiben Nachsehen, Begleiten (z. B. merken, kugel, wache_bewerten) und "
+    "ein neuer Versuch eines Werkzeugs, das gerade fehlgeschlagen ist. Für weitere Schritte schreib zuerst auf, "
+    "was du vorhast, z. B. {{\"tool\": \"plan\", \"punkte\": [\"Ordner ansehen\", \"Datei anlegen\"]}} – im selben "
+    "Zug darfst du direkt danach die Aktion schicken. Hake Punkte mit {{\"tool\": \"plan\", \"erledigt\": 1}} ab.")
 
 _liste: dict | None = None
 _gezeigt: tuple | None = None
-_ohne_liste = 0               # Arbeitsschritte dieser Runde ohne Liste
+_ohne_liste = 0               # Arbeitsschritte dieser Nachricht ohne Liste
+_erster: str = ""             # der freie Arbeitsschritt dieser Nachricht (für die Sperr-Meldung)
+_fehlgeschlagen: set[str] = set()   # Werkzeuge, die in dieser Nachricht fehlschlugen: ein neuer Versuch ist frei
 
 
 def runde_neu() -> bool:
     """Neue Nutzer-Runde. Eine Liste mit offenen Punkten bleibt (lange Arbeit über mehrere Runden),
     eine fertige weicht. True = eine offene Liste läuft weiter."""
-    global _liste, _gezeigt, _ohne_liste
+    global _liste, _gezeigt, _ohne_liste, _erster
     _gezeigt = None
-    _ohne_liste = 0
+    _ohne_liste, _erster = 0, ""
+    _fehlgeschlagen.clear()
     if _liste is not None and aktuell() is not None:
         return True
     _liste = None
@@ -60,15 +65,18 @@ def runde_neu() -> bool:
 
 def verwerfen() -> None:
     """Neuer Chat: keine Liste mitnehmen."""
-    global _liste, _gezeigt, _ohne_liste
-    _ohne_liste = 0
+    global _liste, _gezeigt, _ohne_liste, _erster
+    _ohne_liste, _erster = 0, ""
+    _fehlgeschlagen.clear()
     _liste = None
     _gezeigt = None
 
 
 def abhaken_nach(act: dict, ok) -> bool:
-    """Feld `abhaken` an einer Aktion: Punkt(e) sofort abhaken, wenn sie geklappt hat.
-    True, wenn sich die Liste geändert hat."""
+    """Nach jeder Aktion. Fehlgeschlagen: ein neuer Versuch desselben Werkzeugs ist frei. Feld `abhaken`:
+    Punkt(e) sofort abhaken, wenn sie geklappt hat. True, wenn sich die Liste geändert hat."""
+    if ok is False and act.get("tool"):
+        _fehlgeschlagen.add(str(act["tool"]))
     if ok is not True or _liste is None or act.get("tool") == "plan" or act.get("abhaken") in (None, ""):
         return False
     nrn = _nummern(act.get("abhaken"))
@@ -225,8 +233,9 @@ def zurueckweisen(acts: list[dict], frei: bool = False) -> tuple[list[dict], lis
     """Teilt die Aktionen eines Zuges in (laufen, gesperrt). Eine Aktion läuft, wenn
     schon eine Liste besteht oder im selben Zug vorher eine angelegt wird, wenn sie nur
     nachsieht oder begleitet – oder wenn sie der erste Arbeitsschritt der Runde ist.
-    frei=True (Coding-Assistent an): alles läuft."""
-    global _ohne_liste
+    frei=True (Coding-Assistent an): alles läuft. Ein neuer Versuch eines gerade fehlgeschlagenen
+    Werkzeugs läuft auch (einmal je Fehlschlag)."""
+    global _ohne_liste, _erster
     if frei:
         return list(acts), []
     import modes
@@ -238,8 +247,12 @@ def zurueckweisen(acts: list[dict], frei: bool = False) -> tuple[list[dict], lis
             liste_da = True
         if tool in FREI or tool in BEGLEITEN or tool in modes.READ_TOOLS or liste_da:
             laufen.append(act)
+        elif tool in _fehlgeschlagen:
+            _fehlgeschlagen.discard(tool)
+            laufen.append(act)
         elif _ohne_liste < EINZELN:
             _ohne_liste += 1
+            _erster = _erster or str(tool)
             laufen.append(act)
         else:
             gesperrt.append(act)
@@ -248,4 +261,4 @@ def zurueckweisen(acts: list[dict], frei: bool = False) -> tuple[list[dict], lis
 
 def sperr_text(gesperrt: list[dict]) -> str:
     tools = ", ".join(dict.fromkeys(str(a.get("tool", "?")) for a in gesperrt))
-    return SPERR_TEXT.format(tools=tools)
+    return SPERR_TEXT.format(tools=tools, schon=_erster or "ein anderer Schritt im selben Zug")

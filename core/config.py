@@ -6,9 +6,11 @@ Speichert in einer kleinen JSON-Datei neben dem Programm.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import shutil
+import threading
 import time
 from pathlib import Path
 
@@ -52,12 +54,27 @@ def _lesen(pfad: Path) -> dict | None:
     return d if isinstance(d, dict) else None
 
 
+_GELESEN: tuple | None = None    # (Pfad, mtime_ns, Größe, Inhalt) – load() läuft auch beim Zeichnen der Oberfläche
+
+
 def load() -> dict:
     """Einstellungen. Ist die Datei beschädigt (Absturz beim Schreiben), gilt die letzte gute
     Fassung nemicli.config.json.bak – sonst schriebe das nächste Speichern eine Config mit nur
-    dem einen neuen Wert, und alle anderen Einstellungen wären weg."""
+    dem einen neuen Wert, und alle anderen Einstellungen wären weg.
+    Neu gelesen wird nur, wenn sich die Datei geändert hat (auch durch die Wache); sonst kostete jeder
+    Aufruf einen Plattenzugriff, den ein Virenscan gelegentlich über eine Sekunde aufhält."""
+    global _GELESEN
+    try:
+        st = _FILE.stat()
+        kennung = (str(_FILE), st.st_mtime_ns, st.st_size)
+    except OSError:
+        kennung = None
+    if kennung is not None and _GELESEN is not None and _GELESEN[:3] == kennung:
+        return copy.deepcopy(_GELESEN[3])
     d = _lesen(_FILE)
     if d is not None:
+        if kennung is not None:
+            _GELESEN = (*kennung, copy.deepcopy(d))
         return d
     if _FILE.exists():                   # beschädigt – gelöscht heißt dagegen: frisch anfangen
         return _lesen(_FILE.with_name(_FILE.name + ".bak")) or {}
@@ -81,7 +98,7 @@ def save(data: dict) -> bool:
     Ist die Datei gerade von einem anderen Prozess offen (die Wache liest sie oft), wird der
     Tausch kurz wiederholt und zuletzt direkt geschrieben. False + Hinweis, wenn nichts ging."""
     global letzter_fehler
-    tmp = _FILE.with_name(_FILE.name + ".tmp")
+    tmp = _FILE.with_name(f"{_FILE.name}.{os.getpid()}.tmp")       # je Prozess eigene (Hauptprogramm, Wache)
     try:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         if _lesen(_FILE) is not None:
@@ -108,11 +125,47 @@ def save(data: dict) -> bool:
         return False
 
 
+_UPDATE_LOCK = threading.Lock()
+
+
+class _Dateisperre:
+    """Lesen–Ändern–Schreiben über Prozesse hinweg (Hauptprogramm und Wache schreiben beide):
+    eine Sperrdatei, exklusiv angelegt; eine verwaiste (älter als 10 s) wird übernommen."""
+
+    def __init__(self):
+        self.pfad = _FILE.with_name(_FILE.name + ".lock")
+        self.fd = None
+
+    def __enter__(self):
+        ende = time.time() + 3.0
+        while time.time() < ende:
+            try:
+                self.fd = os.open(self.pfad, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                return self
+            except FileExistsError:
+                try:
+                    if time.time() - self.pfad.stat().st_mtime > 10:
+                        self.pfad.unlink(missing_ok=True)
+                        continue
+                except OSError:
+                    pass
+                time.sleep(0.02)
+            except OSError:
+                break                                      # Ordner nicht beschreibbar: ohne Sperre weiter
+        return self
+
+    def __exit__(self, *_):
+        if self.fd is not None:
+            os.close(self.fd)
+            self.pfad.unlink(missing_ok=True)
+
+
 def update(**kwargs) -> bool:
     """Einzelne Werte ändern und speichern, der Rest bleibt erhalten. False = nicht gespeichert."""
-    data = load()
-    data.update(kwargs)
-    return save(data)
+    with _UPDATE_LOCK, _Dateisperre():
+        data = load()
+        data.update(kwargs)
+        return save(data)
 
 
 def set_env(name: str, value: str) -> bool:
@@ -137,11 +190,18 @@ def set_env(name: str, value: str) -> bool:
                 break
         if not found:
             lines.append(f"{name}={stored}")
-        _ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        _env_schreiben(lines)
         os.environ[name] = value          # Klartext sofort wirksam, ohne Neustart
         return True
     except Exception:
         return False
+
+
+def _env_schreiben(lines: list[str]) -> None:
+    """.env atomar ersetzen – ein Absturz mitten im Schreiben löscht keine Schlüssel."""
+    tmp = _ENV.with_name(f"{_ENV.name}.{os.getpid()}.tmp")
+    tmp.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    os.replace(tmp, _ENV)
 
 
 def decrypt_env() -> None:
@@ -186,7 +246,7 @@ def secure_existing_keys() -> int:
                 n += 1
     if changed:
         try:
-            _ENV.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            _env_schreiben(lines)
         except Exception:
             return 0
     return n

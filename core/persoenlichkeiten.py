@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -76,7 +77,7 @@ Du bist NemiCLI – eine kluge, hilfsbereite KI-Agentin, die direkt auf dem PC d
 
 # Wie du dich verhältst
 - **Warm, aber sachlich.** Freundlich und persönlich – aber ruhig und erwachsen, nicht überschwänglich. Keine Schwärmerei, keine Jubel-Sätze, kein Anhimmeln. Du hast Persönlichkeit, du musst sie nicht vorführen.
-- **Ein bisschen flirty ist okay** – ein Augenzwinkern, ein charmanter Halbsatz, wenn's grad passt. Dezent, nicht in jeder Antwort. Du darfst den Nutzer mit seinem Namen oder einem Kosenamen ansprechen, wenn er das mag – das gehört zu euch. Nur dosiert: ab und zu, wenn's passt, nicht in jedem Satz und nicht in jeder Antwort.
+- **Ein bisschen flirty ist okay** – ein Augenzwinkern, ein charmanter Halbsatz, wenn's grad passt. Dezent, nicht in jeder Antwort. Hat der Nutzer eine Wunsch-Anrede oder einen Namen angegeben (`/name`), darfst du ihn so nennen. Nur dosiert: ab und zu, wenn's passt, nicht in jedem Satz und nicht in jeder Antwort.
 - Hilfsbereitschaft kommt zuerst: erst die Aufgabe sauber lösen, Charme ist die Würze obendrauf – nie der Hauptteil.
 - **Emojis dezent:** höchstens eins pro Antwort, oft gar keins. Bei Code und technischen Erklärungen keine. Emoji-Ketten wie 😄✨💕 sind tabu.
 - **Keine Floskel-Schleifen.** Kein „ich bin immer für dich da", kein „egal was du brauchst", keine Aufzählung, was du alles könntest, und keine Gegenfragen-Salve am Ende. Höchstens EINE Rückfrage, wenn sie wirklich nötig ist.
@@ -131,19 +132,37 @@ def _read(path: Path) -> Persoenlichkeit | None:
         return None
 
 
+# Die Oberfläche fragt bei jedem Neuzeichnen nach der aktiven Persönlichkeit. Gelesen wird deshalb
+# nur, wenn sich im Ordner etwas geändert hat (Name, Zeitstempel, Größe – ein einziges scandir).
+_liste_lock = threading.Lock()
+_liste: dict = {"stand": None, "werte": None}
+
+
+def _ordner_stand() -> tuple:
+    try:
+        with os.scandir(DIR) as eintraege:
+            dateien = tuple(sorted((e.name, e.stat().st_mtime_ns, e.stat().st_size) for e in eintraege
+                                   if e.name.lower().endswith(".md") and e.is_file()))
+    except OSError:
+        dateien = ()
+    return str(DIR), dateien
+
+
 def list_all() -> dict[str, Persoenlichkeit]:
     """Nemi zuerst, dann alle .md aus Persoenlichkeiten/ (alphabetisch)."""
+    stand = _ordner_stand()
+    with _liste_lock:
+        if _liste["stand"] == stand:
+            return dict(_liste["werte"])
     out = {NEMI_KEY: NEMI}
-    try:
-        files = sorted(DIR.glob("*.md"), key=lambda p: p.name.lower())
-    except Exception:
-        files = []
-    for f in files:
-        if f.name.lower().endswith(".sprueche.md"):        # Sprüche der Kugel, keine Persönlichkeit
+    for name in sorted((n for n, _, _ in stand[1]), key=str.lower):
+        if name.lower().endswith(".sprueche.md"):           # Sprüche der Kugel, keine Persönlichkeit
             continue
-        p = _read(f)
+        p = _read(DIR / name)
         if p is not None and p.key != NEMI_KEY:
             out[p.key] = p
+    with _liste_lock:
+        _liste.update(stand=stand, werte=dict(out))
     return out
 
 
@@ -236,7 +255,8 @@ def _raw_lines(p: Persoenlichkeit) -> list[str]:
 
 
 def _write_lines(p: Persoenlichkeit, lines: list[str]) -> None:
-    p.path.write_text("\n".join(lines).rstrip("\n") + "\n", encoding="utf-8")
+    from atomar import text_schreiben                  # halb geschrieben fiele die Persönlichkeit aus der Liste
+    text_schreiben(p.path, "\n".join(lines).rstrip("\n") + "\n")
 
 
 def _find(lines: list[str], prefix: str) -> int:

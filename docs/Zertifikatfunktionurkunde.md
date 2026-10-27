@@ -40,7 +40,7 @@ Es darf sich ab heute offiziell-inoffiziell nennen:
 |---|---|
 | Name | NemiCLI |
 | Version | 6.7 Alpha, Build 6.7.325 |
-| Erbaut von | VibeCoder (@Overbid4592) |
+| Erbaut von | D. Hoffmann (Vibecoder) |
 | Mitgebaut von | Claude (Anthropic) |
 | Erster Stein gelegt | 12. September 2026 |
 | Urkunde ausgestellt | 8. Oktober 2026 |

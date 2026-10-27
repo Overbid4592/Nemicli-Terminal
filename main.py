@@ -95,16 +95,28 @@ import mitschrift
 import lernschleife
 import anhang
 import protokoll
+import neustart
+import vonsichaus
+import beobachter
+import denkwerk
+import pruefer
 import sicherheit
 import snapshot
 import coding
 import notstopp
 import plan
 import modes
+import ersatzbank
 import stats
 from commands import SlashCompleter, parse, PERSONA_CMDS
-from confirm import ask as ask_confirm, ask_text
+from confirm import ask as ask_confirm, ask_text, ask_suche as _ask_suche
 from confirm import review_action as review_action_confirm
+
+
+async def ask_suche(frage: str, optionen: list[tuple[str, str]], **k) -> str:
+    """Auswahl mit 🔍 Suchen über das jeweils gültige ask_confirm (im Hintergrund: nie freigeben)."""
+    return await _ask_suche(frage, optionen, frage_fn=ask_confirm, text_fn=ask_text, **k)
+
 
 load_dotenv(paths.INSTALL / ".env")  # gehoert zum Programm, nicht zu den Daten
 config.decrypt_env()        # verschlüsselte API-Keys (Windows-Umschlag) nutzbar machen
@@ -129,8 +141,11 @@ def _modell_sieht(model: str | None) -> bool:
         return False
     if prov in ("openai", "google", "anthropic", "openrouter"):
         return True
-    # Ollama Cloud & andere OpenAI-kompatible Anbieter: Vision am Namen erkennen
-    # (deren API meldet die Fähigkeit nicht). z.B. deepseek-v4.1-flash = multimodal.
+    if prov == "ollama_cloud":                       # ollama.com meldet die Fähigkeit wie lokales Ollama
+        caps = P.ollama_cloud_capabilities(mid)
+        if caps is not None:
+            return "vision" in caps
+    # Andere OpenAI-kompatible Anbieter (und Ollama Cloud ohne Antwort): Vision am Namen erkennen.
     return P.cloud_name_vision(mid)
 
 
@@ -170,7 +185,7 @@ async def _bilder_fuer_chat(model: str | None, text: str,
     if _modell_sieht(model):
         if bilder:
             text = vision.strip_paths(text, bilder)
-            imgs += [vision.to_data_uri(p) for p in bilder]
+            imgs += await asyncio.to_thread(lambda: [vision.to_data_uri(p) for p in bilder])
         return text, imgs or None, (
             f"🖼 {len(bilder)} Bild(er) angehängt: " + ", ".join(p.name for p in bilder)
             if bilder else None
@@ -186,7 +201,7 @@ async def _bilder_fuer_chat(model: str | None, text: str,
     if bilder:
         text = vision.strip_paths(text, bilder)
     import bildbeschreiber
-    if bildbeschreiber.zustaendig(model):            # lokales Modell ohne Bild-Eingang
+    if bildbeschreiber.zustaendig(model):            # Modell ohne Bild-Eingang
         try:
             bloecke = [bildbeschreiber.block(p if p in bilder else p.name,
                                              await asyncio.to_thread(bildbeschreiber.beschreiben, p))
@@ -207,7 +222,8 @@ async def _bilder_fuer_chat(model: str | None, text: str,
         except Exception:
             pass
     return text, None, ("Das aktive Modell sieht keine Bilder. Nimm mit /model ein "
-                        "Vision-Modell (Cloud oder ein Ollama-Modell mit 👁).")
+                        "Vision-Modell (Cloud oder ein Ollama-Modell mit 👁) – oder leg ein "
+                        "Seh-Modell (.gguf + mmproj) in einen Ordner unter Vision/ (/vision).")
 MAX_STEPS = 12                  # Bremse für Aktions-Ketten pro Nutzer-Nachricht (keine Endlosschleife)
 # Solange in einer Runde NUR gelesen wurde (READ_TOOLS: datei_lesen, abfragen, web …),
 # gilt eine weitere Grenze: Die Systemwache liest ihre Anleitung in drei Stücken und
@@ -227,8 +243,8 @@ _FRAGE_HALT_NOTE = ("\n\n[System] 🟠 Eine Frage ist offen. Stell sie dem Nutze
 # befehl/bild_malen/Helfer bewusst nicht – ein zweites `git status` kann Sinn haben.
 _DEDUPE_TOOLS = {"datei_lesen", "ordner_auflisten", "dateien_suchen", "inhalt_suchen",
                  "ordner_erkennen", "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
-                 "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar",
-                 "gedaechtnis_suchen", "gedaechtnis_lesen"}
+                 "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar", "wache_netz",
+                 "gedaechtnis_suchen", "gedaechtnis_lesen", "bild_protokoll"}
 _STEP_LIMIT_NOTE = (
     "\n\n[System] ⏸ Du hast in dieser Runde die Obergrenze an Aktionen erreicht "
     f"({MAX_STEPS} mit Änderungen, {MAX_LESE_STEPS} nur lesend). Führe jetzt KEINE weitere Aktion aus. Fasse zusammen, was du "
@@ -259,10 +275,11 @@ AUTO_ALLOW: set[str] = set()    # Werkzeuge, die diese Sitzung nicht mehr abgefr
 WEB_BRIDGE = None               # aktive WebUI-Brücke (None = kein /webui gestartet)
 GUI_BRUECKE = None              # Verbindung zum GUI-Fenster (None = kein /gui gestartet)
 MUSIK_BRUECKE = None            # Verbindung zum Musik-Fenster (/musik)
+CHARAKTER_BRUECKE = None        # Verbindung zur Charakter-Galerie (/charaktere)
 # Im GUI-Modus „Chat“ erlaubt: nichts am PC ändern – malen, Bilder ansehen, Gedächtnis, Skills (Prüffenster).
 CHAT_WERKZEUGE = frozenset({"plan", "bild_malen", "bild_serie", "portraet_bewegen", "charakter_zeigen",
                             "charakter_aendern",
-                            "bild_ansehen", "bild_fragen",
+                            "bild_ansehen", "bild_fragen", "bild_protokoll",
                             "gedaechtnis_suchen", "gedaechtnis_lesen", "merken", "tagebuch", "lieblingsbild",
                             "profilbild",
                             "vorschau_schliessen",
@@ -270,7 +287,14 @@ CHAT_WERKZEUGE = frozenset({"plan", "bild_malen", "bild_serie", "portraet_bewege
 _CHAT_GESPERRT = ("Werkzeug „{tool}“ ist im Chat-Modus gesperrt (dort gibt es nur Bilder malen/ansehen, "
                   "das Gedächtnis und Skills). Antworte ohne dieses Werkzeug oder bitte den Nutzer, oben auf "
                   "„Work“ umzuschalten.")
+_FENSTER_GESPERRT = ("Werkzeug „{tool}“ ist in diesem Fenster nicht freigegeben. Hier gibt es: {liste}. "
+                     "Mach es mit diesen Werkzeugen.")
 SPIELE_SERVER = None            # /spiel – Brettspiele im Browser (eigener Server)
+APPSTORE_SERVER = None          # /appstore – Brücke zu NemiView (Store, Apps, debugAI)
+# Im Appstore (debugAI, ➕ Neue App): App-Dateien lesen, anlegen und ändern, Seiten ansehen, App-Funktionen nutzen.
+APP_WERKZEUGE = frozenset({"plan", "datei_lesen", "datei_bearbeiten", "datei_schreiben", "ordner_erstellen",
+                           "ordner_auflisten",
+                           "seite_ansehen", "app_liste", "app_aufrufen", "app_pruefen"})
 CHROME_BRIDGE = None            # Empfangsstelle für die Chrome-Erweiterung (127.0.0.1:9000)
 # Nur EIN Chat-Zug gleichzeitig – egal ob aus Terminal oder Browser. Schützt den
 # gemeinsamen Verlauf (backend.messages) vor Verschachtelung.
@@ -355,9 +379,9 @@ async def _bilder_aus_ergebnis(res, model: str | None):
     if not pfade:
         return None, res
     if _modell_sieht(model):
-        return [vision.to_data_uri_small(p) for p in pfade], res
+        return await asyncio.to_thread(lambda: [vision.to_data_uri_small(p) for p in pfade]), res
     import bildbeschreiber
-    if bildbeschreiber.zustaendig(model):            # lokales Modell ohne Bild-Eingang
+    if bildbeschreiber.zustaendig(model):            # Modell ohne Bild-Eingang
         try:
             bloecke = [bildbeschreiber.block(p, await asyncio.to_thread(bildbeschreiber.beschreiben, p))
                        for p in pfade]
@@ -366,8 +390,8 @@ async def _bilder_aus_ergebnis(res, model: str | None):
         return None, dataclasses.replace(res, text=res.text.replace(
             "wird dir jetzt als Bild gezeigt", "wurde vom Bildbeschreiber angesehen") + "\n" + "\n\n".join(bloecke))
     return None, dataclasses.replace(res, text=res.text + (
-        "(Das aktive Modell sieht keine Bilder – nimm mit /model ein Vision-Modell, "
-        "dann kann ich es ansehen.)"))
+        "(Das aktive Modell sieht keine Bilder – nimm mit /model ein Vision-Modell "
+        "oder leg ein Seh-Modell unter Vision/ (/vision), dann kann ich es ansehen.)"))
 
 
 _KOPF_IN_AUSGABE = re.compile(r"(?m)^Ergebnis von '")
@@ -380,12 +404,104 @@ def _ergebnisse_verbinden(ergebnisse: list[str]) -> str:
     return "\n\n".join(b[:1] + _KOPF_IN_AUSGABE.sub(" Ergebnis von '", b[1:]) for b in ergebnisse)
 
 
-def _result_feedback(tool, result) -> str:
-    """Status stammt vom Werkzeug, nie aus dem Inhalt seiner Ausgabe."""
+def _result_feedback(tool, result, vorab: str = "") -> str:
+    """Status stammt vom Werkzeug, nie aus dem Inhalt seiner Ausgabe. `vorab`: Hinweis des
+    Beobachters, der vor dem Inhalt steht (z. B. die Datei hat sich seit dem letzten Lesen geändert)."""
     status = "erfolgreich" if result.ok is True else (
         "fehlgeschlagen" if result.ok is False else "Status ungeprüft")
     code = f", Exitcode {result.returncode}" if result.returncode is not None else ""
-    return f"Ergebnis von '{tool}' ({status}{code}):\n{result.text}"
+    return f"Ergebnis von '{tool}' ({status}{code}):\n{vorab}{result.text}"
+
+
+# --- Mitdenken: Beobachter (was hat sich geändert?) und Gegenprobe (stimmt die Antwort?) ---
+
+def _schalter(name: str) -> bool:
+    try:
+        return config.load().get(name, True) is not False
+    except Exception:
+        return True
+
+
+def _umgebung() -> dict:
+    """Was der Beobachter zwischen zwei Runden vergleicht."""
+    try:
+        persoenlichkeit = PS.active().name
+    except Exception:
+        persoenlichkeit = None
+    return {"modell": SESSION.get("model"), "persoenlichkeit": persoenlichkeit, "modus": modes.current(),
+            "arbeitsordner": os.getcwd(), "chat": getattr(AKTIVER_CTX, "current_chat", None)}
+
+
+def _runde_beobachten(melde) -> str:
+    """Zu Beginn einer Runde: Hinweis fürs Modell (hinten an die Nachricht), kurz für den Nutzer."""
+    if not _schalter("beobachter"):
+        return ""
+    try:
+        text = beobachter.runde_hinweis(_umgebung())
+    except Exception:
+        return ""
+    if text and beobachter.letzter_kurz:
+        melde("🔄 Seit dem letzten Blick: " + ", ".join(beobachter.letzter_kurz[:5])
+              + (" …" if len(beobachter.letzter_kurz) > 5 else ""))
+    return text
+
+
+def _werkzeug_beobachten(tool: str, act: dict, res, melde) -> str:
+    """Nach einem Werkzeug: Hinweis, der vor dessen Ergebnis steht (oder leer)."""
+    if not _schalter("beobachter"):
+        return ""
+    try:
+        text = beobachter.nach_werkzeug(tool, act, res.text, res.ok)
+    except Exception:
+        return ""
+    if text:
+        melde(text.split(":", 1)[0])
+    return text
+
+
+def _gegenprobe(antwort: str, records: list[dict]) -> tuple[str, list[str]] | None:
+    """Passt die fertige Antwort zur Werkzeug-Bilanz? (Hinweis fürs Modell, Verdachtsmomente) oder None."""
+    if not _schalter("gegenprobe"):
+        return None
+    try:
+        befunde = pruefer.pruefen(antwort, records, modes.READ_TOOLS)
+    except Exception:
+        return None
+    if not befunde:
+        return None
+    import debugbericht as _DBG
+    _DBG.ereignis("Gegenprobe: " + " | ".join(befunde), speicher=False)
+    return pruefer.hinweis(befunde), befunde
+
+
+def _denkwerk_start(backend, denk) -> str:
+    """Denk-Hinweis fürs erste Senden der Runde; bei schweren Fragen eine Zeile für den Nutzer."""
+    if denk is None or not hasattr(backend, "denk_hinweis"):
+        return ""
+    backend.denk_hinweis = denkwerk.hinweis(denk, bool(getattr(backend, "denkt_selbst", False)))
+    import debugbericht as _DBG
+    _DBG.ereignis(f"Denkwerk: {denk.stufe}", speicher=False)
+    return "🧭 Denkwerk: knifflige Frage – gründlich nachdenken" if denk.schwer else ""
+
+
+async def _denkwerk_pruefen(backend, denk, antwort: str, records: list, melde,
+                            mit_stopp: bool = True) -> str | None:
+    """Prüfer bei schweren Fragen: die Nachricht zum Nachbessern, oder None. Nicht nach Werkzeugen – deren
+    Ergebnisse sieht der Prüfer nicht (dort prüft die Gegenprobe)."""
+    if records or not denkwerk.pruefen_noetig(denk, antwort) or not hasattr(backend, "ask_once"):
+        return None
+    melde("⚖️ Prüfer sieht die Antwort durch …")
+    aufgabe = asyncio.create_task(denkwerk.pruefen(backend, denk, antwort))
+    befund = await (_warten_mit_stopp(aufgabe) if mit_stopp else aufgabe)
+    import debugbericht as _DBG
+    _DBG.ereignis("Prüfer: " + ("in Ordnung" if befund is None else befund.replace("\n", " | ")), speicher=False)
+    if notstopp.ausgeloest():
+        return None
+    if befund is None:
+        melde("⚖️ Prüfer: in Ordnung")
+        return None
+    melde("⚖️ Prüfer: " + denkwerk.kurz(befund))
+    return denkwerk.nachbessern(befund)
 
 
 async def _menue_fuer_ki(act: dict) -> "actions.ActionResult":
@@ -407,6 +523,8 @@ async def _menue_fuer_ki(act: dict) -> "actions.ActionResult":
         zusatz = gewaehlt
     vorher = C.auswahl(cmd)
     await handle_line(ctx, f"{cmd} {zusatz}".strip())
+    if not zusatz:                                   # Befehl ohne Auswahl (z. B. /appstore): einfach geöffnet
+        return actions.ActionResult(f"{cmd} ist geöffnet.", ok=True)
     aktiv = [z for z, t, _ in C.auswahl(cmd) if t.lstrip().startswith("✓")]
     stand = f" Jetzt aktiv: {', '.join(aktiv)}." if aktiv and C.auswahl(cmd) != vorher else ""
     return actions.ActionResult(
@@ -467,12 +585,10 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
     if abgelehnt and id(act) in abgelehnt:
         protokoll.schreibe(tool, desc, "rejected", veraendernd=True, wer=wer, stufe=stufe)
         return "rejected", None
-    confirm = (urteil == "ask"
-               and (tool not in AUTO_ALLOW or sicherheit.steuerdatei_grund(act) or actions.fremd_grund(act))
-               and not (frei and id(act) in frei))
+    confirm = (urteil == "ask" and not _immer_erlaubt(act) and not (frei and id(act) in frei))
     if confirm and sicherheit.arbeitsbereich(act):
         # Der Stift der Persönlichkeit: im eigenen Daten-Ordner schreibt sie
-        # ohne Rückfrage (Wunschbrief 19.09.2026). Protokoll + Papierkorb bleiben.
+        # ohne Rückfrage. Protokoll + Papierkorb bleiben.
         confirm = False
         act["_frei"] = "Arbeitsbereich"
         desc = actions.describe(act)
@@ -502,13 +618,21 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
     return "run", None
 
 
+def _immer_erlaubt(act: dict) -> bool:
+    """„Immer erlauben“ gilt je Werkzeug, aber nur für Aufrufe, bei denen die Frage selbst „Immer“
+    anbieten würde – ein später riskanter Aufruf desselben Werkzeugs fragt wieder."""
+    return (act.get("tool") in AUTO_ALLOW
+            and any(w == "always" for w, _ in sicherheit.optionen(act))
+            and not sicherheit.steuerdatei_grund(act) and not actions.fremd_grund(act))
+
+
 async def _buendel_freigabe(acts: list[dict], frage) -> tuple[set, set]:
     """Sammelfrage für mehrere harmlose Änderungen in einer Runde.
     Gibt (freigegebene ids, abgelehnte ids) zurück – leer, wenn es nichts zu bündeln gab
     oder der Nutzer einzeln gefragt werden will."""
     def _fragt(a: dict) -> bool:
         return (modes.decide(a, actions.needs_confirm(a)) == "ask"
-                and a.get("tool") not in AUTO_ALLOW
+                and not _immer_erlaubt(a)
                 and not sicherheit.steuerdatei_grund(a))      # Wächter fragt einzeln, mit Grund
     idx = sicherheit.buendel(acts, _fragt)
     if not idx:
@@ -716,6 +840,7 @@ def _stimme_stopp() -> None:
 async def converse(backend, user_text: str, images: list[str] | None = None) -> list[dict]:
     """Eine Nutzer-Runde; gibt die Werkzeugbilanz zurück (tool, status)."""
     records = []
+    ersatzbank.abholen()              # ein nicht abgeholter Rauswurf gilt nicht für die neue Runde
     persona.runde_beginnt(user_text)  # Gedächtnissuche dieser Runde: mit der Nachricht, nicht mit Werkzeug-Ergebnissen
     indexdb.unterbrechen()           # Bibliothekar gibt Encoder und CPU für die Antwort frei
     _stimme_stopp()                  # neue Frage: laufendes Vorlesen endet
@@ -726,6 +851,7 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
     notstopp.runde_beginnt(stop)
     if stop:                         # „STOP“ als Nachricht: nichts fortsetzen, nur bestätigen
         plan.verwerfen()
+    denk = None if stop else denkwerk.runde(user_text)   # wie viel nachgedacht wird, nach der Nachricht selbst
     offen = plan.runde_neu()         # offene Todo-Liste läuft weiter, sonst beginnt eine neue
     mitschrift.nutzer(user_text)     # F12 soll das ganze Gespräch sichern können
     if offen:
@@ -734,15 +860,20 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
     user_text += ("\n\n" + notstopp.STOP_RUNDE) if stop else notstopp.hinweis_abholen()
     user_text += lernschleife.hinweise_abholen(PS.active().key)     # was im Hintergrund geschah
     user_text += _neuigkeiten(PS.active().key)                       # nach einem Update: was neu ist
+    user_text += _runde_beobachten(ui.info)                          # was sich seit dem letzten Blick geändert hat
     if coding.aktiv() and coding.ist_ende_ansage(user_text):
         _coding_beenden()
     import debugbericht as _DBG
     _DBG.ereignis(f"Runde: {len(user_text)} Zeichen, {len(images or [])} Bild(er)")
+    notstopp.runde_aktiv(True)
     try:
-        await _converse(backend, user_text, images, records)
+        await _converse(backend, user_text, images, records, denk)
         if notstopp.ausgeloest():
             await _nach_notstopp()
     finally:
+        notstopp.runde_aktiv(False)
+        if hasattr(backend, "denk_hinweis"):
+            backend.denk_hinweis = ""        # nicht abgeholt (Abbruch, Fehler): gilt nicht für die nächste Runde
         _close_records(records)
         _DBG.ereignis("Runde fertig")
         if plan.neu_seit_anzeige():          # Endstand der Todo-Liste
@@ -795,9 +926,12 @@ def _ankunft_melden(ankunft: dict, denk_zeichen: int, gesamt: float) -> None:
     _DBG.ereignis("Schritt: " + " · ".join(teile + [f"fertig nach {gesamt:.1f} s"]), speicher=False)
 
 
-async def _converse(backend, user_text, images, records) -> None:
+async def _converse(backend, user_text, images, records, denk=None) -> None:
     """Ein Gespräch mit Aktions-Schleife: antworten → ggf. handeln → weiter.
-    images (base64-Data-URIs) werden nur beim ERSTEN Schritt mitgeschickt."""
+    images (base64-Data-URIs) werden nur beim ERSTEN Schritt mitgeschickt.
+    denk: Einschätzung des Denkwerks (Hinweis beim ersten Senden, Prüfer am Ende)."""
+    if (zeile := _denkwerk_start(backend, denk)):
+        ui.info(zeile)
     next_input = user_text
     first = True
     seen: set[str] = set()                   # identische Lese-Aktionen nur einmal
@@ -805,6 +939,8 @@ async def _converse(backend, user_text, images, records) -> None:
     basis = 0                                # ab diesem Schritt zählt die Bremse
     marke = (coding.marke(), plan.marke())   # Todo-Fortschritt (Coding-Assistent bzw. Todo-Liste)
     frage_halt = False
+    gegenprobe_gemacht = False               # höchstens eine Gegenprobe je Runde
+    block_nachgefragt = False                # unlesbarer Aktionsblock: höchstens einmal neu anfordern
     gesamt = CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
     for schritt in itertools.count():
         if notstopp.ausgeloest():            # Not-Stopp: kein weiterer Schritt
@@ -988,6 +1124,19 @@ async def _converse(backend, user_text, images, records) -> None:
         if not acts:
             if (hinweis := actions.unparsed_action_note(answer, acts)):
                 ui.warn(hinweis)             # Zaun da, JSON kaputt: nicht stumm schlucken
+                if not letzter and not block_nachgefragt:
+                    block_nachgefragt = True     # die KI erfährt den Grund und schickt den Block neu
+                    ui.info("↻ Die KI bekommt den Grund und schickt die Aktion neu.")
+                    next_input = actions.unlesbar_fuer_ki(answer)
+                    continue
+            if not letzter and not gegenprobe_gemacht and (gp := _gegenprobe(cleaned, records)):
+                gegenprobe_gemacht = True    # die KI sieht ihre Antwort noch einmal gegen die Ergebnisse
+                ui.info("🔎 Gegenprobe: " + gp[1][0])
+                next_input = gp[0]
+                continue
+            if not letzter and (nachbessern := await _denkwerk_pruefen(backend, denk, cleaned, records, ui.info)):
+                next_input = nachbessern     # ein unabhängiger Prüfer fand Fehler: die KI bessert nach
+                continue
             _vorlesen_auto(cleaned)
             return
         if letzter:                          # Limit erreicht: geplante Aktion nicht mehr starten
@@ -1018,6 +1167,9 @@ async def _converse(backend, user_text, images, records) -> None:
             tool = act.get("tool")
             if notstopp.ausgeloest() or _abbruch_taste():   # Not-Stopp: Rest der Runde verwerfen
                 notstopp.ausloesen()
+                records.append({"tool": tool, "status": "not_run"})
+                continue
+            if ersatzbank.wechsel_offen():                  # Modell herausgefiltert: nichts mehr ausführen
                 records.append({"tool": tool, "status": "not_run"})
                 continue
 
@@ -1108,7 +1260,7 @@ async def _converse(backend, user_text, images, records) -> None:
                 # Fertigmeldung kommt als Hinweis (hintergrund.py). Ein lokales Modell braucht die
                 # Grafikkarte selbst und bekäme ohnehin erst danach eine Antwort.
                 import hintergrund as HG
-                nr = HG.starten(tool, titel, lambda: actions.run(act), PS.active().key)
+                nr = HG.starten(tool, titel, lambda a=act: actions.run(a), PS.active().key)
                 res = actions.ActionResult(HG.start_text(nr), ok=True)
             elif tool in ("bild_malen", "bild_serie", "kugel_anziehen", "backup_erstellen", "video_erstellen"):
                 # Bildmalen und Backup zeigen einen echten Ladebalken (Schritt i/n), genau
@@ -1160,10 +1312,13 @@ async def _converse(backend, user_text, images, records) -> None:
                 naechste_bilder.extend(uris)
                 for pf in res.bilder[:2]:
                     _bild_vorschau(str(pf), title=f"angesehen: {Path(pf).name}")
-            ergebnisse.append(_result_feedback(tool, res))
+            ergebnisse.append(_result_feedback(tool, res, _werkzeug_beobachten(tool, act, res, ui.info)))
 
         # 4) Ergebnisse zurück ans Modell, nächster Schritt
         if notstopp.ausgeloest():
+            return
+        if ersatzbank.wechsel_offen():
+            ui.warn(ersatzbank.MELDUNG)
             return
         if any(a.get("tool") != "plan" for a in acts) and (stand := plan.kurzstand()):
             ergebnisse.append(stand)
@@ -1212,6 +1367,7 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
     """erlaubt: Menge von Werkzeugnamen (None = alle); andere werden nicht ausgeführt.
     fremd: Nachricht enthält Fremdinhalt – Gedächtnis und Skills nur mit Freigabe."""
     records = []
+    ersatzbank.abholen()
     persona.runde_beginnt(user_text)
     indexdb.unterbrechen()
     _stimme_stopp()
@@ -1222,19 +1378,25 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
     notstopp.runde_beginnt(stop)
     if stop:
         plan.verwerfen()
+    denk = None if stop else denkwerk.runde(user_text)
     if plan.runde_neu():
         user_text += _TODO_OFFEN_NOTE.format(liste=plan.text_fuer_modell())
     user_text += ("\n\n" + notstopp.STOP_RUNDE) if stop else notstopp.hinweis_abholen()
     user_text += lernschleife.hinweise_abholen(PS.active().key)     # was im Hintergrund geschah
     user_text += _neuigkeiten(PS.active().key)                       # nach einem Update: was neu ist
+    user_text += _runde_beobachten(lambda t: emit({"t": "note", "text": t}))
+    notstopp.runde_aktiv(True)
     try:
-        await _web_converse(backend, user_text, images, emit, confirm, records, erlaubt)
+        await _web_converse(backend, user_text, images, emit, confirm, records, erlaubt, denk)
     finally:
+        notstopp.runde_aktiv(False)
+        if hasattr(backend, "denk_hinweis"):
+            backend.denk_hinweis = ""
         _close_records(records)
         emit({"t": "receipt", "records": records})
 
 
-async def _web_converse(backend, user_text, images, emit, confirm, records, erlaubt=None) -> None:
+async def _web_converse(backend, user_text, images, emit, confirm, records, erlaubt=None, denk=None) -> None:
     """Kopflose Variante von converse() fürs WebUI.
 
     Gleiche Aktions-Schleife, aber statt ins Terminal zu rendern, gibt sie
@@ -1242,12 +1404,24 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
     Bestätigungen via confirm(frage, optionen)->wahl (async). Nutzt dieselben
     Werkzeuge/Backends wie das Terminal – derselbe Verlauf, dasselbe Modell.
     """
+    if (zeile := _denkwerk_start(backend, denk)):
+        emit({"t": "note", "text": zeile})
     next_input = user_text
     first = True
     seen: set[str] = set()
     nur_gelesen = True
-    for schritt in range(MAX_LESE_STEPS + 1):
-        letzter = schritt >= _schritt_grenze(nur_gelesen)
+    gegenprobe_gemacht = False
+    block_nachgefragt = False
+    # Gleiche Grenzen wie im Terminal: Coding und Serien brauchen mehr Schritte; Not-Stopp gilt auch hier.
+    gesamt = CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
+    for schritt in itertools.count():
+        if notstopp.ausgeloest():
+            return
+        if plan.aktuell() is not None:
+            gesamt = max(gesamt, SERIE_MAX_STEPS)
+        if schritt > gesamt:
+            break
+        letzter = schritt >= max(_schritt_grenze(nur_gelesen), gesamt if gesamt > MAX_LESE_STEPS else 0)
         if letzter:
             next_input = next_input + _STEP_LIMIT_NOTE
         answer = ""
@@ -1301,9 +1475,23 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
             emit({"t": "warn", "text": "⏹ " + notstopp.GESPERRT_TEXT})
             return
         if not acts:
-            _vorlesen_auto(cleaned)
             if (hinweis := actions.unparsed_action_note(answer, acts)):
                 emit({"t": "note", "text": hinweis})
+                if not letzter and not block_nachgefragt:
+                    block_nachgefragt = True
+                    emit({"t": "note", "text": "↻ Die KI bekommt den Grund und schickt die Aktion neu."})
+                    next_input = actions.unlesbar_fuer_ki(answer)
+                    continue
+            if not letzter and not gegenprobe_gemacht and (gp := _gegenprobe(cleaned, records)):
+                gegenprobe_gemacht = True
+                emit({"t": "note", "text": "🔎 Gegenprobe: " + gp[1][0]})
+                next_input = gp[0]
+                continue
+            if not letzter and (nachbessern := await _denkwerk_pruefen(
+                    backend, denk, cleaned, records, lambda t: emit({"t": "note", "text": t}), mit_stopp=False)):
+                next_input = nachbessern
+                continue
+            _vorlesen_auto(cleaned)
             return
         if letzter:
             for act in acts:
@@ -1318,10 +1506,13 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
             if fixed and fixed != raw_tool:
                 act["tool"] = fixed
         if erlaubt is not None:
+            chat = erlaubt is CHAT_WERKZEUGE
             for act in [a for a in acts if a.get("tool") not in erlaubt]:
-                emit({"t": "note", "text": f"🔒 im Chat-Modus gesperrt: {actions.describe(act)}"})
+                emit({"t": "note", "text": ("🔒 im Chat-Modus gesperrt: " if chat else "🔒 hier nicht freigegeben: ")
+                      + actions.describe(act)})
                 records.append({"tool": act.get("tool", "?"), "status": "not_run"})
-                ergebnisse.append(_CHAT_GESPERRT.format(tool=act.get("tool", "?")))
+                ergebnisse.append(_CHAT_GESPERRT.format(tool=act.get("tool", "?")) if chat else
+                                  _FENSTER_GESPERRT.format(tool=act.get("tool", "?"), liste=", ".join(sorted(erlaubt))))
             acts = [a for a in acts if a.get("tool") in erlaubt]
         acts, gesperrt = plan.zurueckweisen(acts, coding.aktiv())
         if gesperrt:
@@ -1333,6 +1524,12 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
         frei, abgelehnt = await _buendel_freigabe(acts, confirm)
         for act in acts:
             tool = act.get("tool")
+            if notstopp.ausgeloest():                       # Not-Stopp gilt auch in den Fenstern
+                records.append({"tool": tool, "status": "not_run"})
+                continue
+            if ersatzbank.wechsel_offen():                  # Modell herausgefiltert: nichts mehr ausführen
+                records.append({"tool": tool, "status": "not_run"})
+                continue
 
             if tool in _DEDUPE_TOOLS:
                 key = _action_key(act)
@@ -1409,7 +1606,7 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
                          "lora_trainieren": "🧬 trainiere deine LoRA",
                          "coding_lora_trainieren": "🧠 trainiere das Coding-LoRA",
                          "musik_machen": "🎵 komponiere deinen Song", "musik_cover": "🎵 spiele das Cover ein"}.get(tool, tool)
-                nr = HG.starten(tool, titel, lambda: actions.run(act), PS.active().key)
+                nr = HG.starten(tool, titel, lambda a=act: actions.run(a), PS.active().key)
                 res = actions.ActionResult(HG.start_text(nr), ok=True)
             elif tool in ("bild_malen", "bild_serie", "kugel_anziehen", "backup_erstellen", "video_erstellen"):
                 # Gleicher Ladebalken wie im Terminal: Aktion im Thread,
@@ -1436,8 +1633,12 @@ async def _web_converse(backend, user_text, images, emit, confirm, records, erla
             protokoll.schreibe(tool, actions.describe(act), record["status"],
                                veraendernd=actions.needs_confirm(act), wer=PS.active().name,
                                ergebnis=res.text, stufe=sicherheit.stufe(act))
-            ergebnisse.append(_result_feedback(tool, res))
+            ergebnisse.append(_result_feedback(
+                tool, res, _werkzeug_beobachten(tool, act, res, lambda t: emit({"t": "note", "text": t}))))
 
+        if ersatzbank.wechsel_offen():
+            emit({"t": "warn", "text": ersatzbank.MELDUNG})
+            return
         if any(a.get("tool") != "plan" for a in acts) and (stand := plan.kurzstand()):
             ergebnisse.append(stand)
         next_input = _ergebnisse_verbinden(ergebnisse)

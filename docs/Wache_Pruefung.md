@@ -8,6 +8,9 @@ Geprüft: `tools/wache/` `detektor.py`, `folgen.py`, `gru.py`, `justierung.py`, 
 (`speicher.py`, `regeln.py`, `main_start.py` /wache, `core/config.py`). Eine `foldersense(2).py`
 gibt es nicht.
 
+Nachweis-Skripte (Temp-Ordner, keine Config-Schreibzugriffe):
+`wache_nachweis.py`, `wache_gleich.py` im Scratchpad dieser Sitzung.
+
 ---
 
 ## Phase 1 – Bestandsaufnahme
@@ -180,7 +183,7 @@ Neue Abhängigkeiten: keine.
 | W12 | `with os.scandir()` + `islice(MAX_ENTRIES)`, `is_dir(follow_symlinks=False)`, atomares Schreiben, beschädigte Beispieldatei vor dem Überschreiben als `.kaputt` sichern, Einträge prüfen | lassen (kein Sicherheitsbauteil) | keine |
 
 Tests (Phase 5) je Punkt: simulierte harmlose und verdächtige Ereignisse wie in den
-Nachweis-Skripten, als Unit-Tests; danach die bestehenden Wache-Tests und auf Zuruf
+Nachweis-Skripten, als Unit-Tests (Testsuite, nicht im Repository); danach die bestehenden Wache-Tests und auf Zuruf
 die volle Reihe.
 
 ### Offene Frage an den Nutzer

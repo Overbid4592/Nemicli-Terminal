@@ -2,7 +2,7 @@
 reich.py - Wo soll der NemiCLI-Ordner liegen?  (Fenster + Umzug)
 
 WARUM ES DAS GIBT
-Bis zum 15.09.2026 lagen Programm und Daten im selben Ordner. Dann zog das
+Früher lagen Programm und Daten im selben Ordner. Dann zog das
 Programm um (Desktop -> AppData) und das venv blieb auf der Strecke. Genauso
 hätte es die Chats, Bilder und das Gelernte erwischen können. Seitdem trennt
 paths.py die beiden Wurzeln - und HIER entscheidet der Nutzer, wo seine
@@ -194,6 +194,10 @@ def pruefe_ziel(ziel: Path) -> str | None:
     try:
         if ziel.resolve() == paths.INSTALL.resolve():
             return None                      # derselbe Ort - kein Umzug nötig
+        daten = Path(paths.DATEN).resolve()
+        if ziel.resolve() != daten and (daten in ziel.resolve().parents or ziel.resolve() in daten.parents):
+            return ("Der neue Ordner liegt im bisherigen Daten-Ordner (oder umgekehrt) – beim Umziehen würde er "
+                    "sich selbst kopieren. Bitte einen Ort daneben wählen.")
         if paths.INSTALL.resolve() in ziel.resolve().parents:
             return ("Dieser Ordner liegt IM Programm-Ordner. Genau das wollen "
                     "wir ja trennen – bitte einen Ort außerhalb wählen.")

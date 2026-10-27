@@ -38,13 +38,34 @@ function seitentext(auswahl) {
   if (sel && sel.trim()) return sel.trim();
   // Sichtbarer Text der Seite, ohne Skripte; das aktive Feld selbst weglassen
   const clone = document.body.cloneNode(true);
+  // Unsichtbares (display:none, visibility:hidden, Deckkraft 0) fällt weg – sonst könnte eine
+  // Seite versteckten Text an die KI schmuggeln. Klon und Seite haben dieselbe Reihenfolge.
+  const live = [...document.body.querySelectorAll("*")];
+  const kopie = [...clone.querySelectorAll("*")];
+  // Dazu Text, den niemand sieht: Schriftgröße fast 0, Schrift in Hintergrundfarbe, weit außerhalb der Seite,
+  // auf null zugeschnitten.
+  const breit = Math.max(document.documentElement.scrollWidth, innerWidth);
+  const hoch = Math.max(document.documentElement.scrollHeight, innerHeight);
+  const versteckt = (el) => {
+    const s = getComputedStyle(el);
+    if (parseFloat(s.fontSize) < 2) return true;
+    if (s.color && s.color === s.backgroundColor && s.backgroundColor !== "rgba(0, 0, 0, 0)") return true;
+    if (s.clipPath && /inset\(\s*(50%|100%)/.test(s.clipPath)) return true;
+    const r = el.getBoundingClientRect();
+    return r.right + scrollX < -50 || r.bottom + scrollY < -50 || r.left + scrollX > breit + 50 || r.top + scrollY > hoch + 50;
+  };
+  live.forEach((el, i) => {
+    if (!el.checkVisibility({ checkOpacity: true, checkVisibilityCSS: true }) || versteckt(el)) kopie[i]?.remove();
+  });
   clone.querySelectorAll("script, style, noscript, nav, footer, header").forEach((n) => n.remove());
   return (clone.innerText || "").replace(/\n{3,}/g, "\n\n").trim().slice(0, 40000);
 }
 
 // Senden-Knopf zum Feld finden: erst das Formular, dann Knöpfe mit „Senden“-Bedeutung,
 // zuletzt Enter im Feld (so schicken Chats ab).
-const SENDE_WORTE = /senden|send|submit|abschicken|absenden|antworten|reply|post|schicken/i;
+// Nur Beschriftungen, die Menschen sehen bzw. vorgelesen bekommen (Text, aria-label, title) – nicht
+// Klassen- oder Testnamen: dort steckt „post“/„reply“ in vielen fremden Knöpfen („Allen antworten“ …).
+const SENDE_WORTE = /^\s*(senden|send|absenden|abschicken|antworten|reply|post|posten|veröffentlichen|submit)\s*$/i;
 function sendeKnopf(el) {
   const form = el.closest("form");
   if (form) {
@@ -54,8 +75,8 @@ function sendeKnopf(el) {
   const wurzel = el.closest("form, [role='dialog'], main, body") || document.body;
   const knoepfe = [...wurzel.querySelectorAll("button, [role='button'], input[type='submit']")]
     .filter((b) => b.offsetWidth > 0 && b.offsetHeight > 0 && !b.disabled);
-  const passt = (b) => SENDE_WORTE.test([b.textContent, b.getAttribute("aria-label"), b.title,
-                                          b.getAttribute("data-testid"), b.id, b.className].join(" "));
+  const passt = (b) => [b.textContent, b.getAttribute("aria-label"), b.title, b.value]
+    .some((t) => t && SENDE_WORTE.test(String(t)));
   // den nächstgelegenen passenden Knopf nehmen (Abstand zum Feld)
   const r = el.getBoundingClientRect();
   const nah = knoepfe.filter(passt).map((b) => {
@@ -97,8 +118,14 @@ function einsetzen(text, senden) {
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));
   if (senden) {
-    // kurz warten, bis die Seite den Text registriert hat (Senden-Knopf wird oft erst dann aktiv)
+    // kurz warten, bis die Seite den Text registriert hat (Senden-Knopf wird oft erst dann aktiv).
+    // Die Antwort entstand aus dem Seiteninhalt – vor dem Abschicken einmal sichtbar bestätigen lassen.
     setTimeout(() => {
+      const vorschau = text.length > 600 ? text.slice(0, 600) + " …" : text;
+      if (!window.confirm("Nemi möchte das hier abschicken:\n\n" + vorschau + "\n\nJetzt senden?")) {
+        status("🐈 Antwort eingesetzt – nicht gesendet", 2500);
+        return;
+      }
       const wie = absenden(el);
       status("🐈 Antwort gesendet (" + wie + ")", 2500);
     }, 350);

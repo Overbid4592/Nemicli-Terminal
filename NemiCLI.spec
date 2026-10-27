@@ -37,11 +37,16 @@ HIDDEN += ["loramotor"] + ["loramotor." + f.stem for f in sorted((ROOT / "loramo
 # TensorRT-Zusatz (trtmotor); tensorrt_rtx kommt wie torch aus dem venv, das SDK legt der Nutzer ab
 HIDDEN += ["trtmotor"] + ["trtmotor." + f.stem for f in sorted((ROOT / "trtmotor").glob("*.py"))
                           if f.stem != "__init__"]
-# Einrichtungs-Helfer: nur die Laufzeit (reines Python); Training/Lernstoff bleiben in der Werkstatt
-HIDDEN += ["einrichtungshelfer"] + ["einrichtungshelfer." + m for m in ("schema", "wortschatz", "laufzeit", "gespraech",
-                                                                          "fehlerart", "funkechat", "torchmodell")]
+# Einrichtungs-Helfer: nur die Laufzeit (reines Python); Training/Lernstoff bleiben in der Werkstatt.
+# Ohne den Ordner (öffentliche Fassung) baut NemiCLI ohne Funke.
+if (ROOT / "einrichtungshelfer").is_dir():
+    HIDDEN += ["einrichtungshelfer"] + ["einrichtungshelfer." + m for m in (
+        "schema", "wortschatz", "laufzeit", "gespraech", "fehlerart", "funkechat", "torchmodell", "gemmahelfer")
+        if (ROOT / "einrichtungshelfer" / f"{m}.py").is_file()]
 EXCLUDES_HELFER = ["einrichtungshelfer." + m for m in ("training", "daten", "daten_notfall", "daten_gross", "pruefen",
-                                                       "plaudern")]
+                                                       "plaudern", "gemmalernstoff")]
+# NemiView: eigener App-Viewer (JavaScript-Interpreter, HTML/CSS, Fenster) – reines Python
+HIDDEN += ["nemiview"] + ["nemiview." + f.stem for f in sorted((ROOT / "nemiview").glob("*.py")) if f.stem != "__init__"]
 # main.py ist auf vier Dateien verteilt; die Teile lädt main._teil_laden (kein import)
 HIDDEN += ["main_dienste", "main_befehle", "main_start"]
 # Porträt-Motor (LivePortrait-Nachbau) – Paket unter engines/
@@ -97,17 +102,18 @@ for extra in ("README.md", "CHANGELOG.md", ".env.example", "requirements.txt", "
         DATAS.append((str(ROOT / extra), "."))
 DATAS.append((str(ROOT / "engines" / "liveportrait" / "LIZENZ.txt"), "liveportrait"))   # MIT-Hinweis des Originals
 DATAS.append((str(ROOT / "engines" / "musik" / "LIZENZ.txt"), "musik"))                 # MIT-Hinweise der Vorbilder
+for _vorlage in sorted((ROOT / "appstore_vorlagen").rglob("*")):                         # Beispiel-Apps des Appstores
+    if _vorlage.is_file() and "__pycache__" not in _vorlage.parts:
+        DATAS.append((str(_vorlage), str(_vorlage.parent.relative_to(ROOT)).replace("\\", "/")))
 for _db in sorted((ROOT / "ggufengine" / "daten").glob("*.json")):      # Modell-Datenbank
     DATAS.append((str(_db), "ggufengine/daten"))
-# Auch ein frischer Checkout muss beide Modelle korrekt ins EXE-Paket aufnehmen.
-_sys.path.insert(0, str(ROOT))
-from einrichtungshelfer.laufzeit import stuecke_zusammensetzen as _modell_pruefen
-for _ordner in ("modell", "modell_gross"):
-    _basis = ROOT / "einrichtungshelfer" / _ordner
-    if not (_basis / "wortschatz.json").is_file() or not _modell_pruefen(_basis / "helfer.bin"):
-        raise RuntimeError(f"Funke-Modell fehlt oder SHA-256 falsch: {_ordner}")
-    for _helfer in ("helfer.bin", "helfer.bin.sha256", "wortschatz.json"):
-        DATAS.append((str(_basis / _helfer), f"einrichtungshelfer/{_ordner}"))
+for _ordner in ("modell", "modell_gross"):           # Funke (gespraech.ordner) und Funke Groß (funkechat.ordner)
+    for _helfer in ("helfer.bin", "wortschatz.json"):
+        if (ROOT / "einrichtungshelfer" / _ordner / _helfer).exists():
+            DATAS.append((str(ROOT / "einrichtungshelfer" / _ordner / _helfer), f"einrichtungshelfer/{_ordner}"))
+for _zusatz in sorted((ROOT / "einrichtungshelfer" / "lora").glob("*")):   # LoRA des Gemma-Helfers + LIZENZ.txt
+    if _zusatz.suffix in (".safetensors", ".txt") and not _zusatz.stem.endswith("_stand"):
+        DATAS.append((str(_zusatz), "einrichtungshelfer/lora"))
 
 # Build-Nummer in die exe: dort gibt es kein Git, das die Commits zählt.
 _sys.path.insert(0, str(ROOT / "core"))

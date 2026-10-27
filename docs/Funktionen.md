@@ -31,6 +31,17 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     bleibt für den nächsten Start gespeichert.
   - **Modelle von Hugging Face holen** (`/model huggingface`): Größe und MoE wählen, gezeigt werden nur
     Modelle, die der Motor laden kann (ab 4B), jede Datei mit SHA-256 geprüft, Abbruch wird fortgesetzt.
+  - **Modelle der Motoren** (`/einrichten modelle`, auch am Ende von `/einrichten`): Gedächtnis, Reranker,
+    Bildbeschreiber, Stimme, Musik, Video und Porträt – freiwillig, Teil für Teil mit Lizenz und Größe vorab.
+    Quelle, Revision, Größe und SHA-256 jeder Datei stehen fest im Katalog (`tools/modellkatalog.py`); geladen
+    wird genau diese Fassung in den Ordner, in dem der Motor sucht. Krea 2: Hinweis mit Ordner und Link.
+- **Ersatzbank 🪑** (`/model ersatz`): bis zu zwei Cloud-Modelle als Einspringer. Scheitert das aktive Modell
+  innerhalb von 30 Minuten fünfmal an einer Schutzsperre (🛡️ Geschützt, 🔒 Komplett gesperrt, 🛡️ Tabu), wird
+  es herausgefiltert: Die Runde endet sofort, keine weitere Aktion läuft, die Meldung „Lieber Nutzer, die KI hat
+  mehrfach versucht, die Sperre zu durchdringen …“ erscheint, und der erste Ersatz übernimmt – im Terminal, in der
+  Kugel und beim Weckruf (der Weckruf startet mit dem Ersatz neu). „Nur Lesen“, Kugel-Sperre und Lösch-Limit
+  zählen nicht. Ohne Ersatz ist kein Modell aktiv, bis `/model` eins wählt; ein selbst gewähltes Modell ist
+  wieder frei. Fliegt ein Modell im Wache-Prozess raus, wechselt das Terminal bei der nächsten Nachricht mit.
   - **⏱ Ladezeit je Schritt** nach dem ersten Laden: Datei, Tokenizer, Gewichte, Aufwärmen, Bildteil,
     Einlesen bis zum ersten Wort.
   - **128k Kontext** bei Gemma-4-E4B mit **~6 GB VRAM**: die Sliding-Window-Schichten halten nur
@@ -80,8 +91,11 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 
     Der Encoder bleibt im RAM und ist nur zum Kodieren eines Bildes auf der GPU (<2 s). Ein
     Bild wird einmal gelesen und bleibt im Präfix-Cache.
-  - **Bildbeschreiber 🖼** für lokale Modelle ohne Sehen (z. B. DeepSeek-R1-Distill): eigene
-    Abteilung `Vision/<Name>/` im Programm-Ordner mit einem kleinen sehenden Modell
+  - **Bildbeschreiber 🖼** für jedes Modell ohne Sehen – lokal, Ollama oder Cloud (`/vision`): eigene
+    Abteilung `Vision/<Name>/` im Programm-Ordner mit einem kleinen sehenden Modell, je Modell ein
+    Ordner, `/vision <ordner>` wählt; nach 2 Minuten ohne Bild ganz entladen. `/vision restart` lädt neu,
+    `/vision debug` schreibt einen Fehlerbericht, `/vision protokoll` zeigt je Persönlichkeit, welche Bilder
+    beschrieben wurden (die KI liest es mit `bild_protokoll`; dasselbe Bild kommt von dort, ohne neu zu laden)
     (empfohlen: Qwen3-VL-4B-Instruct + mmproj, kleiner: Gemma-4-E2B). Es beschreibt Bilder als Text –
     Art, Personen und Tiere, Dinge mit Farbe und Lage, Text wörtlich – und beantwortet Nachfragen über
     `bild_fragen`. Qwen3-VL-4B im Test: 10 von 10 Nachfragen richtig (Anzahl, Lage, Farben, Fangfragen
@@ -105,13 +119,17 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Auftragskarte → Recherche → Todo-Liste (🔴 offen · 🟠 Frage · 🟢 geprüft) → Punkt für Punkt. Grün setzt
   nur die Prüfung (Prüfbefehl mit Exitcode 0) oder du – nie die KI. Ablage im Projekt unter `.nemicli/`,
   `/code status` zeigt die Liste, `/codeend` beendet. Kein zweites Modell.
+  **Seitenprüfung:** Ein Punkt kann statt (oder neben) dem Prüfbefehl eine Seite tragen (`seite`, z. B.
+  `chat.html`) – grün nur, wenn sie ohne Konsolenfehler und ohne fehlende Dateien lädt. Geht die KI zum
+  nächsten Punkt, obwohl der vorige ungeprüft ist, sagt NemiCLI es („bearbeitet, nie geprüft“); ein
+  Prüfbefehl, der nur nachsieht, ob die Datei da ist, wird beim Anlegen angemerkt.
   **Projektgrenze:** Dateiaktionen außerhalb des Projektordners legt NemiCLI dir zur Freigabe vor – in jedem
   Modus, auch Auto. **Projekt-Gedächtnis:** `merken` mit Art `projektnotiz` schreibt datiert nach
   `.nemicli/memory.md`; das Wissen bleibt beim Projekt.
 - **Coding-Assistent bleibt aktuell:** sieht die installierten Versionen des Projekts, schlägt Funktionen in
   der **installierten** Bibliothek nach (`api_nachschlagen`), bekommt Veraltet-Warnungen und ruff-Funde
   (`code_pruefen`) als Aufgabe, prüft jede geschriebene Datei sofort (Python, JSON, HTML, CSS, JS), sieht
-  Webseiten als Bild samt JS-Fehlern (`seite_ansehen`, Chromium-Browser headless), kennt neue Versionen und
+  Webseiten als Bild samt JS-Fehlern (`seite_ansehen`, mit NemiView – kein Browser), kennt neue Versionen und
   Lücken (`paket_info`) und sucht in der Offline-Doku von Python und MDN (`/doku`, `doku_suchen`).
 - **🟨 Todo-Liste vor jeder Aktion** (Werkzeug `plan`): Bevor die KI in einer Runde etwas tut, schreibt sie
   auf, was sie vorhat – gelber Kasten mit 🔴 offen · 🟠 in Arbeit · 🟢 erledigt · ⚪ gestrichen. Ohne Liste
@@ -158,11 +176,25 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Änderung mit Begründung im Protokoll, `/wache rueckgaengig`). Bericht in `Berichte/Wache_….md` –
   als Datei bleiben die drei neuesten, ältere leben als Vektoren im Gedächtnis weiter (Papierkorb 30 Tage).
   `/wache selbsttest`: 7 von 7 Angriffsmustern, 2 % Fehlalarm auf synthetischem Alltag.
+  **Gegen eingeschleuste Urteile:** Im Weckruf stehen Alarme als gerahmte Messwerte (Kennung je Weckruf, jede
+  Kommandozeile einzeilig) – ein Programm, das sich „harmlos“ nennt, macht sich damit verdächtig. „Bekannt“
+  hängt am Programmpfad. R001, R002, R006, R013 und R014 schaltest nur du stumm. Kam im Gespräch Inhalt aus dem
+  Netz, darf die Persönlichkeit im Hintergrund nichts merken, nichts justieren und dir nichts ausrichten
+  (urteilen und malen geht weiter). Stopp-Datei, Modelle und Normalbild in `Wache/` ändert die KI nur mit
+  deiner Freigabe – `Wache/gruesse.md` bleibt ihr Stift.
+- **Netzwächter 🌐** (`/wache netz`, Werkzeug `wache_netz`): Wer steckt hinter einer Adresse? Name (was
+  NemiCLI selbst nachgeschlagen hat, sonst der DNS-Speicher von Windows), Besitzer laut offiziellem
+  Adressregister, Zweck bei NemiCLI-eigenen Verbindungen und welche Programme sie ansprachen – auch
+  einfach eine Firewall-Meldung einfügen. Dazu ein eigenes Netz-Modell (ML) für einzelne Verbindungen
+  und Netz-Folgen (DL) für Abfolge und Takt je Programm; beide starten im Schattenmodus, scharf
+  schaltest nur du (`/wache netz warnen`). Ohne Admin, keine Inhalte – nur wer mit wem spricht.
 - **Schwebekugel 🟢** (`/wache kugel an|aus`): Ist kein Terminal offen, schwebt die Persönlichkeit als
   kleine Leuchtkugel auf dem Desktop – grün/gelb/rot wie das Schild, verschiebbar, grüßt 2–3× am Tag
   (`Wache/gruesse.md`, darf sie selbst schreiben). Klick öffnet ein Chatfenster im Terminal-Look
   (Sprechblasen, Markdown, Bilder inline): reden, Bilder bekommen, 📸 Screenshot, den sie sieht. Nur
-  lesen und reden – ändern tut sie im großen NemiCLI. Der Verlauf bleibt erhalten, auch nach Schließen
+  lesen und reden – ändern tut sie im großen NemiCLI. Große Suchläufe (`inhalt_suchen`, `dateien_suchen`)
+  laufen nur im Terminal; in der Kugel kommt „Tut mir leid, dazu musst du – um die Stabilität zu bewahren –
+  ins Terminal.“ Der Verlauf bleibt erhalten, auch nach Schließen
   und Neustart; **[+ Neu]** oben im Fenster beginnt einen neuen Chat. Kugel, Fenster und Schild sind Qt (PySide6).
   **Ihr eigenes Gesicht:** liegt `Persoenlichkeiten/<Name>.png` (transparent) da, schwebt das Bild statt
   der Kugel; `<Name>_froh.png`, `_ernst.png`, `_denkt.png` … sind Stimmungen. Und sie steuert das selbst
@@ -265,6 +297,22 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   **Nach einem Update** bekommt jede Persönlichkeit einmal eine Notiz, was NemiCLI jetzt neu kann – die
   Überschriften aus der CHANGELOG seit ihrem letzten Stand (beim ersten Mal die letzten zwei Tage).
   Alte Notizen aus `learned/skills` zeigt `/skills alte` einzeln: übernehmen, weglassen oder später.
+- **Denkt mit 🔎:** NemiCLI sagt der KI von selbst, was sich seit ihrem letzten Blick geändert hat – eine
+  Datei, die sie gelesen hat, wurde von jemand anderem geändert (mit den geänderten Zeilen), ein Ordner
+  hat neue Einträge, das Modell oder die Persönlichkeit wurde gewechselt, Stunden sind vergangen. Und es
+  prüft jede fertige Antwort gegen das, was wirklich passiert ist: Schreibt die KI „Erledigt!“, obwohl
+  ein Werkzeug scheiterte, oder „ich habe gespeichert“, ohne dass etwas gespeichert wurde, bekommt sie
+  eine **Gegenprobe** und denkt noch einmal nach – du siehst kurz „🔎 Gegenprobe: …“. Dazu ihre
+  Denk-Gewohnheit: vorher erwarten, danach vergleichen, Fakt von Vermutung trennen. Abschaltbar mit den
+  Config-Schlüsseln `beobachter` und `gegenprobe`.
+- **Denkwerk 🧭:** Nachdenken für jedes Modell, automatisch. Jede Nachricht wird ohne Modellaufruf
+  eingeschätzt – einfach, mittel oder schwer (Länge, Teilfragen, Code, Rechnen, „warum“, Vergleich,
+  Planung); ein Wunsch geht vor („denk gründlich nach“, „kurz und knapp“). Mittel: Schritt für Schritt.
+  Schwer: zerlegen, zwei bis drei Wege skizzieren, das Beste zusammenführen, selbst nachprüfen. Modelle
+  ohne eigenes Nachdenken denken in `<think>…</think>` (als 💭 abgetrennt), die anderen bekommen nur die
+  Vorgehensweise. Der Hinweis wird nur mitgeschickt, nie gespeichert. Nach schweren Antworten sieht ein
+  **⚖️ Prüfer** (zweite, unabhängige Anfrage) sie durch; bei „FEHLER“ prüft die KI die Einwände und
+  bessert nach. Config `denkwerk`.
 - **Lernt von selbst 🪞:** Nach einer Runde mit Anlass – du hast korrigiert („nein“, „falsch“, „künftig“,
   „ab jetzt“ …), ein Werkzeug schlug fehl oder wurde abgelehnt, oder eine größere Aufgabe (ab 3 Werkzeugen)
   ist erledigt – reflektiert NemiCLI im Hintergrund wie bei `/reflektieren` und merkt sich bleibende
@@ -298,6 +346,15 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Antwort räumt der **Bibliothekar** im Hintergrund ein (Chat, Notizen, Skills, Berichte → Vektoren)
   – sichtbar als 📚-Balken in der Statuszeile, ohne den Chat zu blockieren; `/gedaechtnis indexieren`
   holt einen Rückstand auf einmal nach.
+  - **So sucht es:** Stichworte (BM25) und Vektoren, per RRF vereint. Texte sind an Absätzen, Sätzen,
+    Code-Blöcken und Überschriften geschnitten, jeder Brocken trägt seine Herkunft; alte Brocken werden im
+    Hintergrund nachgeschnitten. Sucht die KI selbst (`gedaechtnis_suchen`), kann sie weitere Fassungen
+    (`fragen`) und eine vermutete Antwort (`vermutung`) mitgeben. Treffer zeigen den Text davor und danach,
+    Beinahe-Kopien fallen weg (MMR), schwache Treffer werden als schwach gemeldet. Eine kleine gelernte
+    **Rangliste** gewichtet nach dem, was die KI danach wirklich gelesen hat.
+  - **🎯 Reranker:** Die 16 besten Treffer gehen mit der Frage durch ein Reranker-Modell (Qwen3-Reranker,
+    GGUF, im eigenen Motor) und werden nach Relevanz sortiert – nur wenn die KI selbst sucht, nie im
+    Prompt-Pfad. Ordner `Models/reranker/`, Config `reranker`.
   - **Wissen für alle Persönlichkeiten:** PDF, Markdown und Text in den Ordner `Wissen/` (auch
     Unterordner) legen – der Bibliothekar liest sie ganz ein, jede Persönlichkeit findet sie
     (`gedaechtnis_suchen` mit Quelle `wissen`) und sieht die Titel im Prompt. Wortgleiche Sätze, die
@@ -321,8 +378,8 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   („Zeichen 12.000–145.977 fehlen"), damit klar ist, ob `datei_lesen` lohnt.
 - **Bilder ansehen:** Pfad in den Chat tippen oder in der WebUI anhängen – Vision-Modelle sehen es.
   Die KI holt sich Bilder auch selbst: `bild_ansehen` (Datei) und `bildschirm_ansehen` (Screenshot,
-  fragt vorher). Sieht ein Modell im eigenen Motor nicht, springt der **Bildbeschreiber** (`Vision/`)
-  ein; bei Cloud und Ollama gibt es sonst den Hinweis, ein sehendes Modell zu wählen. Ollama Cloud
+  fragt vorher). Sieht ein Modell nicht – im eigenen Motor, bei Ollama oder in der Cloud –, springt der
+  **Bildbeschreiber** (`Vision/`, `/vision`) ein; ohne ihn gibt es den Hinweis, ein sehendes Modell zu wählen. Ollama Cloud
   (z.B. `deepseek-v4.1-flash`) wird als sehend erkannt; kleine Gemmas (E2B/E4B) gelten als nicht sehend.
 - **Bild-Vorschau im Chat:** Gemalte oder angesehene Bilder erscheinen als Farbpixel-Block im Verlauf.
 - **Eigene Krea-2-Pipeline** (`engines/krea.py`): Krea 2 direkt in NemiCLI, ohne ComfyUI. Alles von
@@ -406,7 +463,10 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 - **Chrome-Erweiterung** (`chrome-erweiterung/`, `/chrome`): Rechtsklick auf einer Webseite →
   **„Nemi antwortet"** – die Persönlichkeit liest die Seite, schreibt in deinem Namen eine Antwort und setzt sie
   **direkt ins Textfeld**; „… und sendet" drückt auch den Senden-Knopf. **„Nemi, erklär mir das"**
-  erklärt markierten Text. Redet nur mit dem laufenden NemiCLI auf `127.0.0.1:9000`, mit Geheimschlüssel.
+  erklärt markierten Text. Redet nur mit dem laufenden NemiCLI auf `127.0.0.1:9000`, mit Geheimschlüssel
+  und Host-Prüfung. Der Rechtsklick läuft **ohne Werkzeuge**: Der Seitentext ist Fremdinhalt mit Netz-Marke,
+  Pfade darin werden nie geöffnet, nichts wird angehängt – eine Mail kann so keine Datei hinausschicken.
+  Unsichtbare Elemente der Seite gehen nicht mit.
 - **Chrome-Seitenleiste** (Klick aufs 🐈-Symbol): Chat wie im Desktop-Fenster im Modus „Chat“, Antwort
   erscheint live. **📄 Seite** schickt die Seite (oder den markierten Text) mit, **📸 Foto** ein
   Bildschirmfoto. Derselbe Chat wie im Terminal und in `/gui`; gemalte Bilder erscheinen in der Leiste.

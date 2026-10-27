@@ -12,7 +12,7 @@
 
 **Dein eigener KI-Agent im Terminal – Cloud & lokal, mit Werkzeugen, Gedächtnis und Herz.** ✦
 
-**Entwickelt von VibeCoder (@Overbid4592) · gebaut mit Claude Opus 5 (Anthropic)**
+**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5.5 (Anthropic)**
 
 </div>
 
@@ -21,7 +21,7 @@
 ## Was ist das?
 
 NemiCLI ist ein selbstgebauter **KI-Agent fürs Terminal** (Python, Windows). Er redet mit
-**Cloud-Modellen** (11 Anbieter), mit **lokalen Modellen im eigenen GGUF-Motor** oder über Ollama –
+**Cloud-Modellen** (37 Anbieter), mit **lokalen Modellen im eigenen GGUF-Motor** oder über Ollama, LM Studio, Jan, llama.cpp oder vLLM –
 und er kann **handeln**: Dateien lesen und schreiben, Befehle ausführen, im Web nachschlagen,
 programmieren, Bilder ansehen und malen, den PC bewachen. Verändernde Schritte immer mit deiner Freigabe.
 
@@ -35,6 +35,19 @@ Bildbeschreiber und Gedächtnis laufen im eigenen GGUF-Motor, Bilder malt die ei
 >
 > 🎂 **Geburtstag: 19. Juni 2026.** An diesem Morgen kam die Frage, woraus Claude Code besteht – zwei Stunden später lief der erste Chat. Vorläufer war Nemi (V1/V2, Desktop- und Android-Apps) ab März 2026. `/version` zeigt das Alter.
 
+### 🔢 Aktuelle Version: 9.23 Alpha – und ein kleiner Zählfehler
+
+Ehrlich gesagt: Wir haben uns verzählt. 😅 Nach **8.9** haben wir einfach mit **8.10, 8.11 … 8.23**
+weitergemacht – und dabei vergessen, dass vorne irgendwann die **9** dran ist. Eine Version 9 gab es
+deshalb nie, obwohl seit 8.9 vierzehn große Pakete dazukamen (Appstore mit eigener Engine NemiView,
+37 Cloud-Anbieter, Desktop-Kugel, die von sich aus schreibt, und vieles mehr).
+
+Am 26. Oktober 2026 ist es uns aufgefallen – ausgerechnet beim Blick auf den GitHub-Stand, auf dem
+noch 8.9 steht. Seitdem heißt NemiCLI **9.23 Alpha**: vorne die nachgeholte 9, hinten zählen die Pakete
+weiter wie bisher. Die Build-Nummer (Anzahl der Commits) lief die ganze Zeit sauber weiter, und das
+Setup erkennt 9.23 richtig als neuer als 8.23 – passiert ist also nichts, nur die Zahl vorne war
+eingeschlafen. Im [CHANGELOG](CHANGELOG.md) behalten ältere Einträge ihre damalige Nummer.
+
 ---
 
 ## ✨ Auf einen Blick
@@ -44,17 +57,21 @@ Alles ausführlich: **[docs/Funktionen.md](docs/Funktionen.md)**
 | Bereich | Was es kann |
 |---|---|
 | 🧠 **Eigener GGUF-Motor** | Lokale Modelle ohne Server, reines Python + torch im NemiCLI-Prozess. Gemma 4, Qwen3.5/3.6 (auch MoE), Qwen3-Next, Qwen3-VL, Llama 3/4, Mistral/Ministral, Phi, Granite 4 (Hybrid), Nemotron-H, Falcon-H1, LFM2, DeepSeek, Kimi Linear, Ling 3.0 u. a.; alle gängigen Formate bis IQ1; MoE-Experten bei Bedarf im RAM, das Experten-Lager sortiert auch während der Antwort nach (Gemma 4 26B-A4B bis zu 80 % schneller); spekulatives Dekodieren (n-Gramm, MTP bei Qwen 3.5/3.6) mit gleicher Antwort; Präfix-Cache (Folgerunden in ~0,1 s); `/kontext`: Vorgabe 25k, bis 128k mit VRAM-Automatik oder mit Gesprächsspeicher im RAM, Anzeige wie voll der Kontext ist; volle Gespräche werden als „Stand des Gesprächs“ zusammengefasst |
-| 👁 **Sehen** | Cloud, Ollama und eigener Motor (mmproj: Gemma 4, Qwen3.5/Qwen3-VL, Pixtral). Modelle ohne Sehen bekommen Hilfe vom **Bildbeschreiber** (`Vision/`) |
+| 👁 **Sehen** | Cloud, Ollama und eigener Motor (mmproj: Gemma 4, Qwen3.5/Qwen3-VL, Pixtral). Jedes Modell ohne Sehen – lokal, Ollama oder Cloud – bekommt Hilfe vom **Bildbeschreiber** (`Vision/`, wählbar mit `/vision`); ein Seh-Protokoll je Persönlichkeit merkt sich, welches Bild beschrieben wurde |
+| 🔎 **Denkt mit** | NemiCLI sagt der KI, was sich seit ihrem letzten Blick geändert hat (Dateien mit den geänderten Zeilen, Ordner, Modell, Persönlichkeit, lange Pausen), und prüft jede fertige Antwort gegen das, was wirklich passiert ist – „Erledigt!“ trotz Fehlschlag fällt auf, die KI denkt noch einmal nach (Gegenprobe). Dazu die Denk-Gewohnheit: erwarten, vergleichen, Fakt von Vermutung trennen |
+| 🧭 **Denkwerk** | Nachdenken für jedes Modell, automatisch: Jede Nachricht wird eingeschätzt (einfach, mittel, schwer). Bei mittleren denkt die KI Schritt für Schritt, bei schweren zerlegt sie die Aufgabe, probiert zwei bis drei Lösungswege, verwirft schwache und prüft das Ergebnis selbst. Modelle ohne eigenes Nachdenken denken dafür in `<think>` (erscheint als 💭), Denk-Modelle nutzen ihr eigenes. Schwere Antworten sieht danach ein unabhängiger **⚖️ Prüfer** durch; findet er Fehler, bessert die KI nach. „Denk gründlich nach“ oder „kurz und knapp“ in der Nachricht gehen vor |
 | 🔊 **Stimme** | Lokal mit Qwen3-TTS im eigenen Motor (~3 GB VRAM, schneller als Echtzeit): jede Persönlichkeit entwirft ihre Stimme mit dir aus einer Beschreibung, liest auf Wunsch vor (Text, Markdown, PDF), die Kugel spricht ihre Sprechblasen; Esc stoppt. Die Stimme steht als `voice` in der Charakter-Datei; Proben unter 150 Hz (Männerbereich) spielen nicht, Config `stimme_min_hz` |
-| ☁ **Cloud** | Anthropic, OpenAI, Google, Mistral, Cohere, Perplexity, DeepSeek, xAI, Groq, OpenRouter, Ollama Cloud – Modelle live abgefragt, Keys verschlüsselt (DPAPI) |
+| ☁ **Cloud** | 37 Anbieter: Anthropic, OpenAI, Google, Mistral, Cohere, Perplexity, DeepSeek, xAI, Groq, Moonshot (Kimi), Z.ai (GLM), Alibaba (Qwen), MiniMax, StepFun, Inception, Together, Fireworks, DeepInfra, Cerebras, SambaNova, Nebius, Novita, Hyperbolic, SiliconFlow, Chutes, Featherless, NVIDIA NIM, Hugging Face, GitHub Models, Venice, IONOS, Scaleway, OVHcloud, Vercel AI Gateway, AI/ML API, OpenRouter, Ollama Cloud – Modelle live abgefragt, lange Listen mit 🔍 Suchen, Keys verschlüsselt (DPAPI) |
 | ⚙ **Werkzeuge** | Dateien, Ordner, Suche, PowerShell (auch Python/pip), Web über Allowlist (andere Seiten über Ollama), Fachquellen (arXiv, PubMed, GitHub, Stack Overflow, OpenAlex), Recherche mit Bericht (die KI entscheidet selbst, wann gründlich recherchiert wird), PDF, Systemabfragen ohne PowerShell, Zeitplan, Helfer-Agenten, gelbe Todo-Liste bei Aufgaben mit mehreren Schritten |
-| 🟦 **Coding-Assistent** | `/code`: Auftrag → Recherche → Todo-Liste → Punkt für Punkt, grün nur nach echter Prüfung; kennt installierte Versionen, ruff, Offline-Doku (Python, MDN), Seiten-Screenshots; **Coding-Sammlung** aus freigegebenem Code, daraus ein **Coding-LoRA** für lokale Modelle (eigener LoRA-Motor, trainiert von einem Cloud-Modell) |
+| 🟦 **Coding-Assistent** | `/code`: Auftrag → Recherche → Todo-Liste → Punkt für Punkt, grün nur nach echter Prüfung; kennt installierte Versionen, ruff, Offline-Doku (Python, MDN), Seiten-Screenshots, Seitenprüfung (Konsolenfehler, fehlende Dateien) als Prüfung eines Punktes; **Coding-Sammlung** aus freigegebenem Code, daraus ein **Coding-LoRA** für lokale Modelle (eigener LoRA-Motor, trainiert von einem Cloud-Modell) |
 | 🧪 **Sandbox** | Code zum Ausprobieren läuft im Windows-AppContainer – Internet ja, deine Dateien nein |
-| 🛡 **Systemwache** | Hintergrund-Wächter mit 14 Regeln, eigenem Isolation Forest und einem Folgen-Netz (GRU), das ungewöhnliche Abläufe in Prozess-Ketten erkennt (erst im Schattenmodus, scharf nur über `/wache dl warnen`); weckt die Persönlichkeit ab 5–20 ungeprüften Alarmen, sie prüft und urteilt selbst; Vollscan mit jeder Festplatte bis in die Partitionen, Download-Herkunft, zusätzlichen Datenströmen (ADS) und nicht lesbaren Ordnern samt Grund |
-| 💾 **Gedächtnis** | Chats, Fakten, Lehren, Skills, Wissen-Ordner; hybride Suche (Stichworte + Vektoren), lernt nach Korrekturen von selbst, Skills bessern sich nach Problemen selbst nach (Strichliste je Skill), Kontext ohne Ende (AutoContextCleaner) |
-| 🎨 **Bilder** | Eigene Krea-2-Pipeline (NVFP4 auf RTX 50xx), Gesichter nachmalen, Charakter-Datei für eine feste Figur, Serien bis 30 Bilder, Comics mit Sprechblasen; **Charakter-LoRA**: die Persönlichkeit bringt Krea bei, wie sie aussieht (greift nur, wenn sie sich selbst malt); optional Forge-WebUI oder ComfyUI |
-| 🎬 **Video** | Eigener Video-Motor (Wan 2.2 TI2V 5B als GGUF, umT5 als GGUF): bis 20 s, 24 Bilder/s, Clips à 5 s aneinander, ein Startbild von Krea 2 hält die Figur, Charakter-LoRA hält das Gesicht; Werkzeug `video_erstellen`, `/video`. Bei Cloud-Modellen läuft es **im Hintergrund** – weiterreden, Stand rechts neben der Eingabe, Fertigmeldung automatisch. Dazu der **Tagesrückblick**: die Bilder des Tages als Video mit ihrer Stimme |
+| 🛡 **Systemwache** | Hintergrund-Wächter mit 17 Regeln (jede mit ihrer MITRE-ATT&CK-Technik, u. a. umbenannte Windows-Werkzeuge über die Versionsdaten), einem eigenen **Sigma-Leser** (6 mitgelieferte Regeln, weitere als `.yml` in `Wache/sigma/`), lesbaren **Ereignisprotokollen** (neuer Dienst oder neue Aufgabe → Inventar sofort neu, dauerhafte WMI-Abos), eigenem Isolation Forest und einem Folgen-Netz (GRU), das ungewöhnliche Abläufe in Prozess-Ketten erkennt (erst im Schattenmodus, scharf nur über `/wache dl warnen`); weckt die Persönlichkeit ab 5–20 ungeprüften Alarmen, sie prüft und urteilt selbst. Gehärtet gegen schleichendes Anlernen: gelernt wird erst nach 24 h und nie aus offenen Alarmen, „harmlos“ gilt nur für genau dieses Programm, Modelle mit Versionen zum Zurückdrehen. Vollscan (höchstens 3 neue pro Woche) mit jeder Festplatte bis in die Partitionen, Download-Herkunft, zusätzlichen Datenströmen (ADS) und nicht lesbaren Ordnern samt Grund |
+| 🌐 **Netzwächter** | Wer steckt hinter einer Adresse? Name, Besitzer laut Adressregister, ob NemiCLI sie selbst nutzt und wofür – einfach die Firewall-Meldung einfügen. Dazu ein Netz-Modell (ML) für einzelne Verbindungen und Netz-Folgen (DL) für Abfolge und Takt je Programm, beide erst im Schattenmodus (`/wache netz warnen`) |
+| 💾 **Gedächtnis** | Chats, Fakten, Lehren, Skills, Wissen-Ordner; hybride Suche (Stichworte + Vektoren), geschnitten an Absätzen, Sätzen, Code-Blöcken und Kapiteln; die KI sucht selbst – mit mehreren Fassungen und einer vermuteten Antwort, bekommt den Text davor und danach, keine Doppelungen, ehrliches „schwach gefunden“; mit einem Reranker-Modell (z. B. Qwen3-Reranker-0.6B als .gguf in `Models/reranker/<Name>/`) sortiert ein Cross-Encoder die besten Treffer nach echter Relevanz; die Reihenfolge lernt NemiCLI aus dem, was die KI wirklich liest; lernt nach Korrekturen von selbst, Skills bessern sich nach Problemen selbst nach (Strichliste je Skill), Kontext ohne Ende (AutoContextCleaner) |
+| 🎨 **Bilder** | Eigene Krea-2-Pipeline (NVFP4 auf RTX 50xx), Gesichter nachmalen, Charakter-Datei für eine feste Figur, Serien bis 30 Bilder, Comics mit Sprechblasen; **Charakter-LoRA**: die Persönlichkeit bringt Krea bei, wie sie aussieht (greift nur, wenn sie sich selbst malt); optional Forge-WebUI oder ComfyUI · ☁ ohne Grafikkarte auch aus der Cloud (12 Anbieter: OpenAI, Google, xAI, Black Forest Labs/FLUX.2, Ideogram, Runway, fal.ai, Stability AI, Recraft, Together, Replicate, Luma – `/bildmodel cloud …`, Menü mit 🔍 Suchen, neuer Anbieter mit Schlüssel: `/bildmodel cloud neu`) |
+| 🎬 **Video** | Eigener Video-Motor (Wan 2.2 TI2V 5B als GGUF, umT5 als GGUF): bis 20 s, 24 Bilder/s, Clips à 5 s aneinander, ein Startbild von Krea 2 hält die Figur, Charakter-LoRA hält das Gesicht; Werkzeug `video_erstellen`, `/video`. Bei Cloud-Modellen läuft es **im Hintergrund** – weiterreden, Stand rechts neben der Eingabe, Fertigmeldung automatisch. Dazu der **Tagesrückblick**: die Bilder des Tages als Video mit ihrer Stimme · ☁ auch aus der Cloud (Google Gemini Omni, xAI Grok Imagine, Runway Gen-4.5, MiniMax H3, Luma Ray 3.2, fal.ai mit Veo/Kling … – `/video cloud …`, `/video cloud neu`) |
 | 🗣 **Porträt** | Eigener Porträt-Motor (LivePortrait): ein Bild bewegt sich – lächeln, zwinkern, nicken – und **spricht** mit ihrer Stimme (MP4 mit Ton, bis 60 s), im kleinen Fenster oder in der Kugel |
+| 🎭 **Charakter-Galerie** | Fenster `/charaktere`: 9 fertige Persönlichkeiten mit Porträt zum Übernehmen – oder eine eigene erschaffen: Geschlecht (weiblich, männlich, nichtbinär), Alter ab 18, bis zu 8 Eigenschaften; die KI schreibt Vorschläge, Krea malt je ein Porträt. ✨ lässt die KI ein Feld verbessern, 🎨 malt neu (gleiches oder neues Gesicht). Übernehmen legt die Persönlichkeit an, im Profil die Charakter-Datei mit festem Seed (gleiches Gesicht in jedem Bild) und das Porträt als Profilbild |
 | 🎵 **Musik** | Eigener Musik-Motor (ACE-Step 1.5 als GGUF): „Mach mir einen Sommer-Song“ – die KI schreibt Stil und Liedtext, der Song-Planer plant Aufbau und Melodie, 48 kHz Stereo bis 4 Minuten, jeder Song mit Titel. **Cover:** einen vorhandenen Song (auch MP3/M4A/FLAC) im anderen Stil neu einspielen. Fenster `/musik` zum Wünschen, Ausarbeiten und Komponieren |
 | 🎭 **Oberfläche** | Eigenes Terminal-Fenster mit **Reitern** und dem Reiter „🤖 KI“ (jeder Befehl der KI live), Textual-Vollbild, Desktop-Fenster `/gui` (mit 🔊 Vorlesen und ⚙ Einstellungsseite), WebUI mit Lesehilfen, Schwebekugel auf dem Desktop (schläft, sagt etwas zur Musik, wählt selbst, was sie anhat, nimmt Bilder und Dateien per Ziehen an, erinnert dich), Spiele, Chrome-Erweiterung mit Seitenleisten-Chat (Seite, Bildschirmfoto, Entwürfe), Rechtsklick-Menü |
 | 🔒 **Sicherheit** | Prüffenster mit Vorher/Nachher (F8), Risikostufen, Papierkorb + `/undo`, Lösch-Limit, Systemordner nur lesen, Fremddaten markiert, Skill-Wächter mit KI-Zweitmeinung, Aktions-Protokoll, `/backup` als Zip mit SHA-256, tägliche automatische Sicherung von Gedächtnis & Co. |
@@ -67,6 +84,9 @@ Alles ausführlich: **[docs/Funktionen.md](docs/Funktionen.md)**
 nach, was fehlt. Danach `/einrichten`: holt ein eigenes Python (isoliert in `.runtime/`, ohne Admin),
 legt das venv an und öffnet für torch ein Fenster mit aktiviertem venv (`/venv`) – dort den angezeigten Befehl
 eingeben, bei NVIDIA RTX z. B. `pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu132`.
+Am Ende bietet es die Modelle der Motoren an (auch später: `/einrichten modelle`) – alles freiwillig, Teil für
+Teil mit Lizenz und Größe vorab, aus der offiziellen Quelle auf Hugging Face, SHA-256 geprüft, gleich im richtigen
+Ordner: Gedächtnis, Reranker, Bildbeschreiber, Stimme, Musik, Video, Porträt. Krea 2 als Hinweis mit Ordner und Link.
 
 **Weg 2 – von Hand:**
 ```bash
@@ -107,7 +127,7 @@ wird **kopiert, nie gelöscht**.
 | Was | Wo | Wie |
 |---|---|---|
 | Lokales Sprachmodell | `ModelGGUF/<Name>/` im Programm-Ordner | `/model huggingface`: Größe wählen, nur ladbare Modelle ab 4B, SHA-256-Prüfung, fortsetzbar. Eine `mmproj-*.gguf` daneben = Modell sieht |
-| Bildbeschreiber | `Vision/<Name>/` im Programm-Ordner | kleines sehendes Modell (.gguf + mmproj) für lokale Modelle ohne Sehen |
+| Bildbeschreiber | `Vision/<Name>/` im Programm-Ordner | kleines sehendes Modell (.gguf + mmproj) für jedes Modell ohne Sehen; je Modell ein Ordner, Wahl mit `/vision` |
 | Stimme | `Vision/<Name>/` im Programm-Ordner | Qwen3-TTS-Talker (VoiceDesign) + 12-Hz-Tokenizer als GGUF |
 | Gedächtnis-Embeddings | `Models/embeddings/<Name>/` im Programm-Ordner | `/embeddings`; GGUF läuft im eigenen Motor, auf der GPU wenn vorhanden |
 | Krea 2 (Bilder) | `Models/Krea2/` im Daten-Ordner | Modell, `text_encoders/`, `vae/`, `tokenizer/`; `/bildmodel` |
@@ -117,8 +137,17 @@ wird **kopiert, nie gelöscht**.
 | Porträt (LivePortrait) | `Models/LivePortrait/` (Daten- oder Programm-Ordner) | die fünf `.pth`-Netze + `landmark.onnx`; nur mit passender SHA-256 gelesen, einmal nach safetensors umgeschrieben |
 | Cloud | – | `/model` → „Cloud-Anbieter hinzufügen“ → Key eintippen (verschlüsselt) |
 | Ollama | läuft separat | erscheint von selbst, Modelle direkt aus NemiCLI laden |
+| LM Studio · Jan · llama.cpp-Server/LocalAI · vLLM | laufen separat (Ports 1234 · 1337 · 8080 · 8000) | erscheinen von selbst unter `/model`, wenn sie laufen – kein Key |
 
 In jedem Modell-Ordner legt NemiCLI einen `LIES-MICH.txt` an, der erklärt, was hineingehört.
+
+**🪑 Ersatzbank (`/model ersatz`):** Bis zu zwei Cloud-Modelle sitzen auf der Bank. Scheitert das aktive
+Modell innerhalb von 30 Minuten fünfmal an einer Schutzsperre (geschützter Befehl, gesperrter Bereich),
+wird es herausgefiltert, die Runde endet sofort, und der erste Ersatz springt ein – im Terminal, in der
+Kugel und beim Weckruf der Wache (der Weckruf startet mit dem Ersatz neu, kein Alarm bleibt liegen).
+„Nur Lesen“, die Kugel-Sperre und das Lösch-Limit zählen nicht, die entstehen aus normalen Wünschen.
+Ohne Ersatz ist kein Modell aktiv, bis `/model` ein neues wählt; wer ein herausgefiltertes Modell selbst
+wieder wählt, holt es zurück.
 
 ### 🎬 Video-Modelle selbst laden
 
@@ -191,7 +220,7 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 
 | Befehl | Was es tut |
 |---|---|
-| `/model [name\|huggingface]` | Modell wählen, Cloud-Key eintragen, lokales Modell von Hugging Face holen |
+| `/model [name\|huggingface\|ersatz]` | Modell wählen, Cloud-Key eintragen, lokales Modell von Hugging Face holen, Ersatzbank (bis 2 Cloud-Modelle) |
 | `/kontext [anzeigen\|8k…128k\|max\|8bit\|16bit]` | 📊 Womit der Kontext gefüllt ist (wie `/context` bei Claude Code); lokal: Größe, Vorgabe 25k |
 | `/staerke [stufe]` | Denkstufe/Budget: `schnell` · `normal` · `stark` · `max` |
 | `/auto [an\|aus]` | Auto-Stark (Ollama): bei schweren Fragen aufs große Gemma |
@@ -218,6 +247,7 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 |---|---|
 | `/bild [prompt\|schritte]` | Bild malen (Krea 2, WebUI oder ComfyUI) · Krea-Schritte 8–16 |
 | `/video <beschreibung> [--sekunden 10] [--start bild.png]` | 🎬 Video mit dem eigenen Motor: 704×1024 hochkant (Seitenverhältnis wie Krea 2), 24 Bilder/s, Clips à 5 s bis 20 s |
+| `/charaktere` | 🎭 Charakter-Galerie: Vorlagen ansehen und übernehmen, eigene erschaffen (Geschlecht, Alter ab 18, bis zu 8 Eigenschaften), ✨ von der KI verbessern lassen, „Meinen Charakter verbessern“ für die aktive Persönlichkeit |
 | `/musik` | 🎵 Musik-Fenster: Wunsch eintippen, ✨ Ausarbeiten (Stil, Liedtext, Tempo), 🎵 Komponieren, 🎙 Als Cover – oder einfach der KI sagen, welchen Song sie machen soll |
 | `/bildmodel [name]` | Bild-Motor wählen (`webui-adresse` ändert den Host) |
 | `/charakter [oeffnen]` | 🧬 Charakter-Datei: feste Figur der Persönlichkeit |
@@ -237,15 +267,16 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 
 | Befehl | Was es tut |
 |---|---|
-| `/wache [status\|alarme\|fullscan\|dl\|…]` | 🛡 Systemwache: Lage, Alarme, Regeln, Vollscan, Folgen-Netz, Selbsttest |
+| `/wache [status\|alarme\|fullscan\|dl\|netz\|…]` | 🛡 Systemwache: Lage, Alarme, Regeln, Vollscan, Folgen-Netz, Netzwächter (`/wache netz <adresse>`), Modelle zurückdrehen (`ml zurueck`), Selbsttest |
 | `/backup [teil\|voll\|voll modelle] [ganz]` · `auto [jetzt]` · `pruefen` · `auspacken <name>` · `ordner` | 💾 Sicherung als Zip mit SHA-256: Teil (Bilder, Persönlichkeiten, Profile) oder vollständig; danach differenzielle Nachträge, Wiederherstellen in einen neuen Ordner. Dazu täglich automatisch Gedächtnis, Profile, Persönlichkeiten & Co. (zwei Stände, überschrieben) |
 | `/undo` · `/limit [zahl]` · `/whitelist [befehl]` | 🗑 Papierkorb · 🛑 Lösch-Limit · ✅ Befehls-Whitelist |
 | `/schluessel <min> [aufgabe]` · `aus` | 🔑 Programm-Ordner auf Zeit für die KI öffnen |
 | `/protokoll [n]` | 📜 Aktions-Protokoll |
+| `/vision [<ordner>\|restart\|debug\|protokoll\|ordner]` | 👁 Bildbeschreiber: Seh-Modell wählen (je Modell ein Ordner unter `Vision/`), neu laden, Fehlerbericht schreiben, Seh-Protokoll zeigen; nach 2 Minuten ohne Bild ganz entladen |
 | `/voice [an\|knopf\|aus\|jetzt\|text]` | 🔊 Stimme: `an` liest jede Antwort vor, `knopf` nur auf Anfrage (`jetzt` = letzte Antwort einmal) und gibt den Grafikspeicher danach sofort frei, `aus` bleibt aus bis du einschaltest; `text` zeigt die letzte Antwort ganz |
 | `/web [wort\|key\|fremdseiten frei\|fragen\|aus]` | Web-Allowlist · Ollama-Suche einrichten · Seiten außerhalb der Allowlist über Ollama |
 | `/start` | 📁 Wo dein Daten-Ordner liegt |
-| `/einrichten` · `/update` · `/venv` | 🧰 Fehlendes installieren · ⬇ venv prüfen (Lücken über OSV.dev, Updates) · 🪟 Fenster mit dem venv (torch) |
+| `/einrichten [modelle]` · `/update` · `/venv` | 🧰 Fehlendes installieren, Modelle der Motoren laden · ⬇ venv prüfen (Lücken über OSV.dev, Updates) · 🪟 Fenster mit dem venv (torch) |
 | `/systemcheck` · `/selbsttest` · `/version` | PC-Steckbrief · Module prüfen · Version |
 
 **Oberflächen & Extras**
@@ -256,9 +287,11 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | `/webui` | Browser-Oberfläche mit Lesehilfen |
 | `/chrome [neu]` | Chrome-Erweiterung (Seitenleisten-Chat + Rechtsklick): Port und Schlüssel |
 | `/kontextmenue [an\|aus]` | NemiCLI im Windows-Rechtsklick-Menü |
-| `/debug [aus\|an\|motor an\|aus]` | 🐞 Debugbericht läuft immer: Grafikspeicher je Prozess, Modelle laden/entladen, Fehler – eine Datei je Start unter `Debugbericht/`; mit einem Cloud-Modell liest die KI ihn selbst („Was sagt der Debug gerade?“) und schreibt ihre Auswertung nach `Berichte/`. **Selbstdiagnose 🩺:** „Prüf dich mal“ – die Cloud-KI sieht sich in einem Zug an (Version, Rechner, Grafikspeicher je Prozess, Systemcheck, letzte Fehler) und legt den Befund als `Berichte/Diagnose_<Datum>.md` ab. **Fehler-Wächter:** erkennt Hänger und Bremsen (mit der Stelle im Code), Arbeit, die beim Entladen nicht aufhört, Abstürze und ein unsauberes Ende früherer Starts, wiederholte Fehler und ungültige Werte – als „⚠ BEFUND“ im Bericht und in der Selbstdiagnose |
+| `/debug [aus\|an\|motor an\|aus]` | 🐞 Debugbericht läuft immer: Grafikspeicher und Arbeitsspeicher je Prozess (auch festgenagelter RAM und die größten RAM-Nutzer aller Programme), Modelle laden/entladen, Fehler – eine Datei je Start unter `Debugbericht/`; mit einem Cloud-Modell liest die KI ihn selbst („Was sagt der Debug gerade?“) und schreibt ihre Auswertung nach `Berichte/`. **Selbstdiagnose 🩺:** „Prüf dich mal“ – die Cloud-KI sieht sich in einem Zug an (Version, Rechner, Grafikspeicher je Prozess, Systemcheck, letzte Fehler) und legt den Befund als `Berichte/Diagnose_<Datum>.md` ab. **Fehler-Wächter:** erkennt Hänger und Bremsen (mit der Stelle im Code), Arbeit, die beim Entladen nicht aufhört, Abstürze und ein unsauberes Ende früherer Starts, wiederholte Fehler und ungültige Werte – als „⚠ BEFUND“ im Bericht und in der Selbstdiagnose |
 | `/spiel` | Schach · Mühle · Dame · TicTacToe gegen die Persönlichkeit |
+| `/appstore [<app> \| debug <app> \| liste]` | 🛍 Apps aus HTML/CSS/JS in **NemiView**, NemiCLIs eigener Engine (eigener JavaScript-Interpreter, HTML, CSS, Layout, Zeichnen – kein Chrome, kein Internet, keine Grafikkarte); die KI nutzt ihre Funktionen (`app_aufrufen`) und prüft sie (`app_pruefen`); 🐞 debugAI in jeder App: sagen was stört, auf die Stelle tippen, danach vorher → nachher mit Behalten oder Zurück; der Store zeigt kleine Kacheln (Klick öffnet, Rechtsklick → debugAI), **➕ Neue App** lässt die KI eine App aus einer kurzen Beschreibung bauen |
 | `/theme` · `/emoji` · `/nemi` · `/statistik [reset]` | Farben · Emoji-Kürzel · Maskottchen · Nutzung |
+| `/restart` | 🔄 NemiCLI **und** Wache neu starten, im selben Fenster – nach Updates oder als Notbremse, wenn etwas hängt (greift sofort, auch mitten in der Arbeit). Nur über die eigene Eingabe, nie durch die KI. Nach `/update` und Installationen fragt NemiCLI selbst „Jetzt neu starten?“ |
 | `/help` · `/exit` | Hilfe · Beenden |
 
 **Tasten:** `Enter` senden · `Strg+J` neue Zeile · `Esc` abbrechen · `F2` Denktext ·
@@ -288,6 +321,7 @@ schließen · `Strg+Bild ↑/↓` wechseln · `Strg+Umschalt+K` Reiter „🤖 K
   ohne harmlosen Zweck (mshta, certutil, Autostart-Einträge, Firewall …). PowerShell startet nur über
   `befehl`, nach Rückfrage – Systemabfragen, Zeitplan und GPU-Erkennung laufen ohne PowerShell.
 - **Schutzsoftware ist tabu:** deren Ordner, Prozesse und Dateien untersucht die KI nicht.
+- **Die Wache ergänzt deinen Virenschutz, sie ersetzt ihn nicht.** Ohne Adminrechte, ohne Eingriff in Defender oder andere Schutzsoftware; Alarme bewertet die Persönlichkeit, scharf schalten (Folgen-Netz, Netzwächter, seltener wecken) kann nur der Nutzer.
 - **Papierkorb & Lösch-Limit:** Löschen verschiebt nur, Überschriebenes wird gesichert (`/undo`).
   Mehr als 20 Dateien pro Sitzung → STOPP.
 - **Netz nur über HTTPS**, Allowlist (~230 Domains) direkt mit SSRF-Schutz bei jeder Weiterleitung.
@@ -298,11 +332,25 @@ schließen · `Strg+Bild ↑/↓` wechseln · `Strg+Umschalt+K` Reiter „🤖 K
   fragen Befehle, Schreiben und Merken – auch im Auto-Modus; nach privaten Daten auch neue Suchen. Seiten, die
   Befehle einschmuggeln wollten, werden gemerkt und fragen beim nächsten Mal.
 - **Pfade werden aufgelöst, bevor sie geprüft werden** (Freigaben dieses Rechners, Gerätepfade, Kurznamen,
-  Platzhalter, Variablen), und Programme, die die KI startet, bekommen keine API-Schlüssel.
+  Platzhalter, Variablen), und Programme, die die KI startet, bekommen keine API-Schlüssel. In `befehl`
+  zählen auch Umwege: eigene Variablen (`$a = $env:…`), `Join-Path`, `cd` mit relativem Pfad danach;
+  Pfade aus Stücken (`'{0}\x' -f …`, `'C:\a' + …`) und 8.3-Kurznamen weist er ab. Ein Textfilter wird
+  nie ganz dicht – die echte Wand wäre ein eigener Windows-Benutzer für NemiCLI (Roadmap).
 - **Wächter für steuernde Dateien:** Änderungen an der eigenen Persönlichkeit und an Anleitungen werden geprüft,
-  Zeitplan und Skripte fragen immer.
+  Zeitplan und Skripte fragen immer, ebenso `Wache/` (Stopp-Datei, Modelle) und `learned/` (Gedächtnis, Protokoll).
   Web-Inhalte, Dateien und Erinnerungen gelten als **Daten, nie als Anweisungen**; Befehlsmuster
-  darin werden markiert oder entfernt.
+  darin werden markiert oder entfernt. Jeder Fremdinhalt-Rahmen trägt eine **Zufallskennung**, Rahmenlinien im
+  Inhalt werden entschärft – ein Text kann sein Rahmen-Ende nicht fälschen. Notizen über `skill_merken` laufen
+  durch dieselben Filter wie `merken` und überschreiben nie eine vorhandene.
+- **Chrome:** Der Rechtsklick („Nemi antwortet“, „Erklär mir das“) läuft ohne Werkzeuge; der Seitentext ist
+  Fremdinhalt mit Netz-Marke, Pfade darin werden nie geöffnet, nichts wird angehängt. Unsichtbare Elemente der
+  Seite gehen nicht an die KI. Die Brücke prüft den Host (Schutz vor DNS-Rebinding).
+- **Wache:** Alarme kommen als gerahmte **Messwerte** in den Weckruf, jede Kommandozeile einzeilig – ein Programm
+  kann sich nicht selbst als harmlos ausgeben. „Bekannt“ hängt am Programmpfad, nicht nur am Namen. Die Regeln
+  für klassische Angriffe (R001, R002, R006, R013, R014) schaltet nur der Nutzer stumm. Nach Inhalt aus dem Netz
+  darf die Persönlichkeit im Hintergrund nichts merken, nichts justieren und dir nichts ausrichten.
+- **Kugel:** `inhalt_suchen` und `dateien_suchen` laufen nur im Terminal – große Suchläufe im Wache-Prozess
+  brachten den Rechner ins Stocken.
 - **Alles, was auf einen Port hört, hört nur auf `127.0.0.1`** – mit Token oder Schlüssel. Ein Test wacht darüber.
 - **Hintergrund-Läufe** (Zeitplan) laufen fest im Modus „Nur Lesen“.
 - **API-Keys** verschlüsselt in `.env` (Windows-DPAPI). **exe signiert** (`CN=NemiCLI`) mit SHA-256-Prüfsummen.
@@ -334,6 +382,7 @@ NemiCli/
 ├─ Agenten/               Anleitungen, die die Persönlichkeit abarbeitet
 ├─ chrome-erweiterung/    Chrome-Erweiterung (LIESMICH.md)
 ├─ installer/             MSI-Bau
+├─ tests/                 Offline-Tests (nicht im Repository)
 ├─ docs/                  Funktionen, Technik, Modelltests, Pläne, Ideen
 ├─ build_exe.py · NemiCLI.spec · zertifikat.py
 ├─ nemicli.config.json · .env            Einstellungen · Schlüssel (verschlüsselt)
@@ -368,7 +417,13 @@ hochzufahren.
 
 ## 🛠 Voraussetzungen
 
-- **Windows 10/11**, **Python 3.14** (getestet; oder `start.bat` sagt, was fehlt). Die exe bringt ihr Python
+- **Betriebssystem:** **Windows 11** ✅ getestet · Windows 10 ungetestet · **Ubuntu** ⏳ noch offen
+- **Ohne Adminrechte:** NemiCLI wird als normaler Nutzer eingerichtet und läuft so – kein UAC-Fenster, keine
+  Rechte-Erhöhung, auch nicht für die Wache.
+- **Virenschutz:** Die exe ist mit dem eigenen Zertifikat `CN=NemiCLI` signiert (dazu SHA-256-Prüfsummen).
+  Bisher gab es damit **keine Probleme mit Microsoft Defender und Bitdefender** (Windows 11). Das Zertifikat ist
+  ein eigenes, kein offiziell anerkanntes – auf anderen Rechnern kann ein Virenschutz trotzdem nachfragen.
+- **Python 3.14** (getestet; oder `start.bat` sagt, was fehlt). Die exe bringt ihr Python
   mit; das venv von `/einrichten` bekommt dieselbe Version – ein venv für ein anderes Python legt es beiseite.
 - Pakete aus `requirements.txt`: `anthropic`, `openai`, `httpx`, `rich`, `textual`, `prompt_toolkit`,
   `python-dotenv`, `packaging`, `regex`, `safetensors`, `tokenizers`, `numpy`, `pillow`, `ruff`, `pypdf`,
@@ -378,6 +433,44 @@ hochzufahren.
 - Krea 2: am schnellsten ab RTX 50xx (NVFP4 auf den Tensorkernen), ~20 GB freier RAM
 - Optional: **Ollama** ([ollama.com/download](https://ollama.com/download)), eine laufende
   Forge-WebUI oder ComfyUI, Chrome für die Erweiterung
+
+### 🖥 Grafikspeicher (VRAM)
+
+| Kategorie | VRAM | Einschätzung |
+|---|---|---|
+| **Minimum** | 8 GB | Eingeschränkter Betrieb, kleinere Modelle |
+| **Empfohlen** | 16 GB | Flüssigerer Betrieb, größere Modelle |
+| **Optimal** | 24–32 GB | Mehr Reserven für Modelle und Kontext |
+
+**Wichtig:** 8 GB sind die **Mindestanforderung** – keine Garantie, dass jedes KI-Modell läuft. Neben dem VRAM
+spielen auch Quantisierung, Kontextlänge, Arbeitsspeicher (RAM) und die gleichzeitig geladenen Teile (Stimme,
+Bildbeschreiber, Bild- und Video-Motor) eine Rolle.
+
+### 🧠 Arbeitsspeicher (RAM)
+
+| Kategorie | RAM | Einschätzung |
+|---|---|---|
+| **Minimum** | 32 GB | Alles nutzbar, Krea 2 knapp |
+| **Empfohlen** | 64 GB | Krea-Serien, Video, große MoE-Modelle mit Experten im RAM |
+
+**16 GB RAM reichen nicht** für das volle NemiCLI – nur zum Chatten, nicht empfohlen. Gemessen im Debugbericht:
+
+| Wer | RAM |
+|---|---|
+| Windows selbst + Hintergrund (Browser, Steam, Virenschutz …) | ca. 6–10 GB |
+| NemiCLI mit Gedächtnis-Modell | ca. 2–5 GB |
+| **Krea 2 beim Malen** | **20–27 GB festgenagelt**, in einer Bilderserie bis ~40 GB |
+| Ollama beim Laden (lädt unter Windows die ganze Modelldatei in den RAM) | so groß wie das Modell |
+
+Was mit **16 GB RAM + 16 GB VRAM** geht:
+
+| Funktion | Geht? |
+|---|---|
+| Chatten mit Modellen, die ganz in die Grafikkarte passen | ✅ ja, aber knapp |
+| Stimme, Bildbeschreiber | ✅ meistens |
+| Große MoE-Modelle mit Experten im RAM (Hybrid) | ⚠ kaum, dafür fehlt der Platz |
+| **Krea 2 (Bilder malen)** | ❌ nein |
+| Video | ❌ nein |
 
 ---
 
@@ -407,6 +500,10 @@ hochzufahren.
 - [x] Setup-Datei mit eigenem Fenster: findet Installationen, aktualisiert nur das Programm, Desktop-Symbol wählbar
 - [x] Charakter-LoRA für Bilder (Krea 2) und Videos (Wan 2.2), trainiert von der Persönlichkeit selbst
 - [x] Eigene Motoren für Musik (ACE-Step 1.5, mit Cover) und bewegte, sprechende Porträts (LivePortrait)
+- [x] Denkwerk: Nachdenken für jedes Modell, automatisch nach Schwierigkeit, mit Prüfer
+- [x] Gedächtnis-Suche mit Reranker, gelernter Rangliste und sauberem Schnitt
+- [x] Coding-Assistent mit Seitenprüfung: grün nur ohne Konsolenfehler und fehlende Dateien
+- [ ] Eigener Windows-Benutzer für NemiCLI: Windows selbst sperrt den Programm-Ordner, kein Textfilter nötig
 - [ ] Lizenz festlegen (Liebesprojekt – nie zum Verkauf)
 - [ ] Signatur mit einem anerkannten Zertifikat, wenn NemiCLI an andere geht
 - [ ] Build beim Bitdefender-Falsch-Positiv-Formular einreichen

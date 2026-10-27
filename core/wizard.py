@@ -13,11 +13,11 @@ Geprüft/erledigt wird:
   3. torch                       (passend zur Grafikkarte, siehe syscheck)
   4. Pakete aus requirements.txt (Krea 2, Gedächtnis-Encoder …)
   5. Ollama                      (Motor für lokale Modelle – nur prüfen)
-  6. Modelle                     -> NUR prüfen und erklären. Die lädt der
-                                    Nutzer selbst, NemiCLI darf keine
-                                    Gigabyte-Modelle für ihn auswählen.
+  6. Modelle                     -> prüfen und erklären. Laden nur auf Wunsch,
+                                    Teil für Teil mit Lizenz und Größe vorab
+                                    (tools/modellkatalog.py, /einrichten modelle).
 
-ISOLATION (seit 12.09.2026): Python + venv + Bild-Pakete kommen über `uv`
+ISOLATION: Python + venv + Bild-Pakete kommen über `uv`
 (core/uvsetup.py). Es wird ein EIGENSTÄNDIGES Python in <NemiCLI>/.runtime/
 gelegt - kein Admin, keine PATH-Änderung, nichts am System des Nutzers. Das
 löst den alten python.org-Weg (systemweite Installation) ab.
@@ -56,6 +56,11 @@ VENV_DIR = uvsetup.VENV_DIR
 # ===========================================================================
 #  Kleine Helfer
 # ===========================================================================
+
+def _cmd_sicher(pfad) -> str:
+    """Pfad für eine cmd-Zeile: & ^ % | < > würden sonst als Befehl gelesen (Benutzerordner „Tom&Jerry“)."""
+    return "".join("^" + c if c in "&^|<>" else ("%%" if c == "%" else c) for c in str(pfad))
+
 
 def _venv_python() -> Path | None:
     """Das Python der isolierten Umgebung (falls schon angelegt)."""
@@ -127,7 +132,7 @@ def check_all() -> list[dict]:
                  else "fehlt: " + ", ".join(fehlend[:6]) + (" …" if len(fehlend) > 6 else "")),
     })
 
-    # 5. Ollama (der lokale Motor; llama.cpp ist am 15.09.2026 entfallen)
+    # 5. Ollama (der lokale Motor; llama.cpp ist entfallen)
     ollama = S.ollama_running()
     schritte.append({
         "id": "ollama", "titel": "Ollama (Motor für lokale Modelle)",
@@ -199,7 +204,7 @@ def venv_fenster() -> str:
     befehl = torch_befehl()
     skript = (f'call "{py.parent / "activate.bat"}" && '
               f'(python -m pip --version >nul 2>&1 || python -m ensurepip --upgrade >nul) && '
-              f'echo. && echo NemiCLI-venv ist aktiv: {VENV_DIR} && echo. && '
+              f'echo. && echo NemiCLI-venv ist aktiv: "{_cmd_sicher(VENV_DIR)}" && echo. && '
               f'echo torch fuer diese Grafikkarte: && echo   {befehl} && echo.')
     subprocess.Popen(["cmd.exe", "/k", skript], cwd=str(VENV_DIR.parent),
                      creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))

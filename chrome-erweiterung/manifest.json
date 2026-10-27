@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "NemiCLI – Nemi antwortet",
-  "version": "2.3.4",
+  "version": "2.3.5",
   "minimum_chrome_version": "116",
   "description": "Chat in der Seitenleiste und Rechtsklick-Hilfe: die aktive Persönlichkeit antwortet, liest die Seite oder ein Bildschirmfoto mit. Redet nur mit dem laufenden NemiCLI auf 127.0.0.1.",
   "permissions": ["contextMenus", "storage", "activeTab", "scripting", "notifications", "sidePanel"],

@@ -355,9 +355,52 @@ def _pid_lebt(pid: int) -> bool:
         return False
 
 
+# Windows beendet Programme beim Herunterfahren und Abmelden: 1074 Herunterfahren/Neustart angefordert, 7002 Abmelden,
+# 13 Betriebssystem fährt herunter, 109 Kernel fährt herunter, 6006 Ereignisprotokoll beendet.
+_WINDOWS_ENDE = (1074, 7002, 13, 109, 6006)
+
+
+def windows_beendet(zeit: float, vor: float = 15.0, nach: float = 120.0) -> bool:
+    """Hat Windows um `zeit` herunterfahren oder abmelden lassen (Ereignisprotokoll „System“)? Über die
+    Ereignis-API (wevtapi), ohne PowerShell. Im Zweifel False – dann bleibt es beim Befund „unsauber“."""
+    if os.name != "nt" or not zeit:
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        from datetime import timezone
+        api = ctypes.WinDLL("wevtapi")
+        api.EvtQuery.restype = wintypes.HANDLE
+        api.EvtQuery.argtypes = [wintypes.HANDLE, wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD]
+        api.EvtNext.restype = wintypes.BOOL
+        api.EvtNext.argtypes = [wintypes.HANDLE, wintypes.DWORD, ctypes.POINTER(wintypes.HANDLE), wintypes.DWORD,
+                                wintypes.DWORD, ctypes.POINTER(wintypes.DWORD)]
+        api.EvtClose.argtypes = [wintypes.HANDLE]
+
+        def utc(s: float) -> str:
+            return datetime.fromtimestamp(s, timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
+        ids = " or ".join(f"EventID={i}" for i in _WINDOWS_ENDE)
+        abfrage = (f"*[System[({ids}) and TimeCreated[@SystemTime>='{utc(zeit - vor)}' and "
+                   f"@SystemTime<='{utc(zeit + nach)}']]]")
+        h = api.EvtQuery(None, "System", abfrage, 1)          # EvtQueryChannelPath
+        if not h:
+            return False
+        try:
+            ereignis, anzahl = wintypes.HANDLE(), wintypes.DWORD()
+            if api.EvtNext(h, 1, ctypes.byref(ereignis), 1000, 0, ctypes.byref(anzahl)) and anzahl.value:
+                api.EvtClose(ereignis)
+                return True
+            return False
+        finally:
+            api.EvtClose(h)
+    except Exception:
+        return False
+
+
 def letzter_lauf(rolle: str) -> list[dict]:
     """Frühere Starts dieser Rolle ohne normales Ende (Marke liegt noch, Prozess lebt nicht mehr): je Start
-    Zeit, PID, ob die Absturz-Spur Text hat, das Ende des Berichts. Die Marken werden dabei weggeräumt."""
+    Zeit, PID, ob die Absturz-Spur Text hat, das Ende des Berichts, wann der Bericht zuletzt schrieb. Die Marken
+    werden dabei weggeräumt."""
     aus = []
     for marke in sorted(_ordner().glob(f"laeuft_{rolle}_*.json")):
         try:
@@ -373,15 +416,16 @@ def letzter_lauf(rolle: str) -> list[dict]:
                 spur = Path(daten["absturz"]).read_text(encoding="utf-8", errors="replace").strip()
             except OSError:
                 pass
-        ende = ""
+        ende, zuletzt = "", 0.0
         if daten.get("log"):
             try:
                 ende = "\n".join(Path(daten["log"]).read_text(encoding="utf-8", errors="replace")
                                  .splitlines()[-8:])
+                zuletzt = Path(daten["log"]).stat().st_mtime        # der Takt schreibt alle 10 s
             except OSError:
                 pass
         aus.append({"start": daten.get("start", "?"), "pid": pid, "spur": spur, "ende": ende,
-                    "log": Path(daten.get("log", "")).name})
+                    "log": Path(daten.get("log", "")).name, "zuletzt": zuletzt})
         try:
             marke.unlink()
         except OSError:
@@ -400,6 +444,10 @@ def absturz_schutz() -> None:
         if lauf["spur"]:
             befund("absturz", f"Start {lauf['start']} (PID {lauf['pid']}) ist abgestürzt – Bericht {lauf['log']}",
                    lauf["spur"][-3000:])
+        elif windows_beendet(lauf.get("zuletzt") or 0.0):
+            # Herunterfahren/Abmelden: Windows beendet Programme ohne Bescheid, wenn der Qt-Haken nicht ankam
+            D.ereignis(f"Start {lauf['start']} (PID {lauf['pid']}) endete mit dem Herunterfahren oder Abmelden von "
+                       f"Windows – kein Fehler (Bericht {lauf['log']})", speicher=False)
         else:
             befund("unsauber", f"Start {lauf['start']} (PID {lauf['pid']}) endete ohne normales Beenden "
                    f"(beendet von außen oder Absturz ohne Spur) – Bericht {lauf['log']}", lauf["ende"])

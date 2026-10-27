@@ -10,7 +10,7 @@ ZWEI WURZELN, und das ist der ganze Punkt dieser Datei:
   DATEN   - der NemiCLI-Ordner des Nutzers. Chats, Bilder, Modelle, das
             Gelernte, die Persönlichkeiten. Alles, was wächst.
 
-Bis zum 15.09.2026 war das derselbe Ordner. Das ging so lange gut, bis der
+Früher war das derselbe Ordner. Das ging so lange gut, bis der
 Programm-Ordner umzog (Desktop -> AppData) - dabei blieb das venv auf der
 Strecke, und genauso hätte es das ganze Gedächtnis erwischen können. Deshalb
 jetzt getrennt: das Programm darf umziehen, neu gebaut oder als exe gepackt
@@ -207,7 +207,7 @@ _DIRS = ("Models", "Models/Krea2", "Bilder", "chats",
 # Backup/ zieht ebenfalls nicht mit um: Sicherungen können sehr groß sein.
 DATEN_INHALT = ("chats", "Gespraeche", "learned", "Bilder", "Models",
                 "NemiSandbox", "Persoenlichkeiten", "Agenten", "Skills", "Profile", "Befehle",
-                "Vorschläge", "Zeitplan", "Berichte", "Wissen", "Papierkorb", ".cli_history")
+                "Vorschläge", "Zeitplan", "Berichte", "Wissen", "Papierkorb", "Wache", "Apps", ".cli_history")
 
 _BEFEHLE_README = """\
 === Hier landen Hilfs-Skripte (.ps1) ===
@@ -256,10 +256,10 @@ Kein Server, kein llama.cpp, kein Ollama noetig - der Motor rechnet mit torch
 im NemiCLI-Prozess.
 """
 
-_VISION_README = """=== Bildbeschreiber: Augen fuer lokale Modelle ohne Sehen ===
+_VISION_README = """=== Bildbeschreiber: Augen fuer Modelle ohne Sehen ===
 
-Sieht ein Modell im eigenen GGUF-Motor selbst keine Bilder, beschreibt ein
-kleines sehendes Modell aus diesem Ordner das Bild als Text. Das Sprachmodell
+Sieht das aktive Modell (eigener Motor, Ollama oder Cloud) selbst keine Bilder,
+beschreibt ein kleines sehendes Modell aus diesem Ordner das Bild als Text. Das Sprachmodell
 bekommt die Beschreibung und kann mit dem Werkzeug bild_fragen nachfragen.
 
 Ein Unterordner je Beschreiber. Darin:
@@ -270,9 +270,10 @@ Beispiel:
   Vision/Qwen3VL4B/Qwen3VL-4B-Instruct-Q4_K_M.gguf
   Vision/Qwen3VL4B/mmproj-Qwen3VL-4B-Instruct-F16.gguf
 
-Genommen wird der erste Ordner mit bekanntem Bild-Encoder.
-Gilt nur fuer lokale Modelle im eigenen Motor, nie fuer Cloud-Modelle.
-Modelle, die selbst sehen (mmproj im ModelGGUF-Ordner), brauchen ihn nicht.
+Mehrere Beschreiber: /vision zeigt sie, /vision <ordner> waehlt einen.
+Ohne Wahl wird der erste Ordner mit bekanntem Bild-Encoder genommen.
+Nach 2 Minuten ohne Bild wird er ganz entladen.
+Modelle, die selbst sehen, brauchen ihn nicht.
 """
 
 _KREA_README = """\

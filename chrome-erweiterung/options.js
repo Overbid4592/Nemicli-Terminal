@@ -17,13 +17,15 @@ $("test").onclick = async () => {
   const key = $("key").value.trim();
   $("status").textContent = "Prüfe …";
   try {
-    const r = await fetch(`http://127.0.0.1:${port}/ping`, { headers: { "X-Nemi-Key": key } });
-    if (r.status === 403) {
-      $("status").textContent = "✗ Port " + port + " antwortet, aber der Schlüssel stimmt nicht (/chrome zeigt ihn)";
-      return;
-    }
-    const j = await r.json();
-    $("status").textContent = j.nemicli ? "✓ NemiCLI antwortet auf Port " + port + ", Schlüssel stimmt" : "Antwort, aber kein NemiCLI?";
+    // Der Schlüssel selbst geht nicht hinaus: NemiCLI unterschreibt eine Zufallszahl damit, wir vergleichen.
+    const zufall = Array.from(crypto.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, "0")).join("");
+    const j = await (await fetch(`http://127.0.0.1:${port}/hallo?nonce=${zufall}`)).json();
+    const k = await crypto.subtle.importKey("raw", new TextEncoder().encode(key), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const sig = new Uint8Array(await crypto.subtle.sign("HMAC", k, new TextEncoder().encode(`nemicli:${zufall}`)));
+    const soll = Array.from(sig, (b) => b.toString(16).padStart(2, "0")).join("");
+    $("status").textContent = j && j.beweis === soll
+      ? "✓ NemiCLI antwortet auf Port " + port + ", Schlüssel stimmt"
+      : "✗ Port " + port + " antwortet, aber nicht NemiCLI – oder der Schlüssel stimmt nicht (/chrome zeigt ihn)";
   } catch (e) {
     $("status").textContent = "✗ Kein NemiCLI auf Port " + port + " – läuft es? (/chrome zeigt Port und Schlüssel)";
   }

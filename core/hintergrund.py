@@ -54,14 +54,20 @@ def _dauer(e: dict) -> str:
     return f"{s // 60}:{s % 60:02d} min" if s >= 60 else f"{s} s"
 
 
+FUER_KI_MAX = 3000                 # so viel vom Ergebnis bekommt die Persönlichkeit (alle Bildpfade einer Serie)
+
+
 def _melden(e: dict) -> None:
-    """Fertig/gescheitert: Hinweis an die Persönlichkeit und Zeile im Terminal."""
-    kurz = " ".join(str(e["ergebnis"] or "").split())[:200]
-    text = (f"Hintergrund-Aufgabe #{e['nr']} ({e['titel']}) ist nach {_dauer(e)} "
-            f"{'fertig' if e['ok'] else 'gescheitert'}: {kurz}")
+    """Fertig/gescheitert: Hinweis an die Persönlichkeit (ganzes Ergebnis) und kurze Zeile im Terminal."""
+    voll = " ".join(str(e["ergebnis"] or "").split())
+    kopf = (f"Hintergrund-Aufgabe #{e['nr']} ({e['titel']}) ist nach {_dauer(e)} "
+            f"{'fertig' if e['ok'] else 'gescheitert'}: ")
+    kurz = voll[:200]
+    text = kopf + kurz
     try:
         import lernschleife
-        lernschleife.melden(text, e["wer"])
+        lernschleife.melden(kopf + (voll if len(voll) <= FUER_KI_MAX else voll[:FUER_KI_MAX] + " …"), e["wer"],
+                            max_zeichen=len(kopf) + FUER_KI_MAX + 2)
     except Exception:
         pass
     try:

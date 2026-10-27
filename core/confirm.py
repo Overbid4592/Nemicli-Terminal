@@ -169,3 +169,47 @@ async def ask(question: str, options: list[tuple[str, str]]) -> str:
         mouse_support=False,
     )
     return await app.run_async()
+
+
+SUCHEN = "__suchen__"
+ALLE = "__alle__"
+
+
+def treffer(optionen: list[tuple[str, str]], begriff: str) -> list[tuple[str, str]]:
+    """Einträge, in deren Wert oder Text alle Wörter des Suchbegriffs vorkommen (ohne Groß/klein)."""
+    worte = begriff.lower().split()
+    return [o for o in optionen if all(w in f"{o[0]} {o[1]}".lower() for w in worte)]
+
+
+async def ask_suche(question: str, options: list[tuple[str, str]], *, zeigen: int = 30, ab: int = 10,
+                    frage_fn=None, text_fn=None) -> str:
+    """Wie ask, ab `ab` Einträgen mit „🔍 Suchen“; höchstens `zeigen` Einträge auf einmal.
+    Werte mit "__" am Anfang (Abbrechen, Zurück) stehen immer am Ende – Esc wählt weiter den letzten.
+    frage_fn/text_fn ersetzen ask/ask_text (Hintergrund-Aufträge, Tests)."""
+    frage_fn, text_fn = frage_fn or ask, text_fn or ask_text
+    feste = [o for o in options if str(o[0]).startswith("__")]
+    eintraege = [o for o in options if not str(o[0]).startswith("__")]
+    if len(eintraege) < ab:
+        return await frage_fn(question, options)
+    liste, frage = eintraege, question
+    while True:
+        sicht = liste[:zeigen]
+        rest = len(liste) - len(sicht)
+        kopf = [(SUCHEN, f"🔍  Suchen …  ({len(eintraege)} insgesamt)")]
+        if liste is not eintraege:
+            kopf.append((ALLE, "↩  Alle zeigen"))
+        mehr = f"  ·  {rest} weitere – 🔍 Suchen findet sie" if rest > 0 else ""
+        wahl = await frage_fn(frage + mehr, kopf + sicht + feste)
+        if wahl == SUCHEN:
+            begriff = await text_fn("🔍 Suchen nach:")
+            if not begriff:
+                continue
+            gefunden = treffer(eintraege, begriff)
+            if not gefunden:
+                ui.warn(f"🔍 Nichts zu „{begriff}“ gefunden.")
+                continue
+            liste, frage = gefunden, f"{question}  ·  🔍 „{begriff}“: {len(gefunden)} Treffer"
+        elif wahl == ALLE:
+            liste, frage = eintraege, question
+        else:
+            return wahl
