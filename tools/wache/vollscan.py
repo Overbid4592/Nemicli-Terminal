@@ -151,8 +151,9 @@ _ARTEN = [
 ]
 _ART_JE_ENDUNG = {e: name for name, endungen in _ARTEN for e in endungen}
 
-# Nicht gültig signierter Code wird in jedem Lauf neu gehasht.
-_NEU_HASHEN = ("NotSigned", "HashMismatch", "NotTrusted")
+# Nicht gültig signierter Code wird in jedem Lauf neu gehasht – auch Skripte (Inhalt änderbar bei gleicher
+# Größe und zurückgesetzter Zeit) und was beim letzten Mal nicht lesbar war.
+_NEU_HASHEN = ("NotSigned", "HashMismatch", "NotTrusted", "Skript", "kein Zugriff", "nicht lesbar", "unbekannt")
 
 
 # ---------------------------------------------------------------------------
@@ -443,9 +444,23 @@ def stand_lesen() -> dict:
 
 
 def _stand_schreiben(z: dict) -> None:
-    tmp = STAND.with_suffix(".tmp")
-    tmp.write_text(json.dumps(z, ensure_ascii=False), encoding="utf-8")
-    os.replace(tmp, STAND)
+    """Fortschritt schreiben. Liest die Oberfläche gerade (Windows: Datei offen → PermissionError),
+    kurz wiederholen und notfalls auslassen – ein Lesezugriff darf keinen Vollscan abbrechen."""
+    tmp = STAND.with_suffix(f".{os.getpid()}.tmp")
+    try:
+        tmp.write_text(json.dumps(z, ensure_ascii=False), encoding="utf-8")
+        for versuch in range(5):
+            try:
+                os.replace(tmp, STAND)
+                return
+            except PermissionError:
+                time.sleep(0.05 * (versuch + 1))
+    except OSError:
+        pass
+    try:
+        tmp.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def laeuft() -> dict | None:
@@ -544,7 +559,11 @@ def _verbinden() -> sqlite3.Connection:
 class Lauf:
     def __init__(self, c: sqlite3.Connection, wurzeln: list[str] | None = None):
         self.c = c
+        from .herkunft import _SCHUTZ_ERSATZ              # feste Einträge, falls das Sicherheitscenter schweigt
         self.ausgelassen_pfade = ausgelassene_ordner()
+        bekannt = {os.path.normcase(o) for o in self.ausgelassen_pfade}
+        self.ausgelassen_pfade += [o for o in (os.path.expandvars(x) for x in _SCHUTZ_ERSATZ)
+                                   if "%" not in o and os.path.isdir(o) and os.path.normcase(o) not in bekannt]
         if wurzeln is None:
             self.wurzeln, self.unzugaenglich = volumes()
             # Volumes, die ein Sicherheitscenter-Produkt angelegt hat (Bezeichnung
@@ -836,12 +855,12 @@ class Lauf:
 
         eintraege, fehler = systemstand.sammeln(signatur, lambda t: self._melden(sofort=True, teil=t))
         vorher_lauf = self.c.execute("SELECT MAX(lauf) FROM system WHERE lauf < ?", (self.lid,)).fetchone()[0]
-        bekannt = ({(a, n.lower(), p.lower()) for a, n, p in self.c.execute(
+        schluessel = system_schluessel
+        bekannt = ({schluessel(a, n, p) for a, n, p in self.c.execute(
             "SELECT art, name, pfad FROM system WHERE lauf=?", (vorher_lauf,))} if vorher_lauf else None)
         zeilen = []
         for e in eintraege:
-            e["neu"] = 1 if bekannt is not None and (e["art"], e["name"].lower(),
-                                                    e["pfad"].lower()) not in bekannt else 0
+            e["neu"] = 1 if bekannt is not None and schluessel(e["art"], e["name"], e["pfad"]) not in bekannt else 0
             e["ampel"], e["grund"] = systemstand.ampel(e)
             zeilen.append((self.lid, e["art"], e["name"], e["pfad"], e["detail"], e["status"],
                            e["signierer"], e["ampel"], e["grund"], e["neu"]))
@@ -849,6 +868,11 @@ class Lauf:
         self.c.executemany("INSERT INTO system VALUES (?,?,?,?,?,?,?,?,?,?)", zeilen)
         self.c.commit()
         self.z["system_fehler"] = fehler
+        try:
+            from . import zugang
+            self.z["alarme"] = funde_als_alarme(zugang.speicher(), eintraege)
+        except Exception as exc:                 # der Bericht entsteht trotzdem
+            fehler.append(f"Funde als Alarme: {exc!r}"[:200])
 
     def _abschliessen(self) -> Path:
         """Zählen, Verschwundenes austragen, Bericht schreiben."""
@@ -907,8 +931,45 @@ _ART_TITEL = [("autostart", "Autostart"), ("dienst", "Dienste"), ("aufgabe", "Ge
               ("dns", "DNS-Server von Hand gesetzt"), ("proxy", "Proxy")]
 
 
+VS_REGEL = "VS-001"
+_ART_NAME = {"autostart": "Autostart", "dienst": "Dienst", "aufgabe": "Geplante Aufgabe", "treiber": "Treiber",
+             "port": "Offener Port", "netz": "Verbindung", "hosts": "hosts-Eintrag", "dns": "DNS", "proxy": "Proxy"}
+
+
+def funde_als_alarme(speicher, eintraege: list[dict]) -> int:
+    """Rote Einträge des Systemstands werden einmal je Fund ein Alarm (Vorbild: Hayabusa/Chainsaw liefern
+    Treffer statt Listen) – so bekommen sie ein Urteil und wiederholen sich nicht bei jedem Lauf. Was
+    schon einmal gemeldet wurde (egal mit welchem Urteil), kommt nicht noch einmal."""
+    from .ereignisse import Alarm, Schwere
+    from .systemstand import ROT
+    neu = []
+    for e in eintraege:
+        if e.get("ampel") != ROT:
+            continue
+        art, name, pfad = system_schluessel(e["art"], e["name"], e.get("pfad") or "")
+        subjekt = f"{_ART_NAME.get(art, art)} · {name} · {pfad}"[:300]
+        if speicher.urteile_zu(VS_REGEL, subjekt):
+            continue
+        text = (f"{_ART_NAME.get(e['art'], e['art'])} „{e['name']}“ – {e.get('pfad') or 'ohne Pfad'}\n"
+                f"Ampel rot: {e.get('grund', '')}\n"
+                f"Signatur: {e.get('status') or '?'}" + (f" ({e['signierer']})" if e.get("signierer") else "")
+                + (f"\nDetail: {str(e.get('detail'))[:300]}" if e.get("detail") else ""))
+        neu.append(Alarm(titel=f"Vollscan: {_ART_NAME.get(e['art'], e['art'])} rot", text=text,
+                         schwere=Schwere.MITTEL, regel=VS_REGEL, quelle="vollscan", subjekt=subjekt))
+    if neu:
+        speicher.alarme_schreiben(neu)
+    return len(neu)
+
+
+def system_schluessel(art: str, name: str, pfad: str) -> tuple:
+    """Vergleich mit dem vorigen Lauf. Dienste je Anmeldung (CDPUserSvc_dbf95 …) tragen bei jeder Anmeldung
+    eine neue Endung; verglichen wird ohne sie – der Pfad zählt weiter mit."""
+    from .inventar import dienstname
+    return art, (dienstname(name) if art == "dienst" else name).lower(), (pfad or "").lower()
+
+
 def _systemteil(c: sqlite3.Connection, lid: int) -> list[str]:
-    from .systemstand import AMPEL_REGELN, GELB, GRUEN, ROT
+    from .systemstand import GELB, GELB_AB, GRUEN, PUNKTE, ROT, ROT_AB
     zeilen = c.execute("SELECT art, name, pfad, detail, status, signierer, ampel, grund, neu "
                        "FROM system WHERE lauf=?", (lid,)).fetchall()
     if not zeilen:
@@ -916,8 +977,10 @@ def _systemteil(c: sqlite3.Connection, lid: int) -> list[str]:
     zaehl = {f: sum(1 for r in zeilen if r[6] == f) for f in (ROT, GELB, GRUEN)}
     z = ["", "## Systemstand mit Ampel", "",
          f"🔴 anschauen: {zaehl[ROT]} · 🟡 beobachten: {zaehl[GELB]} · 🟢 unauffällig: {zaehl[GRUEN]}", "",
-         "Vorsortierung nach festen Regeln, kein Urteil – die erste passende Regel gilt:", ""]
-    z += [f"- {farbe}: {regel}" for farbe, regel in AMPEL_REGELN]
+         f"Vorsortierung nach Punkten, kein Urteil – alle zutreffenden Gründe zählen zusammen, ab {ROT_AB} rot, "
+         f"ab {GELB_AB} gelb:", ""]
+    z += [f"- {'+' if p > 0 else '−'}{abs(p)}: {grund}" for p, grund in
+          sorted(PUNKTE.values(), key=lambda x: -x[0])]
     symbol = {ROT: "🔴", GELB: "🟡", GRUEN: "🟢"}
     for art, titel in _ART_TITEL:
         teil = [r for r in zeilen if r[0] == art]
@@ -1293,7 +1356,7 @@ class Baseline:
 def zeile(pfad: str) -> str:
     """Beleg für einen Alarm: im letzten fertigen Vollscan erfasst, verändert
     oder seitdem hinzugekommen. Leer, wenn es noch keinen Vollscan gibt."""
-    if not pfad or not DB.exists():
+    if not pfad or not DB.exists() or str(pfad).replace("/", "\\").startswith("\\\\"):
         return ""
     try:
         c = sqlite3.connect(f"file:{DB}?mode=ro", uri=True, timeout=2)

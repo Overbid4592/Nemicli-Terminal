@@ -2,8 +2,8 @@
 Aufgaben, geladene Treiber und Netz – je Eintrag Programmpfad, Signatur und
 Ampel.
 
-Die Ampel ist eine Vorsortierung nach festen, im Bericht abgedruckten Regeln
-(AMPEL_REGELN) – kein Urteil. Sie ordnet nur, was zuerst angesehen werden
+Die Ampel ist eine Vorsortierung nach festen, im Bericht abgedruckten Punkten
+(PUNKTE) – kein Urteil. Sie ordnet nur, was zuerst angesehen werden
 sollte; bewertet wird wie bei Alarmen von der Persönlichkeit.
 
 Alles nur lesend: Registry, psutil, Dienststeuerung. Einzige Ausnahme sind die
@@ -22,18 +22,30 @@ import subprocess
 
 GRUEN, GELB, ROT = "grün", "gelb", "rot"
 
-AMPEL_REGELN = [
-    (ROT, "Programm fehlt: Eintrag zeigt auf eine Datei, die es nicht gibt"),
-    (ROT, "Signatur passt nicht zum Inhalt (HashMismatch) oder nicht vertrauenswürdig (NotTrusted)"),
-    (ROT, "unsigniert und in einem Nutzer-beschreibbaren Ordner (Benutzer, ProgramData, Temp)"),
-    (ROT, "unsigniert und seit dem letzten Lauf neu"),
-    (ROT, "hosts-Eintrag leitet auf eine öffentliche Adresse um"),
-    (GELB, "unsigniert an anderem Ort"),
-    (GELB, "Skript als Ziel (bat, cmd, vbs, js, ps1 …)"),
-    (GELB, "seit dem letzten Lauf neu (signiert)"),
-    (GELB, "Proxy eingeschaltet, DNS-Server von Hand gesetzt, hosts-Sperreintrag"),
-    (GRUEN, "gültig signiert, Datei vorhanden, nicht neu"),
-]
+def _system32(name: str) -> str:
+    """Systemprogramm mit vollem Pfad: sonst suchte Windows zuerst im (beschreibbaren) Arbeitsordner."""
+    import os
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", name)
+
+
+# Ampel mit Punkten (Vorbild: Punktestufen in Loki/THOR Lite): alle zutreffenden Gründe zählen zusammen,
+# der Bericht nennt sie alle – statt „die erste passende Regel gilt“. Ab ROT_AB rot, ab GELB_AB gelb.
+ROT_AB, GELB_AB = 50, 15
+PUNKTE = {
+    "fehlt_nutzer": (60, "Programm fehlt in einem Nutzer-beschreibbaren Ordner (dort könnte jemand eine Datei "
+                         "nachlegen)"),
+    "fehlt": (25, "verwaister Eintrag: Programm fehlt (meist ein Überbleibsel einer Deinstallation)"),
+    "netzwerk": (60, "Programm liegt auf einem Netzwerkpfad (\\\\rechner\\…) – nicht geprüft"),
+    "signatur": (60, "Signatur passt nicht zum Inhalt (HashMismatch) oder nicht vertrauenswürdig (NotTrusted)"),
+    "systemort": (-25, "liegt an einem geschützten Systemort und ist nicht neu"),
+    "unsigniert": (20, "nicht gültig signiert"),
+    "nutzerort": (30, "in einem Nutzer-beschreibbaren Ordner (Benutzer, ProgramData, Temp)"),
+    "neu": (30, "seit dem letzten Lauf neu"),
+    "skript": (15, "Skript als Ziel (bat, cmd, vbs, js, ps1 …)"),
+    "lnk": (25, "Verknüpfung, deren Ziel sich nicht lesen ließ"),
+    "hosts": (60, "hosts-Eintrag leitet auf eine öffentliche Adresse um"),
+    "netzeinstellung": (25, "Proxy eingeschaltet, DNS-Server von Hand gesetzt, hosts-Sperreintrag"),
+}
 
 _SKRIPT = {".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".ps1", ".hta", ".py", ".pyw"}
 # Programme, die eine andere Datei ausführen – maßgeblich ist dann diese.
@@ -92,8 +104,15 @@ def autostart() -> list[dict]:
     from .inventar import Inventar
     raus = []
     for e in Inventar(mit_aufgaben=False).autostart():
-        pfad = programmpfad(e.detail) if e.extra.get("herkunft") == "registry" else e.detail
-        raus.append(_eintrag("autostart", e.name, pfad, f"{e.extra.get('quelle', '')} · {e.detail}"[:300]))
+        if e.extra.get("herkunft") == "registry":
+            pfad, detail = programmpfad(e.detail), e.detail
+        elif e.extra.get("ziel"):                            # Verknüpfung: geprüft wird, worauf sie zeigt
+            pfad = e.extra["ziel"]
+            detail = f"über Verknüpfung {e.name}" + (f" · Argumente {e.extra['argumente']}"
+                                                     if e.extra.get("argumente") else "")
+        else:
+            pfad, detail = e.detail, e.detail
+        raus.append(_eintrag("autostart", e.name, pfad, f"{e.extra.get('quelle', '')} · {detail}"[:300]))
     return raus
 
 
@@ -132,7 +151,7 @@ def aufgaben(timeout: int = 60) -> list[dict]:
     """Aktivierte geplante Aufgaben mit ihrem Programm. Spalten nach Position
     (die Überschriften sind übersetzt): 1 Name, 8 Programm, 11 Zustand, 14 Konto."""
     try:
-        r = subprocess.run(["schtasks", "/query", "/fo", "CSV", "/v", "/nh"], capture_output=True,
+        r = subprocess.run([_system32("schtasks.exe"), "/query", "/fo", "CSV", "/v", "/nh"], capture_output=True,
                            text=True, timeout=timeout, errors="replace",
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except (OSError, subprocess.TimeoutExpired):
@@ -318,40 +337,56 @@ def _nutzerort(pfad: str) -> bool:
 
 
 def ampel(e: dict) -> tuple[str, str]:
-    """(Farbe, Regel) für einen Eintrag mit status/neu. Erste passende Regel gilt."""
+    """(Farbe, Gründe) für einen Eintrag mit status/neu – Punkte aller zutreffenden Gründe (PUNKTE)."""
     art, pfad, status, neu = e["art"], e.get("pfad", ""), e.get("status", ""), e.get("neu", 0)
     if art == "hosts":
         ziel = e.get("detail", "")
         if not _privat(ziel):
-            return ROT, AMPEL_REGELN[4][1]
+            return ROT, PUNKTE["hosts"][1]
         if ziel in ("0.0.0.0", "127.0.0.1", "::1") and e["name"].lower() != "localhost":
-            return GELB, AMPEL_REGELN[8][1]
+            return GELB, PUNKTE["netzeinstellung"][1]
         return GRUEN, "lokaler Eintrag"
     if art in ("dns", "proxy"):
-        return GELB, AMPEL_REGELN[8][1]
+        return GELB, PUNKTE["netzeinstellung"][1]
     if not pfad:
         return GRUEN, "kein Programmpfad (z. B. COM-Handler)"
+    if status == "Schutzsoftware":                     # herkunft.SCHUTZ_STATUS
+        return GRUEN, "Ordner der Schutzsoftware – nicht betreten (Revier des Virenschutzes)"
+    gruende: list[str] = []
+    endung = os.path.splitext(pfad)[1].lower()
+    nutzerort = _nutzerort(pfad)
     if status == "fehlt":
-        return ROT, AMPEL_REGELN[0][1]
-    if status in ("HashMismatch", "NotTrusted"):
-        return ROT, AMPEL_REGELN[1][1]
-    unsigniert = status != "Valid"
-    skript = os.path.splitext(pfad)[1].lower() in _SKRIPT
-    if unsigniert and _nutzerort(pfad):
-        return ROT, AMPEL_REGELN[2][1]
-    if unsigniert and neu:
-        return ROT, AMPEL_REGELN[3][1]
-    if skript:                                    # Skripte haben meist kein Signaturformat
-        return GELB, AMPEL_REGELN[6][1]
-    if unsigniert:
-        return GELB, AMPEL_REGELN[5][1]
+        # Im Nutzerordner könnte jeder die fehlende Datei nachlegen, die dann von selbst startet.
+        # Anderswo ist es ein verwaister Eintrag, meist ein Überbleibsel einer Deinstallation.
+        gruende.append("fehlt_nutzer" if nutzerort else "fehlt")
+    elif status == "Netzwerkpfad":                     # Autostart von einem fremden Rechner: auffällig
+        gruende.append("netzwerk")
+    elif endung in (".lnk", ".url"):                   # Ziel ließ sich nicht lesen
+        gruende.append("lnk")
+    else:
+        if status in ("HashMismatch", "NotTrusted"):
+            gruende.append("signatur")
+            from .herkunft import ist_systemort
+            if not neu and ist_systemort(pfad):        # nur einordnen, nicht freisprechen: bleibt mindestens gelb
+                gruende.append("systemort")
+        elif status != "Valid":
+            gruende.append("unsigniert")
+        if nutzerort:
+            gruende.append("nutzerort")
+        if endung in _SKRIPT:                          # Skripte haben meist kein Signaturformat
+            gruende.append("skript")
     if neu:
-        return GELB, AMPEL_REGELN[7][1]
-    return GRUEN, AMPEL_REGELN[9][1]
+        gruende.append("neu")
+    punkte = sum(PUNKTE[g][0] for g in gruende)
+    if not gruende or punkte < GELB_AB:
+        return GRUEN, "gültig signiert, Datei vorhanden, nicht neu" if not gruende else             " · ".join(PUNKTE[g][1] for g in gruende)
+    farbe = ROT if punkte >= ROT_AB else GELB
+    return farbe, " · ".join(PUNKTE[g][1] for g in gruende) + f" ({punkte} Punkte)"
 
 
 def sammeln(signatur, melden=None) -> tuple[list[dict], list[str]]:
     """Alle Sammler; `signatur(pfad) -> (status, signierer)`. Rückgabe: (Einträge, Fehler)."""
+    from . import herkunft
     raus, fehler = [], []
     for label, fn in SAMMLER:
         if melden:
@@ -363,7 +398,11 @@ def sammeln(signatur, melden=None) -> tuple[list[dict], list[str]]:
             continue
         for e in eintraege:
             if e["pfad"]:
-                if os.path.exists(e["pfad"]):
+                if str(e["pfad"]).replace("/", "\\").startswith("\\\\"):
+                    e["status"], e["signierer"] = "Netzwerkpfad", ""     # nicht anfassen (NTLM)
+                elif herkunft.im_schutzrevier(e["pfad"]):
+                    e["status"], e["signierer"] = herkunft.SCHUTZ_STATUS, ""   # nicht betreten, nicht prüfen
+                elif os.path.exists(e["pfad"]):
                     e["status"], e["signierer"] = signatur(e["pfad"])
                 else:
                     e["status"], e["signierer"] = "fehlt", ""

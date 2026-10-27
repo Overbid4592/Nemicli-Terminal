@@ -23,11 +23,18 @@ eigenen Thread höchstens alle `dl_training_stunden` und nur aus Ereignissen,
 die älter als `dl_karenz_h` sind. Solange `dl_alarm` aus ist (Schattenmodus),
 landen Funde nur in Wache/modelle/folgen_schatten.log – kein Alarm, kein Weckruf.
 
+Netzwächter (netzwaechter.py): Verbindungen nach draußen bekommen beim Aufnehmen den Namen des
+Ziels (netzauskunft) und werden von einem eigenen Netz-Modell (ML-002) und Netz-Folgen (DL-002)
+bewertet. Solange `netz_alarm` aus ist, landen Funde nur in Wache/modelle/netz_schatten.log.
+Besitzer neuer öffentlicher Netze fragt ein eigener Thread beim Adressregister nach (höchstens
+eine Anfrage alle 3 s, Ergebnis gemerkt).
+
 Fehler in der Hauptschleife beenden den Motor nicht: sie werden protokolliert,
 der Durchlauf geht weiter. Häufen sie sich (FEHLER_GRENZE in FEHLER_FENSTER
 Sekunden), meldet `stand()["gestoert"]` den Grund, bis es wieder ruhig läuft.
 
-Verdichten und Dämpfen (ohne: 155 offene Alarme, davon ~135 derselbe Vorgang): Regel + Subjekt ist der Schlüssel. Kommt derselbe Alarm
+Verdichten und Dämpfen (ohne sie ist ein Großteil der offenen Alarme oft
+derselbe Vorgang): Regel + Subjekt ist der Schlüssel. Kommt derselbe Alarm
 innerhalb des Cooldowns wieder, wird am ersten der Zähler hochgesetzt („×37“)
 statt eine neue Zeile zu schreiben – und niemand wird erneut geweckt. Ausnahmen:
 Ist der neue Alarm schwerer oder der erste schon beurteilt, gibt es einen neuen.
@@ -48,6 +55,7 @@ from datetime import datetime
 from queue import Empty, Queue
 
 from . import MODELL_ORDNER, TRAINING_LOG, ordner_anlegen
+from .absolvierung import REGEL as ABSOLVIERUNG_REGEL, Absolvierung
 from . import detektor as _detektor_modul
 from . import folgen as _folgen_modul
 from .detektor import Detektor
@@ -56,6 +64,8 @@ from .folgen import FolgenDetektor
 from .inventar import Inventar, PROZESS as INV_PROZESS, neue_als_ereignisse
 from .justierung import einstellungen
 from .merkmale import Burst, DateiMerkmale, ProzessMerkmale
+from .netzauskunft import Auskunft
+from .netzwaechter import SCHATTEN as NETZ_SCHATTEN, NetzFolgen, NetzMerkmale, SchattenLog, ZieleProMinute, domain_von
 from .regeln import MENGENREGELN, Regelwerk
 from .sensoren import DateiSensor, NetzSensor, ProzessSensor, SensorThread
 from .speicher import Speicher
@@ -107,7 +117,20 @@ class Motor:
                                      schwelle=float(self.e.get("dl_schwelle", 0.995)))
         self._folgen_training = False
         self.dl_auffaellig = 0
+        self.netz_detektor = Detektor(MODELL_ORDNER / "netz.json", NetzMerkmale(),
+                                      schwelle=float(self.e.get("netz_schwelle", 0.99)),
+                                      kontamination=self.e["kontamination"], label="Netz")
+        self.netz_folgen = NetzFolgen(MODELL_ORDNER / "netzfolgen",
+                                      schwelle=float(self.e.get("netz_dl_schwelle", 0.995)))
+        self.netz_schatten = SchattenLog(MODELL_ORDNER / NETZ_SCHATTEN)
+        self.auskunft = Auskunft(self.speicher, register=bool(self.e.get("netz_besitzer", True)))
+        self.ziele_min = ZieleProMinute()
+        self.netz_auffaellig = 0
+        self._netz_training = False
+        self._besitzer_offen: set[str] = set()
+        self._besitzer: threading.Thread | None = None
         self.regeln = Regelwerk(stumm=set(self.e.get("stumme_regeln") or []))
+        self.absolvierung = Absolvierung(urteile=self.speicher.urteile_zu)   # Programme auf Anweisung (R015)
         self.burst = Burst()
         self.datei_burst = Burst()
         self.inventar = Inventar(mit_aufgaben=self.e["inventar_aufgaben"])
@@ -117,6 +140,9 @@ class Motor:
         self.prozess_sensor = ProzessSensor(self.e["prozess_intervall"])
         self.netz_sensor = NetzSensor(self.e["netz_intervall"])
         self.datei_sensor = DateiSensor(self.e.get("pfade"), self.e.get("endungen"))
+        from .protokolle import ProtokollSensor
+        self.protokoll_sensor = ProtokollSensor(float(self.e.get("protokoll_intervall", 30)))
+        self._inventar_angestossen = 0.0
         self.sensoren: list[SensorThread] = []
 
         self._stopp = threading.Event()
@@ -151,7 +177,7 @@ class Motor:
         self.daempfung_aktualisieren()
         # Was seit dem letzten Training reinkam, zählt weiter – sonst fängt der
         # „alle 200“-Takt nach jedem Neustart bei 0 an und ein Tag mit drei
-        # Neustarts lernt nie (20.09.2026: 274 Ereignisse warteten, Zähler stand auf 0).
+        # Neustarts lernt nie.
         try:
             zuletzt = float(self.speicher.meta("training_zuletzt", "0") or 0)
             if zuletzt:
@@ -171,13 +197,16 @@ class Motor:
         self._stopp.clear()
         self.start_zeit = time.time()
         self.sensoren = [SensorThread(s, self._aufnehmen, self._sensor_fehler)
-                         for s in (self.prozess_sensor, self.netz_sensor, self.datei_sensor)]
+                         for s in (self.prozess_sensor, self.netz_sensor, self.datei_sensor)
+                         + ((self.protokoll_sensor,) if self.e.get("protokolle", True) else ())]
         for t in self.sensoren:
             t.start()
         self._worker = threading.Thread(target=self._schleife, daemon=True, name="wache-motor")
         self._worker.start()
         self._wartung = threading.Thread(target=self._wartungsschleife, daemon=True, name="wache-wartung")
         self._wartung.start()
+        self._besitzer = threading.Thread(target=self._besitzer_schleife, daemon=True, name="wache-netzauskunft")
+        self._besitzer.start()
         _protokoll("wache", "Wache gestartet", ergebnis=f"{len(self.sensoren)} Sensoren, "
                    f"Modell {'trainiert' if self.detektor.trainiert else 'Kaltstart'}")
         if self.e["inventar_beim_start"]:
@@ -192,13 +221,17 @@ class Motor:
             self._worker.join(timeout=4)
         if self._wartung:
             self._wartung.join(timeout=2)
+        if self._besitzer:
+            self._besitzer.join(timeout=2)
         _protokoll("wache", "Wache gestoppt",
                    ergebnis=f"{self.verarbeitet} Ereignisse, {self.alarme} Alarme")
 
     def beenden(self) -> None:
         self.stop()
+        self.absolvierung.speichern()
         self.detektor.speichern()
         self.datei_detektor.speichern()
+        self.netz_detektor.speichern()
         self.speicher.schliessen()
 
     @property
@@ -210,6 +243,9 @@ class Motor:
         self.e = einstellungen()
         self.detektor.schwelle = self.datei_detektor.schwelle = float(self.e["schwelle"])
         self.folgen.schwelle = float(self.e.get("dl_schwelle", 0.995))
+        self.netz_detektor.schwelle = float(self.e.get("netz_schwelle", 0.99))
+        self.netz_folgen.schwelle = float(self.e.get("netz_dl_schwelle", 0.995))
+        self.auskunft.register = bool(self.e.get("netz_besitzer", True))
         self.regeln.stumm = set(self.e.get("stumme_regeln") or [])
         self.daempfung_aktualisieren()
 
@@ -229,11 +265,17 @@ class Motor:
     # --------------------------------------------------------------- Pipeline
 
     def _aufnehmen(self, liste: list[Ereignis]) -> None:
+        # Ohne Warten einreihen: bei voller Schlange hing der Sensor sonst je Ereignis bis zu 1 s und sah
+        # dabei nichts Neues. Verworfenes wird gezählt und gemeldet – nie still.
+        weg = 0
         for e in liste:
             try:
-                self.queue.put(e, timeout=1.0)
+                self.queue.put_nowait(e)
             except Exception:
-                pass
+                weg += 1
+        if weg:
+            self.verworfen += weg
+            self._sensor_fehler("schlange", f"Ereignis-Flut: {weg} Ereignisse verworfen (Schlange voll)")
 
     def _sensor_fehler(self, name: str, text: str) -> None:
         self.sensor_fehler.append(f"{name}: {text.strip().splitlines()[-1][:160]}")
@@ -277,24 +319,53 @@ class Motor:
         self._profil_lernen(e, belastet)
 
     def _bewerten_in(self, e: Ereignis, alarme: list[Alarm]) -> None:
-        self._anreichern(e)
+        # Jede Stufe einzeln abgesichert: scheitert Anreichern oder ML (z. B. Datenbank gesperrt),
+        # laufen die festen Regeln trotzdem – fail-closed statt eines stillen Ereignisses.
+        try:
+            self._anreichern(e)
+        except Exception as exc:
+            self._fehler("anreichern", exc)
+        if e.aktion.startswith("evtlog_"):
+            # Aus den Ereignisprotokollen: nur die festen Regeln. Für die gelernten Modelle sind das
+            # unbekannte Ereignisarten – sie wären allein deshalb „ungewöhnlich“.
+            from .protokolle import INSTALLATION
+            if e.aktion in INSTALLATION:
+                self._inventar_anstossen()
+            alarme.extend(self.regeln.pruefen(e))
+            return
         if self.e["ml"]:
-            d = self.datei_detektor if e.kategorie == DATEI else self.detektor
-            score, gruende = d.bewerten(e)
-            e.score = round(score, 4)
-            e.anomalie = d.ist_anomalie(score)
-            if e.anomalie:
-                self.anomalien += 1
-                d.anomalien += 1
-                if e.schwere < Schwere.MITTEL:
-                    e.schwere = Schwere.MITTEL
-                alarme.append(self._ml_alarm(e, score, gruende))
+            try:
+                d = self.datei_detektor if e.kategorie == DATEI else self.detektor
+                score, gruende = d.bewerten(e)
+                e.score = round(score, 4)
+                e.anomalie = d.ist_anomalie(score)
+                if e.anomalie:
+                    self.anomalien += 1
+                    d.anomalien += 1
+                    if e.schwere < Schwere.MITTEL:
+                        e.schwere = Schwere.MITTEL
+                    alarme.append(self._ml_alarm(e, score, gruende))
+            except Exception as exc:
+                self._fehler("ml", exc)
         if self.e.get("dl", True):
             try:
                 self._folgen_bewerten(e, alarme)
             except Exception as exc:
                 self._fehler("folgen-netz", exc)
+        if self.e.get("netz", True) and (e.kategorie == NETZ or e.aktion == "process_stop"):
+            try:
+                self._netz_bewerten(e, alarme)
+            except Exception as exc:
+                self._fehler("netzwaechter", exc)
         alarme.extend(self.regeln.pruefen(e))
+        if e.kategorie == PROZESS:
+            try:
+                neu = self.absolvierung.verarbeiten(e)
+            except Exception as exc:
+                self._fehler("programm-absolvierung", exc)
+            else:
+                if ABSOLVIERUNG_REGEL not in self.regeln.stumm:
+                    alarme.extend(neu)
 
     def _folgen_bewerten(self, e: Ereignis, alarme: list[Alarm]) -> None:
         score, beschreibung = self.folgen.bewerten(e)
@@ -310,6 +381,55 @@ class Motor:
         else:
             e.extra = {**e.extra, "dl_fund": True}        # kein Alarm, aber auch kein Lernstoff
             self.folgen.schatten_melden(e, score, beschreibung)
+
+    def _netz_bewerten(self, e: Ereignis, alarme: list[Alarm]) -> None:
+        """Netzwächter: ML (erst nach dem ersten Training) und DL. Schattenmodus = nur Protokoll."""
+        if e.aktion != "conn_open":
+            self.netz_folgen.bewerten(e)                 # Prozess-Ende schließt seine Kette
+            return
+        ml, gruende = self.netz_detektor.bewerten(e) if self.netz_detektor.trainiert else (0.0, [])
+        dl, schritt = self.netz_folgen.bewerten(e)
+        e.extra = {**e.extra, "netz_ml": round(ml, 4), **({"netz_dl": round(dl, 4)} if dl else {})}
+        ml_auff = self.netz_detektor.trainiert and self.netz_detektor.ist_anomalie(ml)
+        dl_auff = bool(dl) and self.netz_folgen.ist_auffaellig(dl)
+        if not (ml_auff or dl_auff):
+            return
+        self.netz_auffaellig += 1
+        if ml_auff:
+            self.netz_detektor.anomalien += 1
+        if dl_auff:
+            self.netz_folgen.auffaellig += 1
+        if self.e.get("netz_alarm", False):
+            if ml_auff:
+                alarme.append(self._netz_alarm(e, "ML-002", ml, gruende))
+            if dl_auff:
+                alarme.append(self._netz_alarm(e, "DL-002", dl, [f"ungewöhnlicher Schritt: {schritt}"]))
+        else:
+            e.extra = {**e.extra, "netz_fund": True}    # kein Alarm, aber auch kein Lernstoff
+            self.netz_schatten.melden(e, ml, dl, gruende, schritt)
+
+    def _netz_alarm(self, e: Ereignis, regel: str, score: float, gruende: list[str]) -> Alarm:
+        ziel = (e.extra or {}).get("name") or e.ziel
+        quelle = "Netz-Modell" if regel == "ML-002" else "Netz-Folgen"
+        return Alarm(
+            titel=f"Ungewöhnliche Verbindung: {e.prozess or '?'} → {ziel}",
+            text=(f"{quelle}: auffälliger als {score:.1%} des Gelernten. Auslöser: "
+                  f"{'; '.join(gruende) or 'Abweichung vom Gelernten'}. Ziel {e.ziel}:{e.zielport}. Ereignis: {e.text}"),
+            schwere=Schwere.HOCH if score >= 0.999 else Schwere.MITTEL,
+            regel=regel, ereignis_id=e.id, quelle="netz", score=round(score, 4), zeit=e.zeit,
+            subjekt=f"{e.prozess or '?'} → {domain_von(e)}")
+
+    def _besitzer_schleife(self) -> None:
+        """Besitzer neuer öffentlicher Netze nachfragen – eins alle 3 s, Bekanntes kommt aus dem Speicher."""
+        while not self._stopp.wait(3.0):
+            if not self._besitzer_offen or not self.e.get("netz_besitzer", True):
+                continue
+            try:
+                self.auskunft.besitzer(self._besitzer_offen.pop())
+            except KeyError:
+                continue
+            except Exception as exc:
+                self._sensor_fehler("netz-auskunft", f"{type(exc).__name__}: {exc}")
 
     def _durchlauf(self, stapel: list[Ereignis], alarme: list[Alarm], zuletzt: float) -> float:
         """Ein Takt der Hauptschleife. Gibt die Zeit des letzten Schreibens zurück."""
@@ -386,6 +506,15 @@ class Motor:
         else:
             burst = self.burst.beobachten(e.prozess, e.zeit)
         e.extra = {**x, "burst": round(burst, 4)}
+        if e.kategorie == NETZ and e.aktion == "conn_open" and self.e.get("netz", True):
+            neu: dict = {"ziele_min": self.ziele_min.beobachten(e.prozess, e.ziel, e.zeit)}
+            if x.get("extern") and e.ziel:
+                name = self.auskunft.name(e.ziel)
+                if name:
+                    neu["name"] = name
+                if self.e.get("netz_besitzer", True) and len(self._besitzer_offen) < 500:
+                    self._besitzer_offen.add(e.ziel)
+            e.extra = {**e.extra, **neu}
         if (e.kategorie == PROZESS and e.prozess and e.aktion == "process_start"
                 and not self.speicher.profil_bekannt(e.prozess)):
             e.extra = {**e.extra, "erstmals": True}
@@ -458,14 +587,19 @@ class Motor:
             roh = int(a.schwere)                          # vor dem Leiserstellen – Maß für „schwerer“
             alt = self._zuletzt.get(key)
             if alt and 0 <= a.zeit - alt[1] < self.e["cooldown"] and roh <= alt[2]:
-                if self.speicher.alarm_zaehlen(alt[0], a.zeit) != "beurteilt":
+                try:
+                    stand = self.speicher.alarm_zaehlen(alt[0], a.zeit)
+                except Exception as exc:                  # Zählen gescheitert: Alarm lieber neu zeigen
+                    self._fehler("alarm-zaehlen", exc)
+                    stand = "beurteilt"
+                if stand != "beurteilt":
                     self._zuletzt[key] = (alt[0], a.zeit, alt[2])   # gleitend: solange es weitergeht, EIN Alarm
                     self.verdichtet += 1
                     e.extra = {**(e.extra or {}), "alarm": alt[0]}
                     continue
             if menge and bekannt is None:
                 try:
-                    bekannt = bool(self.speicher.bekannt_fuer(e)) and not self._fremder_ort(e)
+                    bekannt = self.speicher.programm_bekannt(e) and not self._fremder_ort(e)
                 except Exception:
                     bekannt = False
             if menge and bekannt and a.schwere > Schwere.NIEDRIG:
@@ -499,9 +633,10 @@ class Motor:
         """Beide Detektoren nachtrainieren, danach das Folgen-Netz. Trainiert der Nutzer selbst,
         endet eine Pause nach dem Zurückdrehen."""
         if wer == "Nutzer":
-            self.detektor.pause_aufheben()
-            self.datei_detektor.pause_aufheben()
-            _folgen_modul.pause_marke(self.folgen.ordner).unlink(missing_ok=True)
+            for d in (self.detektor, self.datei_detektor, self.netz_detektor):
+                d.pause_aufheben()
+            for o in (self.folgen.ordner, self.netz_folgen.ordner):
+                _folgen_modul.pause_marke(o).unlink(missing_ok=True)
         with self._lock:
             self._profile_spiegeln()
             self.daempfung_aktualisieren()
@@ -516,14 +651,27 @@ class Motor:
             else:
                 ergebnis["dateien"] = {"ok": False, "grund": f"nur {len(dateien)} Datei-Ereignisse, "
                                                              f"{self.e['min_training_dateien']} nötig"}
+            netz = [x for x in andere if x.kategorie == NETZ and x.aktion == "conn_open"]
+            mindest = int(self.e.get("min_training_netz", 200))
+            if not self.e.get("netz", True):
+                ergebnis["netz"] = {"ok": False, "grund": "Netzwächter ist aus"}
+            elif self.netz_detektor.pausiert and wer != "Nutzer":
+                ergebnis["netz"] = {"ok": False, "grund": "zurückgedreht – lernt erst nach einem Training durch den Nutzer"}
+            elif len(netz) >= mindest:
+                ergebnis["netz"] = self.netz_detektor.trainieren(netz)
+            else:
+                ergebnis["netz"] = {"ok": False, "grund": f"nur {len(netz)} Verbindungen, {mindest} nötig"}
         self.speicher.meta_setzen("training_zuletzt", str(time.time()))
         kurz = (f"Prozesse: {ergebnis.get('ereignisse', 0)} Ereignisse in {ergebnis.get('sekunden', 0)}s "
                 f"(Lauf {ergebnis.get('laeufe', 0)}) · Dateien: "
                 + (f"{ergebnis['dateien'].get('ereignisse')} Ereignisse" if ergebnis["dateien"].get("ok")
-                   else ergebnis["dateien"].get("grund", "?")))
+                   else ergebnis["dateien"].get("grund", "?"))
+                + " · Netz: " + (f"{ergebnis['netz'].get('ereignisse')} Verbindungen" if ergebnis["netz"].get("ok")
+                                 else ergebnis["netz"].get("grund", "?")))
         _log(f"Training ({wer}) – {kurz}")
         _protokoll("wache_training", f"Modell nachtrainiert ({wer})", ergebnis=kurz)
         ergebnis["folgen"] = self.folgen_trainieren(wer, erzwingen=(wer == "Nutzer"))
+        ergebnis["netz_folgen"] = self.netz_folgen_trainieren(wer, erzwingen=(wer == "Nutzer"))
         for cb in self.bei_training:
             try:
                 cb(ergebnis)
@@ -569,11 +717,50 @@ class Motor:
             t.join()
         return "Folgen-Netz-Training gestartet"
 
+    def netz_folgen_trainieren(self, wer: str = "Wache", *, erzwingen: bool = False, warten: bool = False) -> str:
+        """Netz-Folgen (DL-002) im eigenen Thread – gleicher Takt und gleiche Karenz wie das Folgen-Netz."""
+        if not self.e.get("netz", True):
+            return "Netzwächter ist aus"
+        if self._netz_training:
+            return "Netz-Folgen trainieren schon"
+        if not erzwingen and _folgen_modul.pausiert(self.netz_folgen.ordner):
+            return "Netz-Folgen: zurückgedreht, lernen erst nach einem Training durch den Nutzer wieder"
+        abstand = float(self.e.get("dl_training_stunden", 6.0)) * 3600
+        if not erzwingen and self.netz_folgen.zuletzt and time.time() - self.netz_folgen.zuletzt < abstand:
+            return "Netz-Folgen: nächstes Training später"
+        self._netz_training = True
+
+        def _lauf():
+            try:
+                jetzt = time.time()
+                karenz = float(self.e.get("dl_karenz_h", 24.0)) * 3600
+                ev = [x for x in self.speicher.lern_ereignisse(jetzt - 7 * 86400, jetzt - karenz, limit=60_000)
+                      if (x.kategorie == NETZ and x.aktion == "conn_open") or x.aktion == "process_stop"]
+                r = self.netz_folgen.trainieren(ev, abbruch=self._stopp.is_set)
+                if r.get("ok"):
+                    kurz = (f"{r['version']}: {r['folgen']} Ketten aus {r['ereignisse']} Ereignissen, "
+                            f"{r['vokabular']} Zeichen, Verlust {r['verlust']}, {r['sekunden']}s")
+                else:
+                    kurz = r.get("grund", "?")
+                _log(f"Netz-Folgen ({wer}) – {kurz}")
+                _protokoll("wache_training", f"Netz-Folgen trainiert ({wer})", ergebnis=kurz)
+            except Exception as exc:
+                self._sensor_fehler("netz-training", f"{type(exc).__name__}: {exc}")
+            finally:
+                self._netz_training = False
+
+        t = threading.Thread(target=_lauf, daemon=True, name="wache-netzfolgen")
+        t.start()
+        if warten:
+            t.join()
+        return "Netz-Folgen-Training gestartet"
+
     def ml_zurueckdrehen(self) -> str:
-        """Beide Isolation-Forest-Modelle auf die vorige Version, automatisches Lernen pausiert."""
+        """Alle Isolation-Forest-Modelle auf die vorige Version, automatisches Lernen pausiert."""
         with self._lock:
-            texte = [_detektor_modul.zurueckdrehen(d.pfad) for d in (self.detektor, self.datei_detektor)]
-            for d in (self.detektor, self.datei_detektor):
+            modelle = (self.detektor, self.datei_detektor, self.netz_detektor)
+            texte = [_detektor_modul.zurueckdrehen(d.pfad) for d in modelle]
+            for d in modelle:
                 d.neu_laden_wenn_geaendert()
         _protokoll("wache", "ML-Modell zurückgedreht", ergebnis=" · ".join(texte))
         return "\n".join(texte)
@@ -584,6 +771,8 @@ class Motor:
             self.detektor.zuruecksetzen()
             self.datei_detektor.zuruecksetzen()
             self.folgen.zuruecksetzen()
+            self.netz_detektor.zuruecksetzen()
+            self.netz_folgen.zuruecksetzen()
             self.neue_profile = 0
             self._seit_training = 0
             self._profile_spiegeln()
@@ -644,6 +833,18 @@ class Motor:
                             f"{ergebnis['verschwunden']} verschwunden, {ergebnis['sekunden']}s")
         return ergebnis
 
+    def _inventar_anstossen(self, warten_s: float = 15.0) -> None:
+        """Ein Dienst oder eine Aufgabe wurde laut Protokoll gerade installiert: Inventar gleich neu statt
+        erst beim nächsten 6-Stunden-Lauf – R011 meldet dann mit allen Angaben. Höchstens einmal je Minute;
+        kurz warten, bis die Installation fertig ist."""
+        jetzt = time.time()
+        if jetzt - self._inventar_angestossen < 60:
+            return
+        self._inventar_angestossen = jetzt
+        t = threading.Timer(warten_s, self.inventar_starten)
+        t.daemon = True
+        t.start()
+
     def inventar_starten(self) -> bool:
         if self.inventar_laeuft:
             return False
@@ -669,8 +870,9 @@ class Motor:
                 self.speicher.verdichten()
                 self._profile_spiegeln()
                 self.daempfung_aktualisieren()        # Urteile aus dem Hauptprogramm übernehmen
-                for d in (self.detektor, self.datei_detektor):
+                for d in (self.detektor, self.datei_detektor, self.netz_detektor):
                     d.neu_laden_wenn_geaendert()
+                self.netz_folgen.zeiger_pruefen()
                 stunden = float(self.e["inventar_stunden"])
                 if stunden > 0 and self.inventar.letzter_scan and \
                         time.time() - self.inventar.letzter_scan >= stunden * 3600:
@@ -705,4 +907,9 @@ class Motor:
             "dl": {**self.folgen.stand(), "an": bool(self.e.get("dl", True)),
                    "alarm": bool(self.e.get("dl_alarm", False)), "auffaellig_seit_start": self.dl_auffaellig,
                    "training_laeuft": self._folgen_training},
+            "programme": self.absolvierung.stand(),
+            "netz": {"an": bool(self.e.get("netz", True)), "alarm": bool(self.e.get("netz_alarm", False)),
+                     "ml": self.netz_detektor.stand(), "dl": self.netz_folgen.stand(),
+                     "auffaellig_seit_start": self.netz_auffaellig, "besitzer_offen": len(self._besitzer_offen),
+                     "training_laeuft": self._netz_training},
         }

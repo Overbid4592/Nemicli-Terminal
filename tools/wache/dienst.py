@@ -86,16 +86,20 @@ class Dienst:
         except Exception:
             unklar = 0
         gestoert = self.motor.gestoert or ("" if self.motor.laeuft else "Motor steht")
+        # Die Zahl am Symbol zählt echt + offen + unklar – der Text nennt jeden Teil, der dazugehört.
+        rest = " · ".join(t for n, t in ((offen, f"{offen} offen"), (unklar, f"{unklar} unklar (wird beobachtet)"))
+                          if n)
         if self.pausiert:
             farbe, text = "grau", "🛡 NemiCLI-Wache · pausiert"
         elif echt:
-            farbe, text = "rot", f"🛡 NemiCLI-Wache · {echt} ECHTE Auffälligkeit(en)!"
+            farbe, text = "rot", f"🛡 NemiCLI-Wache · {echt} ECHTE Auffälligkeit(en)!" + (f" · {rest}" if rest else "")
             if gestoert:
                 text += " · Wache gestört"
         elif gestoert:
-            farbe, text = "grau", f"🛡 NemiCLI-Wache · GESTÖRT: {gestoert}"
+            farbe, text = "grau", f"🛡 NemiCLI-Wache · GESTÖRT: {gestoert}" + (f" · {rest}" if rest else "")
         elif offen:
-            farbe, text = "gelb", f"🛡 NemiCLI-Wache · {offen} offene Alarme"
+            farbe, text = "gelb", f"🛡 NemiCLI-Wache · {offen} offene Alarme" + (
+                f" · {unklar} unklar (wird beobachtet)" if unklar else "")
         elif unklar:
             farbe, text = "gelb", f"🛡 NemiCLI-Wache · {unklar} unklare(r) Alarm(e) – wird beobachtet"
         else:
@@ -252,6 +256,14 @@ class Dienst:
                     try:
                         zugang.STOPP.unlink(missing_ok=True)
                     except OSError:
+                        pass
+                    # Jedes Programm des Nutzers kann die Stopp-Datei anlegen: das Beenden nie still –
+                    # es steht im Aktions-Protokoll, NemiCLI zeigt es beim nächsten Start.
+                    try:
+                        import protokoll
+                        protokoll.schreibe("wache_stopp", "Wache über die Stopp-Datei beendet", "ok",
+                                           veraendernd=True, wer="Wache")
+                    except Exception:
                         pass
                     self.beenden()
                     return

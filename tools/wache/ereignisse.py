@@ -117,18 +117,18 @@ class Alarm:
     titel: str
     text: str
     schwere: Schwere
-    regel: str                           # R001…R014, ML-001 oder DL-001
+    regel: str                           # R001…R015, ML-001/002 oder DL-001/002
     ereignis_id: str = ""
     zeit: float = field(default_factory=time.time)
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:12])
     quelle: str = "regel"                # "regel", "ml" oder "dl" (Folgen-Netz)
     score: float = 0.0
-    status: str = "offen"                # offen · gesehen · harmlos · echt
+    status: str = "offen"                # offen · gesehen · harmlos · unpruefbar · echt · erledigt
     urteil_von: str = ""                 # wer den Status gesetzt hat (Persönlichkeit, Nutzer)
     begruendung: str = ""
     # Worum es geht – der Prozess, bei R004 der Elternprozess, bei Dateien der Pfad, bei
-    # Netz „prozess → ziel“. Regel + Subjekt ist der Schlüssel fürs Verdichten
-    # (derselbe Vorgang gab sonst 100 Einzelalarme) und fürs Dämpfen.
+    # Netz „prozess → ziel“. Regel + Subjekt ist der Schlüssel fürs Verdichten (sonst
+    # erzeugt derselbe Vorgang Dutzende Einzelalarme) und fürs Dämpfen.
     subjekt: str = ""
     anzahl: int = 1                      # wie oft dasselbe innerhalb des Cooldowns wiederkam
     zuletzt: float = 0.0                 # Zeit des letzten Wiederkommens (0 = nur einmal)

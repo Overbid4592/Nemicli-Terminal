@@ -1,4 +1,4 @@
-"""Regelwerk R001–R014: bekannte Muster, zuverlässig – das Modell findet Unbekanntes.
+"""Regelwerk R001–R014 und R016 (R015 kommt aus absolvierung.py): bekannte Muster, zuverlässig – das Modell findet Unbekanntes.
 
 Regeln können vom Nutzer oder – in seinen
 Grenzen – von der Persönlichkeit stumm geschaltet werden (`stumm`), nie gelöscht.
@@ -28,7 +28,7 @@ _VERDAECHTIGE_FLAGS = ["-enc", "-encodedcommand", "-e ", "-w hidden", "-windowst
 # NemiCLIs eigener PowerShell-Rahmen (actions.py `abfragen`/`befehl`, zeitplan.py): so beginnt
 # jede Kommandozeile, die NemiCLI selbst startet. Die Wache erkannte ihn nicht und schlug mit
 # R001 „Hoch“ an (-NoProfile = drei „verdächtige Flags“) – weckte die Persönlichkeit, die machte
-# `abfragen`, neuer Alarm … (20.09.2026, 23 falsche Urteile zu powershell.exe). Wer diesen
+# `abfragen`, neuer Alarm … – eine Schleife falscher Urteile zu powershell.exe. Wer diesen
 # Rahmen fälscht, um durchzurutschen, muss ihn erst mal kennen – und das Kind sitzt dann trotzdem
 # unter einem fremden Elternprozess, was R002/Profil sehen.
 EIGENER_RAHMEN = "$progresspreference='silentlycontinue'; $outputencoding = [console]::outputencoding"
@@ -52,11 +52,20 @@ def _flags_in(cmd: str) -> list[str]:
     out = []
     for f in _VERDAECHTIGE_FLAGS:
         if f.startswith("-") and " " not in f.strip():
-            if f in tokens:
-                out.append(f)
+            if f.strip() in tokens:
+                out.append(f.strip())
         elif f in low:
             out.append(f.strip())
+    # Die Shell nimmt jede eindeutige Abkürzung eines Parameters an, auch mit / oder Gedankenstrich:
+    # alle Präfixe des Kodier-Parameters zählen (ohne die des Richtlinien-Parameters).
+    for t in tokens:
+        if len(t) >= 2 and t[0] in "-/–—" and (_KODIER.startswith(t[1:]) or t[1:] == "ec") \
+                and not any(o.startswith("-e") and _KODIER.startswith(o[1:]) for o in out):
+            out.append("-enc")
     return out
+
+
+_KODIER = "encodedcommand"
 _TARNUNG = {
     ".scr": "Bildschirmschoner – in Wahrheit eine gewöhnliche EXE",
     ".pif": "Verknüpfung zu MS-DOS-Programm, wird als Programm ausgeführt",
@@ -80,6 +89,29 @@ BESCHREIBUNG = {
     "R012": "Neuer Listener auf auffälligem Port",
     "R013": "Getarnte ausführbare Datei (.scr .pif .com .hta .cpl)",
     "R014": "Systemprogramm am falschen Ort (bekannter Name außerhalb von System32/SystemApps)",
+    "R015": "Neuer Hintergrund-Prozess eines beobachteten Programms (Programm-Absolvierung)",
+    "R016": "Umbenanntes Windows-Werkzeug (Versionsdaten nennen z. B. cmd.exe, die Datei heißt anders)",
+    "R017": "Dauerhaftes WMI-Abo angelegt (Ereignisprotokoll WMI-Activity 5861)",
+    "VS-001": "Roter Eintrag im Systemstand des Vollscans (einmal je Fund)",
+    "SIGMA": "Treffer einer Sigma-Regel (mitgeliefert oder aus dem Wache-Ordner sigma/)",
+}
+
+# MITRE ATT&CK: welche Technik eine Regel abdeckt (https://attack.mitre.org). Steht im Weckruf und beim Alarm.
+ATTACK = {
+    "R001": "T1059 Befehlsinterpreter · T1027 Verschleierung",
+    "R002": "T1204.002 Ausführung durch den Nutzer · T1036 Tarnung",
+    "R003": "T1204.002 Ausführung durch den Nutzer",
+    "R005": "T1547.001 Autostart (Run/Startup)",
+    "R006": "T1571 Nicht übliche Ports",
+    "R007": "T1071 Protokoll der Anwendungsschicht (Beaconing)",
+    "R009": "T1486 Daten verschlüsselt (Erpressung)",
+    "R010": "T1547.001 Autostart (Run/Startup)",
+    "R011": "T1543.003 Windows-Dienst · T1053.005 Geplante Aufgabe",
+    "R012": "T1571 Nicht übliche Ports",
+    "R013": "T1036.008 Getarnter Dateityp",
+    "R014": "T1036.005 Tarnung als legitimer Name/Ort",
+    "R016": "T1036.003 Umbenannte Systemwerkzeuge",
+    "R017": "T1546.003 WMI-Ereignisabo (Persistenz)",
 }
 
 
@@ -89,7 +121,7 @@ BESCHREIBUNG = {
 # neuer Dienst …): da ist JEDER Treffer eine eigene Frage, auch beim bekannten Prozess. Beispiel:
 # R001·powershell.exe 23× harmlos (Abfragen der KI selbst) darf ein echtes `powershell -enc`
 # nicht stumm schalten.
-MENGENREGELN = {"R004", "R007", "R008", "R009", "ML-001", "DL-001"}
+MENGENREGELN = {"R004", "R007", "R008", "R009", "SIGMA", "ML-001", "DL-001", "ML-002", "DL-002"}
 # Wird verdichtet, aber nie gedämpft: R009 hat ein festes Subjekt („überwachte Ordner“) –
 # eine Dämpfung schaltete die Erkennung massenhafter Änderungen für alle Ordner ab.
 NIE_GEDAEMPFT = {"R009"}
@@ -115,7 +147,7 @@ def subjekt_von(e: Ereignis) -> str:
 
 def subjekt_fuer(regel: str, e: Ereignis) -> str:
     """Subjekt aus Regel + Ereignis – dieselbe Zuordnung, die die Regeln selbst treffen.
-    Gebraucht, um Alarme von vor dem 20.09.2026 (ohne Subjekt) nachzurüsten."""
+    Gebraucht, um Alarme aus älteren Datenbanken (ohne Subjekt) nachzurüsten."""
     if regel == "R004":
         return e.eltern or "?"
     if regel == "R008":
@@ -125,6 +157,9 @@ def subjekt_fuer(regel: str, e: Ereignis) -> str:
     if regel == "ML-001":
         return f"{e.prozess or e.datei or e.ziel or 'Systemereignis'} · {e.aktion}"
     return subjekt_von(e)
+
+
+BEACON_MAX = 5000                   # (Prozess, Ziel)-Paare für R007
 
 
 def _kuerzen(dq: deque, grenze: float) -> None:
@@ -140,10 +175,13 @@ class Regelwerk:
         self._conns: dict[str, deque] = defaultdict(deque)
         self._dateien: deque = deque()
         self._beacon: dict[tuple[str, str], deque] = defaultdict(deque)
+        self._seit_aufraeumen = 0
         self.treffer: dict[str, int] = defaultdict(int)
         self.regeln = [self._r001, self._r002, self._r003, self._r004, self._r005, self._r006,
                        self._r007, self._r008, self._r009, self._r010, self._r011, self._r012,
-                       self._r013, self._r014]
+                       self._r013, self._r014, self._r016, self._r017, self._sigma]
+        self.sigma, self.sigma_uebersprungen = [], []
+        self.sigma_laden()
 
     def pruefen(self, e: Ereignis) -> list[Alarm]:
         self._zustand(e)
@@ -155,12 +193,13 @@ class Regelwerk:
                 continue
             if t is None:
                 continue
-            self.treffer[t.regel] += 1
-            if t.regel in self.stumm:
-                continue
-            out.append(Alarm(titel=t.titel, text=t.text, schwere=t.schwere, regel=t.regel,
-                             ereignis_id=e.id, quelle="regel", zeit=e.zeit,
-                             subjekt=t.subjekt or subjekt_von(e)))
+            for t in (t if isinstance(t, list) else [t]):        # Sigma kann mehrere Regeln treffen
+                self.treffer[t.regel] += 1
+                if t.regel in self.stumm:
+                    continue
+                out.append(Alarm(titel=t.titel, text=t.text, schwere=t.schwere, regel=t.regel,
+                                 ereignis_id=e.id, quelle="regel", zeit=e.zeit,
+                                 subjekt=t.subjekt or subjekt_von(e)))
         return out
 
     def _zustand(self, e: Ereignis) -> None:
@@ -174,8 +213,22 @@ class Regelwerk:
                 bq = self._beacon[(e.prozess or "?", e.ziel)]; bq.append(jetzt); _kuerzen(bq, grenze)
         elif e.kategorie == DATEI and e.aktion in ("file_created", "file_modified", "file_deleted"):
             self._dateien.append(jetzt); _kuerzen(self._dateien, grenze)
-        if len(self._beacon) > 500:
-            self._beacon.clear()
+        self._seit_aufraeumen += 1
+        if self._seit_aufraeumen >= 1000 or len(self._beacon) > BEACON_MAX:
+            self._aufraeumen(jetzt, grenze)
+
+    def _aufraeumen(self, jetzt: float, grenze: float) -> None:
+        """Gezielt nur Altes entfernen – früher wurde bei >500 Paaren alles geleert, und auf einem Rechner mit
+        Browser sah die Beaconing-Regel (R007) so nie sechs Verbindungen in Folge."""
+        self._seit_aufraeumen = 0
+        for d in (self._starts, self._conns):
+            for k in [k for k, dq in d.items() if not dq or dq[-1] < grenze]:
+                del d[k]
+        for k in [k for k, dq in self._beacon.items() if not dq or dq[-1] < jetzt - 3600]:
+            del self._beacon[k]
+        if len(self._beacon) > BEACON_MAX:                 # immer noch zu viele: die ältesten zuerst
+            for k in sorted(self._beacon, key=lambda k: self._beacon[k][-1])[:len(self._beacon) - BEACON_MAX // 2]:
+                del self._beacon[k]
 
     # ------------------------------------------------------------------ Regeln
 
@@ -299,7 +352,7 @@ class Regelwerk:
     def _r010(self, e):
         if e.aktion != "inventory_new_autostart":
             return None
-        ziel = (e.exe or "").lower()
+        ziel = f"{(e.extra or {}).get('befehl') or ''} {e.exe or ''}".lower()   # ganze Befehlszeile und Datei
         verdaechtig = any(h in ziel for h in ("\\temp\\", "\\appdata\\local\\temp", "\\downloads\\",
                                               "powershell", "cmd.exe", "mshta", "rundll32",
                                               "regsvr32", "wscript", "cscript"))
@@ -355,3 +408,50 @@ class Regelwerk:
         if not grund:
             return None
         return Treffer("R014", "Systemprogramm am falschen Ort", grund, Schwere.KRITISCH)
+
+    def _r016(self, e):
+        # Gegenstück zu R014: dort trägt ein fremdes Programm einen Systemnamen, hier trägt ein
+        # Systemwerkzeug einen fremden Namen. Die Versionsdaten verraten den Originalnamen.
+        if e.kategorie != PROZESS or e.aktion != "process_start" or not e.exe:
+            return None
+        grund = herkunft.umbenannt(e.prozess, e.exe)
+        if not grund:
+            return None
+        return Treffer("R016", "Umbenanntes Windows-Werkzeug", grund, Schwere.HOCH)
+
+    def _r017(self, e):
+        # Ein dauerhaftes WMI-Abo startet Code bei einem Ereignis (Anmeldung, Uhrzeit …) – ohne Autostart-Eintrag.
+        if e.aktion != "evtlog_wmi_dauerabo":
+            return None
+        ursache = f"\nUrsache laut Protokoll: {e.cmdline}" if e.cmdline else ""
+        return Treffer("R017", "Dauerhaftes WMI-Abo", e.text + ursache, Schwere.HOCH,
+                       subjekt=f"WMI · {e.extra.get('consumer', '?')}")
+
+    def sigma_laden(self) -> None:
+        """Sigma-Regeln (neu) laden: mitgelieferte und die *.yml im Wache-Ordner sigma/."""
+        try:
+            from . import ORDNER
+            from .sigma import laden
+            self.sigma, self.sigma_uebersprungen = laden(ORDNER / "sigma")
+        except Exception as exc:                         # ohne Sigma laufen die festen Regeln weiter
+            self.sigma, self.sigma_uebersprungen = [], [f"Sigma: {type(exc).__name__}: {exc}"[:200]]
+
+    def _sigma(self, e):
+        if e.kategorie != PROZESS or e.aktion != "process_start" or not self.sigma:
+            return None
+        from .sigma import trifft
+        raus = []
+        for r in self.sigma:
+            try:
+                if not trifft(r, e, herkunft.originalname):
+                    continue
+            except Exception:
+                continue
+            zeilen = [f"{r.titel}: {r.beschreibung}",
+                      f"Sigma-Regel {r.kennung}" + (f" · ATT&CK {r.technik}" if r.technik else "")]
+            if r.fehlalarme:
+                zeilen.append(f"Bekannte Fehlalarme laut Regel: {'; '.join(r.fehlalarme)}")
+            text = "\n".join(zeilen)
+            raus.append(Treffer("SIGMA", f"Sigma: {r.titel}", text, r.schwere,
+                                subjekt=f"{r.kennung} · {e.prozess or e.exe}"))
+        return raus or None

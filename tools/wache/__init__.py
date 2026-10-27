@@ -13,6 +13,7 @@ Bausteine (alles ohne Administratorrechte, alles lokal auf F:):
   sensoren.py     Prozesse (psutil-Diff), Netz (Socket-Diff), Dateien (watchdog)
   inventar.py     Tiefenscan: Prozesse, Dienste, Autostart, Aufgaben, Software, Ports
   regeln.py       R001–R014 – bekannte Muster, zuverlässig
+  absolvierung.py R015 – Programme auf Anweisung beobachten, Normalbild lernen
   merkmale.py     Ereignis → Zahlenvektor (zwei Merkmalssätze: Prozesse, Dateien)
   wald.py         eigener Isolation Forest auf numpy – kein scikit-learn
   detektor.py     Modell + Kaltstart + Perzentil-Score + Feedback + Persistenz

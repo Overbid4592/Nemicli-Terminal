@@ -468,7 +468,8 @@ class Markdown(QTextBrowser):
 
     def setzen(self, text: str) -> None:
         self.roh = text
-        self.document().setMarkdown(text, QTextDocument.MarkdownFeature(
+        import pfadschutz                                # Windows-Pfade nicht als Markdown lesen
+        self.document().setMarkdown(pfadschutz.schuetzen(text), QTextDocument.MarkdownFeature(
             QTextDocument.MarkdownFeature.MarkdownDialectGitHub.value
             | QTextDocument.MarkdownFeature.MarkdownNoHTML.value))
         self._hoehe()

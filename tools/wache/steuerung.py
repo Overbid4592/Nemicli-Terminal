@@ -118,7 +118,7 @@ def outfit_stand(name: str) -> tuple[str, set[str]]:
 
 def bilder(name: str, outfit: bool = True) -> dict[str, Path]:
     """Alle Bilder einer Persönlichkeit: {"": <Name>.png, "froh": <Name>_froh.png, …}
-    (Groß/klein egal: „Nemi_froh.png“, „nemi-froh.PNG“, „Maia_ernst.png“ passen alle).
+    (Groß/klein egal: „Nemi_froh.png“, „nemi-froh.PNG“, „PersonaA_ernst.png“ passen alle).
     outfit=True: Bilder des aktiven Outfits ersetzen die gleichnamigen Grundbilder."""
     out: dict[str, Path] = {}
     if not BILDER_ORDNER.exists():
@@ -205,7 +205,14 @@ def steuern(a: dict, wer: str = "Persönlichkeit") -> str:
             if stimmung in da or "" in da:
                 z["stimmung"] = stimmung
                 eigenes = stimmung in da or stimmung == "neutral"      # neutral.png ist das Standardbild
-                getan.append(f"Stimmung {stimmung}" + ("" if eigenes else f" (kein eigenes Bild dafür – zeige {da[''].name})"))
+                if eigenes:
+                    getan.append(f"Stimmung {stimmung}")
+                else:                                                   # deutlich sagen, sonst bleibt es unbemerkt
+                    vorhanden = ", ".join(sorted(k for k in da if k)[:15]) or "nur das Standardbild"
+                    getan.append(f"Stimmung {stimmung} – ⚠ kein passendes Bild für "
+                                 f"„{str(a.get('stimmung') or a.get('bild')).strip()}“ – "
+                                 f"zeige das Standardbild {da[''].name}. Vorhanden: {vorhanden}. Ein neues Bild malt "
+                                 "kugel_anziehen (Feld motive) oder der Nutzer mit /kugel malen")
                 kleid, im_outfit = outfit_stand(wer)
                 if kleid and eigenes and ("" if stimmung == "neutral" else stimmung) not in im_outfit:
                     getan.append(f"im Outfit {kleid} noch nicht gemalt – zeigt es in Grundkleidung "

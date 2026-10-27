@@ -1,7 +1,7 @@
 """Die gemeinsame Qt-Schicht von Kugel und Tray: EINE QApplication, das Theme,
 die Brücke in den GUI-Thread, das Bildschirmfoto.
 
-WARUM QT (20.09.2026)
+WARUM QT
 Kugel und Chatfenster waren tkinter – gut genug für den ersten Tag, aber eine
 Persönlichkeit, die auf dem Desktop lebt, verdient mehr als einen Canvas-Kreis
 mit Transparenzfarbe und ein graues Text-Widget. PySide6 (nur „Essentials“:
@@ -108,6 +108,17 @@ class _Bruecke(QObject):
             pass
 
 
+def _sitzung_endet(*_args) -> None:
+    """Windows meldet Abmelden oder Herunterfahren (WM_QUERYENDSESSION → commitDataRequest). Die Wache hat
+    kein Konsolenfenster, den Konsolen-Haken des Fehler-Wächters bekommt sie nie – ohne diese Meldung zählte
+    das harte Ende durch Windows beim nächsten Start als „unsauber“."""
+    try:
+        import fehlerwaechter
+        fehlerwaechter.sauber_beendet("Windows meldet Abmelden oder Herunterfahren")
+    except Exception:
+        pass
+
+
 def anwendung() -> QApplication:
     """Die eine QApplication – im Hauptthread anlegen, `exec()` blockiert dort."""
     global _app, _bruecke
@@ -117,6 +128,7 @@ def anwendung() -> QApplication:
         _app.setQuitOnLastWindowClosed(False)         # die Kugel darf sich verstecken
         _app.setFont(QFont("Segoe UI", 10))
         _app.setStyleSheet(QSS)
+        _app.commitDataRequest.connect(_sitzung_endet)
         _bruecke = _Bruecke()
     return _app
 

@@ -108,6 +108,8 @@ class Pty:
         self._prozess = _PROCESS_INFORMATION()
         self._zu = threading.Lock()
         self._geschlossen = False
+        self._handles_zu = threading.Lock()   # Prozess-Handle erst schließen, wenn niemand mehr darauf wartet
+        self._handles_frei = False
         self.exitcode: int | None = None
 
         ein_lesen, aus_schreiben = w.HANDLE(), w.HANDLE()
@@ -186,6 +188,11 @@ class Pty:
         self._konsole_schliessen()
         self._leser.join(timeout=5)
         self.bei_ende(self.exitcode)
+        with self._handles_zu:                # sonst sammeln sich die Handles bei jedem /restart
+            self._handles_frei = True
+            _k32.CloseHandle(self._prozess.hProcess)
+            if not self._leser.is_alive():
+                _k32.CloseHandle(self._aus_lesen)
 
     def schreiben(self, text: str) -> None:
         if self._geschlossen or not text:
@@ -213,6 +220,7 @@ class Pty:
     def beenden(self, warten_s: float = 3.0) -> None:
         """Konsole schließen (das Programm bekommt „Fenster zu“) und notfalls hart beenden."""
         self._konsole_schliessen()
-        if self.exitcode is None:
-            if _k32.WaitForSingleObject(self._prozess.hProcess, int(warten_s * 1000)) != 0:
-                _k32.TerminateProcess(self._prozess.hProcess, 1)
+        with self._handles_zu:
+            if self.exitcode is None and not self._handles_frei:
+                if _k32.WaitForSingleObject(self._prozess.hProcess, int(warten_s * 1000)) != 0:
+                    _k32.TerminateProcess(self._prozess.hProcess, 1)

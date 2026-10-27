@@ -1,6 +1,6 @@
 """Symbol in der Taskleiste (Infobereich) für den Hintergrund-Prozess.
 
-Seit 20.09.2026 Qt (QSystemTrayIcon, siehe oberflaeche.py) – vorher pystray +
+Qt (QSystemTrayIcon, siehe oberflaeche.py) – vorher pystray +
 Pillow. Das Schild wird zur Laufzeit gemalt: grün = Wache läuft, alles ruhig;
 gelb = offene Alarme, noch niemand hat draufgeschaut; rot = die Persönlichkeit
 hat etwas als ECHT eingestuft; grau = Wache gestoppt. Eine Zahl zeigt offene
@@ -23,6 +23,12 @@ from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import QMenu, QSystemTrayIcon
 
 from . import oberflaeche as O
+
+def _system32(name: str) -> str:
+    """Systemprogramm mit vollem Pfad: sonst suchte Windows zuerst im (beschreibbaren) Arbeitsordner."""
+    import os
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", name)
+
 
 FARBEN = {"gruen": (63, 185, 80), "gelb": (210, 153, 34), "rot": (229, 72, 77), "grau": (110, 118, 129)}
 
@@ -101,9 +107,9 @@ class Tray:
         cmd = self.install / "nemicli.cmd"
         try:
             if cmd.exists():
-                subprocess.Popen(["cmd", "/c", "start", "", str(cmd)], cwd=str(Path.home()))
+                subprocess.Popen([_system32("cmd.exe"), "/c", "start", "", str(cmd)], cwd=str(Path.home()))
             else:
-                subprocess.Popen(["cmd", "/c", "start", "", "python", str(self.install / "main.py")],
+                subprocess.Popen([_system32("cmd.exe"), "/c", "start", "", "python", str(self.install / "main.py")],
                                  cwd=str(Path.home()))
         except OSError:
             pass

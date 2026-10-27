@@ -228,8 +228,11 @@ class MusikFenster(QWidget):
             self.sprache.setText(str(ev.get("sprache") or ""))
             self.bpm.setText(str(ev.get("bpm") or ""))
             self.tonart.setText(str(ev.get("tonart") or ""))
-            if ev.get("sekunden"):
-                self.laenge.setValue(int(ev["sekunden"]))
+            try:
+                if ev.get("sekunden"):
+                    self.laenge.setValue(int(float(str(ev["sekunden"]).rstrip("s "))))
+            except (TypeError, ValueError):
+                pass                                    # „60s“ o. ä. vom Entwurf: Länge bleibt
             self._melden("✨ Entwurf da – anpassen oder gleich komponieren.", "ok", False)
         elif t == "fertig":
             pfad = str(ev.get("pfad") or "")
@@ -269,7 +272,8 @@ class MusikFenster(QWidget):
 
     @staticmethod
     def _oeffnen(pfad: str):
-        if pfad and Path(pfad).is_file():
+        # Nur Klang öffnen: der Pfad kommt aus der Sitzung – eine .bat oder .lnk würde sonst gestartet.
+        if pfad and Path(pfad).suffix.lower() in (".wav", ".mp3", ".flac", ".ogg", ".m4a") and Path(pfad).is_file():
             QDesktopServices.openUrl(QUrl.fromLocalFile(pfad))
 
     def _abspielen(self):

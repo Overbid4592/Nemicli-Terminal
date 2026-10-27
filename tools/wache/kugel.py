@@ -29,7 +29,7 @@ gerade nicht im Terminal läuft.
              neben der Uhr.
   Fertig     Bilder aus Hintergrund-Aufgaben und freien Momenten erscheinen klein in der Blase.
 
-Technik (seit 20.09.2026 Qt, vorher tkinter – siehe oberflaeche.py): ein
+Technik (Qt, vorher tkinter – siehe oberflaeche.py): ein
 rahmenloses, durchsichtiges Fenster; die Kugel wird mit QPainter gemalt
 (Radialverlauf, Glanzpunkt, weicher Lichthof), atmet über einen QTimer und
 hebt sich unter der Maus leicht an. Das Chatfenster ist eine dunkle Karte mit
@@ -57,8 +57,8 @@ import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import (QBrush, QColor, QCursor, QFont, QGuiApplication, QMovie, QPainter, QPainterPath, QPen,
+from PySide6.QtCore import QEasingCurve, QPoint, QPropertyAnimation, QRectF, QSize, Qt, QTimer, QUrl, Signal
+from PySide6.QtGui import (QBrush, QColor, QCursor, QDesktopServices, QFont, QGuiApplication, QMovie, QPainter, QPainterPath, QPen,
                            QPixmap, QRadialGradient, QTextDocument)
 from PySide6.QtWidgets import (QApplication, QFrame, QHBoxLayout, QLabel, QPlainTextEdit, QPushButton,
                                QScrollArea, QVBoxLayout, QWidget)
@@ -375,6 +375,34 @@ def impuls_text(name: str) -> str:
     jetzt = datetime.now()
     return IMPULS_TEXT.format(zeit=jetzt.strftime("%H:%M"), tag=_TAGE[jetzt.weekday()],
                               tageszeit=tageszeit(jetzt.hour)) + _bilder_zeile(name)
+
+
+NICHT_DA_S = 120                 # so lange ohne Maus/Tastatur: zusätzlich ein Hinweis neben der Uhr
+
+
+def _spontan(an: bool) -> None:
+    try:
+        import vonsichaus
+        vonsichaus.runde(an)
+    except ImportError:
+        pass
+
+
+def _vram_zeile() -> str:
+    try:
+        import vonsichaus
+        return vonsichaus.hinweis()
+    except ImportError:
+        return ""
+
+
+def _im_chat_zeigen(name: str, text: str, bilder: list) -> None:
+    """Auch im NemiCLI-Chat zeigen (holt das laufende NemiCLI ab, sonst der nächste Start)."""
+    try:
+        import vonsichaus
+        vonsichaus.schreiben(name, text, [str(b) for b in bilder])
+    except Exception:
+        pass
 
 
 def still(antwort: str) -> bool:
@@ -801,6 +829,11 @@ class _Eingabe(QPlainTextEdit):
         super().keyPressEvent(e)
 
 
+def _link_oeffnen(url: str) -> None:
+    if str(url).lower().startswith(("https://", "http://")):
+        QDesktopServices.openUrl(QUrl(url))
+
+
 class _Bild(QLabel):
     def __init__(self, pfad: Path) -> None:
         super().__init__()
@@ -816,6 +849,8 @@ class _Bild(QLabel):
         self.setStyleSheet("background: transparent; border: none;")
 
     def mousePressEvent(self, _e) -> None:
+        if self.pfad.suffix.lower() not in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".bmp"):
+            return                                       # nur Bilder öffnen, nie Programme oder Verknüpfungen
         try:
             os.startfile(str(self.pfad))
         except OSError:
@@ -940,10 +975,17 @@ class _Panel(QWidget):
         kopf = QLabel("Du" if du else name); kopf.setObjectName("wer_du" if du else "wer_sie")
         lbl = QLabel()
         lbl.setTextFormat(Qt.TextFormat.PlainText if du else Qt.TextFormat.MarkdownText)
+        if not du:
+            try:
+                import pfadschutz                        # Windows-Pfade nicht als Markdown lesen
+                text = pfadschutz.schuetzen(text)
+            except ImportError:
+                pass
         lbl.setText(text)
         lbl.setWordWrap(True)
         lbl.setFixedWidth(self._textbreite(text, not du, int(PANEL_BREITE * 0.78) - 26))
-        lbl.setOpenExternalLinks(True)
+        lbl.setOpenExternalLinks(False)                  # nur http(s) öffnen – file:// könnte Programme starten
+        lbl.linkActivated.connect(_link_oeffnen)
         lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
                                     | Qt.TextInteractionFlag.LinksAccessibleByMouse)
         b.addWidget(kopf); b.addWidget(lbl)
@@ -1284,7 +1326,7 @@ class Kugel:
         if (self._chat is None or self._beschaeftigt or self._panel is not None
                 or s.get("farbe") != "gruen" or stunde < 8 or stunde >= 23 or vollbild()):
             return
-        self._impuls_starten(impuls_text(self.name))
+        self._impuls_starten(impuls_text(self.name) + _vram_zeile(), ins_chat=True)
 
     def _ankommen_pruefen(self, s: dict) -> None:
         """Nach mindestens ANKOMMEN_AB_S ohne Eingabe – oder im Standby, dann ruht dieser Prozess
@@ -1335,12 +1377,17 @@ class Kugel:
                 pass
         threading.Thread(target=los, name="nemi-chats-sichern", daemon=True).start()
 
-    def _impuls_starten(self, text: str) -> None:
+    def _impuls_starten(self, text: str, ins_chat: bool = False) -> None:
+        """Spontane Runde (freier Moment, Ankommen, Musik); `ins_chat`: was sie sagt oder malt, steht auch im
+        NemiCLI-Chat – der Gruß beim Ankommen nicht, der gilt dem Moment am Desktop."""
+        self._ins_chat = ins_chat
         self._beschaeftigt = True
         self.fenster.beschaeftigt = True
+        _spontan(True)                                   # Grafikspeicher-Regel für diese Runde
         fut = asyncio.run_coroutine_threadsafe(self._chat(text, []), self._loop)
 
         def fertig(f):
+            _spontan(False)
             try:
                 antwort, bilder, todo = _ergebnis(f.result())
             except Exception:
@@ -1363,9 +1410,13 @@ class Kugel:
             self._schreiben("sie", text)
         for b in bilder:
             self._bild_zeigen(b)
+        if getattr(self, "_ins_chat", False):
+            _im_chat_zeigen(self.name, text, bilder)
+        kurz = " ".join(text.split())[:steuerung.SAGEN_MAX] if text else ""
+        if self._melden is not None and (not self._gezeigt or leerlauf_s() >= NICHT_DA_S):
+            self._melden(self.name, kurz or "🎨 hat dir ein Bild gemalt")      # schaut gerade niemand hin
         if self._panel is not None:
             return
-        kurz = " ".join(text.split())[:steuerung.SAGEN_MAX] if text else ""
         self.blase(kurz, 14, bild=bilder[-1] if bilder else None)
 
     def blase(self, text: str, sekunden: float = 8.0, bild: Path | None = None) -> None:

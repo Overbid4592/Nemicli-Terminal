@@ -64,10 +64,23 @@ def lock_loeschen() -> None:
         pass
 
 
+STILL_AB_S = 60                        # Lebenszeichen kommt alle 10 s – so lange ohne heißt: hängt wohl
+
+
+def still_hinweis(info: dict | None) -> str:
+    """„ ⚠ kein Lebenszeichen seit … – hängt?“, wenn die laufende Wache schweigt; sonst ""."""
+    still = float((info or {}).get("still_s") or 0)
+    if still < STILL_AB_S:
+        return ""
+    dauer = f"{still / 60:.0f} min" if still >= 120 else f"{still:.0f} s"
+    return f" ⚠ kein Lebenszeichen seit {dauer} – hängt? (/wache stop und /wache start)"
+
+
 def laeuft() -> dict | None:
-    """Info über den laufenden Hintergrund-Prozess oder None."""
+    """Info über den laufenden Hintergrund-Prozess oder None. `still_s`: Sekunden seit dem letzten
+    Lebenszeichen – der Prozess kann leben und trotzdem hängen (dann schreibt er keins mehr)."""
     if motor is not None:
-        return {"pid": os.getpid(), "start": getattr(motor, "start_zeit", 0.0), "hier": True}
+        return {"pid": os.getpid(), "start": getattr(motor, "start_zeit", 0.0), "hier": True, "still_s": 0.0}
     try:
         info = json.loads(LOCK.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
@@ -78,6 +91,7 @@ def laeuft() -> dict | None:
         name = p.name().lower()
         if p.is_running() and ("python" in name or "nemicli" in name):   # als exe: NemiCLI.exe
             info["hier"] = False
+            info["still_s"] = max(0.0, time.time() - float(info.get("zuletzt") or info.get("start") or time.time()))
             return info
     except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError):
         pass

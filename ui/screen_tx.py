@@ -26,6 +26,7 @@ import time
 from typing import Callable
 
 from rich.align import Align
+from rich.cells import cell_len
 from rich.console import Console, Group
 from rich.markdown import Markdown
 from rich.padding import Padding
@@ -284,13 +285,30 @@ class _SelectableRich(RichVisual):
                 out.append(strip)
                 continue
             x0, x1 = span
-            if x1 == -1:
-                x1 = strip.cell_length
+            x0 = _zellen(strip, x0)
+            x1 = strip.cell_length if x1 == -1 else _zellen(strip, x1)
             x0 = max(0, min(x0, strip.cell_length))
             x1 = max(x0, min(x1, strip.cell_length))
             mitte = Strip([Segment(s.text, markieren(s.style), s.control) for s in strip.crop(x0, x1)])
             out.append(Strip.join([strip.crop(0, x0), mitte, strip.crop(x1)]))
         return out
+
+
+def _zellen(strip, zeichen: int) -> int:
+    """Spalte vor dem Zeichen Nr. `zeichen` der Zeile. Die Auswahl zählt Zeichen (wie die Offsets),
+    gemalt wird in Spalten – ein Emoji ist ein Zeichen, aber zwei Spalten breit."""
+    spalte = 0
+    for seg in strip:
+        if zeichen <= 0:
+            break
+        n = len(seg.text)
+        if zeichen >= n:
+            spalte += seg.cell_length
+            zeichen -= n
+        else:
+            spalte += cell_len(seg.text[:zeichen])
+            zeichen = 0
+    return spalte
 
 
 def _markier_stil(sel_style, grund):
@@ -1711,8 +1729,17 @@ class Screen:
                 for edge in ("border_left", "border_right", "border_bottom"):
                     setattr(self._frame.styles, edge, ("round", neu["rahmen"]))
             self._chrome_stand = neu
-        except Exception:
-            pass
+        except Exception as e:                   # sonst stünden Kopf und Leiste still, ohne jede Spur
+            art = type(e).__name__
+            gemeldet = getattr(self, "_chrome_fehler", set())
+            if art not in gemeldet:
+                gemeldet.add(art)
+                self._chrome_fehler = gemeldet
+                try:
+                    import debugbericht
+                    debugbericht.fehler("Kopfzeile/Leiste zeichnen", e)
+                except Exception:
+                    pass
 
     def _composer_header(self) -> Text:
         width = self._terminal_width()
@@ -1947,6 +1974,8 @@ class Screen:
     def _submit(self) -> None:
         self._last_input = time.monotonic()
         text = self._input.text
+        if self._modal is None and self._neustart_pruefen(text):
+            return
         if self.busy:
             # „STOP“ während der Arbeit wirkt wie ESC (Not-Stopp); anderes wartet in der Eingabe
             try:
@@ -1987,6 +2016,22 @@ class Screen:
 
         asyncio.get_running_loop().create_task(_runner())
 
+    def _neustart_pruefen(self, text: str) -> bool:
+        """/restart greift sofort, auch mitten in der Arbeit oder wenn die KI hängt (wie der Not-Stopp).
+        Er kommt nur über diese Eingabe – Inbox und Kontextmenü lassen keine /befehle durch."""
+        try:
+            import neustart
+        except Exception:
+            return False
+        if not neustart.ist_befehl(text) or getattr(self, "_neustart_laeuft", False):
+            return False
+        self._neustart_laeuft = True
+        self._input.load_text("")
+        self._echo_user(text)
+        self._abort = True                    # laufende KI anhalten
+        asyncio.get_running_loop().create_task(neustart.ausfuehren())
+        return True
+
     # -- Lebenszeichen & Briefkasten (Rechtsklick-Menü -> offenes Fenster) ------
     _alive_stamp = 0.0
     _inbox_stamp = 0.0
@@ -2011,13 +2056,20 @@ class Screen:
             try:
                 if not K.INBOX_DATEI.exists():
                     return
+                alt = time.time() - K.INBOX_DATEI.stat().st_mtime
                 text = K.INBOX_DATEI.read_text(encoding="utf-8").strip()
                 K.INBOX_DATEI.unlink()
             except OSError:
                 return
-            if text:
-                self._input.load_text(text)
-                self._submit()
+            # Die Inbox ist für Aufträge aus dem Kontextmenü: frisch, kurz, nie ein /befehl – sonst
+            # könnte jedes Programm Einstellungen (Modus, Schlüssel …) wie der Nutzer ändern.
+            if not text or alt > 120 or len(text) > 4000 or text.lstrip().startswith("/"):
+                if text:
+                    ui.warn("📥 Nachricht aus der Inbox verworfen (zu alt, zu lang oder ein /befehl).")
+                return
+            ui.info("📥 Auftrag aus dem Kontextmenü")
+            self._input.load_text(text)
+            self._submit()
 
     def _lebenszeichen_ende(self) -> None:
         try:
@@ -2266,6 +2318,11 @@ class Screen:
         self._practice_fn = practice
         self.app = _NemiApp(self)
         idle = asyncio.create_task(self._idle_loop())
+        try:
+            import neustart
+            neustart.BEENDEN = self.app.exit
+        except Exception:
+            pass
         try:
             await self.app.run_async()
         finally:

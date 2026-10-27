@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import threading
 import time
 import traceback
@@ -33,6 +34,9 @@ PORTS_AUFFAELLIG = {
     9001: "Tor-Alt", 9050: "Tor-SOCKS",
 }
 PORTS_C2 = (4444, 6667, 9001, 9050, 23)
+# Zeilenumbrüche und Steuerzeichen in der Kommandozeile: ein Programm könnte sonst
+# eigene Zeilen (etwa eine gefälschte „herkunft:“) in Berichte an die KI schreiben.
+_STEUER = re.compile(r"[\x00-\x1f\x7f  ]")
 
 _ATTRS = ["pid", "ppid", "name", "username", "exe", "cmdline", "cpu_percent",
           "memory_info", "create_time", "num_threads"]
@@ -83,7 +87,7 @@ class ProzessSensor:
                 procs[pid] = {
                     "pid": pid, "ppid": i.get("ppid") or 0, "name": name, "start": float(start),
                     "nutzer": i.get("username") or "", "exe": i.get("exe") or "",
-                    "cmdline": " ".join(cmd) if isinstance(cmd, list) else "",
+                    "cmdline": _STEUER.sub(" ", " ".join(cmd)) if isinstance(cmd, list) else "",
                     "cpu": i.get("cpu_percent") or 0.0,
                     "mem": (mem.rss / 1_048_576) if mem else 0.0,
                     "threads": i.get("num_threads") or 0,

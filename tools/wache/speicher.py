@@ -66,7 +66,13 @@ CREATE TABLE IF NOT EXISTS justierungen (
 
 -- Bekannte harmlose Dinge: was ist das (bezeichnung) und warum harmlos. Gefüllt
 -- aus den Urteilen der Persönlichkeit (wache_bewerten mit bezeichnung). Schlüssel
--- = "prozess:winstore.app.exe", "ziel:192.0.2.44", "datei:c:\…", "eintrag:…".
+-- = "prozess:winstore.app.exe", "ziel:2.23.246.164", "datei:c:\…", "eintrag:…".
+-- Netz-Auskunft: Besitzer öffentlicher Netze laut Adressregister (RDAP), gemerkt statt jedes Mal gefragt.
+CREATE TABLE IF NOT EXISTS netz_besitzer (
+    von TEXT NOT NULL, bis TEXT NOT NULL, netz TEXT DEFAULT '', org TEXT DEFAULT '',
+    land TEXT DEFAULT '', zeit REAL NOT NULL, PRIMARY KEY (von, bis)
+);
+
 CREATE TABLE IF NOT EXISTS bekannt (
     schluessel TEXT PRIMARY KEY, art TEXT NOT NULL, name TEXT NOT NULL,
     bezeichnung TEXT NOT NULL, begruendung TEXT DEFAULT '', wer TEXT DEFAULT '',
@@ -87,11 +93,13 @@ def bekannt_schluessel(ereignis) -> list[tuple[str, str, str]]:
         return []
     out = []
     if ereignis.prozess:
-        p = ereignis.prozess.lower()
-        if p in _SKRIPT_HOSTS and ereignis.eltern:
+        # Mit bekanntem Pfad gilt der Pfad: ein fremdes „chrome.exe“ aus Temp ist nicht
+        # das Chrome aus Programme. Ohne Pfad (fremder Prozess, keine Rechte) bleibt der Name.
+        p = (getattr(ereignis, "exe", "") or ereignis.prozess).lower()
+        if ereignis.prozess.lower() in _SKRIPT_HOSTS and ereignis.eltern:
             # Ein Skript-Host ist nur zusammen mit seinem Elternprozess „bekannt“: powershell.exe
-            # aus NemiCLI ist etwas anderes als powershell.exe aus winword.exe. Bis 20.09.2026 galt
-            # „powershell.exe = harmlos“ pauschal – nach einem geratenen Urteil („Comfy Desktop“).
+            # aus NemiCLI ist etwas anderes als powershell.exe aus winword.exe. Früher galt
+            # „powershell.exe = harmlos“ pauschal – nach einem geratenen Urteil.
             el = ereignis.eltern.lower()
             out.append((f"prozess:{p}<{el}", "prozess", f"{ereignis.prozess} (von {ereignis.eltern})"))
         else:
@@ -147,7 +155,7 @@ class Speicher:
         self._c.commit()
 
     def _nachruesten(self) -> None:
-        """Spalten, die nach dem 19.09.2026 dazukamen, an bestehende Datenbanken anbauen.
+        """Spalten, die später dazukamen, an bestehende Datenbanken anbauen.
         ALTER TABLE hängt hinten an – genau die Reihenfolge, die Alarm.zeile() liefert."""
         ev = {r["name"] for r in self._c.execute("PRAGMA table_info(ereignisse)")}
         for spalte in ("start", "eltern_start"):
@@ -163,7 +171,7 @@ class Speicher:
             self._subjekte_nachtragen()
 
     def _subjekte_nachtragen(self) -> None:
-        """Alte Alarme (vor dem 20.09.2026) haben kein Subjekt – aus dem Ereignis dahinter
+        """Alarme aus älteren Datenbanken haben kein Subjekt – aus dem Ereignis dahinter
         nachholen, damit auch sie sich als Gruppe bewerten und fürs Dämpfen zählen lassen."""
         from .regeln import subjekt_fuer
         rows = self._c.execute(
@@ -217,7 +225,7 @@ class Speicher:
 
     def ereignisse_seit(self, seit: float, limit: int = 20_000) -> list[Ereignis]:
         """Fürs Training: die NEUESTEN `limit` Ereignisse seit `seit`, aufsteigend sortiert.
-        (Bis 20.09.2026 stand hier ASC LIMIT – bei mehr als `limit` Ereignissen wären die
+        (Mit ASC LIMIT – bei mehr als `limit` Ereignissen wären die
         neuesten weggefallen und das Modell hätte mit dem ältesten Stand gelernt.)"""
         with self._lock:
             rows = self._c.execute(
@@ -230,12 +238,13 @@ class Speicher:
         offenen, unklaren oder echten Alarm zusammenhängt.
 
         Herausgenommen werden: das Ereignis des Alarms, Wiederholungen, die der Motor nur am
-        Alarm gezählt hat (`extra.alarm`), Schatten-Funde des Folgen-Netzes (`extra.dl_fund`),
+        Alarm gezählt hat (`extra.alarm`), Schatten-Funde des Folgen-Netzes (`extra.dl_fund`) und des
+        Netzwächters (`extra.netz_fund`),
         die ganze Prozess-Kette dieser Ereignisse und die Prozesse, die darin gestartet wurden.
         Ketten über PID + Startzeit, bei älteren Ereignissen ohne Startzeit über PID +
         Prozessname innerhalb einer Stunde. Ein Ablauf, den noch niemand als harmlos
-        beurteilt hat, wird so nie zum gelernten Normalbild."""
-        belastete_status = "('offen', 'gesehen', 'echt', 'erledigt')"
+        beurteilt hat, wird so nie zum gelernten Normalbild (auch kein „nicht voll prüfbares“)."""
+        belastete_status = "('offen', 'gesehen', 'unpruefbar', 'echt', 'erledigt')"
         with self._lock:
             rows = self._c.execute(
                 "SELECT * FROM ereignisse WHERE zeit >= ? AND zeit < ? ORDER BY zeit DESC LIMIT ?",
@@ -256,19 +265,19 @@ class Speicher:
                 ohne_start.setdefault((r["pid"], r["prozess"]), []).append(r["zeit"])
         for r in rows:
             x = r["extra"] or ""
-            if '"alarm"' not in x and '"dl_fund"' not in x:
+            if '"alarm"' not in x and '"dl_fund"' not in x and '"netz_fund"' not in x:
                 continue
             try:
                 extra = json.loads(x)
             except ValueError:
                 continue
-            if extra.get("dl_fund") or extra.get("alarm") in offene_alarme:
+            if extra.get("dl_fund") or extra.get("netz_fund") or extra.get("alarm") in offene_alarme:
                 ids.add(r["id"])
                 if r["pid"] and r["start"]:
                     ketten.add((r["pid"], round(r["start"], 3)))
         out = []
         for r in reversed(rows):
-            if r["id"] in ids:
+            if r["id"] in ids or str(r["aktion"] or "").startswith("evtlog_"):   # Protokolle: nur Regeln
                 continue
             if r["pid"] and r["start"] and (r["pid"], round(r["start"], 3)) in ketten:
                 continue
@@ -339,6 +348,13 @@ class Speicher:
             return self._c.execute(
                 "SELECT COUNT(*) FROM alarme WHERE status = 'gesehen' AND urteil_von NOT IN ('', 'Wache') "
                 "AND zeit >= ?", (seit,)).fetchone()[0]
+
+    def urteile_zu(self, regel: str, subjekt: str) -> dict[str, int]:
+        """Wie oft Alarme dieser Regel zu diesem Subjekt so beurteilt wurden: {status: anzahl}."""
+        with self._lock:
+            rows = self._c.execute("SELECT status, COUNT(*) FROM alarme WHERE regel = ? AND LOWER(subjekt) = ? "
+                                   "GROUP BY status", (regel, subjekt.lower())).fetchall()
+        return {s: int(n) for s, n in rows}
 
     def alarm_zaehlen(self, aid: str, zeit: float) -> str:
         """Derselbe Alarm kam innerhalb des Cooldowns wieder: Zähler hoch statt neue Zeile – aber
@@ -426,6 +442,21 @@ class Speicher:
                 out.append(b)
         return out
 
+    def ganz_bekannt(self, ereignis) -> bool:
+        """Sind ALLE Merkmale des Ereignisses bekannt (Programm UND Ziel bzw. Datei)? Ein bekanntes
+        Ziel allein macht ein neues Programm nicht harmlos."""
+        schluessel = bekannt_schluessel(ereignis)
+        return bool(schluessel) and all(self.bekannt(s) for s, _a, _n in schluessel)
+
+    def programm_bekannt(self, ereignis) -> bool:
+        """Leiserstellen bei Mengen-Regeln: Hat das Ereignis ein Programm, muss GENAU dieses bekannt sein
+        (ein bekanntes Ziel adelt kein neues Programm); ohne Programm reicht ein bekanntes Merkmal."""
+        schluessel = bekannt_schluessel(ereignis)
+        prozess = [s for s, art, _n in schluessel if art == "prozess"]
+        if prozess:
+            return bool(self.bekannt(prozess[0]))
+        return any(self.bekannt(s) for s, _a, _n in schluessel)
+
     def bekannt_liste(self, art: str = "", limit: int = 300) -> list[dict]:
         with self._lock:
             if art:
@@ -454,12 +485,12 @@ class Speicher:
         return {r["exe"] for r in rows}
 
     def offene_pfade(self) -> set[str]:
-        """Programmpfade (klein) mit unbeurteiltem Alarm – deren Verhalten wird nicht ins
-        Profil übernommen, bis jemand geurteilt hat."""
+        """Programmpfade (klein) mit unbeurteiltem oder nicht voll prüfbarem Alarm – deren Verhalten wird
+        nicht ins Profil übernommen, bis jemand belegt geurteilt hat."""
         with self._lock:
             rows = self._c.execute(
                 "SELECT DISTINCT LOWER(e.exe) exe FROM alarme a JOIN ereignisse e ON a.ereignis_id = e.id "
-                "WHERE a.status IN ('offen', 'gesehen') AND e.exe != ''").fetchall()
+                "WHERE a.status IN ('offen', 'gesehen', 'unpruefbar') AND e.exe != ''").fetchall()
         return {r["exe"] for r in rows}
 
     # --------------------------------------------------------------- Profile
@@ -581,6 +612,72 @@ class Speicher:
             self._c.execute("INSERT OR REPLACE INTO meta VALUES (?, ?)", (schluessel, str(wert)))
             self._c.commit()
 
+    # ------------------------------------------------------------------ Netz
+
+    def besitzer_merken(self, d: dict) -> None:
+        with self._lock:
+            self._c.execute("INSERT OR REPLACE INTO netz_besitzer VALUES (?,?,?,?,?,?)",
+                            (d["von"], d["bis"], d.get("netz", "")[:200], d.get("org", "")[:200],
+                             d.get("land", "")[:10], time.time()))
+            self._c.commit()
+
+    def besitzer_fuer(self, ip: str, max_alter_s: float = 30 * 86400) -> dict | None:
+        """Gemerktes Netz, in dem `ip` liegt (das kleinste, wenn mehrere passen)."""
+        import ipaddress
+        try:
+            a = ipaddress.ip_address(ip)
+        except ValueError:
+            return None
+        with self._lock:
+            rows = self._c.execute("SELECT * FROM netz_besitzer WHERE zeit >= ?",
+                                   (time.time() - max_alter_s,)).fetchall()
+        best, groesse = None, None
+        for r in rows:
+            try:
+                von, bis = ipaddress.ip_address(r["von"]), ipaddress.ip_address(r["bis"])
+            except ValueError:
+                continue
+            if von.version == a.version and von <= a <= bis:
+                g = int(bis) - int(von)
+                if groesse is None or g < groesse:
+                    best, groesse = dict(r), g
+        return best
+
+    def netz_name_fuer(self, ip: str) -> str:
+        """Zuletzt gestempelter Name (`extra.name`) zu einer Zieladresse."""
+        with self._lock:
+            r = self._c.execute("SELECT extra FROM ereignisse WHERE ziel = ? AND extra LIKE '%\"name\"%' "
+                                "ORDER BY zeit DESC LIMIT 1", (ip,)).fetchone()
+        try:
+            return str(json.loads(r["extra"]).get("name") or "") if r else ""
+        except ValueError:
+            return ""
+
+    def netz_programme_fuer(self, ip: str) -> list[dict]:
+        with self._lock:
+            rows = self._c.execute(
+                "SELECT prozess, exe, COUNT(*) n, MIN(zeit) erst, MAX(zeit) zuletzt FROM ereignisse "
+                "WHERE kategorie = 'netz' AND aktion = 'conn_open' AND ziel = ? "
+                "GROUP BY prozess, exe ORDER BY zuletzt DESC LIMIT 20", (ip,)).fetchall()
+        return [{"prozess": r["prozess"], "exe": r["exe"], "anzahl": r["n"], "erstmals": r["erst"],
+                 "zuletzt": r["zuletzt"]} for r in rows]
+
+    def netz_verbindungen(self, seit: float, limit: int = 20_000) -> list[dict]:
+        """Verbindungen nach draußen seit `seit` – für die Übersicht (/wache netz)."""
+        with self._lock:
+            rows = self._c.execute(
+                "SELECT zeit, prozess, exe, ziel, zielport, extra FROM ereignisse WHERE kategorie = 'netz' "
+                "AND aktion = 'conn_open' AND zeit >= ? ORDER BY zeit DESC LIMIT ?", (seit, limit)).fetchall()
+        out = []
+        for r in rows:
+            try:
+                x = json.loads(r["extra"]) if r["extra"] else {}
+            except ValueError:
+                x = {}
+            out.append({"zeit": r["zeit"], "prozess": r["prozess"], "exe": r["exe"], "ziel": r["ziel"],
+                        "port": r["zielport"], "extra": x})
+        return out
+
     # ---------------------------------------------------------- Justierungen
 
     def justierung_merken(self, wer: str, was: str, alt, neu, begruendung: str) -> None:
@@ -601,13 +698,13 @@ class Speicher:
 
     def aufraeumen(self, tage: int, max_ereignisse: int) -> int:
         """Alte Ereignisse und Urteile weg. Echte und erledigte Alarme bleiben samt ihrem Ereignis
-        (sie sollen sichtbar bleiben), harmlose zählen HARMLOS_TAGE fürs Dämpfen, unklare `tage`."""
+        (sie sollen sichtbar bleiben), harmlose und nicht voll prüfbare bleiben HARMLOS_TAGE, unklare `tage`."""
         grenze = time.time() - tage * 86400
         behalten = "id NOT IN (SELECT ereignis_id FROM alarme WHERE status IN ('echt', 'erledigt'))"
         with self._lock:
             n = self._c.execute(f"DELETE FROM ereignisse WHERE zeit < ? AND {behalten}", (grenze,)).rowcount
             self._c.execute("DELETE FROM alarme WHERE zeit < ? AND status = 'gesehen'", (grenze,))
-            self._c.execute("DELETE FROM alarme WHERE zeit < ? AND status = 'harmlos'",
+            self._c.execute("DELETE FROM alarme WHERE zeit < ? AND status IN ('harmlos', 'unpruefbar')",
                             (time.time() - max(tage, self.HARMLOS_TAGE) * 86400,))
             zuviel = self.anzahl_ereignisse() - max_ereignisse
             if zuviel > 0:

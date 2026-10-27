@@ -108,7 +108,7 @@ _MAX_LINES = 6000          # Verlauf im Speicher kappen
 
 
 # --- Zeichenbreite: Terminal und prompt_toolkit müssen sich einig sein --------
-# Gemessen (Windows Terminal, 12.09.2026): alle nackten Symbole der UI stimmen
+# Gemessen (Windows Terminal): alle nackten Symbole der UI stimmen
 # überein. Auseinander laufen sie nur bei
 #   · Symbol + U+FE0F (Variation Selector-16, „zeig mich als buntes Emoji"):
 #     ❤️ ⚠️ 🛡️ …   Terminal 2 Zellen, prompt_toolkit 1
@@ -124,9 +124,23 @@ _SKIN = re.compile("[\U0001F3FB-\U0001F3FF]")
 _ZWJ_TAIL = re.compile("‍.")
 
 
+_STEUER = re.compile(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]")
+_ESC_FOLGE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[P^_][^\x1b]*(?:\x1b\\)?"
+                        r"|\x1b[@-Z\\-_]|\x1b")
+_FARBE = re.compile(r"\x1b\[[0-9;:]*m")
+
+
 def terminal_safe(text: str) -> str:
-    """Emoji-Varianten auf die Form bringen, deren Breite überall gleich ist."""
-    if not text or text.isascii():
+    """Emoji-Varianten auf die Form bringen, deren Breite überall gleich ist. Steuerzeichen und Escape-Folgen aus
+    Modell-, Datei- oder Webtext fliegen raus – über sie ließen sich Zwischenablage (OSC 52), Fenstertitel, Links
+    oder die Anzeige selbst (Cursor bewegen, Zeilen überschreiben) steuern. Nur Farben (ESC[…m) bleiben, dazu
+    Zeilenumbruch und Tab."""
+    if not text:
+        return text
+    if "\x1b" in text:
+        text = _ESC_FOLGE.sub(lambda m: m.group(0) if _FARBE.fullmatch(m.group(0)) else "", text)
+    text = _STEUER.sub("", text)
+    if text.isascii():
         return text
     text = _VS_KEYCAP.sub("", text)
     text = _SKIN.sub("", text)

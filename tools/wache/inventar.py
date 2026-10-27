@@ -35,6 +35,12 @@ try:
 except ImportError:                       # pragma: no cover
     winreg = None
 
+def _system32(name: str) -> str:
+    """Systemprogramm mit vollem Pfad: sonst suchte Windows zuerst im (beschreibbaren) Arbeitsordner."""
+    import os
+    return os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", name)
+
+
 _AUTOSTART = [
     ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\Run"),
     ("HKCU", r"Software\Microsoft\Windows\CurrentVersion\RunOnce"),
@@ -157,6 +163,7 @@ class Inventar:
                     continue
                 except PermissionError:
                     self.fehler.append(f"Autostart {wurzel}\\{sub}: kein Zugriff")
+            out += self._besondere_autostarts(wurzeln)
         ordner = []
         for var in ("APPDATA", "PROGRAMDATA"):
             basis = os.environ.get(var)
@@ -168,9 +175,81 @@ class Inventar:
             try:
                 for e in os.scandir(o):
                     if e.is_file():
-                        out.append(Eintrag(AUTOSTART, e.name, e.path, quelle=o, herkunft="ordner"))
+                        # Kennung bleibt der Pfad der Datei; bei einer Verknüpfung zählt fürs Prüfen ihr Ziel.
+                        extra = {}
+                        if e.name.lower().endswith(".lnk"):
+                            from .verknuepfung import lesen
+                            v = lesen(e.path)
+                            if v:
+                                extra = {"ziel": v["ziel"], "argumente": v["argumente"][:300]}
+                        out.append(Eintrag(AUTOSTART, e.name, e.path, quelle=o, herkunft="ordner", **extra))
             except OSError:
                 continue
+        return out
+
+    def _besondere_autostarts(self, wurzeln: dict) -> list[Eintrag]:
+        """Weitere Orte, an denen Windows beim Anmelden etwas startet (nur lesen; Vorbild: Velociraptor
+        Windows.Sys.StartupItems/Persistence, osquery autoexec). Gemeldet wird nur, was vom Windows-
+        Normalzustand abweicht – Shell = explorer.exe, Userinit = userinit.exe sind kein Fund."""
+        out = []
+
+        def wert(wurzel, sub, name):
+            try:
+                with winreg.OpenKey(wurzeln[wurzel], sub) as k:
+                    return str(winreg.QueryValueEx(k, name)[0] or "").strip()
+            except OSError:
+                return ""
+
+        winlogon = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon"
+        for wurzel in ("HKLM", "HKCU"):
+            shell = wert(wurzel, winlogon, "Shell")
+            if shell and shell.lower() not in ("explorer.exe", r"c:\windows\explorer.exe"):
+                out.append(Eintrag(AUTOSTART, "Winlogon Shell", shell, quelle=f"{wurzel}\\{winlogon}",
+                                   herkunft="registry"))
+            userinit = wert(wurzel, winlogon, "Userinit")
+            teile = [t.strip().lower() for t in userinit.split(",") if t.strip()]
+            if teile and any(not t.endswith("\\userinit.exe") for t in teile):
+                out.append(Eintrag(AUTOSTART, "Winlogon Userinit", userinit, quelle=f"{wurzel}\\{winlogon}",
+                                   herkunft="registry"))
+        windows = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows"
+        for sub in (windows, r"SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Windows"):
+            dlls = wert("HKLM", sub, "AppInit_DLLs")
+            if dlls:
+                out.append(Eintrag(AUTOSTART, "AppInit_DLLs", dlls, quelle=f"HKLM\\{sub}", herkunft="registry"))
+        anmeldeskript = wert("HKCU", "Environment", "UserInitMprLogonScript")
+        if anmeldeskript:
+            out.append(Eintrag(AUTOSTART, "Anmeldeskript", anmeldeskript, quelle=r"HKCU\Environment",
+                               herkunft="registry"))
+        for wurzel in ("HKCU", "HKLM"):                    # von Richtlinien gesetzte Run-Einträge
+            sub = r"Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"
+            try:
+                with winreg.OpenKey(wurzeln[wurzel], sub) as k:
+                    i = 0
+                    while True:
+                        try:
+                            name, w, _ = winreg.EnumValue(k, i)
+                        except OSError:
+                            break
+                        i += 1
+                        out.append(Eintrag(AUTOSTART, name, str(w), quelle=f"{wurzel}\\{sub}", herkunft="registry"))
+            except OSError:
+                pass
+        ifeo = r"SOFTWARE\Microsoft\Windows NT\CurrentVersion\Image File Execution Options"
+        try:                                               # „Debugger“ startet ein anderes Programm statt des echten
+            with winreg.OpenKey(wurzeln["HKLM"], ifeo) as k:
+                i = 0
+                while True:
+                    try:
+                        prog = winreg.EnumKey(k, i)
+                    except OSError:
+                        break
+                    i += 1
+                    dbg = wert("HKLM", f"{ifeo}\\{prog}", "Debugger")
+                    if dbg:
+                        out.append(Eintrag(AUTOSTART, f"IFEO {prog}", dbg, quelle=f"HKLM\\{ifeo}\\{prog}",
+                                           herkunft="registry"))
+        except OSError:
+            pass
         return out
 
     def dienste(self) -> list[Eintrag]:
@@ -219,7 +298,7 @@ class Inventar:
     def aufgaben(self, timeout: int = 25) -> list[Eintrag]:
         out = []
         try:
-            r = subprocess.run(["schtasks", "/query", "/fo", "CSV", "/nh"], capture_output=True,
+            r = subprocess.run([_system32("schtasks.exe"), "/query", "/fo", "CSV", "/nh"], capture_output=True,
                                text=True, timeout=timeout, errors="replace",
                                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as exc:
@@ -297,18 +376,30 @@ _LABEL = {AUTOSTART: "Neuer Autostart-Eintrag", DIENST: "Neuer Dienst",
 
 def neue_als_ereignisse(eintraege: list[Eintrag], bekannt: set[str]) -> list[Ereignis]:
     """Nur NEUE Funde werden Ereignisse (der erste Scan meldet nur eine Zusammenfassung)."""
+    from .systemstand import programmpfad
     out = []
     for e in eintraege:
         if e.id in bekannt:
             continue
+        extra = {"art": e.art, **{k: v for k, v in e.extra.items() if isinstance(v, (str, int, float, bool))}}
+        if e.art in (AUTOSTART, DIENST):
+            # Autostart und Dienst tragen eine Befehlszeile ("…\x.exe" --flag, svchost.exe -k …). Signatur und
+            # Vollscan brauchen die Datei selbst – mit der ganzen Zeile meldeten sie „Datei nicht mehr vorhanden“.
+            extra["befehl"] = e.detail
+            if e.extra.get("herkunft") == "ordner":       # Datei im Autostart-Ordner, keine Befehlszeile
+                exe = str(e.extra.get("ziel") or e.detail)
+            else:
+                exe = programmpfad(e.detail) or e.detail
+        elif e.art == PROZESS:
+            exe = e.detail
+        else:
+            # Ports tragen den Pfad in extra["exe"] – sonst stünde beim Alarm
+            # „Neuer offener Port“ nur eine Portnummer ohne prüfbares Programm.
+            exe = str(e.extra.get("exe") or "") if e.art == PORT else ""
         out.append(Ereignis(
             SYSTEM, f"inventory_new_{e.art}", f"{_LABEL.get(e.art, 'Neuer Eintrag')}: {e.name}"
             + (f" ({e.detail})" if e.detail else ""),
             schwere=_SCHWERE.get(e.art, Schwere.NIEDRIG),
             prozess=e.name if e.art == PROZESS else (e.detail if e.art == PORT else ""),
-            # Ports tragen den Pfad in extra["exe"] – sonst stünde beim Alarm
-            # „Neuer offener Port“ nur eine Portnummer ohne prüfbares Programm.
-            exe=(e.detail if e.art in (PROZESS, AUTOSTART, DIENST)
-                 else (str(e.extra.get("exe") or "") if e.art == PORT else "")),
-            extra={"art": e.art, **{k: v for k, v in e.extra.items() if isinstance(v, (str, int, float, bool))}}))
+            exe=exe, extra=extra))
     return out

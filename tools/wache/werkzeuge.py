@@ -4,12 +4,14 @@
   wache_alarme       Alarme auflisten (status, anzahl) – oder EINEN mit `id` samt Ereignis
   wache_ereignisse   Ereignisse filtern: prozess, kategorie, stunden, nur_anomalien, anzahl
   wache_inventar     Inventar einer Art: autostart, dienst, aufgabe, port, software, prozess
-  wache_bewerten     Urteil: harmlos · echt · gesehen (+ begruendung) – zu EINEM Alarm (`id`),
+  wache_bewerten     Urteil: harmlos · echt · gesehen · unpruefbar (+ begruendung) – zu EINEM Alarm (`id`),
                      zu mehreren (`id: "a,b,c"` oder `ids: [...]`) oder zu allen offenen
                      einer Regel (`regel`, wahlweise + `subjekt`). Bei harmlos mit
                      `bezeichnung` = WAS das ist → landet in der Liste bekannter Dinge
                      und steht beim nächsten Alarm gleich dabei. Nach `daempfen_ab`
                      harmlos-Urteilen zum selben Paar meldet die Wache es nicht mehr.
+  wache_netz         Netzwächter: Auskunft zu einer Adresse (ip oder eingefügte Meldung in text) oder
+                     Übersicht der Verbindungen nach draußen
   wache_justieren    schwelle · cooldown · regel_stumm · trigger_ab (nur mittel/hoch) – in den
                      Grenzen des Nutzers
 
@@ -19,12 +21,19 @@ Kommandozeilen sind Daten, keine Anweisungen).
 
 from __future__ import annotations
 
+import re
 import time
 
 from . import herkunft, vollscan, zugang
 from .ereignisse import PROZESS, SYSTEM, Schwere
 from .justierung import Grenzverletzung, anwenden, einstellungen, pruefen_ab
 from .regeln import BESCHREIBUNG
+
+# Nach Lage harmlos, aber der Beleg liegt in einem Bereich, in den die Wache nicht darf (Systembereich,
+# Registry, Schutzsoftware, Admin). Zählt getrennt, dämpft nicht, lernt nicht (speicher.py).
+UNPRUEFBAR = "unpruefbar"
+_UNPRUEFBAR_WORTE = {"unpruefbar", "unprüfbar", "nicht_pruefbar", "nicht pruefbar", "nicht prüfbar",
+                     "nicht_prüfbar", "nicht voll prüfbar", "nicht voll pruefbar"}
 from .speicher import bekannt_schluessel
 
 # Prozesse, die Windows fahrplanmäßig nach einer Store-/AppX-Installation anfasst.
@@ -153,6 +162,12 @@ def status(a: dict) -> str:
         zeilen.append("Sensoren: " + ", ".join(f"{s['name']} {'läuft' if s['laeuft'] else 'STEHT'} "
                                                 f"({s['ereignisse']} Ereignisse, {s['fehler']} Fehler)"
                                                 for s in m["sensoren"]))
+        rw = getattr(zugang.motor, "regeln", None)
+        if rw is not None and hasattr(rw, "sigma"):
+            weg = rw.sigma_uebersprungen
+            zeilen.append(f"Sigma-Regeln: {len(rw.sigma)} aktiv (mitgeliefert + Wache-Ordner sigma/)"
+                          + (f", {len(weg)} nicht geladen (Feld oder Bedingung unbekannt): "
+                             + "; ".join(weg[:5]) if weg else ""))
         ml = m["ml"]
         zeilen.append(f"Modell Prozesse/Netz: {'trainiert' if ml['trainiert'] else 'KALTSTART'} – "
                       f"{ml['ereignisse']} Ereignisse, {ml['laeufe']} Läufe, Schwelle {ml['schwelle']}, "
@@ -165,6 +180,7 @@ def status(a: dict) -> str:
             if d.get("fehler"):
                 zeilen.append(f"Modell {d['label']}: {d['fehler']}")
         zeilen.append(folgen_zeile(m.get("dl") or {}))
+        zeilen.append(netz_zeile(m.get("netz") or {}))
         if m.get("gestoert"):
             zeilen.append(f"GESTÖRT – der Motor meldet wiederholt Fehler: {m['gestoert']}")
         inv = m["inventar"]
@@ -183,8 +199,8 @@ def status(a: dict) -> str:
         zeilen.append("Inventar: " + (", ".join(f"{n} {k}" for k, n in sorted(inv.items())) or "noch keins"))
     st = sp.alarm_statistik()
     zeilen.append(f"Alarme: {st.get('offen', 0)} offen, {st.get('gesehen', 0)} gesehen, "
-                  f"{st.get('harmlos', 0)} harmlos, {st.get('echt', 0)} ECHT, {st.get('erledigt', 0)} erledigt "
-                  f"({st.get('gesamt', 0)} gesamt)")
+                  f"{st.get('harmlos', 0)} harmlos, {st.get('unpruefbar', 0)} nicht voll prüfbar, "
+                  f"{st.get('echt', 0)} ECHT, {st.get('erledigt', 0)} erledigt ({st.get('gesamt', 0)} gesamt)")
     zeilen.append(f"Einstellungen: Schwelle {e['schwelle']}, Cooldown {e['cooldown']}s (gleicher Alarm = "
                   f"Zähler statt neue Zeile), Dämpfung ab {e.get('daempfen_ab', 3)}× harmlos, wecken ab "
                   f"{e['trigger_ab']} und ab {pruefen_ab(e)} ungeprüften Alarmen (setzt nur der Nutzer), Training alle {e['training_alle']}, stumme Regeln: "
@@ -204,6 +220,9 @@ def alarme(a: dict) -> str:
             return f"Kein Alarm mit id {aid}."
         zeilen = [al.kurz(), al.text, f"Status: {al.status}"
                   + (f" ({al.urteil_von}: {al.begruendung})" if al.urteil_von else "")]
+        from .regeln import ATTACK
+        if al.regel in ATTACK:
+            zeilen.append(f"ATT&CK: {ATTACK[al.regel]}")
         ev = sp.ereignis(al.ereignis_id) if al.ereignis_id else None
         if ev:
             zeilen.extend(bekannt_hinweise(sp, ev))
@@ -242,7 +261,9 @@ def alarme(a: dict) -> str:
     except (TypeError, ValueError):
         n = 20
     stat = str(a.get("status") or "").strip().lower()
-    liste = sp.alarme(limit=n, status=stat if stat in ("offen", "gesehen", "harmlos", "echt", "erledigt") else "")
+    stat = UNPRUEFBAR if stat in _UNPRUEFBAR_WORTE else stat
+    liste = sp.alarme(limit=n, status=stat if stat in ("offen", "gesehen", "harmlos", UNPRUEFBAR, "echt", "erledigt")
+                      else "")
     if not liste:
         return "Keine Alarme" + (f" mit Status {stat}" if stat else "") + "."
     zeilen = []
@@ -351,11 +372,13 @@ def _alarme_auswaehlen(sp, a: dict) -> tuple[list, str]:
             return gefunden, ""
         return gefunden, (f"{len(gefunden)} Alarm{'e' if len(gefunden) != 1 else ''}"
                           + (f" (nicht gefunden: {', '.join(fehlend)})" if fehlend else ""))
-    regel = str(a.get("regel") or "").strip().upper().replace("ML001", "ML-001").replace("DL001", "DL-001")
+    regel = str(a.get("regel") or "").strip().upper()
+    for alt, neu in (("ML001", "ML-001"), ("DL001", "DL-001"), ("ML002", "ML-002"), ("DL002", "DL-002")):
+        regel = regel.replace(alt, neu)
     if not regel:
         return [], "Fehler: id (eine oder mehrere, kommagetrennt), ids oder regel angeben."
-    if regel not in BESCHREIBUNG and regel not in ("ML-001", "DL-001"):
-        return [], f"Fehler: unbekannte Regel {regel} (R001–R014, ML-001 oder DL-001)."
+    if regel not in BESCHREIBUNG and regel not in ("ML-001", "DL-001", "ML-002", "DL-002"):
+        return [], f"Fehler: unbekannte Regel {regel} (R001–R017, VS-001, ML-001/002 oder DL-001/002)."
     subjekt = " ".join(str(a.get("subjekt") or a.get("prozess") or a.get("ziel") or "").split())
     liste = sp.alarme_unbeurteilt(regel, subjekt)
     if not liste:
@@ -375,8 +398,10 @@ def bewerten(a: dict, wer: str = "Persönlichkeit") -> str:
         urteil = "echt"
     if urteil in ("behoben", "bereinigt", "abgeschlossen", "erledigt"):
         urteil = "erledigt"
-    if urteil not in ("harmlos", "echt", "gesehen", "erledigt"):
-        return "Fehler: urteil muss harmlos, echt, gesehen oder erledigt sein."
+    if urteil in _UNPRUEFBAR_WORTE:
+        urteil = UNPRUEFBAR
+    if urteil not in ("harmlos", "echt", "gesehen", UNPRUEFBAR, "erledigt"):
+        return "Fehler: urteil muss harmlos, echt, gesehen, unpruefbar oder erledigt sein."
     if urteil != "gesehen" and len(grund) < 10:
         return "Fehler: ein Urteil braucht eine Begründung (mindestens ein Satz)."
     liste, was = _alarme_auswaehlen(sp, a)
@@ -424,15 +449,18 @@ def bewerten(a: dict, wer: str = "Persönlichkeit") -> str:
     except Exception:
         pass
     kopf = f"{was} → {urteil}." if was else f"Alarm {liste[0].id} → {urteil}."
-    return (kopf + (" Dieses Programm (am Pfad) wird künftig leiser bewertet – Ausreißer melden weiter – "
-                    "und fließt beim nächsten Training als normal ein." if urteil == "harmlos" else "")
+    return (kopf + (" Hat das Programm einen lesbaren Pfad, wird es an genau diesem Pfad künftig leiser bewertet "
+                    "(ohne Pfad, z. B. „System“, nicht) – Ausreißer melden weiter – und fließt beim nächsten Training "
+                    "als normal ein." if urteil == "harmlos" else "")
             + (f" Als bekannt gemerkt: {', '.join(gemerkt)} = {bezeichnung}." if gemerkt else "")
             + (f" Ab jetzt still (oft genug harmlos): {', '.join(neu_gedaempft)}." if neu_gedaempft else "")
             + (" (Tipp: mit bezeichnung=… merkst du dir, WAS das ist – dann steht es beim nächsten "
                "Alarm gleich dabei.)" if urteil == "harmlos" and not bezeichnung else "")
             + (" Bleibt für den Nutzer sichtbar (rot im Tray), bis er ihn als erledigt abschließt."
                if urteil == "echt" else "")
-            + (" Abgeschlossen: bleibt im Verlauf, das Schild ist dafür nicht mehr rot." if urteil == "erledigt" else ""))
+            + (" Abgeschlossen: bleibt im Verlauf, das Schild ist dafür nicht mehr rot." if urteil == "erledigt" else "")
+            + (" Zählt getrennt als „nicht voll prüfbar“: dämpft nichts, geht nicht ins Normalbild – kommt es "
+               "wieder, meldet die Wache es wieder." if urteil == UNPRUEFBAR else ""))
 
 
 def justieren(a: dict, wer: str = "Persönlichkeit") -> str:
@@ -473,4 +501,160 @@ def regeln_text() -> str:
     zeilen.append("ML-001         Isolation Forest: einzelnes Ereignis weicht vom gelernten Normalbild ab")
     zeilen.append("DL-001         Folgen-Netz: ungewöhnlicher Schritt in einer Prozess-Kette"
                   + ("" if e.get("dl_alarm") else " (Schattenmodus – meldet nur ins Protokoll)"))
+    netz_hinweis = "" if e.get("netz_alarm") else " (Schattenmodus – meldet nur ins Protokoll)"
+    zeilen.append("ML-002         Netz-Modell: einzelne Verbindung weicht vom Gelernten ab" + netz_hinweis)
+    zeilen.append("DL-002         Netz-Folgen: ungewöhnliche Abfolge oder Takt der Verbindungen eines Programms"
+                  + netz_hinweis)
     return "\n".join(zeilen)
+
+_IP = re.compile(r"(?<![\w.:])(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F]{1,4}(?::[0-9a-fA-F]{0,4}){2,7})(?![\w.:])")
+
+
+def _adressen(text: str) -> list[str]:
+    import ipaddress
+    out = []
+    for m in _IP.findall(text or ""):
+        try:
+            out.append(str(ipaddress.ip_address(m)))
+        except ValueError:
+            continue
+    return list(dict.fromkeys(out))
+
+
+def netz_zeile(n: dict) -> str:
+    """Eine Zeile zum Netzwächter für Status und Bericht."""
+    if not n.get("an", True):
+        return "Netzwächter (ML-002/DL-002): aus"
+    modus = "WARNT (Alarme ML-002/DL-002)" if n.get("alarm") else "Schattenmodus (nur Protokoll, keine Alarme)"
+    ml, dl = n.get("ml") or {}, n.get("dl") or {}
+    teile = [f"Netzwächter: {modus}",
+             f"Netz-Modell {'trainiert' if ml.get('trainiert') else 'noch nicht trainiert'}",
+             f"Netz-Folgen {('Version ' + str(dl.get('version'))) if dl.get('trainiert') else 'noch nicht trainiert'}"]
+    if "auffaellig_seit_start" in n:
+        teile.append(f"{n['auffaellig_seit_start']} auffällige Verbindungen seit Start")
+    return ", ".join(teile)
+
+
+def netz(a: dict) -> str:
+    """Netzwächter: Auskunft zu Adressen (`ip`, oder ein eingefügter Text wie eine Firewall-Meldung in
+    `text`) – sonst die Übersicht der letzten Verbindungen nach draußen."""
+    from . import MODELL_ORDNER, netzwaechter as NW
+    from .netzauskunft import Auskunft, bericht_text
+    sp = zugang.speicher()
+    e = einstellungen()
+    if zugang.motor is not None:
+        auskunft = zugang.motor.auskunft
+    else:
+        auskunft = Auskunft(sp, register=bool(e.get("netz_besitzer", True)))
+    adressen = _adressen(" ".join(str(a.get(k) or "") for k in ("ip", "adresse", "text", "meldung")))
+    if adressen:
+        teile = [bericht_text(auskunft.bericht(ip)) for ip in adressen[:5]]
+        return _rahmen("\n\n".join(teile), quelle=f"Netz-Auskunft {', '.join(adressen[:5])}")
+    if a.get("ip") or a.get("text"):
+        return "Keine gültige IP-Adresse gefunden – ip=\"1.2.3.4\" oder den Text der Meldung in text= angeben."
+    try:
+        stunden = max(1.0, min(168.0, float(a.get("stunden") or 24)))
+    except (TypeError, ValueError):
+        stunden = 24.0
+    s_ml, s_dl = float(e.get("netz_schwelle", 0.99)), float(e.get("netz_dl_schwelle", 0.995))
+    liste = NW.uebersicht(sp.netz_verbindungen(time.time() - stunden * 3600),
+                          besitzer=lambda ip: auskunft.besitzer(ip, abfragen=False), n=int(a.get("anzahl") or 25))
+    zeilen = [f"Verbindungen nach draußen der letzten {stunden:g} h (je Programm und Ziel, neueste zuerst):"]
+    for g in liste:
+        zeilen.append(f"{NW.ampel(g['ml'], g['dl'], s_ml, s_dl)} {g['prozess']} → {g['name'] or g['ziel']}"
+                      + (f" ({g['ziel']})" if g["name"] else "") + f":{g['port']}"
+                      + (f" · {g['besitzer']}" if g["besitzer"] else "")
+                      + f" · {g['anzahl']}× · zuletzt {time.strftime('%d.%m. %H:%M', time.localtime(g['zuletzt']))}"
+                      + f" · ML {NW.score_text(g['ml'])} DL {NW.score_text(g['dl'])}")
+    if not liste:
+        zeilen.append("(keine – läuft die Wache?)")
+    schatten = NW.SchattenLog(MODELL_ORDNER / NW.SCHATTEN).lesen(10)
+    if schatten:
+        zeilen.append("")
+        zeilen.append("Letzte Funde im Schattenmodus (kein Alarm):")
+        zeilen += [f"  {z}" for z in schatten]
+    return _rahmen("\n".join(zeilen), quelle="Netzwächter")
+
+
+
+def _programm_zeilen(key: str, mit_laufenden: bool = True) -> list[str]:
+    from . import absolvierung as AB
+    a, b = AB.auftrag(key), AB.bild(key)
+    anzeige = a.get("anzeige") or key
+    if a.get("aus"):
+        phase = "⏹ beendet"
+    elif AB.lernt(a):
+        phase = f"📖 lernt noch bis {time.strftime('%d.%m. %H:%M', time.localtime(float(a['lernen_bis'])))}"
+    else:
+        phase = "🛡 wacht (Neues meldet R015)"
+    kinder = b.get("kinder") or {}
+    zeilen = [f"{anzeige} ({key}) · {phase} · {len(kinder)} Hintergrund-Prozess(e) im Normalbild"
+              + (f" · {b['laeufe']}× gestartet gesehen" if b.get("laeufe") else "")]
+    for k in sorted(kinder, key=lambda x: -int(kinder[x].get("anzahl", 0)))[:25]:
+        v = kinder[k]
+        zeilen.append(f"  ✓ {v.get('name') or k} · {v.get('anzahl', 0)}× · von {v.get('eltern') or '?'}"
+                      + (f" · {v['exe']}" if v.get("exe") else "") + f" · {v.get('quelle', '')}")
+    if len(kinder) > 25:
+        zeilen.append(f"  … und {len(kinder) - 25} weitere")
+    if a.get("erlaubt"):
+        zeilen.append("  von Hand erlaubt: " + ", ".join(a["erlaubt"]))
+    if mit_laufenden:
+        jetzt = AB.laufende(key)
+        if jetzt:
+            zeilen.append(f"  Läuft gerade ({len(jetzt)}):")
+            for p in jetzt[:20]:
+                k = AB.kind_schluessel(p["name"], p["exe"])
+                zeilen.append(f"    {'✓' if k in kinder else '★ neu'} {p['name']}" + (f" · {p['exe']}" if p["exe"] else ""))
+        else:
+            zeilen.append("  Läuft gerade: nichts davon")
+    return zeilen
+
+
+def programm(a: dict, wer: str = "Persönlichkeit") -> str:
+    """Programm-Absolvierung: ein Programm beobachten, sein Normalbild an Hintergrund-Prozessen lernen, danach
+    Neues melden (R015). aktion: start (programm, tage) · stop · erlauben (prozess) · status · liste."""
+    from . import absolvierung as AB
+    aktion = str(a.get("aktion") or ("status" if a.get("programm") else "liste")).strip().lower()
+    programm_ = str(a.get("programm") or a.get("name") or "").strip()
+    try:
+        if aktion == "liste" or (aktion == "status" and not programm_):
+            alle = AB.auftraege()
+            if not alle:
+                return ("Noch kein Programm in Beobachtung. Mit aktion=\"start\" und programm=\"steam\" lernt die Wache, "
+                        "welche Hintergrund-Prozesse es startet.")
+            zeilen = ["Programme in Beobachtung (Programm-Absolvierung):"]
+            for x in alle:
+                zeilen += _programm_zeilen(x["programm"], mit_laufenden=False)
+            return _rahmen("\n".join(zeilen), quelle="Programm-Absolvierung")
+        if not programm_:
+            return "Welches Programm? programm=\"steam\" (Name der exe, mit oder ohne .exe)."
+        key = AB.schluessel(programm_)
+        if aktion in ("start", "starten", "beobachten", "lernen"):
+            try:
+                tage = float(a.get("tage") if a.get("tage") not in (None, "") else AB.LERNEN_TAGE)
+            except (TypeError, ValueError):
+                return "tage muss eine Zahl sein (Lernphase in Tagen)."
+            neu = AB.starten(programm_, tage, von=wer, anzeige=str(a.get("anzeige") or ""))
+            bis = time.strftime("%d.%m. %H:%M", time.localtime(neu["lernen_bis"]))
+            text = (f"🔍 Ich passe ab jetzt auf {neu['anzeige']} ({key}) auf: bis {bis} lerne ich, welche Hintergrund-"
+                    "Prozesse es startet, danach melde ich Neues als Alarm R015. Läuft es gerade, zählt die Wache "
+                    "sofort mit.")
+            if not zugang.laeuft():
+                text += " Die Wache läuft gerade nicht – sie beginnt, sobald sie startet."
+            return text
+        if aktion in ("stop", "stoppen", "beenden", "aus"):
+            alt = AB.stoppen(programm_)
+            return (f"⏹ {alt.get('anzeige') or key} wird nicht mehr beobachtet – das gelernte Normalbild bleibt "
+                    "gespeichert, ein neuer Start macht dort weiter." if alt else f"{key} war nicht in Beobachtung.")
+        if aktion in ("erlauben", "erlaubt", "aufnehmen"):
+            prozess = str(a.get("prozess") or "").strip()
+            neu = AB.erlauben(programm_, prozess)
+            return (f"✓ {prozess} gehört ab jetzt zum Normalbild von {neu.get('anzeige') or key}." if neu
+                    else f"{key} ist nicht in Beobachtung – erst aktion=\"start\".")
+        if aktion == "status":
+            if not AB.auftrag(key):
+                return f"{key} ist nicht in Beobachtung – mit aktion=\"start\" fängt die Wache an zu lernen."
+            return _rahmen("\n".join(_programm_zeilen(key)), quelle=f"Programm-Absolvierung {key}")
+        return "aktion: start · stop · erlauben · status · liste"
+    except ValueError as exc:
+        return f"Fehler: {exc}"

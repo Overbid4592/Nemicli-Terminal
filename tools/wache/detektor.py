@@ -38,6 +38,11 @@ AUSREISSER = 0.995             # ab hier dämpft kein „harmlos“-Urteil mehr
 DAEMPFUNG = 0.35
 
 
+def _skript_host(e: Ereignis) -> bool:
+    from .speicher import _SKRIPT_HOSTS
+    return os.path.basename(str(e.exe or e.prozess or "")).lower() in _SKRIPT_HOSTS
+
+
 def _log(text: str) -> None:
     try:
         TRAINING_LOG.parent.mkdir(parents=True, exist_ok=True)
@@ -178,8 +183,9 @@ class Detektor:
         self.bewertet += 1
         # Gedämpft wird nur dasselbe Programm (Pfad) und nur unterhalb der Ausreißer-Grenze:
         # nie Gesehenes und extreme Abweichungen melden auch nach einem „harmlos“.
+        # Skript-Hosts (Shells, Python …) nie: ein „harmlos“ zu einem Skript dämpfte sonst jedes andere.
         if (e.exe and e.exe.lower() in self.gedaempft and score < AUSREISSER
-                and not len(unbekannt)):
+                and not len(unbekannt) and not _skript_host(e)):
             score *= DAEMPFUNG
         return score, gruende
 

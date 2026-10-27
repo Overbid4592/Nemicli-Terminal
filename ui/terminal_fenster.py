@@ -21,11 +21,87 @@ from __future__ import annotations
 import base64
 import os
 import re
+import secrets
+import functools
 import sys
 import threading
+import unicodedata
 from pathlib import Path
 
 import pyte
+import pyte.screens
+
+
+@functools.lru_cache(maxsize=4096)
+def zellbreite(zeichen: str) -> int:
+    """Zellen eines Zeichens, gezählt wie rich/Textual, die in diesem Fenster laufen. pyte zählt mit wcwidth:
+    Hautton-Modifier (👍🏻) als 2 statt 0 und Flaggen-Buchstaben als 2 statt 1 – dahinter verrutschte die
+    Oberfläche, und ihre Updates trafen die falschen Spalten (alte Zellen blieben stehen)."""
+    try:
+        from rich.cells import get_character_cell_size
+        return get_character_cell_size(zeichen)
+    except Exception:
+        return max(0, pyte.screens._wcwidth(zeichen))
+
+
+pyte.screens.wcwidth = zellbreite
+
+
+class _NullbreiteAnhaengen:
+    """Schreibt Text in Graphem-Gruppen – so, wie rich/Textual ihn zählt. pyte schreibt Zeichen für Zeichen: an
+    Zeichen ohne eigene Zelle, die kein Akzent sind (Emoji-Variante U+FE0F, Verbinder U+200D, Hautton), bricht es
+    ab und verwirft den REST des Textstücks („Herz ❤️ und weiter“ wurde zu „Herz ❤“); Gruppen wie „❤️“ (2 Zellen)
+    oder „👩‍💻“ (2 statt 4) zählt es anders als die Oberfläche. Jede Gruppe kommt hier mit genau den Zellen der
+    Oberfläche in eine Zelle (breite: mit Stummel dahinter).
+
+    Gruppen, die pyte anders zählen würde, schreibt ein Platzhalter gleicher Breite (Umbruch, Einfügemodus und
+    Stummel erledigt pyte), danach ersetzt die Gruppe ihn in seiner Zelle."""
+
+    _PLATZHALTER = {1: "\uf8ff", 2: "\u3000"}
+
+    def draw(self, data: str) -> None:
+        try:
+            from rich.cells import split_graphemes
+            spannen, _ = split_graphemes(data)
+        except Exception:
+            super().draw(data)
+            return
+        einfach: list[str] = []
+        for a, e, w in spannen:
+            g = data[a:e]
+            if len(g) == 1 and zellbreite(g) == w:
+                einfach.append(g)
+                continue
+            if einfach:
+                super().draw("".join(einfach))
+                einfach = []
+            if w == 0:
+                self._anhaengen(g)
+            elif w in self._PLATZHALTER:
+                self._gruppe(g, w)
+            else:
+                super().draw(g)
+        if einfach:
+            super().draw("".join(einfach))
+
+    def _gruppe(self, g: str, w: int) -> None:
+        platz = self._PLATZHALTER[w]
+        super().draw(platz)
+        zeile = self.buffer[self.cursor.y]
+        for x in range(min(self.cursor.x, self.columns) - 1, -1, -1):
+            if zeile[x].data == platz:
+                zeile[x] = zeile[x]._replace(data=g)
+                break
+
+    def _anhaengen(self, z: str) -> None:
+        zeile = self.buffer[self.cursor.y]
+        x = self.cursor.x - 1
+        if x >= 1 and zeile[x].data == "":                 # zweite Zelle eines breiten Zeichens
+            x -= 1
+        if x >= 0:
+            zeile[x] = zeile[x]._replace(data=zeile[x].data + z)
+            self.dirty.add(self.cursor.y)
+
 
 # ---------------------------------------------------------------------------
 # Farbschemata
@@ -203,9 +279,11 @@ def platzhalter_kaesten(zeilen: list) -> dict[int, tuple[int, int, int, int, int
 # ---------------------------------------------------------------------------
 
 STEUER_TITEL = "nemicli-steuer:"   # Titel „nemicli-steuer:<befehl>:<zähler>“ steuert das Fenster
+STEUER_KEY = secrets.token_hex(8)    # je Fenster neu
+NEUSTART_CODE = 75                   # Exit-Code von NemiCLI für /restart: das Fenster startet es neu
 
 
-class Schirm(pyte.Screen):
+class Schirm(_NullbreiteAnhaengen, pyte.Screen):
     """pyte-Bildschirm, der Antworten (Cursor-Position, Gerätekennung) ans Programm
     zurückgibt und die privaten Modi merkt, die pyte selbst nicht auswertet.
 
@@ -223,7 +301,11 @@ class Schirm(pyte.Screen):
 
     def set_title(self, param: str) -> None:
         if param.startswith(STEUER_TITEL):
-            self.steuer(param[len(STEUER_TITEL):].split(":", 1)[0])
+            # „nemicli-steuer:<schlüssel>:<befehl>:<zähler>“ – ohne den Schlüssel dieses Fensters (etwa aus einer
+            # ausgegebenen Datei oder einem fremden Programm) passiert nichts.
+            teile = param[len(STEUER_TITEL):].split(":")
+            if len(teile) >= 2 and secrets.compare_digest(teile[0].encode(), STEUER_KEY.encode()):
+                self.steuer(teile[1])
             return
         super().set_title(param)
 
@@ -320,7 +402,7 @@ def _app_kennung() -> None:
             pass
 
 
-class KiSchirm(pyte.HistoryScreen):
+class KiSchirm(_NullbreiteAnhaengen, pyte.HistoryScreen):
     """Bildschirm des Reiters „KI“: nur zum Lesen, mit Verlauf zum Zurückrollen. Er antwortet nicht,
     kennt keine Maus- und Steuer-Modi – Ausgaben der Befehle können dort nichts auslösen."""
 
@@ -515,7 +597,8 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 self.pty.schreiben(text)
 
         def _steuer(self, befehl):                      # Lese-Thread
-            self.steuerbefehle.append(befehl)
+            if self.haupt:                              # Titel aus Kommandozeilen-Reitern steuern nichts
+                self.steuerbefehle.append(befehl)
 
         def beenden(self):
             if self.pty is not None and self.pty.laeuft():
@@ -523,6 +606,15 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
 
         def _takt(self):
             if self.ende:
+                if self.haupt and self.pty is not None and self.pty.exitcode == NEUSTART_CODE:
+                    # /restart: NemiCLI hat sich zum Neustart beendet – im selben Fenster neu starten, erst
+                    # jetzt, wo der alte Prozess wirklich weg ist (Grafikkarte und Dateien sind frei).
+                    self.ende = False
+                    with self.lock:
+                        self.schirm.reset()
+                        self.neu = True
+                    self.programm_starten()
+                    return
                 self.takt.stop()
                 self.fenster.programm_zu(self)
                 return
@@ -620,8 +712,9 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                             zellen.append(n.data)
                             x += 1
                         self._lauf(p, start, y, x - start, zellen, stil)
-                self._bilder_malen(p, [[z.data for z in (s.buffer[y][x] for x in range(s.columns))]
-                                       for y in range(s.lines)])
+                if self.bilder:                  # die Zellmatrix nur bauen, wenn es Bilder gibt
+                    self._bilder_malen(p, [[z.data for z in (s.buffer[y][x] for x in range(s.columns))]
+                                           for y in range(s.lines)])
                 if self.auswahl:
                     (x1, y1), (x2, y2) = geordnet(*self.auswahl)
                     farbe_a = QColor(thema["hell"][4])
@@ -733,6 +826,9 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
         def _text_einfuegen(self, text):
             if not text or self.nur_lesen:
                 return
+            # Steuerzeichen aus der Zwischenablage weg (Tab und Zeilenende bleiben): „ESC[201~“ beendete sonst
+            # den Einfüge-Modus vorzeitig, und der Rest liefe als getippte Eingabe samt Enter los.
+            text = re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f-\x9f]", "", text)
             text = text.replace("\r\n", "\r").replace("\n", "\r")
             if self.schirm.einfuegen_geklammert():
                 text = "\x1b[200~" + text + "\x1b[201~"
@@ -1089,6 +1185,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
     fenster = Fenster()
     haupt_env = dict(env if env is not None else os.environ)
     haupt_env["NEMICLI_FENSTER"] = "1"
+    haupt_env["NEMICLI_STEUER_KEY"] = STEUER_KEY      # nur NemiCLI im Haupt-Reiter kennt ihn
     if ki_leitung is not None:
         haupt_env.update(ki_leitung.umgebung())
     fenster.haupt = Ansicht(fenster, befehl, kind_env=haupt_env, haupt=True)

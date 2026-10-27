@@ -168,9 +168,10 @@ class Kettenbuch:
         return out + self._anhaengen(kette, zeichen)
 
 
-def folgen_bauen(ereignisse: list[Ereignis], fenster: int = FENSTER) -> list[tuple[list[str], list[bool]]]:
+def folgen_bauen(ereignisse: list[Ereignis], fenster: int = FENSTER,
+                 buch_klasse=None) -> list[tuple[list[str], list[bool]]]:
     """Ereignisse → Folgen (Zeichen, zu bewerten?) in der Form, die die Bewertung später sieht."""
-    buch = Kettenbuch(fenster)
+    buch = (buch_klasse or Kettenbuch)(fenster)
     offen: dict[tuple, tuple[list[str], list[bool]]] = {}
     fertig: list[tuple[list[str], list[bool]]] = []
     for e in sorted(ereignisse, key=lambda x: x.zeit):
@@ -194,6 +195,9 @@ class Vokabular:
     Sammelzeichen (E:~, S:~, K:~) – ein Name, den das Netz nie sah, ist „ein seltenes Programm“,
     nicht automatisch ein Alarm. Unbekannte Zeichen anderer Art werden zu „?“."""
 
+    SPEZIAL = SPEZIAL
+    NAMEN = ("E:", "S:", "K:")
+
     def __init__(self, zeichen: list[str]):
         self.zeichen = list(zeichen)
         self._id = {z: i for i, z in enumerate(self.zeichen)}
@@ -207,17 +211,16 @@ class Vokabular:
         for zeichen, _ in folgen:
             for z in zeichen:
                 anzahl[z] = anzahl.get(z, 0) + 1
-        namen = ("E:", "S:", "K:")
-        kandidaten = [z for z, n in anzahl.items() if z not in SPEZIAL
-                      and (n >= min_anzahl or not z.startswith(namen))]
+        kandidaten = [z for z, n in anzahl.items() if z not in cls.SPEZIAL
+                      and (n >= min_anzahl or not z.startswith(cls.NAMEN))]
         kandidaten.sort(key=lambda z: (-anzahl[z], z))
-        return cls(list(SPEZIAL) + kandidaten[: max_groesse - len(SPEZIAL)])
+        return cls(list(cls.SPEZIAL) + kandidaten[: max_groesse - len(cls.SPEZIAL)])
 
     def id(self, z: str) -> int:
         i = self._id.get(z)
         if i is not None:
             return i
-        if z[:2] in ("E:", "S:", "K:"):
+        if z[:2] in self.NAMEN:
             return self._id[z[:2] + "~"]
         return self._id["?"]
 
@@ -322,6 +325,12 @@ def schatten_zaehlen(ordner: Path, seit: float) -> int:
 # ---------------------------------------------------------------- Detektor
 
 class FolgenDetektor:
+    # Austauschbar für andere Folgen (netzwaechter.NetzFolgen): wie Ereignisse zu Zeichen werden,
+    # welches Vokabular, wohin der Schattenmodus schreibt.
+    KETTENBUCH = Kettenbuch
+    VOKABULAR = Vokabular
+    SCHATTEN = "folgen_schatten.log"
+
     def __init__(self, ordner: Path, *, schwelle: float = 0.995, fenster: int = FENSTER):
         self.ordner = Path(ordner)
         self.schwelle = schwelle
@@ -330,7 +339,7 @@ class FolgenDetektor:
         self.netz: GRU | None = None
         self.vokabular: Vokabular | None = None
         self.referenz: np.ndarray | None = None
-        self.kettenbuch = Kettenbuch(fenster)
+        self.kettenbuch = self.KETTENBUCH(fenster)
         self._h: dict[tuple, np.ndarray] = {}
         self.version = ""
         self.kopf: dict = {}
@@ -401,7 +410,7 @@ class FolgenDetektor:
         self._schatten_zuletzt[key] = jetzt
         if len(self._schatten_zuletzt) > 2000:
             self._schatten_zuletzt.clear()
-        pfad = schatten_pfad(self.ordner)
+        pfad = self.ordner.parent / self.SCHATTEN
         try:
             pfad.parent.mkdir(parents=True, exist_ok=True)
             if pfad.exists() and pfad.stat().st_size > 2_000_000:
@@ -417,11 +426,11 @@ class FolgenDetektor:
     def trainieren(self, ereignisse: list[Ereignis], *, epochen: int = 6, zeitlimit: float = 120.0,
                    abbruch=None) -> dict:
         start = time.perf_counter()
-        folgen = folgen_bauen(ereignisse, self.fenster)
+        folgen = folgen_bauen(ereignisse, self.fenster, self.KETTENBUCH)
         if len(folgen) < MIN_FOLGEN:
             return {"ok": False, "grund": f"nur {len(folgen)} Prozess-Ketten, {MIN_FOLGEN} nötig"}
         folgen = folgen[-6000:]
-        vok = Vokabular.bauen(folgen)
+        vok = self.VOKABULAR.bauen(folgen)
         daten = [(vok.ids(z), b) for z, b in folgen]
         rng = np.random.default_rng(42)
         reihe = rng.permutation(len(daten))
@@ -452,7 +461,7 @@ class FolgenDetektor:
     def _uebernehmen(self, name, netz, vok, referenz, kopf) -> None:
         self.netz, self.vokabular, self.referenz = netz, vok, referenz
         self.version, self.kopf = name, dict(kopf)
-        self.kettenbuch = Kettenbuch(self.fenster)     # Zustände gehören zum alten Netz
+        self.kettenbuch = self.KETTENBUCH(self.fenster)     # Zustände gehören zum alten Netz
         self._h = {}
 
     # -------------------------------------------------------------- Speichern
@@ -480,7 +489,7 @@ class FolgenDetektor:
         try:
             z = json.loads(pfad.read_text(encoding="utf-8"))
             netz = GRU.aus_zustand(z["netz"])
-            vok = Vokabular(z["vokabular"])
+            vok = self.VOKABULAR(z["vokabular"])
             if len(vok) != netz.V:
                 return False
             referenz = np.asarray(z["referenz"], dtype=np.float64)
@@ -501,7 +510,7 @@ class FolgenDetektor:
         with self._lock:
             self.netz = self.vokabular = self.referenz = None
             self.version, self.kopf = "", {}
-            self.kettenbuch = Kettenbuch(self.fenster)
+            self.kettenbuch = self.KETTENBUCH(self.fenster)
             self._h = {}
             self.bewertet = self.auffaellig = 0
         for p in list(versionen(self.ordner)) + [self.ordner / "aktuell.txt", pause_marke(self.ordner)]:

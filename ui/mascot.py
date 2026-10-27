@@ -1,8 +1,8 @@
 """
 mascot.py - das kleine Maskottchen, das ab und zu was bubbelt. 💜
 
-Beim Start ein Gruß, zwischendurch ein Tipp oder ein Spruch. Seit 19.09.2026
-spricht hier die AKTIVE PERSÖNLICHKEIT, nicht mehr ein fester Spruchzettel
+Beim Start ein Gruß, zwischendurch ein Tipp oder ein Spruch. Hier
+spricht die AKTIVE PERSÖNLICHKEIT, nicht mehr ein fester Spruchzettel
 („Dein Terminal-Kumpel ist wach“ passte zu keiner von ihnen). Jede
 Persönlichkeit hat ihre eigene Datei `Persoenlichkeiten/<key>.sprueche.md`
 mit zwei Abschnitten (## Begrüßung / ## Sprüche, eine Zeile je Satz,
@@ -90,7 +90,7 @@ def _fuellen(text: str) -> str:
 def _say(text: str) -> None:
     face = random.choice(FACES)
     name = _ps().active().name
-    ui.console.print(f"  [accent]{face}[/accent] [brand]💬 {name}[/brand] [muted]{text}[/muted]")
+    ui.console.print(f"  [accent]{face}[/accent] [brand]💬 {ui._esc(name)}[/brand] [muted]{ui._esc(text)}[/muted]")
 
 
 def gruss_text() -> str:

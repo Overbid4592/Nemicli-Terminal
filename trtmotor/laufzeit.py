@@ -88,7 +88,10 @@ def laden():
             _zustand["grund"] = f"kein TensorRT-RTX unter Models/{ORDNER_NAME}/"
             return None
         bin_ = str(sdk / "bin")
-        os.environ["PATH"] = bin_ + os.pathsep + os.environ.get("PATH", "")
+        # Hinten anhängen, nicht vorne: sonst fänden alle Kindprozesse (git, python, PowerShell …) zuerst
+        # gleichnamige Programme aus dem SDK-Ordner. Die DLLs selbst kommen über add_dll_directory.
+        if bin_ not in os.environ.get("PATH", "").split(os.pathsep):
+            os.environ["PATH"] = os.environ.get("PATH", "") + os.pathsep + bin_
         try:
             _zustand["dll"] = os.add_dll_directory(bin_)
         except (AttributeError, OSError):

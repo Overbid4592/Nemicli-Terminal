@@ -45,11 +45,19 @@ SYSTEM_ORTE = tuple(os.path.normcase(p) for p in (
 # … mit Ausnahme der Ablageorte INNERHALB des Windows-Ordners: dort packen auch
 # Installer aus (z. B. `C:\Windows\SystemTemp\…`). Solche Ordner sind kein
 # Beleg für Herkunft und zählen hier bewusst nicht als geschützt.
+# Dazu die bekannten Unterordner von System32/SysWOW64, in die auch normale Nutzer schreiben dürfen.
 KEINE_SYSTEM_ORTE = tuple(os.path.normcase(p) for p in (
     os.path.join(_WINDOWS, "Temp"),
     os.path.join(_WINDOWS, "SystemTemp"),
     os.path.join(_WINDOWS, "Tasks"),
     os.path.join(_WINDOWS, "Debug"),
+    os.path.join(_WINDOWS, "Tracing"),
+    os.path.join(_WINDOWS, "Registration", "CRMLog"),
+    *(os.path.join(_WINDOWS, sys_, *teil) for sys_ in ("System32", "SysWOW64") for teil in (
+        ("Tasks",), ("Tasks_Migrated",), ("Com", "dmp"), ("FxsTmp",), ("spool", "PRINTERS"),
+        ("spool", "SERVERS"), ("spool", "drivers", "color"), ("Microsoft", "Crypto", "RSA", "MachineKeys"),
+        ("LogFiles", "WMI"),
+    )),
 ))
 
 # Systemprogramme, die direkt im Windows-Ordner liegen statt in System32. Erlaubt
@@ -104,6 +112,76 @@ def maskerade(prozess: str, exe: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Umbenannte Systemprogramme (version.dll: OriginalFilename aus den Versionsdaten)
+# ---------------------------------------------------------------------------
+
+# Werkzeuge, die Angreifer gern umbenannt mitbringen (ATT&CK T1036.003). Vorbild: Velociraptor
+# Windows.Detection.BinaryRename. Nur diese – ein anderes Programm mit eigenem Originalnamen ist normal.
+UMBENENNBAR = {"cmd.exe", "powershell.exe", "pwsh.exe", "rundll32.exe", "regsvr32.exe", "mshta.exe",
+               "wscript.exe", "cscript.exe", "certutil.exe", "bitsadmin.exe", "schtasks.exe", "wmic.exe",
+               "reg.exe", "net.exe", "net1.exe", "sc.exe", "msbuild.exe", "installutil.exe", "regasm.exe",
+               "regsvcs.exe", "msiexec.exe", "cmstp.exe", "forfiles.exe", "conhost.exe"}
+_ORIGINAL_MAX_BYTES = 20 * 1024 * 1024           # größere Dateien sind keine umbenannten Systemwerkzeuge
+_original_cache: dict[tuple, str] = {}
+
+
+def originalname(exe: str) -> str:
+    """OriginalFilename aus den Versionsdaten einer Programmdatei (klein, ohne .mui) – "" wenn keiner."""
+    if os.name != "nt" or not exe or im_schutzrevier(exe):
+        return ""
+    kennung = _kennung(exe)
+    if kennung is None or kennung[2] > _ORIGINAL_MAX_BYTES:
+        return ""
+    with _cache_lock:
+        if kennung in _original_cache:
+            return _original_cache[kennung]
+    name = ""
+    try:
+        import ctypes
+        from ctypes import wintypes as w
+        v = ctypes.WinDLL("version", use_last_error=True)
+        groesse = v.GetFileVersionInfoSizeW(exe, None)
+        if groesse:
+            puffer = ctypes.create_string_buffer(groesse)
+            if v.GetFileVersionInfoW(exe, 0, groesse, puffer):
+                zeiger, laenge = ctypes.c_void_p(), w.UINT()
+                sprachen = []
+                if v.VerQueryValueW(puffer, r"\VarFileInfo\Translation", ctypes.byref(zeiger),
+                                    ctypes.byref(laenge)) and laenge.value >= 4:
+                    paare = (w.WORD * (laenge.value // 2)).from_address(zeiger.value)
+                    sprachen = [f"{paare[i]:04x}{paare[i + 1]:04x}" for i in range(0, len(paare) - 1, 2)]
+                for sp in sprachen + ["040904b0", "040904e4", "000004b0"]:
+                    if v.VerQueryValueW(puffer, rf"\StringFileInfo\{sp}\OriginalFilename",
+                                        ctypes.byref(zeiger), ctypes.byref(laenge)) and laenge.value:
+                        name = ctypes.wstring_at(zeiger.value, laenge.value).rstrip("\0").strip().lower()
+                        break
+    except Exception:
+        name = ""
+    if name.endswith(".mui"):
+        name = name[:-4]
+    with _cache_lock:
+        if len(_original_cache) > _CACHE_GRENZE:
+            _original_cache.clear()
+        _original_cache[kennung] = name
+    return name
+
+
+def umbenannt(prozess: str, exe: str) -> str:
+    """Ein bekanntes Systemwerkzeug unter anderem Namen? Satz mit Grund, sonst ""."""
+    if not exe:
+        return ""
+    original = originalname(exe)
+    if original not in UMBENENNBAR:
+        return ""
+    jetzt = os.path.basename(exe).lower()
+    if jetzt == original:
+        return ""
+    return (f"{os.path.basename(exe)} ist laut seinen Versionsdaten eigentlich {original} – ein "
+            "Windows-Werkzeug unter fremdem Namen. So tarnen Angreifer mitgebrachte Werkzeuge "
+            f"(läuft aus {exe}).")
+
+
+# ---------------------------------------------------------------------------
 # Signatur (wintrust.dll)
 # ---------------------------------------------------------------------------
 
@@ -136,6 +214,46 @@ def _kennung(pfad: str) -> tuple | None:
     return (os.path.normcase(os.path.abspath(pfad)), int(s.st_mtime), s.st_size)
 
 
+# Ordner der Schutzsoftware betritt die Wache nicht – auch nicht für eine Signatur (Revier des Virenschutzes).
+# Die Liste kommt aus dem Windows-Sicherheitscenter; die festen Einträge gelten, falls dort nichts steht.
+SCHUTZ_STATUS = "Schutzsoftware"
+_SCHUTZ_ERSATZ = (r"%ProgramFiles%\Windows Defender", r"%ProgramFiles(x86)%\Windows Defender",
+                  r"%ProgramFiles%\Windows Defender Advanced Threat Protection",
+                  r"%ProgramData%\Microsoft\Windows Defender",
+                  r"%ProgramData%\Microsoft\Windows Defender Advanced Threat Protection",
+                  r"%SystemRoot%\System32\drivers\wd")
+_SCHUTZ_TTL = 600.0
+_schutz: dict = {"t": -1e9, "ordner": []}
+
+
+def schutz_ordner() -> list[str]:
+    """Programmordner der Schutzsoftware (normcase), kurz gemerkt."""
+    jetzt = time.monotonic()
+    if jetzt - _schutz["t"] < _SCHUTZ_TTL:
+        return _schutz["ordner"]
+    try:
+        from .vollscan import ausgelassene_ordner
+        ordner = list(ausgelassene_ordner())
+    except Exception:
+        ordner = []
+    for o in _SCHUTZ_ERSATZ:
+        o = os.path.expandvars(o)
+        if "%" not in o:
+            ordner.append(o)
+    _schutz.update(t=jetzt, ordner=sorted({os.path.normcase(os.path.abspath(o)) for o in ordner}))
+    return _schutz["ordner"]
+
+
+def im_schutzrevier(pfad: str) -> bool:
+    if not pfad or os.name != "nt":
+        return False
+    try:
+        n = os.path.normcase(os.path.abspath(str(pfad).strip('"')))
+    except (ValueError, OSError):
+        return False
+    return any(n == o or n.startswith(o + os.sep) for o in schutz_ordner())
+
+
 def signatur(exe: str, timeout: float = 12.0) -> dict:
     """Authenticode-Signatur einer Datei: {status, signierer, gueltig, gecacht}.
 
@@ -145,6 +263,8 @@ def signatur(exe: str, timeout: float = 12.0) -> dict:
     """
     if not exe:
         return {"status": "unbekannt", "signierer": "", "gueltig": False, "gecacht": False}
+    if im_schutzrevier(exe):
+        return {"status": SCHUTZ_STATUS, "signierer": "", "gueltig": False, "gecacht": False}
     kennung = _kennung(exe)
     if kennung is None:
         return {"status": "fehlt", "signierer": "", "gueltig": False, "gecacht": False}
@@ -341,7 +461,11 @@ def signatur_zeile(exe: str) -> str:
     """Eine Zeile für den Alarm – das, was die Persönlichkeit lesen soll."""
     if not exe:
         return ""
+    if str(exe).replace("/", "\\").startswith("\\\\") and not str(exe).startswith("\\\\?\\"):
+        return "liegt auf einem Netzwerkpfad – nicht geprüft (der Zugriff ginge an den fremden Rechner)"
     s = signatur(exe)
+    if s["status"] == SCHUTZ_STATUS:
+        return "liegt im Ordner der Schutzsoftware – nicht geprüft (Revier des Virenschutzes)"
     ort = "geschützter Systemordner" if ist_systemort(exe) else "kein Systemordner"
     if s["gueltig"]:
         return f"signiert: {s['signierer'] or 'gültig, Aussteller unbekannt'} · {ort}"

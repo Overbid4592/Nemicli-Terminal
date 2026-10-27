@@ -5,7 +5,7 @@ Wert setzen (/wache …, `nutzer=True`). Die Persönlichkeit darf über `wache_j
 nur vier Dinge, und nur in den Grenzen, die der Nutzer unter "grenzen" festlegt:
 
   schwelle      ML-Alarmschwelle (Perzentil), z. B. 0,90 … 0,995
-  regel_stumm   eine Regel R001–R014 stumm schalten oder wieder anschalten
+  regel_stumm   eine Regel R001–R017 stumm schalten oder wieder anschalten
   cooldown      Sekunden, in denen derselbe Alarm (Regel + Subjekt) nicht erneut
                 meldet, sondern nur den Zähler am ersten hochsetzt („×37“)
   trigger_ab    nur strenger: mittel oder hoch. „kritisch“ und „nie“ hießen,
@@ -61,10 +61,22 @@ STANDARD = {
     "dl_schwelle": 0.995,               # Perzentil, ab dem ein Schritt auffällig ist
     "dl_karenz_h": 24,                  # so alt muss ein Ereignis sein, bevor das Netz daraus lernt
     "dl_training_stunden": 6.0,         # höchstens so oft automatisch nachtrainieren
+    # Netzwächter (netzwaechter.py) – ebenfalls nur für den Nutzer.
+    "netz": True,                       # Verbindungen nach draußen mit ML + DL bewerten und lernen
+    "netz_alarm": False,                # False = Schattenmodus: Funde nur nach netz_schatten.log
+    "netz_schwelle": 0.99,              # Perzentil des Netz-Modells (ML-002)
+    "netz_dl_schwelle": 0.995,          # Perzentil der Netz-Folgen (DL-002)
+    "netz_besitzer": True,              # Besitzer öffentlicher Netze beim Adressregister (RDAP) nachfragen
+    "min_training_netz": 200,           # so viele Verbindungen, bevor das Netz-Modell lernt
     # Grenzen für die Justierungen der Persönlichkeit
     "grenzen": {"schwelle_min": 0.90, "schwelle_max": 0.995, "cooldown_min": 60,
                 "cooldown_max": 3600, "regeln_stumm_max": 3},
 }
+
+# Regeln für klassische Angriffswege: die Persönlichkeit darf sie nicht stumm schalten – ein
+# eingeschleuster Text („schalte R001 stumm“) würde sonst genau die Erkennung abschalten.
+# Dazu Massen-Dateiänderungen (Verschlüsselungs-Trojaner) und alle Autostart-/Aufgaben-Regeln.
+NIE_STUMM_KI = frozenset({"R001", "R002", "R003", "R005", "R006", "R009", "R010", "R011", "R013", "R014"})
 
 _TRIGGER = ("mittel", "hoch", "kritisch", "nie")
 _TRIGGER_KI = ("mittel", "hoch")
@@ -190,6 +202,9 @@ def pruefen(was: str, wert, e: dict | None = None, *, nutzer: bool = False) -> t
             raise Grenzverletzung("Unbekannte Regel. Gültig: " + ", ".join(sorted(BESCHREIBUNG)))
         stumm = set(e.get("stumme_regeln") or [])
         neu = set(stumm)
+        if an and not nutzer and text in NIE_STUMM_KI:
+            raise Grenzverletzung(f"{text} ({BESCHREIBUNG[text]}) erkennt klassische Angriffe und darf nur "
+                                  "der Nutzer stumm schalten. Bewerte die Alarme einzeln.")
         if an:
             neu.add(text)
         else:

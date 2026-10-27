@@ -240,7 +240,7 @@ def _banner_panel(logo: Text, width: int | None = None) -> Panel:
     tagline.append(APP_SUBTITLE, style="muted")
     tagline.append(" ✦", style="accent")
     credit = Text(justify="center")
-    credit.append("von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5", style="brand.dim")
+    credit.append("von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5.5", style="brand.dim")
     inner = Group(Align.center(logo), Text(""), tagline, credit)
     return Panel(inner, box=HEAVY, border_style="brand.dim",
                  padding=(1, _banner_pad(width)))
@@ -569,14 +569,23 @@ def theme_menu() -> None:
 # Nachrichten-Panels
 # ---------------------------------------------------------------------------
 
+_PERSONA_NAME: list = [0.0, ""]       # (Zeit, Name): die Kopfzeile fragt 5× je Sekunde, jedes Mal mit Ordnerscan
+
+
 def persona_name() -> str:
     """Name der aktiven Persönlichkeit – für Titel und Kopfzeile.
     Fällt auf „Nemi" zurück, wenn das Profil-Modul (noch) nicht erreichbar ist."""
+    import time
+    jetzt = time.monotonic()
+    if _PERSONA_NAME[1] and jetzt - _PERSONA_NAME[0] < 1.5:
+        return _PERSONA_NAME[1]
     try:
         import persoenlichkeiten
-        return persoenlichkeiten.active().name or "Nemi"
+        name = persoenlichkeiten.active().name or "Nemi"
     except Exception:
         return "Nemi"
+    _PERSONA_NAME[:] = [jetzt, name]
+    return name
 
 
 
@@ -683,6 +692,10 @@ class NemiMarkdown(Markdown):
 
     elements = {**Markdown.elements,
                 "fence": NemiCodeBlock, "code_block": NemiCodeBlock}
+
+    def __init__(self, markup: str, *args, **kwargs):
+        import pfadschutz                                # Windows-Pfade nicht als Markdown lesen
+        super().__init__(pfadschutz.schuetzen(markup), *args, **kwargs)
 
 
 CODING_BLAU = "#3b82f6"
@@ -1188,8 +1201,15 @@ def tool_result(name: str, result: str):
 # Kleine Helfer
 # ---------------------------------------------------------------------------
 
+def _esc(msg) -> str:
+    """Meldungen enthalten oft fremden Text (Dateinamen, Fehlertexte, Modell-Antworten): eckige Klammern darin
+    sind kein Markup – „[/b]“ ließ sonst die Ausgabe abstürzen, „[link=…]“ baute einen Link."""
+    from rich.markup import escape
+    return escape(str(msg))
+
+
 def info(msg: str) -> None:
-    console.print(f"[muted]ℹ {msg}[/muted]")
+    console.print(f"[muted]ℹ {_esc(msg)}[/muted]")
 
 
 def helfer_zeile(name: str, text: str) -> Text:
@@ -1204,16 +1224,21 @@ def helfer_sagt(name: str, text: str) -> None:
     console.print(helfer_zeile(name, text))
 
 
+def nutzer_sagt(text: str) -> None:
+    """Antwort des Nutzers im Verlauf, wie eine gesendete Nachricht (ohne Markup)."""
+    console.print(Text(f"  ❯ {text}", style="user"))
+
+
 def success(msg: str) -> None:
-    console.print(f"[ok]✓ {msg}[/ok]")
+    console.print(f"[ok]✓ {_esc(msg)}[/ok]")
 
 
 def warn(msg: str) -> None:
-    console.print(f"[warn]⚠ {msg}[/warn]")
+    console.print(f"[warn]⚠ {_esc(msg)}[/warn]")
 
 
 def error(msg: str) -> None:
-    console.print(f"[err]✗ {msg}[/err]")
+    console.print(f"[err]✗ {_esc(msg)}[/err]")
 
 
 # ---------------------------------------------------------------------------
