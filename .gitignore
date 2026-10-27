@@ -68,24 +68,5 @@ schreibsperre.json
 Backup/
 /kernel-cache/
 
-# Zusaetzliche private Profil- und Zustandsdaten
-/Profile/
-/Wache/
-*.db
-*.db-shm
-*.db-wal
-*.sqlite
-*.sqlite3
-
-# Zugangsdaten, lokale Umgebungsdateien und private Zertifikate
-.env.*
-!.env.example
-*.pem
-*.key
-*.pfx
-*.p12
-
-# Weitere lokale Nutzerdaten (core/paths.py)
-/Wissen/
-/Papierkorb/
-/Skills/
+# Zwischenstände des LoRA-Trainings
+*_stand.safetensors
