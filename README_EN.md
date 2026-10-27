@@ -189,54 +189,79 @@ Or simply ask the AI – it knows all commands and opens suitable menus itself.
 
 ## 📁 Folders
 
-**The program** (`INSTALL`):
+**Source repository and program files** (checked against the current repository root):
 
-```
-NemiCli/
-├─ main.py                Chat loop, action logic, commands, startup
-├─ start.bat · nemicli.cmd Starter
-├─ core/                  Persona, commands, modes, config, keys, paths, coding assistant
-├─ engines/               Chat engines, Krea 2, image describer, WebUI/ComfyUI, systemcheck
-├─ ggufengine/            own GGUF engine (reader, tokenizer, kernel, models)
-├─ tools/                 Tools, memory, sandbox, web, watch (tools/wache/)
-├─ ui/                    Textual full screen, desktop window, terminal window, themes
-├─ ModelGGUF/             local language models, one folder per model      (not in Git)
-├─ Vision/                image describer, one folder per model            (not in Git)
-├─ Models/embeddings/     embedding model for memory                       (not in Git)
-├─ Agenten/               instructions the personality follows
-├─ chrome-erweiterung/    Chrome extension (LIESMICH.md)
-├─ installer/             MSI build
-├─ docs/                  Functions, technology, model tests, plans, ideas
-├─ build_exe.py · NemiCLI.spec · zertifikat.py
-├─ nemicli.config.json · .env            settings · keys (encrypted)
-├─ allowlist.json · befehl_whitelist.json · schreibsperre.json
-└─ venv/ · .runtime/      working environment, isolated Python
-```
-
-**Your data** (`DATEN` – choose the location with `/start`; without a choice, next to the program):
-
-```
-<dein Ordner>/
-├─ chats/ · Gespraeche/   conversations (/resume) · saved with F12
-├─ learned/               memory (memory.db), statistics, action log
-├─ Profile/<Name>/        per personality: Chats, images, Skills, memories, character file
-├─ Persoenlichkeiten/     custom personalities (.md) and orb images
-├─ Skills/ · Wissen/      Skills and knowledge for all personalities
-├─ Bilder/                generated images, screenshots
-├─ Models/Krea2/          files for Krea 2
-├─ Wache/ · Berichte/     system watch · reports from watch and scheduler
-├─ Zeitplan/ · Befehle/   tasks for scheduling · helper scripts
-├─ NemiSandbox/           sandbox: run folder and packages
-├─ Doku/ · Cache/         offline docs · prefix cache of the engine
-├─ Papierkorb/            deleted and overwritten items (30 days, /undo)
-└─ Vorschläge/            what the personality suggests on its own
+```text
+Nemicli-Terminal/
+├─ main.py                 Main entry point; loads the three parts below
+├─ main_dienste.py         Services, learning, integrations and setup
+├─ main_befehle.py         Downloads, updates, input and slash commands
+├─ main_start.py           More commands, watchdog service and startup
+├─ start.bat               Windows starter
+├─ nemicli.cmd             Command-line launcher
+├─ core/                   Core application modules
+├─ engines/                Model, image and other engines
+├─ ggufengine/             Built-in GGUF engine
+├─ loramotor/              LoRA engine
+├─ trtmotor/               TensorRT-related engine
+├─ nemiview/               NemiView interface/rendering engine
+├─ tools/                  Tools and system watchdog (tools/wache/)
+├─ ui/                     Terminal and desktop interfaces
+├─ einrichtungshelfer/     Setup assistant and bundled helper model files
+├─ appstore_vorlagen/      Appstore templates
+├─ chrome-erweiterung/     Chrome extension
+├─ installer/              Installer sources
+├─ docs/                   Documentation, plans and ideas
+├─ .github/                GitHub workflows and templates
+├─ build_exe.py            Executable build helper
+├─ NemiCLI.spec            PyInstaller specification
+├─ zertifikat.py           Certificate-related utility
+├─ allowlist.json          Allowed resources/configuration
+├─ befehl_whitelist.json   Command whitelist
+├─ schreibsperre.example.json   Example write-protection config
+├─ .env.example            Example environment file; no real credentials
+└─ requirements.txt        Python dependencies
 ```
 
-If the data folder is unavailable at startup, **NemiCLI says so** – instead of
-starting with empty memory.
+The four `main*.py` files form **one application**: `main.py` loads `main_dienste.py`, `main_befehle.py`, and `main_start.py` into its shared namespace. They are not four independent programs.
+
+**Local or generated folders** (not tracked in the Git repository; availability depends on installation and usage):
+
+```text
+NemiCli/ or your configured data directory/
+├─ ModelGGUF/             Downloaded local language models
+├─ Vision/                Downloaded image describer models
+├─ Models/embeddings/     Embedding models
+├─ Agenten/               Agent/personality instructions (created at runtime if used)
+├─ venv/                  Python virtual environment
+├─ .runtime/              Isolated Python/runtime files
+├─ .env                   Local credentials (never commit)
+├─ nemicli.config.json    Local settings
+└─ schreibsperre.json      Local write-protection settings, if configured
+```
+
+**Your data** (`DATEN` — choose the location with `/start`; without a choice, next to the program):
+
+```text
+<your folder>/
+├─ chats/ · Gespraeche/   Conversations and saved transcripts
+├─ learned/               Memory, statistics, action logs
+├─ Profile/<Name>/        Per-personality chats, images, skills and memory
+├─ Persoenlichkeiten/     Custom personality definitions and orb images
+├─ Skills/ · Wissen/      Shared skills and knowledge
+├─ Bilder/                Generated images and screenshots
+├─ Models/Krea2/          Krea 2 model files
+├─ Wache/ · Berichte/     Watchdog data and reports
+├─ Zeitplan/ · Befehle/   Scheduled tasks and helper scripts
+├─ NemiSandbox/           Sandbox files and packages
+├─ Doku/ · Cache/         Offline docs and engine caches
+├─ Papierkorb/            Deleted/overwritten files (undo)
+└─ Vorschläge/            Proactive personality suggestions
+```
+
+These data paths describe the intended runtime layout; individual directories may only appear when their feature is used. If the selected data folder is unavailable at startup, NemiCLI reports it rather than silently starting with empty memory.
 
 ---
-
 
 ## 🛠 Requirements
 
