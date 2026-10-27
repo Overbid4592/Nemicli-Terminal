@@ -1,6 +1,6 @@
 # Spec: Experten-Streaming im eigenen GGUF-Motor
 
-Stand: 30.09.2026 · Idee von David · Grundgerüst mit Claude · **Umsetzung mit Claude Code**
+Stand: 30.09.2026 · Idee von Hoffmann Vibecoder · Grundgerüst mit Claude · **Umsetzung mit Claude Code**
 
 ## Der Gedanke
 Ein großes MoE-Modell wird **nicht komplett geladen, sondern gestreamt** – nach dem Prinzip
