@@ -1,6 +1,6 @@
 # Idee: Baby-NemiCLI – eine eigene KI von null
 
-Stand: 26.09.2026 · Idee von David · besprochen mit Claude · **noch nicht begonnen, Umsetzung „die Tage“**
+Stand: 26.09.2026 · Idee von Hoffmann Vibecoder · besprochen mit Claude · **noch nicht begonnen, Umsetzung „die Tage“**
 
 ## Der Gedanke
 Keine fremde KI nachtrainieren („Fine-Tune-Lappen“), sondern eine **eigene KI von null** auf dem
@@ -26,7 +26,7 @@ Die KI wird **fest in NemiCLI verankert**.
 4. 🛠 **Betrieb übernehmen:** Schritt für Schritt Aufgaben in NemiCLI.
 
 ## Der Vater (Lehrer)
-**DeepSeek V4.1 Flash über Ollama Cloud** (Davids Favorit).
+**DeepSeek V4.1 Flash über Ollama Cloud** (Hoffmann Vibecoders Favorit).
 - Modell-Lizenz: MIT (sehr frei).
 - Ollama-Bedingungen: Antworten gehören dem Nutzer, kein Trainingsverbot für eigene Modelle.
 - Offener Punkt: Ollama verbietet, den Dienst für „konkurrierende Produkte“ zu nutzen. Für das
@@ -38,8 +38,8 @@ Die KI wird **fest in NemiCLI verankert**.
 - Kleine KIs erfinden anfangs **mehr**, nicht weniger – das Baby weiß noch nichts.
 - Das System zerschießen kann auch die eigene KI nicht: Die Sicherheit steckt in NemiCLI
   (Sandbox, Bestätigungen, Admin-Sperre, Schreibsperre), nicht im Modell.
-- Davids Regel „Sprachmodelle unter 4B tabu“: gilt für Arbeits-KIs; die Baby-KI ist ein
-  Lernprojekt (Ausnahme entscheidet David).
+- Hoffmann Vibecoders Regel „Sprachmodelle unter 4B tabu“: gilt für Arbeits-KIs; die Baby-KI ist ein
+  Lernprojekt (Ausnahme entscheidet Hoffmann Vibecoder).
 - Training in der **Labor-VHD** bzw. getrennt vom Alltags-NemiCLI.
 
 ## Nächster Schritt (wenn es losgeht)
