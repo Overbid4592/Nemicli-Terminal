@@ -77,9 +77,7 @@ COMMAND_LIST: list[Cmd] = [
     Cmd("/persönlichkeiten", "Persönlichkeit wählen oder eigene anlegen 🎭", "[name · neu · export [name]]",
         "🎭 Wer spricht? Ohne Name: Menü (eingebaute Nemi + deine eigenen). "
         "'/persönlichkeiten neu' legt per Fragen eine neue an – als Markdown-Datei "
-        "in Persoenlichkeiten/, die du frei umschreiben kannst. Gilt sofort, bleibt gespeichert. "
-        "'/persönlichkeiten export' legt die aktive (oder die genannte) als Datei fürs Handy in Export/ – "
-        "die NemiCLI-App liest sie über „📥 Vom PC“ ein: Name, Wesen und Profilbild."),
+        "in Persoenlichkeiten/, die du frei umschreiben kannst. Gilt sofort, bleibt gespeichert."),
     Cmd("/bild", "Bild erzeugen 🎨 (Krea 2 · WebUI · ComfyUI)", "<beschreibung> | schritte",
         "Malt ein Bild mit dem aktiven Motor. '/bild schritte' stellt die Krea-2-Schritte "
         "dauerhaft ein (8 bis 16, Auswahl mit Enter)."),
