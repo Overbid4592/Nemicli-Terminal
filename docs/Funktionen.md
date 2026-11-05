@@ -605,9 +605,6 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   laufen im Browser; die Persönlichkeit bekommt Brett und erlaubte Züge, wählt selbst und redet dazu.
 
 ### 🎭 Oberfläche & Persönlichkeit
-- **📱 Fürs Handy** (`/persönlichkeiten export [name]`, auch im Menü): legt die aktive Persönlichkeit als
-  `<Name>.nemicli.json` in `Export/` – Name, Wesen (Platzhalter eingesetzt) und Profilbild (verkleinert). Die
-  NemiCLI-App (eigenes Projekt `NemiAPPStudio/`, Android) liest sie über „📥 Vom PC“ ein.
 - **Emojis nach Maß** (`/emoji low · middle · strong · frei`): low = selten, höchstens eins; middle =
   ab und zu; strong = gerne und lebendig. Welche Emojis passen, wählt die KI aus dem Inhalt – nie in
   Code oder Pfaden. Ohne Einstellung (frei) entscheidet die Persönlichkeit. Einfach sagen („nimm
