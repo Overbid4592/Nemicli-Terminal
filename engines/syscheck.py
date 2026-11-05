@@ -22,7 +22,6 @@ import shutil
 import sys
 from pathlib import Path
 
-import models as M
 import setup as S
 import systemprofil
 
@@ -230,12 +229,17 @@ def transformers_ok() -> bool | None:
 # ===========================================================================
 
 def model_stock() -> dict:
-    """Zählt vorhandene Bild-Modelle (Krea 2) und sagt, wo sie hingehören."""
+    """Zählt vorhandene Bild-Modelle (Krea 2 und die weiteren Bild-Motoren) und sagt, wo sie hingehören."""
     try:
         import krea
         bilder, ordner = len(krea.discover()), str(krea.krea_dir())
     except Exception:
         bilder, ordner = 0, str(ROOT / "Models" / "Krea2")
+    try:
+        import bildmotoren
+        bilder += len(bildmotoren.modelle())
+    except Exception:
+        pass
 
     try:
         import gguflokal

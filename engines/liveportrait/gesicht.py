@@ -35,6 +35,48 @@ def bild_laden(pfad) -> np.ndarray:
     return np.ascontiguousarray(arr[: arr.shape[0] & ~1, : arr.shape[1] & ~1])
 
 
+def bild_und_alpha(pfad) -> tuple[np.ndarray, np.ndarray | None]:
+    """Wie bild_laden, dazu die Deckkraft (H, W) 0–1, wenn das Bild durchsichtige Stellen hat – sonst None.
+    Durchsichtige Stellen bekommen für die Netze die Farben vom Rand der Figur (ihre eigenen Farbwerte sind
+    beliebig); mit einer festen Farbe malte das Netz einen Saum um Haare und Schultern."""
+    from PIL import Image
+    with Image.open(pfad) as im:
+        if "A" not in im.getbands() and "transparency" not in im.info:
+            return bild_laden(pfad), None
+        im = im.convert("RGBA")
+        w, h = im.size
+        if max(w, h) > MAX_KANTE:
+            f = MAX_KANTE / max(w, h)
+            im = im.resize((round(w * f), round(h * f)), Image.LANCZOS)
+        arr = np.array(im).astype(np.float32)
+    arr = arr[: arr.shape[0] & ~1, : arr.shape[1] & ~1]
+    alpha = arr[..., 3] / 255.0
+    if alpha.min() > 0.99:
+        return np.ascontiguousarray(arr[..., :3].round().astype(np.uint8)), None
+    rgb = arr[..., :3] * alpha[..., None] + _randfarben(arr[..., :3], alpha) * (1 - alpha[..., None])
+    return np.ascontiguousarray(rgb.round().clip(0, 255).astype(np.uint8)), np.ascontiguousarray(alpha)
+
+
+def _randfarben(rgb: np.ndarray, alpha: np.ndarray) -> np.ndarray:
+    """Farben der Figur nach außen gezogen (Push-Pull über eine Bildpyramide); ganz leer: Grau."""
+    import torch
+    import torch.nn.functional as F
+    a = torch.from_numpy(alpha)[None, None]
+    vor = torch.from_numpy(rgb).permute(2, 0, 1)[None] * a                     # vormultipliziert
+    stufen = [(vor, a)]
+    while min(stufen[-1][1].shape[-2:]) > 2:
+        v, w = stufen[-1]
+        stufen.append((F.avg_pool2d(v, 2, ceil_mode=True), F.avg_pool2d(w, 2, ceil_mode=True)))
+    v, w = stufen[-1]
+    farbe = torch.where(w > 1e-6, v / w.clamp_min(1e-6), torch.full_like(v, 128.0))
+    for v, w in reversed(stufen[:-1]):
+        grob = F.interpolate(farbe, size=v.shape[-2:], mode="bilinear", align_corners=False)
+        fein = v / w.clamp_min(1e-6)
+        anteil = w.clamp(0, 1)
+        farbe = fein * anteil + grob * (1 - anteil)
+    return farbe[0].permute(1, 2, 0).numpy()
+
+
 # ---------------------------------------------------------------------------
 # Transformationen (wie crop.py, in numpy)
 # ---------------------------------------------------------------------------

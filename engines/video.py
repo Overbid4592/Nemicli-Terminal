@@ -203,11 +203,22 @@ def gewaehlt() -> str | None:
 
 
 def set_modell(name: str) -> str:
+    """Wan-2.2-Modell oder Modell eines Video-Motors wählen (bleibt gespeichert)."""
+    try:
+        import videomotoren
+    except Exception:
+        videomotoren = None
+    if videomotoren is not None and name in videomotoren.modelle():
+        videomotoren.waehlen(name)
+        return name
     alle = modelle()
     if name not in alle:
-        raise ValueError(f"Kein Video-Modell '{name}' – vorhanden: {', '.join(alle) or 'keins'}")
+        andere = list(videomotoren.modelle()) if videomotoren is not None else []
+        raise ValueError(f"Kein Video-Modell '{name}' – vorhanden: {', '.join(list(alle) + andere) or 'keins'}")
     import config
     config.update(video_modell=name)
+    if videomotoren is not None:
+        videomotoren.abwaehlen()
     return name
 
 
@@ -255,8 +266,23 @@ def familie(cfg: dict) -> str:
     raise RuntimeError(f"Unbekannte Video-Bauart (in_dim {in_dim})")
 
 
+def motor_aktiv(name: str | None = None) -> bool:
+    """Rechnet ein Video-Motor (videomotoren: LTX-2.5 …) statt Wan 2.2? Ein genannter Modellname entscheidet,
+    sonst die Wahl unter /video."""
+    try:
+        import videomotoren
+    except Exception:
+        return False
+    if name:
+        return name in videomotoren.modelle()
+    return videomotoren.aktiv()
+
+
 def missing_reason(name: str | None = None) -> str | None:
     """None, wenn alles da ist – sonst, was fehlt (für die Oberfläche)."""
+    if motor_aktiv(name):
+        import videomotoren
+        return videomotoren.missing_reason(name)
     d = video_dir()
     t = teile(name)
     if t["dit"] is None:
@@ -1523,9 +1549,17 @@ def _uhr_neu() -> None:
         _TIMER = None
         entladen()
         return
-    _TIMER = threading.Timer(sek, entladen)
+    _TIMER = threading.Timer(sek, _ruhe_entladen)
     _TIMER.daemon = True
     _TIMER.start()
+
+
+def _ruhe_entladen() -> None:
+    """Callback der Entlade-Uhr: nur, wenn sie noch die aktuelle ist – ein Video, das schon lief, als sie
+    auslöste, hat danach eine neue gestellt."""
+    with _LOCK:
+        if _TIMER is threading.current_thread():
+            entladen()
 
 
 # ===========================================================================
@@ -1850,13 +1884,23 @@ def generate(prompt: str, *, sekunden: float = 5.0, startbild: str | None = None
              loeser: str | None = None, cfg_bis: float | None = None, vorstufe: float | None = None,
              lora: str | Path | None = None, schaerfe: str | None = None,
              on_status=None,
-             abbruch=None) -> str:
+             abbruch=None, motor_extra: dict | None = None) -> str:
     """Erzeugt ein Video (bis MAX_SEKUNDEN) und gibt den MP4-Pfad zurück. Blockiert.
     Clips (5 s) hängen aneinander: das letzte Bild wird das Startbild des nächsten.
     `magcache`: Fehlerschwelle für MagCache (Config `video_magcache`, 0 = aus).
     `schluesselbilder`: ein Bild je Clip-Ende (alle 5 s). Dann rechnet ein Modell mit Start- und Endbild
     (Fun InP; ist ein anderes gewählt, wird ein vorhandenes Fun-InP-Modell genommen), und jeder Clip startet
-    am Schlüsselbild des vorigen – die Figur kann nicht von Clip zu Clip wegdriften."""
+    am Schlüsselbild des vorigen – die Figur kann nicht von Clip zu Clip wegdriften.
+    Ist ein Video-Motor gewählt (oder `modell` einer seiner Modelle), rechnet er; `motor_extra` überstimmt dort
+    einzelne Einstellungen für dieses Video (aufloesung, format, fps, ton)."""
+    if motor_aktiv(modell):
+        import videomotoren
+        HINWEISE.clear()
+        GENUTZT.clear()
+        if startbild or schluesselbilder:
+            HINWEISE.append("Start- und Schlüsselbilder gehen nur mit Wan 2.2 – dieses Video entsteht aus dem Text")
+        return videomotoren.generate(prompt, sekunden=sekunden, size=size, seed=seed, steps=steps, modell=modell,
+                                     on_status=on_status, abbruch=abbruch, extra=motor_extra)
     grund = missing_reason(modell)
     if grund:
         raise RuntimeError(grund)
@@ -1865,7 +1909,6 @@ def generate(prompt: str, *, sekunden: float = 5.0, startbild: str | None = None
                            "Media Feature Pack installieren).")
     import numpy as np
     import torch
-    from PIL import Image
 
     HINWEISE.clear()
     GENUTZT.clear()

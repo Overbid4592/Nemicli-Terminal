@@ -48,7 +48,8 @@ def kontext_merken(ref: str, n: int) -> None:
 
 
 def context_window(ref: str | None) -> int:
-    """Wie viele Tokens passen ins Gedächtnis dieses Modells (Richtwert)."""
+    """Wie viele Tokens passen ins Gedächtnis dieses Modells: gemessen (lokales Ollama), sonst wie der
+    Anbieter sie nennt (providers.kontext), sonst der Richtwert nach dem Namen."""
     if not ref:
         return DEFAULT_CTX
     if ref in _GEMESSEN:
@@ -60,10 +61,16 @@ def context_window(ref: str | None) -> int:
         return gguflokal.wirksamer_kontext(mid)
     if _prov == "funke":                      # Funke Groß kürzt den Verlauf selbst auf sein Gedächtnis
         return 512
-    if _prov == "ollama_cloud":               # echte Werte je Modell (reasoning.OLLAMA_CLOUD)
+    try:                                      # wie der Anbieter sie nennt (Modell-Liste, /api/show, Server)
+        import providers
+        if (n := providers.kontext(_prov, mid)):
+            return n
+    except Exception:
+        pass
+    if _prov == "ollama_cloud":               # Rückfall ohne Antwort von ollama.com: Stand der Tabelle
         import reasoning
-        info = reasoning.OLLAMA_CLOUD.get(reasoning.ollama_family(low))
-        if info:
+        info = reasoning.cloud_info(reasoning.ollama_family(low))
+        if info and info.get("ctx"):
             return int(info["ctx"])
     for needle, n in _CTX:
         if needle in low:
@@ -110,11 +117,7 @@ def price_per_million(ref: str | None) -> tuple[float, float] | None:
     return None
 
 
-# --- Verlauf kappen (nach Größe, nicht nach Anzahl) ------------------------
-# Vorher kappten die Motoren stur bei den letzten 40 Nachrichten. Das ist in
-# beide Richtungen falsch: 40 kurze Zeilen passen locker rein (das Modell
-# vergisst grundlos), 40 lange sprengen den Kontext trotzdem. Also schauen wir
-# auf die geschätzte Größe statt aufs Zählen.
+# --- Verlauf kappen (nach geschätzter Größe, nicht nach Anzahl) ------------
 
 IMG_TOKENS = 800        # grober Ansatz für EIN Bild im Verlauf
 HISTORY_SHARE = 0.55    # so viel vom Kontextfenster darf der Verlauf belegen
@@ -122,10 +125,8 @@ MIN_KEEP = 3            # so viele Nachrichten bleiben nach dem Aufräumen stehe
 HARD_MAX = 200          # Notbremse gegen endlos wachsende Listen
 START_TOKENS = 20_000   # so viel vom letzten Gespräch lädt der Start; der Rest bleibt durchsuchbar
 
-# Aufräumen statt gleitend kürzen: Der Verlauf wächst, bis er das Budget sprengt, dann
-# bleiben nur die letzten MIN_KEEP Nachrichten. Gleitendes Kürzen änderte fast jede
-# Runde den Anfang des Gesprächs – der Präfix-Cache musste dann alles neu lesen. Der
-# Rest bleibt im Chat gespeichert und im Gedächtnis dieses Chats durchsuchbar.
+# Aufräumen statt gleitend kürzen: erst beim Überlauf bleiben die letzten MIN_KEEP Nachrichten – so
+# bleibt der Gesprächsanfang für den Präfix-Cache stabil. Der Rest bleibt im Chat durchsuchbar.
 
 
 def est_tokens(content) -> int:

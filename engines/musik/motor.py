@@ -177,13 +177,10 @@ def komponieren(stil: str, text: str = INSTRUMENTAL, sekunden: float = 30, bpm: 
                 codes: list[int] | None = None, vorlage: torch.Tensor | None = None, naehe: float = 0.0,
                 genre: str | None = None) -> dict:
     """Einen Song erzeugen. Rückgabe: pfad, titel, sekunden, seed, sekunden_rechnen, vram_mb, geraet.
-    Ohne `titel` gilt die erste Zeile des Refrains; er steht im Dateinamen und in der WAV-Datei.
-    `planen`: liegt der Song-Planer (acestep-5Hz-lm) bereit, schreibt er zuerst die Audio-Codes – der
-    Komponist arbeitet dann mit diesem Gerüst statt aus Stille. `codes` gibt das Gerüst fertig vor (Cover);
-    mit `vorlage` (Latents [T, 64]) und `naehe` > 0 beginnt die Rechnung nicht bei reinem Rauschen, sondern
-    bei einer Mischung mit der Vorlage – das Ergebnis bleibt näher am Original.
-    Die GPU-Sperre prüfen die Aufrufer (hintergrund.sperre) – als Hintergrund-Aufgabe sähe der Motor
-    sonst sich selbst als belegende Aufgabe."""
+    Ohne `titel`: erste Zeile des Refrains. `planen`: der Song-Planer schreibt zuerst das Gerüst (Audio-Codes);
+    `codes` gibt es fertig vor (Cover). `vorlage` (Latents [T, 64]) mit `naehe` > 0: Start aus einer Mischung
+    von Rauschen und Vorlage. Die GPU-Sperre prüfen die Aufrufer (hintergrund.sperre): als Hintergrund-Aufgabe
+    sähe der Motor sonst sich selbst als Belegung."""
     if (grund := fehlt()):
         raise RuntimeError(grund)
     melden = on_status or (lambda _m: None)
@@ -263,12 +260,12 @@ def komponieren(stil: str, text: str = INSTRUMENTAL, sekunden: float = 30, bpm: 
     kontext = torch.cat([quelle, torch.ones_like(quelle)], -1)[None]
     plan = zeitplan()
     if vorlage is not None and naehe > 0:
-        start = min(range(len(plan)), key=lambda i: abs(plan[i] - (1.0 - naehe)))
+        ab = min(range(len(plan)), key=lambda i: abs(plan[i] - (1.0 - naehe)))
         rein = vorlage[:T].to(geraet, torch.float32)
         if len(rein) < T:
             rein = torch.cat([rein, rein[-1:].expand(T - len(rein), -1)])
-        xt = plan[start] * xt + (1.0 - plan[start]) * rein[None]
-        plan = plan[start:]
+        xt = plan[ab] * xt + (1.0 - plan[ab]) * rein[None]
+        plan = plan[ab:]
     for i, t in enumerate(plan):
         pruefen_abbruch()
         melden(f"Musik: Schritt {i + 1}/{len(plan)}")

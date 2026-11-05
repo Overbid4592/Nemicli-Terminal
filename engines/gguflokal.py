@@ -4,6 +4,7 @@ gguflokal.py - Lokale Sprachmodelle über den eigenen GGUF-Motor (ggufengine).
 Kein Server, kein Kindprozess: das Modell läuft im NemiCLI-Prozess auf torch.
 Referenz: `gguf:<Ordner>` – jeder Unterordner von `ModelGGUF/` im Programm-Ordner
 ist ein Modell (die .gguf darin; eine .gguf mit „mmproj“ im Namen ist der Bild-/Audio-Teil).
+Ein Ordner ohne eigene .gguf fasst eine Familie zusammen: `gguf:<Familie>-<Unterordner>`.
 
 Der Motor bleibt nach dem ersten Laden im Speicher, damit der Präfix-Cache wirkt:
 Systemprompt und bisheriges Gespräch werden nur einmal gelesen. Der Systemprompt
@@ -70,7 +71,8 @@ except Exception:                                    # Selbsttest ohne Bootstrap
 
 ORDNER = _INSTALL / "ModelGGUF"
 PROVIDER = "gguf"
-VORGABE_KONTEXT = 25600                # 25k: schnelles Vorlesen des Verlaufs, wenig VRAM; mehr über /kontext
+VORGABE_KONTEXT = 0                    # 0 = so viel, wie das Modell kann; wird es voll, räumen Doppelpuffer und /compact auf
+KONTEXT_UNBEKANNT = 131072             # Modell ohne Kontext-Angabe
 VORGABE_TOK_S = 30
 MAX_ANTWORT = 8192
 ANLEITUNG_MARKE = GS.ANLEITUNG_MARKE
@@ -84,11 +86,8 @@ ERGEBNIS_ANFANG = 400               # so viel bleibt stehen
 STAND_MARKE = GS.MARKE
 STAND_MAX = GS.MAX_ZEICHEN
 STAND_SYSTEM = GS.SYSTEM
-# Doppelpuffer: Platz für Nachrichten = Kontext ohne Anleitung (Systemprompt, Werkzeuge) und ohne
-# Antwort-Reserve. Belegen die Nachrichten nach einer Antwort mehr als PUFFER_AB davon, räumt NemiCLI im
-# Hintergrund auf – Älteres in den Stand des Gesprächs, die neuesten (bis PUFFER_BEHALTEN des Platzes)
-# bleiben – und liest den neuen Kontext schon vor. Der Abstand dazwischen ist Puffer für die nächsten
-# Runden; die nächste Nachricht liest nur sich.
+# Doppelpuffer: belegen die Nachrichten mehr als PUFFER_AB des Platzes (Kontext ohne Anleitung und
+# Antwort-Reserve), wandert Älteres im Hintergrund in den Stand; PUFFER_BEHALTEN bleibt, vorgelesen wird vorab.
 PUFFER_AB = GS.PUFFER_AB
 PUFFER_BEHALTEN = GS.PUFFER_BEHALTEN
 
@@ -132,19 +131,24 @@ def _config() -> dict:
         return {}
 
 
-KONTEXT_STUFEN = (8192, 16384, 25600, 32768, 65536, 131072)
+KONTEXT_STUFEN = (8192, 16384, 32768, 65536, 131072)
+
+
+def kontext_einstellung() -> int:
+    """Config `gguf_kontext` in Token; 0 = max (Vorgabe)."""
+    try:
+        return int(_config().get("gguf_kontext", VORGABE_KONTEXT))
+    except (TypeError, ValueError):
+        return VORGABE_KONTEXT
 
 
 def kontext(name: str | None = None) -> int:
     """Eingestellter Kontext (`gguf_kontext`, 0 = max); mit `name` höchstens so viel,
     wie das Modell kann."""
-    try:
-        wert = int(_config().get("gguf_kontext", VORGABE_KONTEXT))
-    except (TypeError, ValueError):
-        wert = VORGABE_KONTEXT
+    wert = kontext_einstellung()
     grenze = kontext_max(name) if name else None
     if wert <= 0:
-        return grenze or VORGABE_KONTEXT
+        return grenze or KONTEXT_UNBEKANNT
     wert = max(2048, wert)
     return min(wert, grenze) if grenze else wert
 
@@ -187,15 +191,23 @@ def kontext_max(name: str) -> int | None:
 def kv_bytes_pro_token(name: str, bits: int = 16) -> int | None:
     """Wie viel der Gesprächsspeicher (KV) pro Token Kontext belegt – nur die Schichten,
     die mit dem Kontext wachsen (Gemma 4: Voll-Schichten mit eigenem KV, Qwen3.5: jede
-    `full_attention_interval`-te Schicht); mit 8 Bit int8 plus eine bf16-Skala je 32 Werte."""
+    `full_attention_interval`-te Schicht). Je 32 Werte: int8 32 Byte + bf16-Skala (17/32 von bf16),
+    4 Bit 16 Byte + Skala (9/32); 6 Bit = Schlüssel int8, Werte 4 Bit."""
     bf16 = _kopf_werte(name)[1]
-    return bf16 * 17 // 32 if bf16 and bits == 8 else bf16
+    teil = {8: 17 + 17, 6: 17 + 9, 4: 9 + 9}.get(bits)
+    return bf16 * teil // 64 if bf16 and teil else bf16
+
+
+def kv_stufen() -> tuple:
+    """Bit-Stufen des Gesprächsspeichers, die der Erkenner nacheinander probiert (`gguf_kv_4bit`,
+    Vorgabe an: nach 8 Bit noch 6 und 4 Bit mit gedrehten 4-Bit-Werten, bevor Schichten in den RAM wandern)."""
+    return (16, 8, 6, 4) if bool(_config().get("gguf_kv_4bit", True)) else (16, 8)
 
 
 def werkzeug_nativ() -> bool:
     """Werkzeuge in der Muttersprache des Modells (`gguf_werkzeug_nativ`, Vorgabe an): Modelle mit
-    eigenem Werkzeug-Format in der Vorlage rufen Werkzeuge darin auf (engines/werkzeugsprache.py).
-    Gemessen mit Qwen3.5-9B, 12 Aufgaben: 12/12 statt 8/12 im ```aktion-Format."""
+    eigenem Werkzeug-Format in der Vorlage rufen Werkzeuge darin auf (engines/werkzeugsprache.py) –
+    das trifft verlässlicher als das ```aktion-Format."""
     return bool(_config().get("gguf_werkzeug_nativ", True))
 
 
@@ -210,6 +222,21 @@ def sprache(engine):
         except Exception:
             engine._nemicli_sprache = None
     return engine._nemicli_sprache
+
+
+DRY_STAERKE = 2.5                      # Floskel-Bremse bei Temperatur 1 (siehe _sampler)
+
+
+def _getrennt(engine) -> bool:
+    """Bekommt das Modell den Hintergrund einer Nachricht als eigenen System-Zug (ChatFormatter)?"""
+    return bool(getattr(getattr(engine, "chat_format", None), "hintergrund_getrennt", False))
+
+
+def _dry_marken(dialekt) -> tuple:
+    """Marken eines Werkzeug-Aufrufs im Format des Modells: dazwischen bleibt die Floskel-Bremse aus."""
+    if dialekt is None or not getattr(dialekt, "anfang", ""):
+        return ()
+    return ((dialekt.anfang.encode("utf-8"), (dialekt.ende or "").encode("utf-8")),)
 
 
 def system_nachricht(system: str, dialekt=None):
@@ -281,6 +308,9 @@ def _kv_bytes(gg) -> int | None:
         elif a in ("qwen35", "qwen35moe", "qwen3next"):          # nur jede n-te Schicht mit Attention
             schritt = int(gg.get(f"{a}.full_attention_interval", 4))
             schichten = [i for i in range(n) if (i + 1) % schritt == 0]
+        elif a == "lfm3":                                       # Fenster-Schichten: fester Ring
+            fenster = gg.get(f"{a}.attention.sliding_window_pattern") or [False] * n
+            schichten = [i for i in range(n) if not fenster[i]]
         else:
             schichten = range(n)
         return sum(kv[i] for i in schichten) * d * 2 * 2
@@ -298,17 +328,21 @@ def tok_s() -> float | None:
 
 
 def denken() -> bool:
+    """Alte Config `gguf_denken`; heute entscheidet die Denkweise der Persönlichkeit (denkweise.py)."""
     return bool(_config().get("gguf_denken", False))
 
 
 VORGABE_DENK_BUDGET = 8192
+# Denk-Budget je Stärke (/staerke); 0 = ohne Grenze
+STAERKE_BUDGET = {"schnell": 1024, "normal": VORGABE_DENK_BUDGET, "stark": 16384, "max": 0}
 
 
-def denk_budget() -> int | None:
+def denk_budget(staerke: str | None = None) -> int | None:
     """Höchstens so viele Denk-Token je Antwort, dann wird der Denkblock geschlossen und das
-    Modell antwortet (Config `gguf_denk_budget`, 0 = ohne Grenze)."""
+    Modell antwortet. Eine feste Config `gguf_denk_budget` geht vor, sonst die Stärke; 0 = ohne Grenze."""
+    roh = _config().get("gguf_denk_budget")
     try:
-        wert = int(_config().get("gguf_denk_budget", VORGABE_DENK_BUDGET))
+        wert = int(roh) if roh is not None else STAERKE_BUDGET.get(staerke or "", VORGABE_DENK_BUDGET)
     except (TypeError, ValueError):
         wert = VORGABE_DENK_BUDGET
     return wert if wert > 0 else None
@@ -332,15 +366,66 @@ def _gguf_in(ordner: Path) -> Path | None:
     return dateien[0] if dateien else None
 
 
+def familien() -> dict[str, dict[str, Path]]:
+    """{Familie: {Mitglied: .gguf}} – Ordner unter ModelGGUF/ ohne eigene Modelldatei, deren Unterordner
+    je ein Modell halten (eine Ebene tiefer wird nicht gesucht – dort liegt, was keine Chat-Modelle sind)."""
+    if not ORDNER.is_dir():
+        return {}
+    raus = {}
+    for d in sorted(ORDNER.iterdir()):
+        if not d.is_dir() or _gguf_in(d) is not None:
+            continue
+        mitglieder = {u.name: datei for u in sorted(d.iterdir()) if u.is_dir() and (datei := _gguf_in(u)) is not None}
+        if mitglieder:
+            raus[d.name] = mitglieder
+    return raus
+
+
+def _kopf(mitglieder: dict[str, Path]) -> Path:
+    """Wer in einer Familie chattet: das erste Mitglied ohne Bild-/Audio-Teil (reines Sprachmodell),
+    sonst das erste."""
+    return next((p for p in mitglieder.values() if not any(_ist_mmproj(m) for m in p.parent.glob("*.gguf"))),
+                next(iter(mitglieder.values())))
+
+
 def modelle() -> dict[str, Path]:
-    """{Ordnername: .gguf} für alle Unterordner von ModelGGUF/ mit einer Modelldatei."""
+    """{Name: .gguf} für alle Unterordner von ModelGGUF/ mit einer Modelldatei. Eine Familie erscheint
+    als ganzes Team (ihr Name, gerechnet wird mit dem Kopf) und mit jedem Mitglied als „Familie-Mitglied“."""
     if not ORDNER.is_dir():
         return {}
     raus = {}
     for d in sorted(ORDNER.iterdir()):
         if d.is_dir() and (datei := _gguf_in(d)) is not None:
             raus[d.name] = datei
-    return raus
+    for name, mitglieder in familien().items():
+        raus.setdefault(name, _kopf(mitglieder))
+        for m, datei in mitglieder.items():
+            raus.setdefault(f"{name}-{m}", datei)
+    return dict(sorted(raus.items(), key=lambda kv: kv[0].lower()))
+
+
+def aktive_familie() -> str | None:
+    """Die Familie, wenn das gewählte Chat-Modell (Config `model`) eine ist."""
+    ref = str(_config().get("model") or "")
+    if not ref.startswith(PROVIDER + ":"):
+        return None
+    name = ref.split(":", 1)[1]
+    return name if name in familien() else None
+
+
+def familien_augen(familie: str) -> tuple[Path, Path] | None:
+    """(Modell, mmproj) des Mitglieds, das für die Familie Bilder ansieht: eine mmproj mit bekanntem
+    Bild-Encoder, am liebsten ohne Audio-Teil (der reine Seher ist auf Bilder trainiert)."""
+    kandidaten = []
+    for datei in familien().get(familie, {}).values():
+        for mm in sorted(p for p in datei.parent.glob("*.gguf") if _ist_mmproj(p)):
+            if projektor_bekannt(mm):
+                kandidaten.append((_projektor_info(mm)[1], datei, mm))
+                break
+    if not kandidaten:
+        return None
+    _, datei, mm = min(kandidaten, key=lambda k: k[0])
+    return datei, mm
 
 
 def _mmproj(name: str) -> Path | None:
@@ -361,8 +446,8 @@ def sieht(name: str) -> bool:
     return mm is not None and projektor_bekannt(mm)
 
 
-def projektor_bekannt(mm: Path) -> bool:
-    """Kennt der Motor den Bild-Encoder dieser mmproj?"""
+def _projektor_info(mm: Path) -> tuple[str | None, bool]:
+    """(Bild-Projektor-Typ, hat einen Audio-Teil) aus dem Kopf der mmproj, je Datei gemerkt."""
     schluessel = (str(mm), mm.stat().st_mtime)
     if schluessel not in _mmproj_typ:
         try:
@@ -370,19 +455,29 @@ def projektor_bekannt(mm: Path) -> bool:
             from ggufengine.vision import projector_type
             gg = GGUFFile(str(mm))
             try:
-                _mmproj_typ[schluessel] = projector_type(gg)
+                _mmproj_typ[schluessel] = (projector_type(gg), bool(gg.get("clip.has_audio_encoder")))
             finally:
                 gg.close()
         except Exception:
-            _mmproj_typ[schluessel] = None
+            _mmproj_typ[schluessel] = (None, False)
+    return _mmproj_typ[schluessel]
+
+
+def projektor_bekannt(mm: Path) -> bool:
+    """Kennt der Motor den Bild-Encoder dieser mmproj?"""
     from ggufengine.vision import ENCODERS
-    return _mmproj_typ[schluessel] in ENCODERS
+    return _projektor_info(mm)[0] in ENCODERS
 
 
 def beschreibung(name: str) -> str:
     datei = modelle().get(name)
     if datei is None:
         return name
+    if name in (fam := familien()):
+        gb = sum(f.stat().st_size for d in fam[name].values() for f in d.parent.glob("*.gguf")) / 2**30
+        augen = "  ·  👁 sieht Bilder" if familien_augen(name) else ""
+        return (f"🧬 {name}  ·  Team: {' · '.join(fam[name])}  ·  {gb:.1f} GB, "
+                f"geladen wird nur, wer gerade gebraucht wird{augen}")
     gb = datei.stat().st_size / 2**30
     sehen = "  ·  👁 sieht Bilder" if sieht(name) else ""
     return f"{name}  ·  {datei.name}  ·  {gb:.1f} GB{sehen}"
@@ -462,7 +557,8 @@ def modell_ort(name: str) -> str:
     else:
         ort = (f"Hybrid – {plan.ram_bytes / 2**30:.1f} GB im RAM, die Grafikkarte holt sie über PCIe "
                "(langsamer, dafür passt der ganze Kontext)")
-    ort += f"  ·  Gesprächsspeicher {getattr(engine, 'kv_bits_wahl', 16)} Bit"
+    bits = getattr(engine, "kv_bits_wahl", 16)
+    ort += f"  ·  Gesprächsspeicher {bits} Bit" + (" (Schlüssel 8, Werte 4)" if bits == 6 else "")
     if (kv := getattr(engine, "kv_im_vram", None)):
         ort += f", davon {kv // 1024}k in der Grafikkarte, der Rest im RAM"
     return ort
@@ -539,7 +635,7 @@ def passender_kontext(name: str, ctx: int, frei: int | None = None, budget: int 
 
 
 class Verteilung(NamedTuple):
-    bits: int                    # Gesprächsspeicher 16 oder 8 Bit
+    bits: int                    # Gesprächsspeicher 16, 8, 6 oder 4 Bit
     experten: int | None         # VRAM-Budget der MoE-Experten (None: alle im VRAM)
     schichten: int | None        # VRAM-Budget der Gewichte dichter Modelle (None: alle im VRAM)
     n_ctx: int
@@ -550,20 +646,23 @@ def verteilen(name: str, ctx: int, frei: int | None = None) -> Verteilung:
     """Der Erkenner: die schnellste Verteilung, mit der der eingestellte Kontext ganz gilt.
     1. alles in der Grafikkarte, Gesprächsspeicher 16 Bit
     2. alles in der Grafikkarte, Gesprächsspeicher 8 Bit (halber Platz, kaum langsamer)
-    3. 8 Bit, Experten oder Schichten so weit nötig im RAM (über PCIe, langsamer)
-    4. reicht auch das nicht: ein Teil des Gesprächsspeichers im RAM (ohne CUDA-Graphen)"""
+    3. alles in der Grafikkarte, Gesprächsspeicher 6, dann 4 Bit (41 % bzw. 28 %, abschaltbar: kv_stufen)
+    4. kleinste Stufe, Experten oder Schichten so weit nötig im RAM (über PCIe, langsamer)
+    5. reicht auch das nicht: ein Teil des Gesprächsspeichers im RAM (ohne CUDA-Graphen)"""
     frei = _frei_vram() if frei is None else frei
-    for bits in (16, 8):
+    stufen = kv_stufen()
+    for bits in stufen:
         if passender_kontext(name, ctx, frei, bits=bits) >= ctx:
             return Verteilung(bits, None, None, ctx, None)
-    budget, schicht = experten_budget(name, ctx, frei, 8), schichten_budget(name, ctx, frei, 8)
-    if passender_kontext(name, ctx, frei, budget, schicht, 8) >= ctx:
-        return Verteilung(8, budget, schicht, ctx, None)
-    return Verteilung(8, budget, schicht, ctx, kv_gpu_token(name, ctx, frei, budget, schicht, 8))
+    b = stufen[-1]
+    budget, schicht = experten_budget(name, ctx, frei, b), schichten_budget(name, ctx, frei, b)
+    if passender_kontext(name, ctx, frei, budget, schicht, b) >= ctx:
+        return Verteilung(b, budget, schicht, ctx, None)
+    return Verteilung(b, budget, schicht, ctx, kv_gpu_token(name, ctx, frei, budget, schicht, b))
 
 
 def antwort_reserve(n_ctx: int) -> int:
-    """So viel Kontext bleibt für die Antwort frei (bei 25k gut 4k)."""
+    """So viel Kontext bleibt für die Antwort frei (ein Sechstel, 2.048 bis 8.192 Token)."""
     return min(MAX_ANTWORT, max(2048, n_ctx // 6))
 
 
@@ -912,13 +1011,13 @@ def gpu_fuer_bild():
     with _ZAEHLER_SPERRE:                            # Bildserie und Chat-Bild können gleichzeitig malen
         _bild_tiefe += 1
         erster = _bild_tiefe == 1
-    if erster:
-        with versucht_geliehen(engine) as da, _lock:
+    try:                                             # auch ein Fehler beim Auslagern zählt wieder herunter
+        if erster:
+            with versucht_geliehen(engine) as da, _lock:
+                if da:
+                    engine.offload()
             if da:
-                engine.offload()
-        if da:
-            _DBG.ereignis("Sprachmodell für das Bild in den RAM")
-    try:
+                _DBG.ereignis("Sprachmodell für das Bild in den RAM")
         yield
     finally:
         with _ZAEHLER_SPERRE:
@@ -1037,9 +1136,9 @@ class _Kettentrenner:
         return self._weiter(self.erster.ende()) + self.zweiter.ende()
 
 
-def _trenner(engine):
+def _trenner(engine, denkt: bool):
     fmt = engine.chat_format
-    fmt.thinking = denken()
+    fmt.thinking = denkt
     eigen = _Denktrenner(fmt.fmt, offen=fmt.opens_thinking)
     return eigen if eigen.AUF == "<think>" else _Kettentrenner(eigen)
 
@@ -1083,6 +1182,9 @@ class _Zusatz:
         self._eintraege.clear()
 
 
+_KEINE_RUNDE = object()
+
+
 class GgufChat:
     """Backend wie cloud.CloudChat: messages, reset, stream, ask_once, ask_messages."""
 
@@ -1099,11 +1201,17 @@ class GgufChat:
         self._kompakt_text = ""                      # Bilanz des letzten Aufräumens (/compact)
         self._platz_cache: tuple = (None, (0, 0))
         self.denk_hinweis = ""                       # Denkwerk: nur mit der nächsten gesendeten Nachricht
+        self.denk_runde = _KEINE_RUNDE               # neue Nutzer-Runde (main): Denkwerk-Einschätzung, einmal abgeholt
+        self._denkt_jetzt = False                    # eigenes Nachdenken in dieser Runde (denkweise.nativ)
 
     @property
     def denkt_selbst(self) -> bool:
-        """Eigenes Nachdenken des Modells ist eingeschaltet (Config `gguf_denken`)."""
-        return denken()
+        """Eigenes Nachdenken des Modells ist in dieser Runde eingeschaltet."""
+        return self._denkt_jetzt
+
+    def _denken_vorgabe(self, engine) -> bool:
+        import denkweise
+        return denkweise.vorgabe(engine.chat_format)
 
     async def schliessen(self, warten_s: float = 5.0) -> None:
         """Modellwechsel: die Hintergrund-Arbeit (Doppelpuffer: Vorlesen, Zusammenfassen) anhalten – sie hält das
@@ -1140,7 +1248,7 @@ class GgufChat:
                     and not _ist_ergebnis(m.get("content"))), default=-1)
 
     def _nachrichten(self, system: str, verlauf: list[dict], denk_weg: bool = False, stand: bool = False,
-                     dialekt=None):
+                     dialekt=None, getrennt: bool = False):
         """Verlauf für die Engine. Antworten tragen ihre erzeugten Token (samt Denktext).
         `denk_weg` (Vorlage verwirft alten Denktext): bei Antworten vor der letzten echten
         Nutzernachricht fällt er weg; innerhalb der laufenden Werkzeug-Kette (nur
@@ -1148,7 +1256,9 @@ class GgufChat:
         jeden Schritt (interleaved thinking, wie in den Vorlagen von Qwen3, GLM-4.5, gpt-oss).
         Werkzeug-Ergebnisse vor der letzten echten Nachricht sind gekürzt (`_ergebnis_kurz`);
         mit `stand` steht der Stand des Gesprächs vor der ersten Nachricht. Mit `dialekt` (Muttersprache
-        des Modells): Antworten als Text und Werkzeug-Ergebnisse in seinem Werkzeug-Format."""
+        des Modells): Antworten als Text und Werkzeug-Ergebnisse in seinem Werkzeug-Format. Mit `getrennt`
+        (ChatFormatter.hintergrund_getrennt) steht der Hintergrund einer Nachricht (Stand, Gedächtnis-Treffer,
+        nachgereichte Anleitungen) als eigener System-Zug davor – die Nutzer-Nachricht enthält nur das Gesagte."""
         from ggufengine import Message
         if dialekt is not None:
             import werkzeugsprache
@@ -1172,6 +1282,15 @@ class GgufChat:
                 text = self._zusatz.get(m, "gesendet", inhalt)
                 if i < letzte_echte and _ist_ergebnis(inhalt):
                     text = _ergebnis_kurz(text)
+                if getrennt and not _ist_ergebnis(inhalt):
+                    vor, marke, nach = text.rpartition(NACHRICHT_MARKE)
+                    hinter = [STAND_MARKE + self.stand] if i == erste else []
+                    if marke and vor.strip():
+                        hinter.append(vor.strip())
+                    if hinter:
+                        raus.append(Message("system", "\n\n".join(hinter)))
+                    raus.append(Message("user", nach if marke else text, images=self._zusatz.get(m, "bilder")))
+                    continue
                 if i == erste:
                     text = STAND_MARKE + self.stand + "\n\n" + text
                 if dialekt is not None and _ist_ergebnis(inhalt):
@@ -1230,7 +1349,7 @@ class GgufChat:
         sieht (ältere Ergebnisse gekürzt, alter Denktext weg)."""
         platzhalter = {"role": "user", "content": ""}
         return self._nachrichten(system, self.messages + [platzhalter], engine.chat_format.drops_old_thinking,
-                                 stand=True, dialekt=sprache(engine))[:-1]
+                                 stand=True, dialekt=sprache(engine), getrennt=_getrennt(engine))[:-1]
 
     async def _vorlesen(self, engine, system: str) -> int:
         anfang = self._naechster_anfang(system, engine)
@@ -1240,7 +1359,7 @@ class GgufChat:
                 if (not da or _stopp.is_set() or gpuzustand.kaputt()               # entladen / Wechsel / GPU-Fehler
                         or _bild_tiefe or engine.offloaded):                       # ein Bild entsteht gerade
                     return 0
-                engine.chat_format.thinking = denken()
+                engine.chat_format.thinking = self._denken_vorgabe(engine)
                 with _DBG.messen("Doppelpuffer: vorlesen"):
                     return engine.vorlesen(anfang, abbruch=_stopp.is_set)
         return await asyncio.to_thread(lesen)
@@ -1402,25 +1521,27 @@ class GgufChat:
 
         def laenge() -> int:
             return len(fmt.encode(self._nachrichten(system, self.messages, fmt.drops_old_thinking, stand=True,
-                                                    dialekt=sprache(engine))))
-        while laenge() + reserve > n_ctx and len(self.messages) > 1:
+                                                    dialekt=sprache(engine), getrennt=_getrennt(engine))))
+        n = laenge()                                 # der ganze Verlauf durch den Tokenizer: nur nach einem Schnitt neu
+        while n + reserve > n_ctx and len(self.messages) > 1:
             if not pricing.abschneiden(self, max(1, len(self.messages) // 4)):
                 break
-        if laenge() + reserve > n_ctx:
+            n = laenge()
+        if n + reserve > n_ctx:
             raise RuntimeError(f"Die Nachricht ist zu lang für den Kontext ({n_ctx // 1024}k) – kürzer fassen "
                                "oder /kontext höher stellen.")
 
     @staticmethod
     def _sampler(engine):
-        from ggufengine import SamplerConfig
+        from ggufengine.sampling import empfohlen
         # Floskel-Bremse (DRY): früh und kräftig, nur am Wortanfang – schwächer oder mitten
-        # im Wort weicht das Modell auf Tippfehler aus („Freundn“, „Präfix-Cape“)
-        dry = dict(dry_multiplier=2.5, dry_allowed_length=1)
-        if engine.chat_format.fmt == "deepseek":             # Vorgabe von DeepSeek-R1
-            return SamplerConfig(temperature=0.6, top_p=0.95, top_k=0, min_p=0.0, **dry)
-        if engine.chat_format.fmt == "bailing":              # Vorgabe von Ling 3.0
-            return SamplerConfig(temperature=1.0, top_p=0.95, top_k=20, min_p=0.0, **dry)
-        return SamplerConfig(temperature=1.0, top_p=0.95, top_k=64, min_p=0.0, **dry)
+        # im Wort weicht das Modell auf Tippfehler aus („Freundn“, „Präfix-Cape“). Gemessen bei
+        # Temperatur 1; sampling.py gleicht kleinere Temperaturen aus, Familien können sie abschalten.
+        dry = dict(dry_multiplier=DRY_STAERKE, dry_allowed_length=1)
+        gg = getattr(engine, "gg", None)
+        fmt = engine.chat_format
+        return empfohlen(getattr(gg, "metadata", {}) or {}, fmt.fmt, getattr(gg, "architecture", "") or "",
+                         bool(fmt.thinking), _config().get("gguf_sampling"), **dry)
 
     def _geladen(self):
         """Der Motor, wenn er schon mit diesem Modell (und diesen Einstellungen) läuft – lädt nie nach."""
@@ -1434,7 +1555,7 @@ class GgufChat:
         return await asyncio.to_thread(motor, self.name)
 
     async def _erzeugen(self, engine, nachrichten, max_tokens, abbruch: threading.Event, denken_aus: bool = False,
-                        hintergrund: bool = False, sprache=None):
+                        hintergrund: bool = False, sprache=None, denkt: bool | None = None):
         """Lässt die Engine in einem Thread laufen und reicht die Textstücke weiter. Im Hintergrund
         (Doppelpuffer) endet sie, sobald entladen() anläuft, und wartet nicht auf ein Bild.
         Mit `sprache` (Werkzeug-Dialekt) gehen Aufrufe in der Muttersprache als ```aktion-Block weiter."""
@@ -1454,8 +1575,10 @@ class GgufChat:
                         raise MotorWeg("Modell wird entladen")
                     if not hintergrund and _motor is not None and _motor[2] is engine:
                         _lora_abgleich(engine, _motor[0])
-                    engine.chat_format.thinking = False if denken_aus else denken()
-                    engine.denk_budget = denk_budget()
+                    engine.chat_format.thinking = (False if denken_aus else
+                                                   self._denken_vorgabe(engine) if denkt is None else denkt)
+                    engine.denk_budget = denk_budget(self.strength)
+                    engine.dry_frei = _dry_marken(sprache)
                     gen = engine.chat(nachrichten, max_tokens=max_tokens, sampler=self._sampler(engine))
                     bisher = ""
                     import werkzeugsprache
@@ -1508,9 +1631,11 @@ class GgufChat:
                 raise RuntimeError("Modell nicht geladen")
         else:
             engine = await self._laden()
-        teile, trenner = [], _trenner(engine)
-        async for stueck in self._erzeugen(engine, self._nachrichten(system, verlauf, engine.chat_format.drops_old_thinking),
-                                           max_tokens, threading.Event(), denken_aus, hintergrund):
+        denkt = False if denken_aus else self._denken_vorgabe(engine)
+        teile, trenner = [], _trenner(engine, denkt)
+        async for stueck in self._erzeugen(engine, self._nachrichten(system, verlauf, engine.chat_format.drops_old_thinking,
+                                                                     getrennt=_getrennt(engine)),
+                                           max_tokens, threading.Event(), denken_aus, hintergrund, denkt=denkt):
             teile += [t for art, t in trenner(stueck) if art == "text"]
         teile += [t for art, t in trenner.ende() if art == "text"]
         if hintergrund and (_stopp.is_set() or self._geladen() is not engine):
@@ -1576,6 +1701,14 @@ class GgufChat:
             treffer = await asyncio.to_thread(_gedaechtnis, user_text)
             zeiten["vorbereitung"] = time.time() - t
             denk, self.denk_hinweis = self.denk_hinweis, ""
+            runde_neu, self.denk_runde = self.denk_runde, _KEINE_RUNDE
+            if runde_neu is not _KEINE_RUNDE:            # neue Nutzer-Runde: jetzt ist das Chat-Format bekannt
+                import denkweise
+                import denkwerk
+                self._denkt_jetzt = denkweise.nativ(engine.chat_format, runde_neu)
+                denk = denkwerk.hinweis(runde_neu, self._denkt_jetzt)
+                _DBG.ereignis(f"Denkweise: {denkweise.stufe()} · eigenes Nachdenken "
+                              f"{'an' if self._denkt_jetzt else 'aus'}", speicher=False)
             vorsatz = [t.strip() for t in (treffer, self._anleitungen_fuer(user_text)) if t and t.strip()]
             if vorsatz or denk:                          # Denkwerk-Hinweis hinter die Nachricht
                 gesendet = "\n\n".join(vorsatz + [NACHRICHT_MARKE + user_text]) if vorsatz else user_text
@@ -1601,14 +1734,16 @@ class GgufChat:
         if await asyncio.to_thread(prefix_laden, self.name, engine, system):
             yield {"type": "note", "text": "⚡ Anleitung aus dem Zwischenspeicher – kein erneutes Einlesen."}
         zeiten["zwischenspeicher"] = time.time() - t
-        trenner, voll, abbruch = _trenner(engine), "", threading.Event()
+        trenner, voll, abbruch = _trenner(engine, self._denkt_jetzt), "", threading.Event()
         gedacht = False
         try:
             t = time.time()
             async for stueck in self._erzeugen(engine, self._nachrichten(system, self.messages,
                                                                          engine.chat_format.drops_old_thinking,
-                                                                         stand=True, dialekt=sprache(engine)),
-                                               MAX_ANTWORT, abbruch, sprache=sprache(engine)):
+                                                                         stand=True, dialekt=sprache(engine),
+                                                                         getrennt=_getrennt(engine)),
+                                               MAX_ANTWORT, abbruch, sprache=sprache(engine),
+                                               denkt=self._denkt_jetzt):
                 zeiten.setdefault("erstes_token", time.time() - t)
                 for art, text in trenner(stueck):
                     if art == "text":

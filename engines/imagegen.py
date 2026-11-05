@@ -2,17 +2,20 @@
 imagegen.py - Weiche für den Bild-Motor: wer malt, mit welchen Angaben.
 
   krea   eigene Krea-2-Pipeline (krea.py) – der Standard
+  motor  weitere eigene Bild-Motoren, je Bauart einer (bildmotoren/: Z-Image …)
   webui  Forge/A1111 über /sdapi/v1/…    (sdwebui.py)
   comfy  ComfyUI über /prompt + /history  (comfyui.py)
   cloud  OpenAI, Google, xAI              (videobildcloud.py) – ohne eigene Grafikkarte
 
 Eine externe Stelle gilt nur, wenn sie ausdrücklich gewählt ist UND gerade läuft –
-sonst malt Krea 2. Die frühere eigene SD-1.5/SDXL-Pipeline ist entfernt.
+sonst malt Krea 2.
 """
 
 from __future__ import annotations
 
+import os
 import re
+import sys
 
 
 def _ollama_freigeben() -> None:
@@ -41,33 +44,49 @@ def _ollama_freigeben() -> None:
 
 def _gpu_fuer_bild(fn):
     """Beim Malen hat das Bildmodell die GPU allein: ein geladenes lokales
-    Sprachmodell (gguflokal) wartet solange im RAM, ein Ollama-Modell wird entladen."""
+    Sprachmodell (gguflokal) wartet solange im RAM, ein Ollama-Modell wird entladen.
+    Andere NemiCLI-Prozesse (Mal-Prozess der Wache) malen nicht gleichzeitig (malsperre)."""
     import functools
-    import sys
 
-    ist_paint = getattr(fn, "__name__", "") == "paint"
+    name = getattr(fn, "__name__", "")
+    ist_paint = name == "paint"
 
     @functools.wraps(fn)
     def huelle(*args, **kw):
         if ist_paint and backend() == CLOUD:
             return fn(*args, **kw)                 # die Cloud braucht die Grafikkarte nicht
-        zustand = sys.modules.get("gpuzustand")
-        if zustand is not None:
-            zustand.sicherstellen()                # nach einem CUDA-Speicherfehler malt nichts mehr
-        st = sys.modules.get("stimme")
-        if st is not None:
-            st.gpu_freigeben()                     # die Stimme lädt beim nächsten Satz neu
-        _ollama_freigeben()                        # Ollama lädt beim nächsten Chat selbst neu
-        lokal = sys.modules.get("gguflokal")
-        if lokal is None:
-            return fn(*args, **kw)
-        with lokal.gpu_fuer_bild():
-            return fn(*args, **kw)
+        import malkind
+        import malsperre
+        if name in ("paint", "gesicht_nachbessern") and malkind.aktiv():
+            return _gpu_vorbereitet(fn, args, kw)  # die Wache gibt ab: ihr Mal-Prozess hält die Sperre
+        im_kind = bool(os.environ.get(malkind.ENV))    # Mal-Prozess der Wache: nicht ewig warten
+        with malsperre.halten(kw.get("on_status"), name or "Bild",
+                              max_warten=malkind.MAX_WARTEN_S if im_kind else None):
+            return _gpu_vorbereitet(fn, args, kw)
     return huelle
+
+
+def _gpu_vorbereitet(fn, args, kw):
+    zustand = sys.modules.get("gpuzustand")
+    if zustand is not None:
+        zustand.sicherstellen()                    # nach einem CUDA-Speicherfehler malt nichts mehr
+    st = sys.modules.get("stimme")
+    if st is not None:
+        st.gpu_freigeben()                         # die Stimme lädt beim nächsten Satz neu
+    _ollama_freigeben()                            # Ollama lädt beim nächsten Chat selbst neu
+    ix = sys.modules.get("indexdb")
+    if ix is not None:
+        ix.unterbrechen()                          # der Bibliothekar gibt eine GPU-Fassung des Encoders frei
+    lokal = sys.modules.get("gguflokal")
+    if lokal is None:
+        return fn(*args, **kw)
+    with lokal.gpu_fuer_bild():
+        return fn(*args, **kw)
 
 
 _EXTERN = {"webui": "sdwebui", "comfy": "comfyui", "cloud": "videobildcloud"}
 KREA = "krea"
+MOTOR = "motor"
 CLOUD = "cloud"
 
 
@@ -81,15 +100,25 @@ def gewaehltes_backend() -> str:
     try:
         import config
         gewaehlt = str(config.load().get("bild_backend") or "")
-        return gewaehlt if gewaehlt in _EXTERN else KREA
+        return gewaehlt if gewaehlt in _EXTERN or gewaehlt == MOTOR else KREA
     except Exception:
         return KREA
 
 
+def _motor_bereit() -> bool:
+    try:
+        import bildmotoren
+        return bildmotoren.missing_reason() is None
+    except Exception:
+        return False
+
+
 def backend() -> str:
-    """Der Motor, der JETZT malen würde: 'krea' · 'webui' · 'comfy'.
-    Ist eine externe Stelle gewählt, aber nicht erreichbar, malt Krea 2."""
+    """Der Motor, der JETZT malen würde: 'krea' · 'motor' · 'webui' · 'comfy' · 'cloud'.
+    Ist eine externe Stelle oder ein Bild-Motor gewählt, aber nicht bereit, malt Krea 2."""
     gewaehlt = gewaehltes_backend()
+    if gewaehlt == MOTOR:
+        return MOTOR if _motor_bereit() else KREA
     if gewaehlt in _EXTERN:
         try:
             if _extern_modul(gewaehlt).available():
@@ -105,6 +134,12 @@ def missing_reason_aktiv() -> str | None:
     torch und seine Modelldateien."""
     import krea
     gewaehlt = gewaehltes_backend()
+    if gewaehlt == MOTOR:
+        import bildmotoren
+        grund_motor = bildmotoren.missing_reason()
+        if grund_motor is None or krea.missing_reason() is None:
+            return None                       # sonst springt Krea 2 ein
+        return f"{grund_motor}\nRichte das Bild-Modell ein oder wähle ein anderes (/bildmodel)."
     if gewaehlt in _EXTERN:
         try:
             if _extern_modul(gewaehlt).available():
@@ -136,17 +171,27 @@ def active_label() -> str:
     if art == "comfy":
         import comfyui
         return f"🧩 ComfyUI · {comfyui.chosen_model() or comfyui.resolve_model(None) or '?'}"
+    if art == MOTOR:
+        import bildmotoren
+        return f"{bildmotoren.titel()} · {bildmotoren.gewaehlt() or '?'}"
     import krea
     return f"🟣 Krea 2 · {krea.chosen_model() or '?'}"
 
 
 def menu() -> dict[str, str]:
-    """Krea-2-Modelle für die Autovervollständigung (ohne Netzaufruf)."""
+    """Eigene Bild-Modelle für die Autovervollständigung (ohne Netzaufruf)."""
+    aus: dict[str, str] = {}
     try:
         import krea
-        return {n: "🟣 Krea 2" for n in krea.discover()}
+        aus.update({n: "🟣 Krea 2" for n in krea.discover()})
     except Exception:
-        return {}
+        pass
+    try:
+        import bildmotoren
+        aus.update({n: bildmotoren.titel(n) for n in bildmotoren.modelle()})
+    except Exception:
+        pass
+    return aus
 
 
 def modell_aufloesen(wunsch: str | None) -> tuple[str | None, str]:
@@ -162,11 +207,14 @@ def modell_aufloesen(wunsch: str | None) -> tuple[str | None, str]:
     elif art == "comfy":
         import comfyui
         namen = list(comfyui.models())
+    elif art == MOTOR:
+        import bildmotoren
+        namen = list(bildmotoren.modelle())
     else:
         import krea
         namen = list(krea.discover())
     kurz = re.split(r"[\\/]", str(wunsch).strip().strip('"\''))[-1]
-    kurz = re.sub(r"\.safetensors$", "", kurz, flags=re.I).lower()
+    kurz = re.sub(r"\.(safetensors|gguf)$", "", kurz, flags=re.I).lower()
     treffer = [n for n in namen if kurz and (kurz in n.lower() or n.lower() in kurz)]
     if len(treffer) == 1:
         return treffer[0], ""
@@ -179,10 +227,10 @@ def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
           size: tuple[int, int] | None = None, seed: int | None = None,
           sampler: str | None = None, on_status=None, vorlage: str | None = None,
           staerke: float | None = None, figur: bool = False) -> str:
-    """Malt EIN Bild mit dem aktiven Motor und gibt den Pfad zurück. Krea 2 nimmt
-    keinen Negativ-Prompt und keine CFG; die externen Stellen schon. `vorlage`/`staerke`
-    (Bild umzeichnen) nur mit Krea 2. `figur`: die Persönlichkeit selbst ist im Bild – Krea nimmt dann
-    ihre Charakter-LoRA dazu, falls es eine gibt.
+    """Malt EIN Bild mit dem aktiven Motor und gibt den Pfad zurück. Krea 2 und die Bild-Motoren
+    nehmen keinen Negativ-Prompt und keine CFG; die externen Stellen schon. `vorlage`/`staerke`
+    (Bild umzeichnen) nur mit Krea 2 – ist ein Bild-Motor gewählt, zeichnet Krea 2 um, wenn es da ist.
+    `figur`: die Persönlichkeit selbst ist im Bild – Krea nimmt dann ihre Charakter-LoRA dazu, falls es eine gibt.
     Ein geladenes lokales Sprachmodell wartet solange im RAM (gguflokal) – nicht bei der Cloud; dort gilt
     auch kein Modellname (er gehört zu Krea/WebUI/ComfyUI), der Anbieter nimmt sein Modell."""
     art = backend()
@@ -192,14 +240,33 @@ def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
         return _extern_modul(art).generate(
             prompt, model=model, neg=neg, steps=steps, cfg=cfg,
             size=size, seed=seed, sampler=sampler, on_status=on_status)
+    import malkind
+    if malkind.aktiv():                        # Wache: im kurzen Kindprozess, ihr CUDA-Kontext endet mit ihm
+        return malkind.auftrag("paint", {"prompt": prompt, "model": model, "steps": steps,
+                                         "size": list(size) if size else None, "seed": seed,
+                                         "sampler": sampler, "vorlage": vorlage, "staerke": staerke,
+                                         "figur": figur}, on_status)
     import krea
-    extra = {"vorlage": vorlage, "staerke": staerke} if vorlage and staerke is not None else (
+    if art == MOTOR and not (vorlage and krea.missing_reason() is None):
+        import bildmotoren
+        if krea.im_ram():
+            krea.entladen()                    # zwei Bildnetze zugleich im Arbeitsspeicher wären zu viel
+        return bildmotoren.generate(prompt, model=model, steps=steps, size=size, seed=seed, on_status=on_status)
+    _motoren_entladen()
+    extra ={"vorlage": vorlage, "staerke": staerke} if vorlage and staerke is not None else (
         {"vorlage": vorlage} if vorlage else {})
     if figur and (lora := krea.lora_fuer_figur()):
         extra["lora"] = lora
     return krea.generate(prompt, model=model, steps=steps, size=size, seed=seed,
                          sampler=sampler if sampler in ("euler", "euler_ancestral") else None,
                          on_status=on_status, **extra)
+
+
+def _motoren_entladen() -> None:
+    """Krea 2 malt: die Bild-Motoren geben ihren Arbeitsspeicher frei (nur wenn sie geladen sind)."""
+    mod = sys.modules.get("bildmotoren")
+    if mod is not None and mod.im_ram():
+        mod.entladen()
 
 
 @_gpu_fuer_bild
@@ -209,6 +276,9 @@ def gesicht_nachbessern(path: str, on_status=None) -> str | None:
     import krea
     if "backend=krea2" not in _params(path) or not krea.gesicht_an():
         return None
+    import malkind
+    if malkind.aktiv():
+        return malkind.auftrag("gesicht_nachbessern", {"path": path}, on_status)
     return krea.gesicht_nachbessern(path, on_status=on_status)
 
 

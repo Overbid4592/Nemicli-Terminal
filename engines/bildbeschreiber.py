@@ -4,7 +4,8 @@ bildbeschreiber.py - Augen für lokale Sprachmodelle ohne Bild-Eingang.
 Ein kleines Modell mit Bild-Encoder beschreibt Bilder als Text; das aktive Modell
 bekommt die Beschreibung. Ordner: `Vision/<Name>/` im Programm-Ordner mit einer
 .gguf und einer mmproj-*.gguf (Encoder wie bei `ModelGGUF/` automatisch erkannt).
-Mehrere Ordner: Config `vision_ordner` (`/vision <name>`) wählt, sonst der erste.
+Mehrere Ordner: Config `vision_ordner` (`/vision <name>`) wählt, sonst der erste. Ist eine
+Modell-Familie das Chat-Modell (ModelGGUF/<Familie>/), sieht ihr eigenes Mitglied mit Bild-Teil.
 
 Gilt für jedes Chat-Modell, das selbst nichts sieht – eigener Motor, Ollama oder
 Cloud. Ans Modell geht nur der Text, nie das Bild.
@@ -116,7 +117,10 @@ def gewaehlt() -> str:
 
 
 def finden() -> tuple[Path, Path] | None:
-    """(Modell, mmproj) des gewählten Vision-Ordners – fehlt er, der erste passende."""
+    """(Modell, mmproj): Ist eine Modell-Familie das Chat-Modell, sieht ihr eigener Seher; sonst der
+    gewählte Vision-Ordner – fehlt er, der erste passende."""
+    if (familie := gguflokal.aktive_familie()) and (augen := gguflokal.familien_augen(familie)):
+        return augen
     alle = kandidaten()
     if not alle:
         return None
@@ -126,9 +130,14 @@ def finden() -> tuple[Path, Path] | None:
 
 
 def aktiv() -> str | None:
-    """Name des Ordners, den finden() nimmt."""
+    """Name des Ordners, den finden() nimmt (bei einer Familie „Familie-Mitglied“)."""
     teile = finden()
-    return teile[0].parent.name if teile else None
+    if not teile:
+        return None
+    ordner = teile[0].parent
+    if ordner.parent.parent.resolve() == gguflokal.ORDNER.resolve():      # Mitglied einer Familie
+        return f"{ordner.parent.name}-{ordner.name}"
+    return ordner.name
 
 
 def geladen() -> bool:
@@ -220,7 +229,7 @@ def fragen_roh(bild, text: str, max_tokens: int = MAX_ANTWORT) -> str:
             engine.restore()
             _DBG.ereignis("Bildbeschreiber auf der GPU")
             try:
-                emb = engine.encode_image(bild, BILD_TOKEN)
+                emb = engine.encode_image(bild, getattr(engine.vision, "beschreiber_tokens", BILD_TOKEN))
                 engine.reset()
                 antwort = "".join(engine.chat(
                     [Message("user", text, images=[emb])], checkpoint_system=False,
@@ -322,7 +331,7 @@ def _encoder(mm: Path) -> str:
     """Bild-Encoder einer mmproj, wie der Motor ihn erkennt (oder warum nicht)."""
     try:
         bekannt = gguflokal.projektor_bekannt(mm)
-        typ = gguflokal._mmproj_typ.get((str(mm), mm.stat().st_mtime))
+        typ = gguflokal._projektor_info(mm)[0]
     except Exception as e:
         return f"nicht lesbar: {e!r}"
     return f"{typ} ({'bekannt' if bekannt else 'kennt der Motor nicht'})" if typ else "kein Encoder erkannt"

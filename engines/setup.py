@@ -9,10 +9,7 @@ NemiCLI soll auch ohne Vorwissen laufen. Dieses Modul:
   • erkennt, ob Ollama installiert/erreichbar ist, gibt sonst einen
     Hinweis, und lädt Ollama-Modelle direkt herunter (/api/pull).
 
-Früher lud dieses Modul zusätzlich die llama.cpp-Binaries von
-GitHub (passend zur GPU, mit Zip-Slip-Schutz und Host-Allowlist). Das ist
-komplett entfallen - lokale Modelle laufen jetzt
-ausschließlich über Ollama, das sein eigenes Laufzeit-Paket mitbringt.
+Es lädt keine Laufzeit-Binaries: Ollama bringt sein eigenes Laufzeit-Paket mit.
 """
 
 from __future__ import annotations

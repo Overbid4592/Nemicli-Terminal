@@ -1,16 +1,14 @@
 """
-providers.py - Cloud-Anbieter: erkennen, Modelle live abfragen, anbinden.
+providers.py - Anbieter: lokale Server (offline) und die gemeinsame Registry.
 
-Kerngedanke: Modellnamen werden NICHT im Code festgenagelt. Stattdessen fragt
-NemiCLI den jeweiligen Anbieter live ab (`/models`-Endpunkt), sobald dessen
-API-Key in der Umgebung gesetzt ist. Neues Modell beim Anbieter -> erscheint
-automatisch. Kein Key -> der Anbieter taucht gar nicht erst auf.
+Hier stehen die lokalen Server ohne Schlüssel – Ollama, LM Studio, Jan, llama.cpp-Server/LocalAI
+und vLLM: erkennen, Modelle abfragen, Kontextlänge auslesen, Grafikspeicher freigeben. Die
+Cloud-Anbieter mit API-Schlüssel stehen in cloudprovider.py; PROVIDERS führt beide zusammen,
+alle übrigen Module fragen nur hier.
 
-Anbindung: eigene schlanke Adapter, kein Zusatzpaket.
-Fast alle sprechen das OpenAI-Protokoll (nur eine andere base_url) -> ein
-einziger Cloud-Motor (cloud.py) deckt sie ab. Anthropic ist nativ (chat.py).
-
-Neuen Anbieter ergänzen = einen Eintrag in PROVIDERS. Das war's.
+Anbindung: eigene schlanke Adapter, kein Zusatzpaket. Fast alle sprechen das OpenAI-Protokoll
+(nur eine andere base_url) -> ein einziger Cloud-Motor (cloud.py) deckt sie ab. Anthropic ist
+nativ (chat.py).
 """
 
 from __future__ import annotations
@@ -18,49 +16,27 @@ from __future__ import annotations
 import os
 import re
 import time
-from dataclasses import dataclass, field
-from typing import Callable
 
+import cloudprovider as CP
 import httpx
-
-
-@dataclass
-class Provider:
-    id: str                      # kurzer Schlüssel, z.B. "openai"
-    label: str                   # Anzeigename, z.B. "OpenAI"
-    env: str                     # Name der Umgebungsvariable mit dem Key
-    chat_base: str | None        # base_url für den Chat (None = nativ, siehe kind)
-    kind: str = "openai"         # "openai" (kompatibel) | "anthropic" (nativ)
-    list_url: str | None = None  # Endpunkt für die Modell-Liste (None = statisch)
-    # Filter: welche Modell-IDs sind echte Chat-Modelle? (gegen TTS/Embeddings-Müll)
-    keep: Callable[[str], bool] = lambda mid: True
-    static_models: list[str] = field(default_factory=list)  # Fallback ohne Liste
-    note: str = ""               # kurzer Hinweis fürs Menü
-    keyless: bool = False         # braucht keinen API-Key (z.B. lokales Ollama)
-
-    def key(self) -> str | None:
-        return os.getenv(self.env)
-
-    def available(self) -> bool:
-        if self.keyless:
-            # Keyless-Anbieter sind lokal: nur „verfügbar", wenn der Dienst läuft.
-            return ollama_reachable() if self.id == "ollama" else lokal_erreichbar(self.list_url)
-        return bool(self.key())
-
-
-# --- Filter-Helfer ----------------------------------------------------------
-def _any(*subs):
-    subs = tuple(s.lower() for s in subs)
-    return lambda mid: any(s in mid.lower() for s in subs)
-
-
-_KEIN_CHAT = ("embed", "whisper", "tts", "rerank", "guard", "moderation", "transcri", "speech", "flux",
-              "stable-diffusion", "sdxl", "image-gen", "imagen", "video")
-
-
-def _chat(mid: str) -> bool:
-    """Hoster mit gemischtem Katalog: alles außer Embeddings, Sprache, Bild- und Video-Modellen."""
-    return not any(x in mid.lower() for x in _KEIN_CHAT)
+from cloudprovider import (
+    _KEIN_CHAT,
+    CLOUD,
+    CLOUD_NEUER_VERSUCH_S,
+    CLOUD_SHOW_URL,
+    KEY_URLS,
+    Provider,
+    _any,
+    _auth_headers,
+    _chat,
+    _cloud_caps_cache,
+    _cloud_caps_fehler,
+    _offen,
+    _parse_models,
+    cloud_name_vision,
+    ollama_cloud_capabilities,
+    status_text,
+)
 
 
 def _lokal(pid, label, port):
@@ -70,133 +46,8 @@ def _lokal(pid, label, port):
                     keep=_chat, keyless=True, note=f"lokal (Port {port}), kein Key")
 
 
-def _offen(label, env, base, keep=_chat, note=""):
-    """OpenAI-kompatibler Anbieter mit /models-Liste unter derselben Adresse."""
-    pid = env.removesuffix("_API_KEY").lower()
-    return Provider(pid, label, env, chat_base=base, list_url=base.rstrip("/") + "/models", keep=keep, note=note)
-
-
-# --- Die Anbieter-Registry --------------------------------------------------
-# Reihenfolge = Reihenfolge im Menü.
-PROVIDERS: dict[str, Provider] = {
-    "anthropic": Provider(
-        "anthropic", "Anthropic (Claude)", "ANTHROPIC_API_KEY",
-        chat_base=None, kind="anthropic",
-        list_url="https://api.anthropic.com/v1/models",
-        keep=_any("claude"),
-        note="adaptives Thinking mit Denk-Stärke (/staerke)",
-    ),
-    "openai": Provider(
-        "openai", "OpenAI (GPT)", "OPENAI_API_KEY",
-        chat_base="https://api.openai.com/v1",
-        list_url="https://api.openai.com/v1/models",
-        keep=_any("gpt", "o1", "o3", "o4", "chatgpt"),
-    ),
-    "google": Provider(
-        "google", "Google (Gemini)", "GEMINI_API_KEY",
-        chat_base="https://generativelanguage.googleapis.com/v1beta/openai/",
-        list_url="https://generativelanguage.googleapis.com/v1beta/models",
-        keep=_any("gemini"),
-    ),
-    "mistral": Provider(
-        "mistral", "Mistral", "MISTRAL_API_KEY",
-        chat_base="https://api.mistral.ai/v1",
-        list_url="https://api.mistral.ai/v1/models",
-        keep=lambda mid: not any(x in mid.lower() for x in ("embed", "moderation", "ocr")),
-    ),
-    "cohere": Provider(
-        "cohere", "Cohere (Command)", "COHERE_API_KEY",
-        chat_base="https://api.cohere.com/compatibility/v1",
-        list_url="https://api.cohere.com/v1/models",
-        keep=_any("command"),
-    ),
-    "perplexity": Provider(
-        "perplexity", "Perplexity (Sonar)", "PERPLEXITY_API_KEY",
-        chat_base="https://api.perplexity.ai",
-        list_url=None,   # kein Listen-Endpunkt -> statisch
-        static_models=["sonar", "sonar-pro", "sonar-reasoning",
-                       "sonar-reasoning-pro", "sonar-deep-research"],
-        note="hat Internet-Zugang eingebaut",
-    ),
-    "deepseek": Provider(
-        "deepseek", "DeepSeek", "DEEPSEEK_API_KEY",
-        chat_base="https://api.deepseek.com",
-        list_url="https://api.deepseek.com/models",
-        keep=_any("deepseek"),
-    ),
-    "xai": Provider(
-        "xai", "xAI (Grok)", "XAI_API_KEY",
-        chat_base="https://api.x.ai/v1",
-        list_url="https://api.x.ai/v1/models",
-        keep=_any("grok"),
-    ),
-    "groq": Provider(
-        "groq", "Groq (schnell)", "GROQ_API_KEY",
-        chat_base="https://api.groq.com/openai/v1",
-        list_url="https://api.groq.com/openai/v1/models",
-        keep=lambda mid: not any(x in mid.lower()
-                                 for x in ("whisper", "tts", "guard", "embed")),
-        note="extrem schnelle Inferenz",
-    ),
-    # --- Weitere Hersteller (OpenAI-kompatibel) ---
-    "moonshot": _offen("Moonshot (Kimi)", "MOONSHOT_API_KEY", "https://api.moonshot.ai/v1", _any("kimi", "moonshot")),
-    "zai": _offen("Z.ai (GLM)", "ZAI_API_KEY", "https://api.z.ai/api/paas/v4", _any("glm")),
-    "dashscope": _offen("Alibaba (Qwen)", "DASHSCOPE_API_KEY",
-                        "https://dashscope-intl.aliyuncs.com/compatible-mode/v1", _any("qwen", "qwq")),
-    "minimax": _offen("MiniMax", "MINIMAX_API_KEY", "https://api.minimax.io/v1", _any("minimax", "abab")),
-    "stepfun": _offen("StepFun (Step)", "STEPFUN_API_KEY", "https://api.stepfun.ai/v1", _any("step")),
-    "inception": _offen("Inception (Mercury)", "INCEPTION_API_KEY", "https://api.inceptionlabs.ai/v1",
-                        _any("mercury"), note="Diffusions-Sprachmodell, sehr schnell"),
-    # --- Hoster offener Modelle ---
-    "together": _offen("Together AI", "TOGETHER_API_KEY", "https://api.together.ai/v1"),
-    "fireworks": _offen("Fireworks AI", "FIREWORKS_API_KEY", "https://api.fireworks.ai/inference/v1"),
-    "deepinfra": _offen("DeepInfra", "DEEPINFRA_API_KEY", "https://api.deepinfra.com/v1/openai"),
-    "cerebras": _offen("Cerebras", "CEREBRAS_API_KEY", "https://api.cerebras.ai/v1", note="extrem schnell"),
-    "sambanova": _offen("SambaNova", "SAMBANOVA_API_KEY", "https://api.sambanova.ai/v1", note="sehr schnell"),
-    "nebius": _offen("Nebius Token Factory", "NEBIUS_API_KEY", "https://api.tokenfactory.nebius.com/v1"),
-    "novita": _offen("Novita AI", "NOVITA_API_KEY", "https://api.novita.ai/openai/v1"),
-    "hyperbolic": _offen("Hyperbolic", "HYPERBOLIC_API_KEY", "https://api.hyperbolic.xyz/v1"),
-    "siliconflow": _offen("SiliconFlow", "SILICONFLOW_API_KEY", "https://api.siliconflow.com/v1"),
-    "chutes": _offen("Chutes", "CHUTES_API_KEY", "https://llm.chutes.ai/v1"),
-    "featherless": _offen("Featherless", "FEATHERLESS_API_KEY", "https://api.featherless.ai/v1",
-                          note="sehr viele offene Modelle"),
-    "nvidia": _offen("NVIDIA NIM", "NVIDIA_API_KEY", "https://integrate.api.nvidia.com/v1"),
-    "huggingface": _offen("Hugging Face (Inference)", "HUGGINGFACE_API_KEY", "https://router.huggingface.co/v1"),
-    "github": Provider(
-        "github", "GitHub Models", "GITHUB_MODELS_API_KEY",
-        chat_base="https://models.github.ai/inference",
-        list_url="https://models.github.ai/catalog/models",
-        keep=_chat,
-        note="Zugangs-Token von GitHub",
-    ),
-    "venice": _offen("Venice", "VENICE_API_KEY", "https://api.venice.ai/api/v1", note="ohne Speichern der Chats"),
-    # --- Rechenzentren in Europa ---
-    "ionos": _offen("IONOS AI Model Hub", "IONOS_API_KEY", "https://openai.inference.de-txl.ionos.com/v1",
-                    note="Rechenzentrum in Deutschland"),
-    "scaleway": _offen("Scaleway", "SCALEWAY_API_KEY", "https://api.scaleway.ai/v1",
-                       note="Rechenzentrum in Frankreich"),
-    "ovh": _offen("OVHcloud AI Endpoints", "OVH_API_KEY", "https://oai.endpoints.kepler.ai.cloud.ovh.net/v1",
-                  note="Rechenzentrum in Frankreich"),
-    # --- Sammel-Zugänge (ein Key, viele Anbieter) ---
-    "ai_gateway": _offen("Vercel AI Gateway", "AI_GATEWAY_API_KEY", "https://ai-gateway.vercel.sh/v1",
-                         note="ein Key, viele Anbieter"),
-    "aimlapi": _offen("AI/ML API", "AIMLAPI_API_KEY", "https://api.aimlapi.com/v1", note="ein Key, viele Anbieter"),
-    "openrouter": Provider(
-        "openrouter", "OpenRouter (alles)", "OPENROUTER_API_KEY",
-        chat_base="https://openrouter.ai/api/v1",
-        list_url="https://openrouter.ai/api/v1/models",
-        keep=lambda mid: True,
-        note="ein Key, viele Anbieter",
-    ),
-    "ollama_cloud": Provider(
-        "ollama_cloud", "Ollama Cloud", "OLLAMA_API_KEY",
-        chat_base="https://ollama.com/v1",
-        list_url="https://ollama.com/v1/models",
-        keep=lambda mid: not any(x in mid.lower()
-                                 for x in ("embed", "guard", "-rerank")),
-        note="Ollama-Modelle auf fremder Hardware, Key nötig",
-    ),
-    # --- Weitere lokale Server (laufen sie, stehen sie unter /model) ---
+# --- Lokale Server (laufen sie, stehen sie unter /model) ------------------------
+LOKAL: dict[str, Provider] = {
     "lmstudio": _lokal("lmstudio", "LM Studio", 1234),
     "jan": _lokal("jan", "Jan", 1337),
     "llamacpp": _lokal("llamacpp", "llama.cpp-Server / LocalAI", 8080),
@@ -211,47 +62,8 @@ PROVIDERS: dict[str, Provider] = {
     ),
 }
 
-
-# Wo man den jeweiligen API-Key bekommt (für die Einrichtung in der CLI).
-KEY_URLS: dict[str, str] = {
-    "anthropic":  "https://console.anthropic.com/settings/keys",
-    "openai":     "https://platform.openai.com/api-keys",
-    "google":     "https://aistudio.google.com/apikey",
-    "mistral":    "https://console.mistral.ai/api-keys",
-    "cohere":     "https://dashboard.cohere.com/api-keys",
-    "perplexity": "https://www.perplexity.ai/settings/api",
-    "deepseek":   "https://platform.deepseek.com/api_keys",
-    "xai":        "https://console.x.ai",
-    "groq":       "https://console.groq.com/keys",
-    "openrouter": "https://openrouter.ai/keys",
-    "ollama_cloud": "https://ollama.com/settings/keys",
-    "moonshot":   "https://platform.kimi.ai",
-    "zai":        "https://z.ai/manage-apikey/apikey-list",
-    "dashscope":  "https://modelstudio.console.alibabacloud.com",
-    "minimax":    "https://www.minimax.io/platform",
-    "stepfun":    "https://platform.stepfun.ai",
-    "inception":  "https://platform.inceptionlabs.ai",
-    "together":   "https://api.together.ai/settings/api-keys",
-    "fireworks":  "https://fireworks.ai/account/api-keys",
-    "deepinfra":  "https://deepinfra.com/dash/api_keys",
-    "cerebras":   "https://cloud.cerebras.ai",
-    "sambanova":  "https://cloud.sambanova.ai",
-    "nebius":     "https://tokenfactory.nebius.com",
-    "novita":     "https://novita.ai/settings/key-management",
-    "hyperbolic": "https://app.hyperbolic.xyz",
-    "siliconflow": "https://cloud.siliconflow.com",
-    "chutes":     "https://chutes.ai",
-    "featherless": "https://featherless.ai",
-    "nvidia":     "https://build.nvidia.com",
-    "huggingface": "https://huggingface.co/settings/tokens",
-    "github":     "https://github.com/settings/personal-access-tokens",
-    "venice":     "https://venice.ai/settings/api",
-    "ionos":      "https://dcd.ionos.com",
-    "scaleway":   "https://console.scaleway.com/iam/api-keys",
-    "ovh":        "https://endpoints.ai.cloud.ovh.net",
-    "ai_gateway": "https://vercel.com/dashboard",
-    "aimlapi":    "https://aimlapi.com",
-}
+# Reihenfolge = Reihenfolge im Menü: erst die Cloud, dann die lokalen Server.
+PROVIDERS: dict[str, Provider] = {**CLOUD, **LOKAL}
 
 
 def get(provider_id: str) -> Provider | None:
@@ -473,14 +285,8 @@ _ollama_caps_cache: dict = {}      # model_id -> capabilities-Liste (pro Modell 
 
 
 def _ollama_capabilities(model_id: str) -> list:
-    """Die VOLLSTÄNDIGEN Capabilities eines Ollama-Modells.
-
-    Wichtig: /api/tags meldet vision/audio NICHT zuverlässig – dort steht z.B. bei
-    Gemma nur `completion, tools, thinking`, obwohl das Modell Bilder sehen kann.
-    Die volle Liste (inkl. `vision`) gibt es nur über /api/show. Früher hielt
-    NemiCLI deshalb ALLE Ollama-Modelle für „blind" und hängte Bilder nie an –
-    das Modell hat die Beschreibung dann frei halluziniert.
-    """
+    """Die vollständigen Capabilities eines Ollama-Modells über /api/show – /api/tags meldet
+    vision/audio nicht zuverlässig (bei Gemma z. B. nur `completion, tools, thinking`)."""
     if model_id in _ollama_caps_cache:
         return _ollama_caps_cache[model_id]
     try:
@@ -498,123 +304,12 @@ def ollama_is_vision(model_id: str) -> bool:
     return "vision" in _ollama_capabilities(model_id)
 
 
-CLOUD_SHOW_URL = "https://ollama.com/api/show"
-CLOUD_NEUER_VERSUCH_S = 600.0        # nach einem Fehlschlag so lange wieder am Namen erkennen
-_cloud_caps_cache: dict[str, list] = {}
-_cloud_caps_fehler: dict[str, float] = {}
-
-
-def ollama_cloud_capabilities(model_id: str) -> list | None:
-    """Capabilities eines Ollama-Cloud-Modells (vision, tools, thinking …) über /api/show bei ollama.com,
-    gemerkt je Modell. None, wenn die Abfrage nicht ging (dann gilt die Namensliste)."""
-    mid = (model_id or "").strip()
-    if not mid:
-        return None
-    if mid in _cloud_caps_cache:
-        return _cloud_caps_cache[mid]
-    if time.monotonic() < _cloud_caps_fehler.get(mid, 0.0):
-        return None
-    p = get("ollama_cloud")
-    key = p.key() if p else ""
-    try:
-        r = httpx.post(CLOUD_SHOW_URL, json={"model": mid},
-                       headers={"Authorization": f"Bearer {key}"} if key else None,
-                       timeout=httpx.Timeout(3.0, connect=1.0))
-        r.raise_for_status()
-        caps = r.json().get("capabilities")
-        if not isinstance(caps, list):
-            raise ValueError("keine capabilities")
-    except Exception:
-        _cloud_caps_fehler[mid] = time.monotonic() + CLOUD_NEUER_VERSUCH_S
-        return None
-    _cloud_caps_cache[mid] = [str(c) for c in caps]
-    return _cloud_caps_cache[mid]
-
-
-# Cloud-Modelle (OpenAI-Protokoll) melden ihre Vision-Fähigkeit nicht abfragbar.
-# Deshalb erkennen wir bekannte multimodale Familien am Namen. Lieber knapp und
-# treffsicher als breit – ein falsches „sieht Bilder" schickt einem reinen
-# Text-Modell ein Bild, das es nicht verarbeiten kann.
-_CLOUD_VISION_HINTS = (
-    "deepseek-v4.1", "deepseek-flash", "deepseek-v4-flash-vision",   # DeepSeek nativ multimodal
-    "gpt-4o", "gpt-4.1", "gpt-5", "o1", "o3", "o4",                  # OpenAI
-    "gemini",                                                        # Google
-    "claude-3", "claude-opus", "claude-sonnet", "claude-haiku",     # Anthropic
-    "grok-2-vision", "grok-4", "grok-vision",                       # xAI
-    "pixtral", "mistral-small-3", "mistral-medium-3",               # Mistral
-    "-vl", "vision", "llava", "internvl", "qwen2-vl", "qwen2.5-vl",  # generische VLMs
-    "qwen3-vl", "minicpm-v", "molmo", "moondream", "cogvlm",
-    "llama-3.2-11b", "llama-3.2-90b", "llama-4",                    # Llama-Vision
-)
-
-
-def cloud_name_vision(model_id: str) -> bool:
-    """Erkennt an bekannten Namen, ob ein Cloud-Modell Bilder sehen kann.
-    Für Anbieter wie Ollama Cloud, deren API keine Capability-Abfrage bietet."""
-    m = (model_id or "").lower()
-    return any(h in m for h in _CLOUD_VISION_HINTS)
-
-
 def ist_vision_schwach(model_id: str) -> bool:
     """True für kleine Gemmas (e2b/e4b): Die MELDEN zwar 'vision', sind aber zu
     klein, um Bilder wirklich brauchbar zu lesen (Text/Zahlen/Details gehen unter).
     Sie gelten deshalb als nicht sehend."""
     low = (model_id or "").lower()
     return "gemma" in low and any(_hat_groesse(low, k) for k in ("e2b", "e4b"))
-
-
-# --- Modell-Liste live abfragen --------------------------------------------
-
-def _auth_headers(p: Provider) -> dict:
-    key = p.key() or ""
-    if p.kind == "anthropic":
-        return {"x-api-key": key, "anthropic-version": "2023-06-01"}
-    if p.id == "google":                       # Gemini: Schlüssel im Kopf – in der Adresse stünde er in Fehlermeldungen
-        return {"x-goog-api-key": key}
-    return {"Authorization": f"Bearer {key}"}
-
-
-def status_text(anbieter: str, status: int) -> str:
-    """Fehler einer Anfrage ohne Adresse und Schlüssel – nur der Status, bei 401/403 mit Hinweis."""
-    if status in (401, 403):
-        return (f"{anbieter} lehnt den API-Schlüssel ab ({status}) – ist er gültig und für diese Schnittstelle "
-                "freigeschaltet? Neu eintragen unter /model.")
-    return f"{anbieter} antwortet mit Fehler {status}."
-
-
-def _parse_models(p: Provider, data: dict | list) -> list[str]:
-    """Holt die Modell-IDs aus der jeweiligen Antwort-Form."""
-    ids: list[str] = []
-    if p.id == "google":
-        # {"models":[{"name":"models/gemini-2.5-pro", ...}]}
-        for m in data.get("models", []):
-            methods = m.get("supportedGenerationMethods", [])
-            if methods and "generateContent" not in methods:
-                continue
-            name = (m.get("name") or "").split("/")[-1]
-            if name:
-                ids.append(name)
-    elif p.id == "cohere":
-        # {"models":[{"name":"command-r-plus","endpoints":[...]}]}
-        for m in data.get("models", []):
-            eps = m.get("endpoints", [])
-            if eps and "chat" not in eps:
-                continue
-            if m.get("name"):
-                ids.append(m["name"])
-    else:
-        # OpenAI-Form: {"data":[{"id":"..."}]} (auch Anthropic, Mistral, ...); Together und GitHub: gleich die Liste
-        eintraege = data if isinstance(data, list) else data.get("data", [])
-        for m in eintraege:
-            if not isinstance(m, dict):
-                continue
-            art = str(m.get("type") or "").lower()
-            if art and art not in ("chat", "language", "code", "model", "llm", "text"):
-                continue                          # Embeddings, Bilder, Audio aus gemischten Katalogen
-            mid = m.get("id") or m.get("name")
-            if mid:
-                ids.append(mid)
-    return ids
 
 
 LISTE_MAX = 2000           # /model zeigt davon 30 auf einmal, 🔍 Suchen findet den Rest
@@ -652,6 +347,8 @@ async def list_models(provider_id: str, limit: int = 40,
         if r.status_code >= 400:
             raise RuntimeError(status_text(p.label, r.status_code))
         data = r.json()
+    if not p.keyless:                         # Kontextlängen aus derselben Liste merken
+        CP._liste_merken(p, data)
 
     ids = [mid for mid in _parse_models(p, data) if p.keep(mid)]
     ids = sorted(set(ids))
@@ -661,3 +358,50 @@ async def list_models(provider_id: str, limit: int = 40,
     if ids:                                   # nur Brauchbares merken
         _models_cache[ck] = (time.monotonic(), list(ids))
     return ids
+
+
+# --- Kontextlänge ---------------------------------------------------------------
+# Cloud: wie der Anbieter sie in seiner Modell-Liste nennt (cloudprovider.kontext). Lokale Server: der
+# Kontext, mit dem das Modell gerade geladen ist – LM Studio `loaded_context_length` (/api/v0/models),
+# llama.cpp `n_ctx` (/props), vLLM `max_model_len` und Jan aus /v1/models. Lokal nur kurz gemerkt: ein
+# neu geladenes Modell kann einen anderen Kontext haben. Lokales Ollama misst cloud.py (ollama_kontext).
+_LOKAL_KONTEXT: dict[str, tuple[float, int]] = {}
+LOKAL_KONTEXT_TTL = 60.0
+
+
+def _lokal_kontext_holen(p: Provider, model_id: str) -> bool:
+    wurzel = p.list_url.rsplit("/v1", 1)[0]
+    n = None
+    zeit = httpx.Timeout(2.0, connect=0.4)
+    if p.id == "lmstudio":
+        daten = httpx.get(wurzel + "/api/v0/models", timeout=zeit).json()
+        for m in daten.get("data", []) if isinstance(daten, dict) else []:
+            if isinstance(m, dict) and m.get("id") == model_id:
+                n = CP._zahl(m.get("loaded_context_length")) or CP.kontext_aus_eintrag(m)
+    elif p.id == "llamacpp":
+        try:
+            daten = httpx.get(wurzel + "/props", timeout=zeit).json()
+            n = CP._zahl((daten.get("default_generation_settings") or {}).get("n_ctx")) or CP._zahl(daten.get("n_ctx"))
+        except Exception:
+            n = None                              # LocalAI kennt /props nicht: dann aus /v1/models
+    if not n:
+        daten = httpx.get(p.list_url, timeout=zeit).json()
+        n = next((CP.kontext_aus_eintrag(m) for mid, m in CP._eintraege(p, daten) if mid == model_id), None)
+    if n:
+        _LOKAL_KONTEXT[f"{p.id}:{model_id}"] = (time.monotonic(), n)
+    return bool(n)
+
+
+def kontext(provider_id: str, model_id: str) -> int | None:
+    """Kontextlänge, wie Anbieter oder lokaler Server sie nennen – None, solange unbekannt (dann gilt der
+    Richtwert in pricing). Nachgefragt wird im Hintergrund; die Oberfläche wartet nie aufs Netz."""
+    p = PROVIDERS.get(provider_id)
+    if p is None or provider_id == "ollama":
+        return None
+    if not p.keyless:
+        return CP.kontext(provider_id, model_id)
+    schluessel = f"{provider_id}:{model_id}"
+    hit = _LOKAL_KONTEXT.get(schluessel)
+    if hit is None or time.monotonic() - hit[0] > LOKAL_KONTEXT_TTL:
+        CP.im_hintergrund("lokal:" + schluessel, lambda: _lokal_kontext_holen(p, model_id))
+    return hit[1] if hit else None

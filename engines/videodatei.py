@@ -57,7 +57,8 @@ MF_MT_AUDIO_BITS_PER_SAMPLE = _guid("f2deb57f-40fa-4764-aa33-ed4f2d1ff669")
 MF_MT_AUDIO_AVG_BYTES_PER_SECOND = _guid("1aab75c8-cfef-451c-ab95-ac034b8e1731")
 MF_MT_AUDIO_BLOCK_ALIGNMENT = _guid("322de230-9eeb-43bd-ab7a-ff412251541d")
 TON_RATE = 48_000
-TON_BYTES_JE_S = 16_000                  # AAC 128 kbit/s
+TON_BYTES_JE_S = 16_000                  # AAC 128 kbit/s (mono); Stereo: 192 kbit/s
+TON_BYTES_JE_S_STEREO = 24_000
 
 # Plätze in den COM-Tabellen (IUnknown 0–2, IMFAttributes 3–32)
 _SET_UINT32, _SET_UINT64, _SET_GUID = 21, 22, 24
@@ -131,29 +132,42 @@ def _typ(plat, untertyp: _GUID, W: int, H: int, fps: int, bitrate: int | None):
     return t
 
 
-def _ton_typ(plat, aac: bool):
+def _ton_typ(plat, aac: bool, kanaele: int = 1):
     t = c_void_p()
     _pruefen(plat.MFCreateMediaType(byref(t)), "MFCreateMediaType")
     _setzen(t, MF_MT_MAJOR_TYPE, MFMediaType_Audio, "guid")
     _setzen(t, MF_MT_SUBTYPE, MFAudioFormat_AAC if aac else MFAudioFormat_PCM, "guid")
-    _setzen(t, MF_MT_AUDIO_NUM_CHANNELS, 1, "u32")
+    _setzen(t, MF_MT_AUDIO_NUM_CHANNELS, kanaele, "u32")
     _setzen(t, MF_MT_AUDIO_SAMPLES_PER_SECOND, TON_RATE, "u32")
     _setzen(t, MF_MT_AUDIO_BITS_PER_SAMPLE, 16, "u32")
     if aac:
-        _setzen(t, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, TON_BYTES_JE_S, "u32")
+        _setzen(t, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, TON_BYTES_JE_S if kanaele == 1 else TON_BYTES_JE_S_STEREO, "u32")
     else:
-        _setzen(t, MF_MT_AUDIO_BLOCK_ALIGNMENT, 2, "u32")
-        _setzen(t, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, TON_RATE * 2, "u32")
+        _setzen(t, MF_MT_AUDIO_BLOCK_ALIGNMENT, 2 * kanaele, "u32")
+        _setzen(t, MF_MT_AUDIO_AVG_BYTES_PER_SECOND, TON_RATE * 2 * kanaele, "u32")
     return t
 
 
-def ton_vorbereiten(wellen, rate: int) -> bytes:
-    """Wellenform (float −1…1, mono, beliebige Abtastrate) -> 16-Bit-PCM mit 48 kHz."""
+def kanaele(wellen) -> int:
+    """2 für Stereo (2, Proben), sonst 1."""
     import numpy as np
-    w = np.asarray(wellen, dtype=np.float32).ravel()
-    if len(w) and rate != TON_RATE:
-        n = max(1, round(len(w) * TON_RATE / rate))
-        w = np.interp(np.linspace(0, len(w) - 1, n), np.arange(len(w)), w).astype(np.float32)
+    w = np.asarray(wellen)
+    return 2 if w.ndim == 2 and w.shape[0] == 2 else 1
+
+
+def ton_vorbereiten(wellen, rate: int) -> bytes:
+    """Wellenform (float −1…1, mono oder Stereo (2, Proben), beliebige Abtastrate) -> 16-Bit-PCM mit 48 kHz,
+    Stereo verschränkt (L, R, L, R …)."""
+    import numpy as np
+    w = np.asarray(wellen, dtype=np.float32)
+    spuren = list(w) if kanaele(w) == 2 else [w.ravel()]
+    aus = []
+    for s in spuren:
+        if len(s) and rate != TON_RATE:
+            n = max(1, round(len(s) * TON_RATE / rate))
+            s = np.interp(np.linspace(0, len(s) - 1, n), np.arange(len(s)), s).astype(np.float32)
+        aus.append(s)
+    w = np.stack(aus, 1).ravel() if len(aus) == 2 else aus[0]
     return (np.clip(w, -1, 1) * 32767).astype("<i2").tobytes()
 
 
@@ -194,7 +208,8 @@ def nv12(rgb):
 def schreiben(bilder, pfad: Path, fps: int, rate: float = 1.0, ton=None) -> None:
     """bilder (T, H, W, 3) uint8 RGB – oder eine Folge solcher Bilder, die erst beim Schreiben entsteht
     (dann liegt nie das ganze Video im Speicher) -> MP4 (H.264) über Media Foundation; `rate` hebt die
-    Datenrate an. ton: (Wellenform float mono, Abtastrate) -> AAC-Tonspur, im Takt der Bilder geschrieben."""
+    Datenrate an. ton: (Wellenform float mono oder Stereo (2, Proben), Abtastrate) -> AAC-Tonspur, im Takt
+    der Bilder geschrieben."""
     import itertools
     import numpy as np
     plat, rw = _dlls()
@@ -203,7 +218,9 @@ def schreiben(bilder, pfad: Path, fps: int, rate: float = 1.0, ton=None) -> None
     H, W = erstes.shape[0] & ~1, erstes.shape[1] & ~1
     dauer = round(10_000_000 / fps)                       # Media Foundation zählt in 100 ns
     pcm = ton_vorbereiten(*ton) if ton is not None else b""
-    ton_stueck = TON_RATE // 10 * 2                      # 100 ms je Ton-Probe (Bytes)
+    k = kanaele(ton[0]) if ton is not None else 1
+    fb = 2 * k                                            # Bytes je Abtastzeitpunkt (16 Bit je Kanal)
+    ton_stueck = TON_RATE // 10 * fb                     # 100 ms je Ton-Probe (Bytes)
     pfad = Path(pfad).resolve()
     pfad.parent.mkdir(parents=True, exist_ok=True)
     ole = ctypes.WinDLL("ole32")
@@ -221,7 +238,7 @@ def schreiben(bilder, pfad: Path, fps: int, rate: float = 1.0, ton=None) -> None
              was="SetInputMediaType")
         ton_strom = c_uint32()
         if pcm:
-            typen += [_ton_typ(plat, aac=True), _ton_typ(plat, aac=False)]
+            typen += [_ton_typ(plat, aac=True, kanaele=k), _ton_typ(plat, aac=False, kanaele=k)]
             _ruf(schreiber, _SW_ADD_STREAM, (c_void_p, POINTER(c_uint32)), typen[2], byref(ton_strom),
                  was="AddStream (Ton)")
             _ruf(schreiber, _SW_SET_INPUT, (c_uint32, c_void_p, c_void_p), ton_strom.value, typen[3], None,
@@ -231,10 +248,10 @@ def schreiben(bilder, pfad: Path, fps: int, rate: float = 1.0, ton=None) -> None
 
         def ton_bis(zeit: int) -> None:                  # Ton bis zur Zeit `zeit` (100 ns) nachschreiben
             nonlocal ton_pos
-            while ton_pos < len(pcm) and ton_pos // 2 * 10_000_000 // TON_RATE < zeit:
+            while ton_pos < len(pcm) and ton_pos // fb * 10_000_000 // TON_RATE < zeit:
                 stueck = pcm[ton_pos:ton_pos + ton_stueck]
-                _probe(plat, schreiber, ton_strom.value, stueck, ton_pos // 2 * 10_000_000 // TON_RATE,
-                       len(stueck) // 2 * 10_000_000 // TON_RATE)
+                _probe(plat, schreiber, ton_strom.value, stueck, ton_pos // fb * 10_000_000 // TON_RATE,
+                       len(stueck) // fb * 10_000_000 // TON_RATE)
                 ton_pos += len(stueck)
 
         # Endet eine Spur früher, wartet der Schreiber bei jeder Probe der anderen auf sie (~0,4 s je
@@ -250,8 +267,8 @@ def schreiben(bilder, pfad: Path, fps: int, rate: float = 1.0, ton=None) -> None
                 luecke(ton_strom.value, zeit)
             _probe(plat, schreiber, strom.value, np.ascontiguousarray(nv12(bild)).tobytes(), zeit, dauer)
         while ton_pos < len(pcm):                         # Ton, der länger ist als das Bild
-            luecke(strom.value, ton_pos // 2 * 10_000_000 // TON_RATE)
-            ton_bis(ton_pos // 2 * 10_000_000 // TON_RATE + 1)
+            luecke(strom.value, ton_pos // fb * 10_000_000 // TON_RATE)
+            ton_bis(ton_pos // fb * 10_000_000 // TON_RATE + 1)
         _ruf(schreiber, _SW_FINALIZE, (), was="Finalize")
     finally:
         for t in typen:

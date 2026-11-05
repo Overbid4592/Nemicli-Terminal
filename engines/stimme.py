@@ -161,9 +161,9 @@ def geladen() -> bool:
 
 
 def freigeben() -> None:
-    """GPU frei machen (wartet auf einen laufenden Satz)."""
+    """GPU frei machen (wartet auf einen laufenden Satz oder eine Probe)."""
     global _modell
-    with _lock:
+    with _rechnen, _lock:                          # erst nach der Rechnung: sonst bliebe ihr Modell belegt
         if _modell is None:
             return
         if (zustand := sys.modules.get("gpuzustand")) is not None and zustand.kaputt():
@@ -414,6 +414,13 @@ def spricht() -> bool:
     return _zustand["spricht"] or time.time() < _spielt_bis
 
 
+def _vorher_fertig(gen: int) -> bool:
+    """Wartet, bis das vorige Stück zu Ende ist; False, wenn inzwischen stopp() kam."""
+    while gen == _generation and (rest := _spielt_bis - time.time()) > 0:
+        time.sleep(min(rest, 0.1))
+    return gen == _generation
+
+
 def _arbeiter() -> None:
     zaehler = 0
     while True:
@@ -430,7 +437,10 @@ def _arbeiter() -> None:
                     break
                 zaehler += 1
                 ziel = Path(tempfile.gettempdir()) / "NemiCLI-Stimme" / f"stueck_{zaehler % 4}.wav"
-                abspielen(wav_schreiben(wav, ziel), len(wav) / ABTASTRATE)
+                wav_schreiben(wav, ziel)
+                if not _vorher_fertig(gen):
+                    break
+                abspielen(ziel, len(wav) / ABTASTRATE)
             _zustand["fehler"] = ""
         except Exception as exc:                                       # Stimme ist Zugabe, nie Pflicht
             _zustand["fehler"] = str(exc)
@@ -485,8 +495,8 @@ def schalter(name: str, vorgabe: bool) -> bool:
 def modus() -> str:
     """Stimm-Modus (`voice_modus`): „aus“ – nichts spricht, das Modell lädt nie, bis der Nutzer wieder
     einschaltet; „knopf“ (Vorgabe) – nur auf Anfrage (Werkzeug vorlesen, Kugel, /voice jetzt), danach
-    sofort entladen; „an“ – jede Antwort wird vorgelesen. Alte Werte: True → an, False → aus
-    (der Nutzer hatte abgeschaltet); ohne Eintrag zählt der alte Schalter vorlesen_auto."""
+    sofort entladen; „an“ – jede Antwort wird vorgelesen. Alte Werte: True → an, False → aus;
+    ohne Eintrag zählt der alte Schalter vorlesen_auto."""
     import config
     v = config.load().get("voice_modus")
     if isinstance(v, str) and v.strip().lower() in MODI:

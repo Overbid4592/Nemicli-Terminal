@@ -17,7 +17,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
-from . import gesicht, gewichte, netze
+from . import gesicht, gewichte, netze, sprechen
 
 # Werte und Grenzen wie die Regler des Originals (app.py)
 NEUTRAL = {"nicken": 0.0, "drehen": 0.0, "neigen": 0.0, "laecheln": 0.0, "zwinkern": 0.0, "augenbrauen": 0.0,
@@ -211,6 +211,9 @@ class Quelle:
     augen: tuple[float, float]   # offen links, rechts
     M_c2o: np.ndarray            # Ausschnitt -> Original (3×3)
     maske: torch.Tensor          # (1, 1, H, W) im Original
+    alpha: torch.Tensor | None = None        # Deckkraft (1, 1, H, W) – None: Bild ohne Freistellung
+    alpha_ausschnitt: torch.Tensor | None = None   # dieselbe im Gesichtsausschnitt (1, 1, 512, 512)
+    aus_datei: bool = False      # Deckkraft stammt aus dem Bild selbst (PNG mit durchsichtigen Stellen)
 
 
 class Motor:
@@ -245,8 +248,13 @@ class Motor:
             "cpu", enabled=False)
 
     @torch.no_grad()
-    def vorbereiten(self, pfad, kasten=None) -> Quelle:
-        arr = gesicht.bild_laden(pfad)
+    def vorbereiten(self, pfad, kasten=None, frei: bool = False) -> Quelle:
+        """frei: Hintergrund durchsichtig – die Deckkraft kommt aus dem Bild (PNG mit Alpha) oder wird
+        einmal freigestellt; beim Bewegen wandert sie mit dem Bewegungsfeld mit."""
+        arr, alpha = gesicht.bild_und_alpha(pfad)
+        aus_datei = alpha is not None
+        if alpha is None and frei:
+            alpha = freistellen(arr)
         pts = gesicht.finden(arr, self.punkte, kasten)
         mitte, groesse, winkel = gesicht.rechteck(pts, gesicht.QUELLE_SKALA, vy=gesicht.QUELLE_VY)
         M = gesicht.matrix(mitte, groesse, winkel, gesicht.QUELLE_GROESSE)
@@ -264,12 +272,18 @@ class Motor:
         M_c2o = np.linalg.inv(M)
         h, w = arr.shape[:2]
         maske = gesicht.verziehen(gesicht.maske().to(self.geraet), M_c2o, w, h)
+        a = a_aus = None
+        if alpha is not None:
+            a = torch.from_numpy(alpha)[None, None].float().to(self.geraet)
+            a_aus = gesicht.verziehen(a, M, gesicht.QUELLE_GROESSE, gesicht.QUELLE_GROESSE).clamp(0, 1)
         return Quelle(bild, merkmal, kp, ausdruck, info["scale"], info["t"], winkel3, x_s,
-                      gesicht.augen_offen(pts), M_c2o, maske)
+                      gesicht.augen_offen(pts), M_c2o, maske, a, a_aus, aus_datei)
 
     @torch.no_grad()
-    def bilder(self, q: Quelle, werte: list[dict], mit_gesicht: bool = False):
-        """Werte je Bild -> ganze Bilder (B, 3, H, W) 0–1; mit_gesicht: dazu der Gesichtsausschnitt (B, 3, 512, 512)."""
+    def bilder(self, q: Quelle, werte: list[dict], mit_gesicht: bool = False, mit_alpha: bool = False):
+        """Werte je Bild -> ganze Bilder (B, 3, H, W) 0–1; mit_gesicht: dazu der Gesichtsausschnitt (B, 3, 512, 512);
+        mit_alpha (nur mit q.alpha): zuletzt die mitbewegte Deckkraft (B, 1, H, W)."""
+        mit_alpha = mit_alpha and q.alpha is not None
         B = len(werte)
         w = {k: torch.tensor([float(v[k]) for v in werte], device=self.geraet) for k in NEUTRAL}
         R = drehmatrix(q.winkel[0] + w["nicken"], q.winkel[1] + w["drehen"], q.winkel[2] + w["neigen"])
@@ -291,12 +305,53 @@ class Motor:
         x_d = x_d + naht[:, :63].view(B, -1, 3)
         x_d[..., :2] += naht[:, 63:65].view(B, 1, 2)
         with self._halb():
-            merkmal = self.netze["W"](q.merkmal.expand(B, -1, -1, -1, -1), x_d, x_s)
+            aus = self.netze["W"](q.merkmal.expand(B, -1, -1, -1, -1), x_d, x_s, mit_fluss=mit_alpha)
+            merkmal, fluss = aus if mit_alpha else (aus, None)
             gesichter = self.netze["G"](merkmal).float()
         H, W = q.bild.shape[-2:]
         zurueck = gesicht.verziehen(gesichter, q.M_c2o, W, H)
         ganz = (q.maske * zurueck + (1 - q.maske) * q.bild).clamp(0, 1)
-        return (ganz, gesichter.clamp(0, 1)) if mit_gesicht else ganz
+        raus = [ganz, gesichter.clamp(0, 1)] if mit_gesicht else [ganz]
+        if mit_alpha:
+            raus.append(alpha_mitbewegen(q, fluss))
+        return tuple(raus) if len(raus) > 1 else ganz
+
+
+def alpha_mitbewegen(q: Quelle, fluss: torch.Tensor) -> torch.Tensor:
+    """Deckkraft je Bild (B, 1, H, W): im Ausschnitt mit dem Bewegungsfeld des Warping-Netzes verschoben
+    (dieselbe Bewegung, die das Gesicht macht), außerhalb wie im Bild – ohne zweites Modell, ohne Flackern."""
+    B, h, w, _ = fluss.shape
+    g = gesicht.QUELLE_GROESSE
+    # Nur die Verschiebung übernehmen: Das Netz rechnet sein Gitter mit (n−1)-Teilung, sampelt aber mit
+    # align_corners=False – für die 512er-Maske wäre das eine Verzerrung von 1/63 (~4 Pixel am Rand).
+    eigen = netze.koordinatengitter(1, h, w, ref=fluss)[0, ..., :2]                  # (h, w, 2)
+    schub = F.interpolate((fluss - eigen).permute(0, 3, 1, 2), size=(g, g), mode="bilinear", align_corners=False)
+    achse = (torch.arange(g, dtype=fluss.dtype, device=fluss.device) * 2 + 1) / g - 1
+    yy, xx = torch.meshgrid(achse, achse, indexing="ij")
+    gitter = torch.stack([xx, yy], dim=-1)[None] + schub.permute(0, 2, 3, 1)
+    a = F.grid_sample(q.alpha_ausschnitt.expand(B, -1, -1, -1), gitter,
+                      mode="bilinear", padding_mode="border", align_corners=False)
+    H, W = q.bild.shape[-2:]
+    zurueck = gesicht.verziehen(a, q.M_c2o, W, H)
+    return (q.maske * zurueck + (1 - q.maske) * q.alpha).clamp(0, 1)
+
+
+FREISTELL_MODELL = "isnet-general-use"     # dasselbe Modell wie bei den Kugel-Bildern
+_freistell_sitzung = None
+
+
+def freistellen(arr: np.ndarray) -> np.ndarray:
+    """Deckkraft (H, W) 0–1 eines RGB-Bildes über rembg – einmal je Porträt, nicht je Bild."""
+    global _freistell_sitzung
+    from PIL import Image
+    try:
+        from rembg import new_session, remove
+    except ImportError as exc:
+        raise RuntimeError("rembg fehlt – damit wird der Hintergrund freigestellt.") from exc
+    if _freistell_sitzung is None:
+        _freistell_sitzung = new_session(FREISTELL_MODELL)
+    maske = remove(Image.fromarray(arr), session=_freistell_sitzung, only_mask=True)
+    return np.asarray(maske, dtype=np.float32) / 255.0
 
 
 _MOTOR: Motor | None = None
@@ -330,6 +385,10 @@ def fehlt() -> str | None:
 
 VORSCHAU_KANTE = 480          # animiertes WebP fürs kleine Fenster
 KUGEL_KANTE = 256             # Gesichtsausschnitt für die Kugel
+FREI_KANTE = 384              # freigestellte Figur für die Kugel (durchsichtig, nicht rund)
+FREI_RAND = 0.06              # Rand um die Figur (Anteil), damit Bewegung nicht abgeschnitten wird
+GRUND = (0.08, 0.08, 0.1)     # MP4/Vorschau eines durchsichtigen Bildes: ruhiger dunkler Grund statt Randfarben
+WEBP_METHODE = 0              # schnellste Kompression – method 4 kostete bei 7 s Sprache 13 s, kaum kleiner
 
 
 def _uint8(b: torch.Tensor) -> np.ndarray:
@@ -343,23 +402,62 @@ def _klein(bild: np.ndarray, kante: int):
     return Image.fromarray(bild).resize((max(2, round(w * f)), max(2, round(h * f))), Image.LANCZOS)
 
 
+def _figur_kasten(alpha: torch.Tensor) -> tuple[int, int, int, int]:
+    """Quadrat um alles Sichtbare (l, o, r, u) mit etwas Rand – passt für alle Bilder des Clips."""
+    a = alpha[0, 0] > 0.05
+    H, W = a.shape
+    if not bool(a.any()):
+        return 0, 0, W, H
+    zeilen, spalten = torch.nonzero(a.any(1)).flatten(), torch.nonzero(a.any(0)).flatten()
+    o, u, l, r = int(zeilen[0]), int(zeilen[-1]) + 1, int(spalten[0]), int(spalten[-1]) + 1
+    seite = int(max(r - l, u - o) * (1 + 2 * FREI_RAND))
+    cx, cy = (l + r) // 2, (o + u) // 2
+    return cx - seite // 2, cy - seite // 2, cx - seite // 2 + seite, cy - seite // 2 + seite
+
+
+def _frei_bilder(ganz: torch.Tensor, alpha: torch.Tensor, kasten, kante: int) -> np.ndarray:
+    """RGBA der Figur im Kasten (B, kante, kante, 4) uint8 – auf der Grafikkarte zugeschnitten und verkleinert;
+    was über den Bildrand ragt, bleibt durchsichtig."""
+    l, o, r, u = kasten
+    H, W = ganz.shape[-2:]
+    rgba = torch.cat([ganz * alpha, alpha], dim=1)                       # vormultipliziert: saubere Kanten
+    rgba = F.pad(rgba, (max(0, -l), max(0, r - W), max(0, -o), max(0, u - H)))
+    l2, o2 = max(0, l), max(0, o)
+    rgba = rgba[..., o2:o2 + (u - o), l2:l2 + (r - l)]
+    rgba = F.interpolate(rgba, size=(kante, kante), mode="area")
+    a = rgba[:, 3:4]
+    rgb = torch.where(a > 1e-4, rgba[:, :3] / a.clamp_min(1e-4), torch.zeros_like(rgba[:, :3]))
+    return _uint8(torch.cat([rgb.clamp(0, 1), a], dim=1))
+
+
 def webp_schreiben(bilder, pfad: Path, fps: float, kante: int) -> Path:
     """Animiertes WebP (Endlosschleife), längste Kante höchstens `kante` – Qt spielt es mit QMovie ab.
     bilder: Array (T, H, W, 3) oder schon verkleinerte PIL-Bilder."""
     folge = [b if not isinstance(b, np.ndarray) else _klein(b, kante) for b in bilder]
     folge[0].save(pfad, save_all=True, append_images=folge[1:], duration=round(1000 / fps), loop=0,
-                  quality=82, method=4)
+                  quality=82, method=WEBP_METHODE)
     return pfad
 
 
 def animieren(bild, ablauf_oder_schluessel="lebendig", sekunden: float = 4.0, fps: int = FPS, ziel=None,
               geraet: str | None = None, kasten=None, on_status=None, mund: list[float] | None = None,
-              ton=None) -> dict:
+              ton=None, text: str = "", frei: bool = False, seed: int = 0) -> dict:
     """Porträt bewegen und als MP4 speichern, dazu zwei animierte WebP: <name>.webp (ganzes Bild, fürs
     kleine Fenster) und <name>_kugel.webp (Gesicht, für die Kugel). Rückgabe: pfad, vorschau, kugel,
     bilder, sekunden_rechnen, vram_mb, geraet.
-    Sprechen: mund = Mundöffnung je Bild (mundwerte) bestimmt die Länge, ton = (Wellenform, Abtastrate)
-    landet als Tonspur im MP4."""
+    Sprechen: ton = (Wellenform, Abtastrate) – die Lippen formen die Laute (sprechen.lippen), der Kopf
+    spricht mit (sprechen.koerpersprache, statt „lebendig“; `text` verrät Fragen), der Ton landet im MP4.
+    mund = nur Mundöffnung je Bild (ältere Steuerung, ohne Formen).
+    frei: Hintergrund durchsichtig – <name>_frei_kugel.webp zeigt die ganze Figur ohne Kreis; die Maske
+    wandert mit der Bewegung mit."""
+    from PIL import Image
+    lippen = None
+    if ton is not None and not mund:
+        klang = sprechen.analyse(ton[0], ton[1], fps)
+        lippen = sprechen.lippen(klang, fps)
+        sekunden = len(lippen) / fps
+        if ablauf_oder_schluessel == "lebendig":
+            ablauf_oder_schluessel = sprechen.koerpersprache(klang, fps, text, seed)
     if mund:
         sekunden = len(mund) / fps
     if (grund := fehlt()):
@@ -375,20 +473,28 @@ def animieren(bild, ablauf_oder_schluessel="lebendig", sekunden: float = 4.0, fp
     m = motor(geraet)
     if m.geraet == "cuda":
         torch.cuda.reset_peak_memory_stats()
-    q = m.vorbereiten(bild, kasten)
-    schluessel = (ablauf(ablauf_oder_schluessel, sekunden) if isinstance(ablauf_oder_schluessel, str)
+    q = m.vorbereiten(bild, kasten, frei=frei)
+    frei = frei and q.alpha is not None
+    mit_alpha = frei or q.aus_datei
+    schluessel = (ablauf(ablauf_oder_schluessel, sekunden, seed) if isinstance(ablauf_oder_schluessel, str)
                   else list(ablauf_oder_schluessel))
     werte = verlauf(schluessel, min(float(sekunden), MAX_SEKUNDEN), fps, sum(q.augen) / 2)
     if mund:
         lo, hi = GRENZEN["mund"]
         for i, v in enumerate(werte):
             v["mund"] = min(hi, max(lo, v["mund"] + (mund[i] if i < len(mund) else 0.0)))
+    if lippen:
+        for v, lp in zip(werte, lippen):
+            for name, wert in lp.items():
+                lo, hi = GRENZEN[name]
+                v[name] = min(hi, max(lo, v[name] + wert))
+    kasten_frei = _figur_kasten(q.alpha) if frei else None
     stapel = 2
     if m.geraet == "cuda":
-        frei = torch.cuda.mem_get_info()[0] / 2 ** 20
-        stapel = next(n for grenze, n in STAPEL if frei >= grenze)
+        frei_mb = torch.cuda.mem_get_info()[0] / 2 ** 20
+        stapel = next(n for grenze, n in STAPEL if frei_mb >= grenze)
     jedes = max(1, math.ceil(len(werte) / VORSCHAU_BILDER))      # Vorschau: höchstens so viele Bilder
-    vorschau_bilder, kugel_bilder = [], []
+    vorschau_bilder, kugel_bilder, frei_bilder = [], [], []
 
     def folge():
         """Bilder entstehen erst, wenn der MP4-Schreiber sie holt – im Speicher bleibt nur die Vorschau."""
@@ -396,19 +502,27 @@ def animieren(bild, ablauf_oder_schluessel="lebendig", sekunden: float = 4.0, fp
         i = 0
         while i < len(werte):
             try:
-                b, g = m.bilder(q, werte[i:i + stapel], mit_gesicht=True)
+                b, g, *a = m.bilder(q, werte[i:i + stapel], mit_gesicht=True, mit_alpha=mit_alpha)
             except torch.OutOfMemoryError:
                 if stapel == 1:
                     raise
                 torch.cuda.empty_cache()
                 stapel = max(1, stapel // 2)
                 continue
+            figur = _frei_bilder(b, a[0], kasten_frei, FREI_KANTE) if frei else None
+            if q.aus_datei:                         # durchsichtiges Bild: fürs MP4 auf einen festen Grund
+                grund = torch.tensor(GRUND, device=b.device).view(1, 3, 1, 1)
+                b = b * a[0] + grund * (1 - a[0])
+                g_alpha = gesicht.verziehen(a[0], np.linalg.inv(q.M_c2o), g.shape[-1], g.shape[-2])
+                g = g * g_alpha + grund * (1 - g_alpha)
             ganz = _uint8(b)
-            gesicht = _uint8(F.interpolate(g, size=(KUGEL_KANTE, KUGEL_KANTE), mode="area"))
+            klein = _uint8(F.interpolate(g, size=(KUGEL_KANTE, KUGEL_KANTE), mode="area"))
             for k in range(len(ganz)):
                 if (i + k) % jedes == 0:
                     vorschau_bilder.append(_klein(ganz[k], VORSCHAU_KANTE))
-                    kugel_bilder.append(_klein(gesicht[k], KUGEL_KANTE))
+                    kugel_bilder.append(_klein(klein[k], KUGEL_KANTE))
+                    if frei:
+                        frei_bilder.append(Image.fromarray(figur[k], "RGBA"))
                 yield ganz[k]
             i += len(ganz)
             if on_status:
@@ -424,6 +538,24 @@ def animieren(bild, ablauf_oder_schluessel="lebendig", sekunden: float = 4.0, fp
     vram = torch.cuda.max_memory_allocated() / 2 ** 20 if m.geraet == "cuda" else 0.0
     vorschau = webp_schreiben(vorschau_bilder, ziel.with_suffix(".webp"), fps / jedes, VORSCHAU_KANTE)
     kugel = webp_schreiben(kugel_bilder, ziel.with_name(ziel.stem + "_kugel.webp"), fps / jedes, KUGEL_KANTE)
-    return {"pfad": str(ziel), "vorschau": str(vorschau), "kugel": str(kugel), "bilder": len(werte),
-            "sekunden_rechnen": round(rechnen, 2),
-            "vram_mb": round(vram), "geraet": m.geraet}
+    erg = {"pfad": str(ziel), "vorschau": str(vorschau), "kugel": str(kugel), "bilder": len(werte),
+           "sekunden_rechnen": round(rechnen, 2),
+           "vram_mb": round(vram), "geraet": m.geraet}
+    if frei_bilder:                     # durchsichtige Figur; die Kugel zeigt sie statt des runden Gesichts
+        erg["kugel"] = str(webp_schreiben(frei_bilder, ziel.with_name(ziel.stem + "_frei_kugel.webp"),
+                                          fps / jedes, FREI_KANTE))
+    if ton is not None:                 # Tonspur einzeln – die Kugel spielt sie zum WebP ab
+        erg["ton"] = str(ton_schreiben(ton[0], ton[1], ziel.with_suffix(".wav")))
+    return erg
+
+
+def ton_schreiben(wellen, abtastrate: int, pfad: Path) -> Path:
+    """Mono-WAV (16 Bit) neben dem Video."""
+    import wave
+    w = np.clip(np.asarray(wellen, dtype=np.float32).ravel(), -1, 1)
+    with wave.open(str(pfad), "wb") as f:
+        f.setnchannels(1)
+        f.setsampwidth(2)
+        f.setframerate(int(abtastrate))
+        f.writeframes((w * 32767).astype("<i2").tobytes())
+    return pfad

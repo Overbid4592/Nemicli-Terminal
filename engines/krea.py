@@ -1,5 +1,5 @@
 """
-krea.py - NemiCLIs eigene Pipeline für Krea 2 (getrennt von der SD-Pipeline).
+krea.py - NemiCLIs eigene Pipeline für Krea 2.
 
 Erwarteter Ordner `Models/Krea2/`:
 
@@ -1061,8 +1061,18 @@ def _beschaeftigt() -> bool:
         return False
 
 
+def _fremd_malt() -> bool:
+    """Malt ein anderer NemiCLI-Prozess oder wartet darauf? Dann ruhende Gewichte nicht doppelt halten."""
+    try:
+        import malsperre
+        return malsperre.fremd_will_malen()
+    except Exception:
+        return False
+
+
 class _Ruheuhr(threading.Thread):
-    """Entlädt nach `sek` Sekunden ohne Arbeit; `cancel()` hält sie an."""
+    """Entlädt nach `sek` Sekunden ohne Arbeit – oder sofort in Ruhe, wenn ein anderer Prozess malt;
+    `cancel()` hält sie an."""
 
     def __init__(self, sek: float):
         super().__init__(daemon=True)
@@ -1077,11 +1087,12 @@ class _Ruheuhr(threading.Thread):
         while not self._halt.wait(min(RUHE_TAKT_S, self.sek)):
             if _beschaeftigt():
                 ruhig_seit = time.monotonic()
-            elif time.monotonic() - ruhig_seit >= self.sek:
+            elif (fremd := _fremd_malt()) or time.monotonic() - ruhig_seit >= self.sek:
                 with _LOCK:
                     if self._halt.is_set():      # inzwischen kam ein neues Bild
                         return
-                    _DBG.ereignis(f"Bildmotor: {self.sek:g} s Ruhe")
+                    _DBG.ereignis("Bildmotor: ein anderer Prozess malt – Speicher frei" if fremd
+                                  else f"Bildmotor: {self.sek:g} s Ruhe")
                     entladen()
                 return
 
@@ -1414,7 +1425,10 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
                 fertig += 1
         except Exception as e:
             fehler = f"{type(e).__name__}: {e}"
-        _frei()
+        try:
+            _frei()
+        except Exception:                   # CUDA nach einem Fehler unbrauchbar: die Meldung zählt
+            pass
         _uhr_neu()
         if fehler:
             raise RuntimeError(f"Krea 2 (Gesicht): {fehler}")

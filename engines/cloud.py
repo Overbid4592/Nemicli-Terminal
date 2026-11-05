@@ -90,6 +90,10 @@ class CloudChat:
         self.provider_id = provider_id
         self.model_id = model_id
         self.model = f"{provider_id}:{model_id}"
+        try:                                         # Kontextlänge schon jetzt im Hintergrund nachfragen
+            P.kontext(provider_id, model_id)
+        except Exception:
+            pass
         self.strength = (reasoning.normalize_strength(strength)
                          if reasoning.profile(self.model) else None)
         self.messages: list[dict] = []
@@ -149,7 +153,7 @@ class CloudChat:
             return self.strength != "schnell"
         if art == "ollama_cloud":
             familie = reasoning.ollama_family(self.model_id)
-            info = reasoning.OLLAMA_CLOUD.get(familie) or {}
+            info = reasoning.cloud_info(familie) or {}
             if not info.get("think"):
                 return False
             stufe = reasoning.cloud_effort(familie, reasoning.normalize_strength(self.strength))

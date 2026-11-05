@@ -3,9 +3,8 @@ comfyui.py - Bilder über eine laufende ComfyUI (Standard: 127.0.0.1:8188).
 
 Eigene Stelle neben `sdwebui.py` (Forge/A1111), weil ComfyUI eine völlig
 andere Sprache spricht. Forge kennt `--api` und danach `/sdapi/v1/txt2img`:
-ein Aufruf rein, fertiges Bild raus. ComfyUI hat diese Adressen NICHT – ein
-`GET /sdapi/v1/sd-models` beantwortet es mit 404, und NemiCLI hielt das früher
-für „nicht erreichbar". Der Port war immer da; die Frage war die falsche.
+ein Aufruf rein, fertiges Bild raus. ComfyUI hat diese Adressen nicht
+(`/sdapi/…` antwortet mit 404) und wird an seinen eigenen Endpunkten erkannt.
 
 ComfyUI arbeitet mit einem **Ablaufplan** (Workflow): man schickt einen Graphen
 aus Bausteinen, bekommt eine Auftragsnummer, fragt nach dem Ergebnis und holt
@@ -26,8 +25,7 @@ die man in ComfyUI auch von Hand zusammenklickt:
                            → VAEDecode → SaveImage
 
 NemiCLI startet ComfyUI NICHT und ändert dort nichts. Es redet nur mit einer
-laufenden Instanz auf 127.0.0.1. Den Start übernimmt ComfyUI selbst (z. B. mit
-Windows); NemiCLI generiert nur.
+laufenden Instanz auf 127.0.0.1.
 """
 
 from __future__ import annotations
@@ -36,7 +34,6 @@ import json
 import random
 import time
 import uuid
-from pathlib import Path
 
 import httpx
 
@@ -130,9 +127,8 @@ def _client(timeout: float):
 def available(timeout: float = 2.5) -> bool:
     """Läuft ComfyUI und antwortet?
 
-    Gefragt wird `/system_stats` – ComfyUIs eigene Adresse. NICHT
-    `/sdapi/v1/...`: das ist die Forge-Sprache, darauf antwortet ComfyUI mit
-    404, und daraus wurde früher fälschlich „nicht erreichbar"."""
+    Gefragt wird `/system_stats` – ComfyUIs eigene Adresse, nicht die
+    Forge-Adresse `/sdapi/v1/...` (darauf antwortet ComfyUI mit 404)."""
     try:
         with _client(timeout) as c:
             return c.get("/system_stats").status_code == 200

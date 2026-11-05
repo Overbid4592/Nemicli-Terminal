@@ -294,11 +294,19 @@ class WarpingNetwork(nn.Module):
         self.third = SameBlock2d(max_features, breite, lrelu=True)
         self.fourth = nn.Conv2d(breite, breite, kernel_size=1)
 
-    def forward(self, merkmal, kp_ziel, kp_quelle):
+    def forward(self, merkmal, kp_ziel, kp_quelle, mit_fluss: bool = False):
         verformung, verdeckt = self.dense_motion_network(merkmal, kp_ziel, kp_quelle)
         out = F.grid_sample(merkmal, verformung, align_corners=False)
         b, c, d, h, w = out.shape
-        return self.fourth(self.third(out.view(b, c * d, h, w))) * verdeckt
+        ergebnis = self.fourth(self.third(out.view(b, c * d, h, w))) * verdeckt
+        if not mit_fluss:
+            return ergebnis
+        # Bildebene: je Ziel-Pixel die Quellstelle, über die Tiefe gewichtet mit dem Inhalt der Schicht
+        # (leere Tiefenschichten sollen die Bewegung nicht verwässern). Für Masken, die mitwandern.
+        gewicht = out.float().norm(dim=1)                                        # (b, d, h, w)
+        gewicht = gewicht / gewicht.sum(dim=1, keepdim=True).clamp_min(1e-6)
+        fluss = (verformung[..., :2].float() * gewicht[..., None]).sum(dim=1)     # (b, h, w, 2) x, y
+        return ergebnis, fluss
 
 
 # ---------------------------------------------------------------------------

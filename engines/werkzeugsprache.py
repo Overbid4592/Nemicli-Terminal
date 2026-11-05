@@ -204,6 +204,25 @@ class Dialekt:
             return None
         return (m.group(1), felder, ende) if isinstance(felder, dict) else None
 
+    def reparieren(self, rest: str) -> str | None:
+        """Ein angefangener Aufruf, dem nur der Schluss fehlt (das Modell hörte mitten darin auf): mit den
+        Schlussteilen des Formats ergänzt als ```aktion-Block – None, wenn daraus nicht genau ein Aufruf mit
+        mindestens einem Feld wird (endet er gleich nach dem Namen, ist nicht klar, was gemeint war)."""
+        if not self.ende or not rest.startswith(self.anfang):
+            return None
+        a = self.e["aufruf"]
+        schluss = a["vorlage"].split("%{felder}", 1)[-1]
+        feld_schluss = a["feld"].split("%{wert}", 1)[-1] if "feld" in a else ""
+        basis = rest.rstrip()
+        for zusatz in (schluss, feld_schluss + schluss, self.ende):
+            versuch = basis + zusatz
+            gefunden = self.aufrufe_finden(versuch)
+            if len(gefunden) == 1 and gefunden[0][0] == 0 and gefunden[0][1] == len(versuch) and gefunden[0][3]:
+                _, _, name, felder = gefunden[0]
+                felder = {k: v.strip() if isinstance(v, str) else v for k, v in felder.items()}
+                return "```aktion\n" + json.dumps({"tool": name, **felder}, ensure_ascii=False) + "\n```"
+        return None
+
     def aufruf_laenge(self, text: str) -> int | None:
         """Länge des vollständigen Aufrufs am Anfang von `text` (None: noch nicht fertig)."""
         if not self.ende:
@@ -321,8 +340,11 @@ class Strom:
         return "".join(raus)
 
     def ende(self) -> str:
-        """Rest am Ende: ein unvollständiger Aufruf bleibt sichtbar, wie er kam."""
-        rest, self.puffer, self.drin = self.puffer, "", False
+        """Rest am Ende: ein Aufruf, dem nur der Schluss fehlt, wird ergänzt; sonst bleibt er sichtbar, wie er kam."""
+        rest, drin, self.puffer, self.drin = self.puffer, self.drin, "", False
+        if drin and (block := self.d.reparieren(rest)) is not None:
+            self.aufrufe += 1
+            return block
         return rest
 
 
@@ -453,9 +475,9 @@ def _text_felder(werkzeug: str) -> frozenset:
 
 
 def werkzeug_liste() -> list[dict]:
-    """NemiCLIs Werkzeuge als Funktions-Schemas wie in den Vorlagen, schlank: Pflichtfelder mit Namen,
-    Bedeutung und weitere Felder erklärt die Werkzeug-Liste im Systemprompt. Gemessen (Qwen3.5-9B,
-    12 Aufgaben): so 12/12 richtig wie mit Typ-Angaben für jedes Werkzeug, nur mit Namen 11/12."""
+    """NemiCLIs Werkzeuge als Funktions-Schemas wie in den Vorlagen, schlank: Pflichtfelder mit Namen
+    (trifft so gut wie volle Typ-Angaben); Bedeutung und weitere Felder erklärt die Werkzeug-Liste im
+    Systemprompt."""
     import actions
     liste = []
     for name, a in actions.ACTIONS.items():

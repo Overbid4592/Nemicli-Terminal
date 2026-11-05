@@ -36,14 +36,11 @@ _OPENAI_MODELS = {
 }
 
 
-# Ollama Cloud – Stand 19.09.2026, je Modell über https://ollama.com/api/show
-# abgefragt (model_info.*.context_length und "thinking.values"/"default").
+# Ollama Cloud: Rückfall, solange ollama.com/api/show nicht geantwortet hat (cloudprovider liest live).
 # Schlüssel = Modellfamilie (alles vor dem ":"). ctx = Kontextfenster in Tokens,
 # think = welche Denk-Werte reasoning_effort annimmt (None = an/aus geht nicht,
 # False in der Liste = abschaltbar → "none"), default = Voreinstellung.
-# Die OpenAI-Schnittstelle von Ollama kennt reasoning_effort = none/low/medium/high/max
-# (https://docs.ollama.com/api/openai-compatibility).
-# Neue Modelle: python -c "…/api/show" – oder einfach hier eintragen.
+# reasoning_effort = none/low/medium/high/max (https://docs.ollama.com/api/openai-compatibility).
 OLLAMA_CLOUD: dict[str, dict] = {
     "deepseek-v4-flash":   {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "low"},
     "deepseek-v4-pro":     {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "low"},
@@ -58,7 +55,7 @@ OLLAMA_CLOUD: dict[str, dict] = {
     "kimi-k2.6":           {"ctx":   262_144, "think": (False, True), "default": True},
     "kimi-k2.7-code":      {"ctx":   262_144, "think": (False, True), "default": True},
     "kimi-k3":             {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "max"},
-    # Kimi K3.1 Pro: Denken nicht abschaltbar (platform.kimi.ai, Quickstart, 25.10.2026)
+    # Kimi K3.1 Pro: Denken nicht abschaltbar (platform.kimi.ai, Quickstart)
     "kimi-k3.1-pro":       {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
     "kimi-k3.1-pro-highspeed": {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
     "minimax-m2.7":        {"ctx":   196_608, "think": (True,), "default": True},
@@ -69,11 +66,23 @@ OLLAMA_CLOUD: dict[str, dict] = {
     "nemotron-3-ultra":    {"ctx":   262_144, "think": (False, True), "default": True},
     "qwen3.5":             {"ctx":   262_144, "think": (False, True), "default": True},
 }
-# Helfer (Bibliothekar, Zeitplan, Spielzug …) auf Denk-Modellen: das Nachdenken
-# zählt mit ins Budget – mit 4096 war nach dem Denken kein Platz mehr für die
-# Antwort („Tokenbudget erreicht“ bei jedem Mühle-Zug). Deshalb mehr Luft und
-# die niedrigste Denkstufe.
+# Helfer auf Denk-Modellen: das Nachdenken zählt ins Budget – daher mehr Luft und die niedrigste Denkstufe.
 CLOUD_HELPER_BUDGET = 16384
+
+
+def cloud_info(family: str) -> dict | None:
+    """Werte eines Ollama-Cloud-Modells: live aus ollama.com/api/show, sobald abgefragt
+    (cloudprovider.cloud_denken), sonst die Tabelle OLLAMA_CLOUD."""
+    try:
+        import cloudprovider
+        live = cloudprovider.cloud_denken(family)
+    except Exception:
+        live = None
+    if live is None:
+        return OLLAMA_CLOUD.get(family)
+    if not live.get("ctx") and family in OLLAMA_CLOUD:
+        live = dict(live, ctx=OLLAMA_CLOUD[family]["ctx"])
+    return live
 
 
 def ollama_family(model: str) -> str:
@@ -89,7 +98,7 @@ def cloud_effort(family: str, strength: str, *, helper: bool = False) -> str | N
     Voreinstellung des Modells, stark → high, max → max (oder high, wenn es
     kein max gibt). An/aus-Modelle: schnell → "none" (Denken aus), sonst wie
     voreingestellt. Helfer nehmen immer die niedrigste Stufe."""
-    info = OLLAMA_CLOUD.get(family)
+    info = cloud_info(family)
     if not info or not info["think"]:
         return None
     werte = info["think"]
@@ -124,9 +133,9 @@ def profile(ref: str | None) -> str | None:
             return "kimi"
         if family in ("gpt-oss", "gpt-oss-20b", "gpt-oss-120b"):
             return "ollama_effort"
-        if provider == "ollama_cloud" and family in OLLAMA_CLOUD:
+        if provider == "ollama_cloud" and cloud_info(family) is not None:
             return "ollama_cloud"
-    if provider == "moonshot" and ollama_family(model) in OLLAMA_CLOUD:
+    if provider == "moonshot" and cloud_info(ollama_family(model)) is not None:
         return "moonshot"            # Kimi direkt beim Hersteller: dieselben Stufen, reasoning_effort oben
     if provider == "openai":
         # Offizielle datierte Snapshots derselben bekannten Modellfamilien.
@@ -138,10 +147,8 @@ def profile(ref: str | None) -> str | None:
 
 def request_options(provider: str, model: str, strength: str | None,
                     *, helper: bool = False) -> dict[str, int | str]:
-    """API-Optionen. Unbekannte Modelle (z.B. DeepSeek bei Ollama Cloud) bekommen
-    einen hohen Deckel: Denk-Modelle zählen ihr Nachdenken mit, und beim Coden
-    brach die Antwort mit 4096 mitten im Code ab. Der Deckel kostet nichts –
-    bezahlt wird nur, was wirklich geschrieben wird."""
+    """API-Optionen. Unbekannte Ollama-Modelle bekommen einen hohen Deckel: Denk-Modelle zählen
+    ihr Nachdenken mit, und bezahlt wird nur, was wirklich geschrieben wird."""
     kind = profile(f"{provider}:{model}")
     if kind is None:
         if provider not in ("ollama", "ollama_cloud"):
@@ -181,8 +188,13 @@ def strength_menu(ref: str | None) -> dict[str, str]:
     if kind in ("ollama_cloud", "moonshot"):
         _prov, _, model = (ref or "").partition(":")
         fam = ollama_family(model)
-        info = OLLAMA_CLOUD[fam]
-        ctx = f"{info['ctx']:,}".replace(",", ".")
+        info = cloud_info(fam)
+        try:                                         # live gelesen, sonst die Tabelle
+            import pricing
+            n = pricing.context_window(ref)
+        except Exception:
+            n = info["ctx"]
+        ctx = f"{n:,}".replace(",", ".")
         out = {}
         for key in BUDGETS:
             e = cloud_effort(fam, key)
@@ -217,9 +229,9 @@ def strength_note(ref: str | None, strength: str | None) -> str:
     if kind == "kimi":
         return description + ". Kimi bietet keine getrennten Denkstufen; geändert wird das Budget."
     if kind == "ollama_cloud":
-        return description + " (Ollama Cloud, Stand 19.09.2026)."
+        return description + " (Ollama Cloud)."
     if kind == "moonshot":
-        return description + " (Moonshot, Stand 25.10.2026)."
+        return description + " (Moonshot)."
     if strength == "max":
         return description + " für Denken und Antwort; keine zusätzliche Denkstufe."
     return description + "."

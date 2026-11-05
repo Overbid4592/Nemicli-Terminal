@@ -27,10 +27,7 @@ derselbe wie für die Chat-Modelle (/model).
 Chat-Anbieter (openai, google, xai, together, minimax) nutzen den Schlüssel aus /model; die reinen Bild-/Video-Anbieter haben einen
 eigenen (Feld `env`), eingetragen über /bildmodel bzw. /video → ☁ Anbieter hinzufügen.
 
-Stand der Schnittstellen und Modelle: Oktober 2026; FLUX, Ideogram, Runway und fal nach den offiziellen Anleitungen
-vom 25.10.2026 (OpenAI-Videos/Sora am 24.09.2026 abgeschaltet,
-Veo-3.1-Vorschau am 22.10.2026). Modelle lassen sich über die Config ändern (cloud_bild_modell,
-cloud_video_modell), ohne den Code anzufassen.
+Modelle lassen sich über die Config ändern (cloud_bild_modell, cloud_video_modell), ohne den Code anzufassen.
 
 Die Anbieter haben eigene Inhaltsregeln; was lokal geht, kann dort abgelehnt werden. Eine Ablehnung
 kommt als Fehlermeldung des Anbieters zurück.

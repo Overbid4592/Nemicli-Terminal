@@ -42,13 +42,23 @@ def effort_for(strength: str) -> str:
 
 def strength_supported(ref: str | None) -> bool:
     """Ob für dieses Backend eine Denkstärke oder ein Denkbudget bekannt ist."""
-    return bool(ref and (ref.startswith("anthropic:") or reasoning.profile(ref)))
+    return bool(ref and (ref.startswith(("anthropic:", "gguf:")) or reasoning.profile(ref)))
+
+
+def _gguf_staerken() -> dict[str, str]:
+    """Eigener Motor: die Stärke ist das Denk-Budget; ob nachgedacht wird, regelt /denken."""
+    import gguflokal
+    return {k: ("Denken ohne Grenze" if not n else f"Denk-Budget {n:,} Token".replace(",", "."))
+            + f" · {desc}" for k, (_eff, desc) in STRENGTHS.items()
+            for n in (gguflokal.STAERKE_BUDGET[k],)}
 
 
 def strength_menu(ref: str | None = None) -> dict[str, str]:
     """Modellgerechte Beschreibungen; ohne Ref bleibt das klassische Menü."""
     if ref is None or ref.startswith("anthropic:"):
         return {k: desc for k, (_eff, desc) in STRENGTHS.items()}
+    if ref.startswith("gguf:"):
+        return _gguf_staerken()
     return reasoning.strength_menu(ref)
 
 
@@ -56,6 +66,10 @@ def strength_note(ref: str | None, strength: str) -> str:
     """Erläutert die wirksame Einstellung ohne unbelegte Denkstufen."""
     if ref and ref.startswith("anthropic:"):
         return STRENGTHS.get(strength, STRENGTHS[DEFAULT_STRENGTH])[1]
+    if ref and ref.startswith("gguf:"):
+        import denkweise
+        return (_gguf_staerken().get(strength, "") + f". Ob nachgedacht wird: /denken "
+                f"({denkweise.TEXT[denkweise.stufe()]}).")
     return reasoning.strength_note(ref, strength)
 
 
