@@ -116,15 +116,33 @@ class Pty:
         if not _k32.CreatePipe(ctypes.byref(ein_lesen), ctypes.byref(self._ein_schreiben), None, 0):
             raise ctypes.WinError(ctypes.get_last_error())
         if not _k32.CreatePipe(ctypes.byref(self._aus_lesen), ctypes.byref(aus_schreiben), None, 0):
-            raise ctypes.WinError(ctypes.get_last_error())
+            fehler = ctypes.get_last_error()
+            _k32.CloseHandle(ein_lesen)
+            _k32.CloseHandle(self._ein_schreiben)
+            raise ctypes.WinError(fehler)
         hr = _k32.CreatePseudoConsole(_COORD(spalten, zeilen), ein_lesen, aus_schreiben, 0,
                                       ctypes.byref(self._hpc))
         # Die Konsole hat ihre eigenen Kopien – unsere Enden auf ihrer Seite brauchen wir nicht.
         _k32.CloseHandle(ein_lesen)
         _k32.CloseHandle(aus_schreiben)
         if hr != 0:
+            _k32.CloseHandle(self._ein_schreiben)
+            _k32.CloseHandle(self._aus_lesen)
             raise OSError(f"CreatePseudoConsole fehlgeschlagen (0x{hr & 0xFFFFFFFF:08x})")
+        try:
+            self._prozess_starten(befehl, ordner, env)
+        except Exception:
+            _k32.CloseHandle(self._aus_lesen)               # zuerst: sonst wartet ClosePseudoConsole auf einen Leser
+            _k32.ClosePseudoConsole(self._hpc)
+            _k32.CloseHandle(self._ein_schreiben)
+            raise
+        _k32.CloseHandle(self._prozess.hThread)
+        self.pid = self._prozess.dwProcessId
+        self._leser = threading.Thread(target=self._lesen, name="nemicli-pty-lesen", daemon=True)
+        self._leser.start()
+        threading.Thread(target=self._warten, name="nemicli-pty-warten", daemon=True).start()
 
+    def _prozess_starten(self, befehl: list[str], ordner: str | None, env: dict | None) -> None:
         groesse = ctypes.c_size_t()
         _k32.InitializeProcThreadAttributeList(None, 1, 0, ctypes.byref(groesse))
         liste = ctypes.create_string_buffer(groesse.value)
@@ -159,11 +177,6 @@ class Pty:
                 raise ctypes.WinError(fehler)
         finally:
             _k32.DeleteProcThreadAttributeList(liste)
-        _k32.CloseHandle(self._prozess.hThread)
-        self.pid = self._prozess.dwProcessId
-        self._leser = threading.Thread(target=self._lesen, name="nemicli-pty-lesen", daemon=True)
-        self._leser.start()
-        threading.Thread(target=self._warten, name="nemicli-pty-warten", daemon=True).start()
 
     # -- Datenfluss --------------------------------------------------------------
     def _lesen(self) -> None:

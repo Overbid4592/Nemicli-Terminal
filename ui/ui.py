@@ -106,6 +106,9 @@ def _build_theme(name: str) -> Theme:
             "user":       f"bold {p['accent']}",
             "assistant":  "#c8c4ff",
             "tool":       "bold #fbbf24",
+            "diff.add":   "#c3f5cd on #17351f",
+            "diff.del":   "#ffc2c6 on #3e1b1f",
+            "diff.nr":    "#7d8590",
         }
     )
 
@@ -334,8 +337,7 @@ def _hint(cmd: str, desc: str) -> Text:
 
 
 def help_panel() -> None:
-    # Die Befehle kommen aus commands.py – der EINZIGEN Liste. Vorher stand hier
-    # eine zweite, handgepflegte Tabelle; die driftete zwangsläufig auseinander.
+    # Befehle kommen nur aus commands.py.
     import commands
 
     table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
@@ -906,7 +908,14 @@ def thinking_panel(text: str, collapsed: bool = False,
     Der Inhalt bleibt Plain Text. Die verfügbare Breite bestimmt den Umbruch,
     statt dass ein fester Zeichenausschnitt die Panelhöhe schwanken lässt.
     """
-    heading = "Nachgedacht" if done or collapsed else "Denkt nach"
+    try:
+        name = persona_name()
+    except Exception:
+        name = ""
+    if name:
+        heading = f"{name} hat nachgedacht" if done or collapsed else f"{name} denkt nach …"
+    else:
+        heading = "Nachgedacht" if done or collapsed else "Denkt nach"
     details = []
     if seconds is not None:
         details.append(fmt_elapsed(max(0, seconds)))
@@ -964,10 +973,187 @@ def _chip(symbol: str, stil: str, text: str, rest: int, zusatz: str = "") -> Tex
     return t
 
 
-def action_request(desc: str, confirm: bool, kopf: str | None = None, risiko: bool = False):
+# ---------------------------------------------------------------------------
+# Werkzeug-Anzeige: kompakt („● Befehl(git status)“ / „⎿ Ergebnis“) oder mit Rahmen
+# ---------------------------------------------------------------------------
+ANZEIGE_STILE = ("kompakt", "rahmen")
+_anzeige: str | None = None
+_KOMPAKT_ZEILEN = 3              # eingeklappt im Vollbild
+_DIFF_ZEILEN = 40                # ausgeklappt; der Rest steht in der Datei
+
+_WERKZEUG_NAMEN = {
+    "befehl": "Befehl", "datei_lesen": "Lesen", "datei_schreiben": "Schreiben",
+    "datei_bearbeiten": "Ändern", "loeschen": "Löschen", "verschieben": "Verschieben",
+    "datei_kopieren": "Kopieren", "ordner_erstellen": "Ordner", "ordner_auflisten": "Ordner ansehen",
+    "dateien_suchen": "Finden", "inhalt_suchen": "Suchen", "web_lesen": "Web", "web_suche": "Websuche",
+    "web_wiki": "Wiki", "fach_suche": "Fachsuche", "bild_malen": "Malen", "bild_ansehen": "Bild ansehen",
+    "merken": "Merken", "gedaechtnis_suchen": "Gedächtnis", "code_pruefen": "Code prüfen",
+    "seite_ansehen": "Seite ansehen", "pdf_erstellen": "PDF", "todo": "Todo", "plan": "Plan",
+}
+_ZIEL_FELDER = ("pfad", "von", "url", "query", "suche", "muster", "frage", "was", "name", "prompt", "text")
+
+
+def anzeige() -> str:
+    """'kompakt' (Vorgabe) oder 'rahmen' – aus der Konfiguration, einmal gelesen."""
+    global _anzeige
+    if _anzeige is None:
+        try:
+            import config
+            wert = str(config.load().get("anzeige", ANZEIGE_STILE[0]))
+        except Exception:
+            wert = ANZEIGE_STILE[0]
+        _anzeige = wert if wert in ANZEIGE_STILE else ANZEIGE_STILE[0]
+    return _anzeige
+
+
+def anzeige_setzen(stil: str) -> bool:
+    global _anzeige
+    if stil not in ANZEIGE_STILE:
+        return False
+    _anzeige = stil
+    try:
+        import config
+        config.update(anzeige=stil)
+    except Exception:
+        pass
+    return True
+
+
+def _kurzpfad(roh: str) -> str:
+    import os
+    try:
+        rel = os.path.relpath(roh)
+        return rel if not rel.startswith("..") else roh
+    except ValueError:                           # anderes Laufwerk
+        return roh
+
+
+def werkzeug_zeile(act: dict | None, desc: str = "") -> Text:
+    """„● Name(Ziel)“ – Ziel ist der Befehl, Pfad, die Adresse oder Suche der Aktion."""
+    zeile = Text(no_wrap=True, overflow="ellipsis")
+    zeile.append("● ", style="accent")
+    if not act:
+        zeile.append(_erste_zeile(desc)[0], style="assistant")
+        return zeile
+    tool = str(act.get("tool") or "?")
+    zeile.append(_WERKZEUG_NAMEN.get(tool, tool), style="bold")
+    ziel = ""
+    if tool == "befehl":
+        try:
+            import actions
+            ziel = actions._befehl_text(act)
+        except Exception:
+            ziel = str(act.get("befehl") or "")
+    else:
+        for f in _ZIEL_FELDER:
+            wert = act.get(f)
+            if isinstance(wert, str) and wert.strip():
+                ziel = _kurzpfad(wert) if f in ("pfad", "von") else wert
+                if f == "von" and isinstance(act.get("nach"), str):
+                    ziel += " → " + _kurzpfad(act["nach"])
+                break
+    ziel = " ".join(ziel.split())
+    if ziel:
+        zeile.append("(", style="muted")
+        zeile.append(ziel if len(ziel) <= 100 else ziel[:99] + "…", style="assistant")
+        zeile.append(")", style="muted")
+    return zeile
+
+
+def _haengend(zeichen: str, inhalt, stil: str = "muted") -> Table:
+    """Einzug wie „  ⎿  …“: umbrochene Zeilen bleiben unter dem Text, nicht unter dem Zeichen."""
+    t = Table.grid(padding=0)
+    t.add_column(width=5, no_wrap=True)
+    t.add_column(ratio=1)
+    t.add_row(Text(zeichen, style=stil), inhalt)
+    return t
+
+
+def _ergebnis_kompakt(result: str, ok: bool | None, sekunden: float | None, kurz: bool) -> Table:
+    zeilen = str(result).rstrip().splitlines() or [""]
+    stil = "err" if ok is False else "assistant"
+    rest = 0
+    if kurz and len(zeilen) > _KOMPAKT_ZEILEN:
+        rest = len(zeilen) - _KOMPAKT_ZEILEN
+        zeilen = zeilen[:_KOMPAKT_ZEILEN]
+    body = Text("\n".join(zeilen), style=stil)
+    fuss = Text()
+    if rest:
+        fuss.append(f"… +{rest} Zeile{'n' if rest != 1 else ''}  ▸", style="accent.dim")
+    if ok is None:
+        status, sstil = "◇ Status ungeprüft", "muted"
+    else:
+        status, sstil = ("✓", "ok") if ok else ("✗ Fehler", "err")
+    fuss.append(("   " if rest else "") + status, style=sstil)
+    if sekunden is not None:
+        fuss.append((" " if ok else "  ·  ") + fmt_elapsed(sekunden), style="brand.dim")
+    return _haengend("  ⎿  ", Group(body, fuss))
+
+
+def diff_anzeige(pfad: str, alt: str | None, neu: str | None):
+    """Rot/grüner Diff einer Dateiänderung mit Zeilennummern; None ohne Unterschied."""
+    import difflib
+    if neu is None or alt == neu:
+        return None
+    a, b = (alt or "").splitlines(), neu.splitlines()
+    plus = minus = 0
+    zeilen: list[tuple[str, int | None, str]] = []
+    for gruppe in difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(2):
+        if zeilen:
+            zeilen.append(("…", None, ""))
+        for op, i1, i2, j1, j2 in gruppe:
+            if op == "equal":
+                zeilen += [(" ", j1 + k + 1, b[j1 + k]) for k in range(j2 - j1)]
+                continue
+            if op in ("replace", "delete"):
+                zeilen += [("-", i1 + k + 1, a[i1 + k]) for k in range(i2 - i1)]
+                minus += i2 - i1
+            if op in ("replace", "insert"):
+                zeilen += [("+", j1 + k + 1, b[j1 + k]) for k in range(j2 - j1)]
+                plus += j2 - j1
+    if not zeilen:
+        return None
+    breite = max(len(str(n)) for _, n, _ in zeilen if n) if any(n for _, n, _ in zeilen) else 1
+    text = Text(no_wrap=True, overflow="ellipsis")
+    gezeigt = zeilen[:_DIFF_ZEILEN]
+    for idx, (zeichen, nr, inhalt) in enumerate(gezeigt):
+        if idx:
+            text.append("\n")
+        if zeichen == "…":
+            text.append(" " * breite + "  ⋮", style="diff.nr")
+            continue
+        stil = {"+": "diff.add", "-": "diff.del"}.get(zeichen)
+        text.append(f"{nr:>{breite}} ", style="diff.nr")
+        text.append(f"{zeichen} {inhalt.expandtabs(4)}", style=stil or "muted")
+    if len(zeilen) > len(gezeigt):
+        text.append(f"\n… +{len(zeilen) - len(gezeigt)} Zeilen", style="accent.dim")
+    neu_datei = alt is None
+    kopf = Text()
+    if neu_datei:
+        kopf.append(f"{len(b)} Zeile{'n' if len(b) != 1 else ''} geschrieben", style="assistant")
+    else:
+        kopf.append(f"{plus} hinzugefügt", style="ok")
+        kopf.append(", ", style="muted")
+        kopf.append(f"{minus} entfernt", style="err")
+    kopf.append(f"  ·  {_kurzpfad(pfad)}", style="brand.dim")
+    return _haengend("     ", Group(kopf, text))     # gehört zum Ergebnis darüber
+
+
+def action_request(desc: str, confirm: bool, kopf: str | None = None, risiko: bool = False,
+                   act: dict | None = None):
     """Panel: NemiCLI möchte eine Aktion ausführen.
     risiko=True (löschen, fremder Befehl, Zeitplan, ganzer Ordner): roter Rahmen
-    und roter Titel – damit man bei der zehnten Frage nicht blind drückt."""
+    und roter Titel – damit man bei der zehnten Frage nicht blind drückt.
+    Ohne Rückfrage und im Stil kompakt: eine Zeile „● Name(Ziel)“."""
+    if not confirm and anzeige() == "kompakt":
+        zeile = werkzeug_zeile(act, desc)
+        rest = "" if act else "\n".join(str(desc).splitlines()[1:]).strip("\n")
+        if TUI is not None:
+            voll = Group(zeile, Text(str(desc), style="muted")) if act or rest else zeile
+            kurz = zeile.copy()
+            kurz.append("  ▸", style="accent.dim")
+            return Klapp(kurz, voll)
+        return Group(zeile, Text(rest, style="muted")) if rest else zeile
     head = kopf or ("🔐 NemiCLI möchte ausführen" if confirm else "⚙ NemiCLI führt aus")
     border = "warn" if confirm else "accent.dim"
     title = f"[tool]{head}[/tool]"
@@ -1071,7 +1257,12 @@ def anzeige_kurz(text: str, zeilen: int = 14) -> str:
 
 def action_result(result: str, ok: bool | None = None, sekunden: float | None = None):
     """Panel: Ergebnis einer Aktion. Im Vollbild als Chip „✓ erste Zeile · 6 s ▸“, der per Klick aufgeht;
-    Fehler stehen offen da."""
+    Fehler stehen offen da. Im Stil kompakt: „⎿ Ergebnis“ eingerückt unter der Werkzeug-Zeile."""
+    if anzeige() == "kompakt":
+        voll = _ergebnis_kompakt(result, ok, sekunden, kurz=False)
+        if TUI is None:
+            return voll
+        return Klapp(_ergebnis_kompakt(result, ok, sekunden, kurz=True), voll, offen=ok is False)
     if ok is None:
         title = Text("◇ Ergebnis · Status ungeprüft", style="muted")
     else:

@@ -18,7 +18,8 @@ alle 1,5 s und setzt um, was neu ist.
   versteckt  true/false – sich zurückziehen / wieder zeigen
   groesse    48 … 200 Pixel
   bewegt     Gesichts-WebP von portraet_bewegen (<Video>_kugel.webp im eigenen Videos-Ordner) –
-             die Kugel spielt es zweimal rund ab und zeigt dann wieder ihr Bild
+             die Kugel spielt es zweimal rund ab und zeigt dann wieder ihr Bild; <Video>_frei_kugel.webp
+             (freigestellt) ohne Kreis; mit ton (<Video>.wav daneben) einmal und mit Stimme
 
 GRENZEN (damit ein Desktop-Wesen nicht zur Nervensäge wird):
   • von sich aus reden höchstens alle `kugel_reden_min` Minuten (Config, Standard 10)
@@ -118,7 +119,7 @@ def outfit_stand(name: str) -> tuple[str, set[str]]:
 
 def bilder(name: str, outfit: bool = True) -> dict[str, Path]:
     """Alle Bilder einer Persönlichkeit: {"": <Name>.png, "froh": <Name>_froh.png, …}
-    (Groß/klein egal: „Nemi_froh.png“, „nemi-froh.PNG“, „PersonaA_ernst.png“ passen alle).
+    (Groß/klein egal, „_“ oder „-“: „<Name>_froh.png“, „<name>-froh.PNG“ passen beide).
     outfit=True: Bilder des aktiven Outfits ersetzen die gleichnamigen Grundbilder."""
     out: dict[str, Path] = {}
     if not BILDER_ORDNER.exists():
@@ -149,6 +150,22 @@ def _reden_min() -> float:
         return float(config.load().get("kugel_reden_min", 10))
     except Exception:
         return 10.0
+
+
+def kugelbild(name: str) -> Path | None:
+    """Das Bild, das die Kugel gerade zeigt (Stimmung bzw. Grundbild) – None, wenn sie keins hat."""
+    da = bilder(name)
+    stimmung = str(lesen().get("stimmung") or "")
+    return da.get("" if stimmung == "kugel" else stimmung) or da.get("")
+
+
+def ton_pruefen(ton: str, bewegt: str) -> str | None:
+    """Tonspur zum bewegten Porträt: dieselbe Aufnahme (<Video>.wav) im selben Ordner."""
+    p, b = Path(ton).resolve(), Path(bewegt).resolve()
+    stamm = b.name.removesuffix("_kugel.webp").removesuffix("_frei")
+    if p.suffix.lower() != ".wav" or p.parent != b.parent or p.stem != stamm or not p.is_file():
+        return "Ton nur als <Video>.wav neben dem bewegten Porträt"
+    return None
 
 
 def bewegt_pruefen(pfad: str, wer: str) -> str | None:
@@ -293,7 +310,13 @@ def steuern(a: dict, wer: str = "Persönlichkeit") -> str:
                 z["bewegt_runden"] = max(1, min(RUNDEN_MAX, int(a.get("runden") or 2)))
             except (TypeError, ValueError):
                 z["bewegt_runden"] = 2
-            getan.append(f"bewegtes Porträt ({z['bewegt_runden']}×)")
+            ton = str(a.get("ton") or "").strip().strip('"')
+            z["bewegt_ton"] = ""
+            if ton and (grund := ton_pruefen(ton, bewegt)):
+                abgelehnt.append(grund)
+            elif ton:
+                z["bewegt_ton"], z["bewegt_runden"] = str(Path(ton).resolve()), 1     # mit Stimme: einmal
+            getan.append(f"bewegtes Porträt ({z['bewegt_runden']}×{', mit Stimme' if z['bewegt_ton'] else ''})")
 
     if not getan and not abgelehnt:
         da = bilder(wer)

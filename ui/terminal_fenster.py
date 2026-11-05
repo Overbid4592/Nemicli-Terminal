@@ -25,7 +25,6 @@ import secrets
 import functools
 import sys
 import threading
-import unicodedata
 from pathlib import Path
 
 import pyte
@@ -199,6 +198,32 @@ def abgelegt_zu_text(pfade: list[str]) -> str:
     Anführungszeichen, durch Leerzeichen getrennt, eins am Ende zum Weitertippen."""
     teile = [f'"{p}"' if " " in p else p for p in pfade if p]
     return " ".join(teile) + " " if teile else ""
+
+
+EINFUEGEN_TAGE = 7                       # so lange bleiben eingefügte Bilder liegen
+
+
+def einfuege_ordner() -> Path:
+    """Ablage für Bilder aus der Zwischenablage – der Chat bekommt ihren Pfad wie bei einer abgelegten Datei."""
+    import tempfile
+    return Path(tempfile.gettempdir()) / "NemiCLI" / "eingefuegt"
+
+
+def einfuegungen_aufraeumen(ordner: Path, tage: float = EINFUEGEN_TAGE) -> None:
+    import time
+    grenze = time.time() - tage * 86400
+    for p in ordner.glob("bild_*.png"):
+        try:
+            if p.stat().st_mtime < grenze:
+                p.unlink()
+        except OSError:
+            pass
+
+
+def nur_link(text: str) -> bool:
+    """Ist der Text nur eine Web-Adresse? (Browser legen beim Bild-Kopieren oft die Adresse mit ab.)"""
+    t = (text or "").strip()
+    return bool(re.fullmatch(r"https?://\S+", t))
 
 
 def geordnet(a: tuple, b: tuple) -> tuple:
@@ -479,6 +504,11 @@ class KiLeitung:
                         self._ereignisse.append(ereignis)
         except Exception:
             pass
+        finally:
+            try:
+                conn.close()
+            except OSError:
+                pass
 
     def holen(self) -> list[dict]:
         with self._lock:
@@ -510,8 +540,8 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
     Weitere Reiter: Kommandozeile (Strg+Umschalt+T) und „🤖 KI“ (Befehle der KI live, nur lesen)."""
     _app_kennung()
     from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
-    from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QIcon, QKeySequence,
-                               QPainter, QPixmap, QShortcut)
+    from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QIcon, QImage,
+                               QKeySequence, QPainter, QPixmap, QShortcut)
     from PySide6.QtWidgets import (QApplication, QHBoxLayout, QMenu, QStackedWidget, QSystemTrayIcon, QTabBar,
                                    QToolButton, QVBoxLayout, QWidget)
     import terminal_pty
@@ -821,7 +851,29 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 QGuiApplication.clipboard().setText(text)
 
         def _einfuegen(self):
-            self._text_einfuegen(QGuiApplication.clipboard().text())
+            """Strg+V: kopierte Dateien als Pfade, sonst Text, sonst ein Bild (als PNG abgelegt, Pfad eingefügt)."""
+            mime = QGuiApplication.clipboard().mimeData()
+            if mime is None:
+                return
+            text = self._abgelegt(mime)
+            if mime.hasImage() and (not text.strip() or nur_link(text)):
+                text = self._bild_ablegen(mime.imageData()) or text
+            self._text_einfuegen(text)
+
+        def _bild_ablegen(self, bild) -> str:
+            import time
+            if bild is None or not isinstance(bild, QImage):
+                bild = QImage(bild) if isinstance(bild, QPixmap) else None
+            if bild is None or bild.isNull():
+                return ""
+            ordner = einfuege_ordner()
+            try:
+                ordner.mkdir(parents=True, exist_ok=True)
+                einfuegungen_aufraeumen(ordner)
+            except OSError:
+                return ""
+            pfad = ordner / f"bild_{time.strftime('%Y%m%d_%H%M%S')}_{secrets.token_hex(2)}.png"
+            return abgelegt_zu_text([str(pfad)]) if bild.save(str(pfad), "PNG") else ""
 
         def _text_einfuegen(self, text):
             if not text or self.nur_lesen:

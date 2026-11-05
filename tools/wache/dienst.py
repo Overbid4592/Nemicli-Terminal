@@ -33,8 +33,9 @@ UNKLAR_TAGE = 7          # so lange hält ein „unklar“-Urteil die Kugel gelb
 
 
 class Dienst:
-    def __init__(self, wecken, install_ordner: Path, *, chat=None, chat_neu=None, name: str = "Persönlichkeit",
-                 nutzer: str = "du", mit_tray: bool = True, mit_kugel: bool = True, name_von=None):
+    def __init__(self, wecken, install_ordner: Path, *, chat=None, chat_neu=None, zuschauen=None,
+                 name: str = "Persönlichkeit", nutzer: str = "du", mit_tray: bool = True, mit_kugel: bool = True,
+                 name_von=None):
         ordner_anlegen()
         self.install = install_ordner
         self.name = name
@@ -54,6 +55,7 @@ class Dienst:
         self._stoerung_gemeldet = ""
         self._chat = chat
         self._chat_neu = chat_neu
+        self._zuschauen = zuschauen
         self.tray = None
         self.kugel = None
         self.gui = None
@@ -151,7 +153,8 @@ class Dienst:
         try:
             import kontextmenue
             if kontextmenue.nemicli_laeuft():
-                return False
+                from . import lebendig
+                return lebendig.zuschauen_an() and lebendig.spiel_im_vordergrund() is not None   # Spiel-Begleiterin
         except Exception:
             pass
         return True
@@ -340,7 +343,8 @@ class Dienst:
                                        sichtbar=self.kugel_sichtbar, name=self.name, nutzer=self.nutzer,
                                        nemicli_oeffnen=self.nemicli_oeffnen, screenshot=self.screenshot,
                                        chat_neu=self._chat_neu, name_von=self._name_von,
-                                       erinnerungen=True, leben=True, musik=True, melden=self._melden)
+                                       erinnerungen=True, leben=True, musik=True, melden=self._melden,
+                                       zuschauen=self._zuschauen, frage_taste=True)
                 except Exception as exc:
                     print(f"Kugel nicht verfügbar: {exc}")
                     self.kugel = None

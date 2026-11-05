@@ -36,7 +36,6 @@ from prompt_toolkit.layout import Layout, HSplit, VSplit, Window, FormattedTextC
 from prompt_toolkit.layout.containers import (Float, FloatContainer,
                                               ConditionalContainer)
 from prompt_toolkit.layout.controls import BufferControl
-from prompt_toolkit.layout.dimension import Dimension as D
 from prompt_toolkit.layout.menus import CompletionsMenu
 from prompt_toolkit.layout.processors import ConditionalProcessor, PasswordProcessor
 from prompt_toolkit.layout.screen import Char, Screen as _PTScreen
@@ -108,17 +107,9 @@ _MAX_LINES = 6000          # Verlauf im Speicher kappen
 
 
 # --- Zeichenbreite: Terminal und prompt_toolkit müssen sich einig sein --------
-# Gemessen (Windows Terminal): alle nackten Symbole der UI stimmen
-# überein. Auseinander laufen sie nur bei
-#   · Symbol + U+FE0F (Variation Selector-16, „zeig mich als buntes Emoji"):
-#     ❤️ ⚠️ 🛡️ …   Terminal 2 Zellen, prompt_toolkit 1
-#   · ZWJ-Ketten (👨‍💻), Hauttönen (👋🏽), Keycaps (1️⃣): Terminal 2, prompt_toolkit 4
-# Ein solches Zeichen verschiebt den Rest der Zeile um eine Zelle; beim nächsten
-# Hochrutschen des Verlaufs bleiben dann Buchstaben stehen, die prompt_toolkit
-# für „unverändertes Leerzeichen" hält (die Geister-Zeichen). Häufigster
-# Auslöser: „<3" → ❤️ aus emoji.py. Deshalb wird alles, was auf den Bildschirm
-# geht, auf die nackte Form gebracht – Terminal, rich und prompt_toolkit
-# rechnen dann gleich. (Flaggen 🇩🇪 bleiben; die fängt _mark_dirty ab.)
+# Terminal und prompt_toolkit zählen VS16 (❤️), ZWJ-Ketten, Hauttöne und Keycaps
+# verschieden breit; das verschiebt Zeilen und hinterlässt Geister-Zeichen. Darum geht
+# alles in der nackten Form auf den Bildschirm (Flaggen fängt _mark_dirty ab).
 _VS_KEYCAP = re.compile("[︎️⃣]")
 _SKIN = re.compile("[\U0001F3FB-\U0001F3FF]")
 _ZWJ_TAIL = re.compile("‍.")
@@ -261,12 +252,8 @@ class Screen:
 
     # -- Theme-treue rich-Console, die in den Puffer schreibt --------------
     def _text_width(self) -> int:
-        """Nutzbare Breite des Verlaufsbereichs: Terminal MINUS Scrollbalken.
-
-        Wird bei jedem Rendern neu bestimmt. Vorher stand die Breite einmal beim
-        Start fest – nach dem Ziehen am Fenster rechnete rich dann dauerhaft mit
-        der alten Breite (Ränder verrutschen, Zeilen brechen falsch um).
-        """
+        """Nutzbare Breite des Verlaufsbereichs: Terminal minus Scrollbalken – bei jedem
+        Rendern neu, damit Größenänderungen des Fensters wirken."""
         try:
             cols = self.app.output.get_size().columns
         except Exception:

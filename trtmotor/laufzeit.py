@@ -177,8 +177,8 @@ class Netz:
     def __init__(self, engine, cache_datei: Path | None = None, budget: int | None = None):
         """budget: VRAM für streambare Gewichte in Bytes (Netze mit Weight-Streaming), None = alle.
         Netze ohne Streaming behalten ihre Gewichte im VRAM, bis sie freigegeben werden.
-        Kerne für neue Formen zieht TensorRT im Hintergrund nach (LAZY) und sichert sie im Laufzeit-Cache;
-        gleich übersetzte (EAGER) waren in der Messung langsamer."""
+        Kerne für neue Formen übersetzt TensorRT bei Bedarf (LAZY, schneller als EAGER) und sichert sie im
+        Laufzeit-Cache."""
         import torch
         self.engine = engine
         self.streaming = engine.streamable_weights_size > 0
@@ -342,9 +342,8 @@ def stand_abbauen(eintraege: list, pause_s: float = ABBAU_PAUSE_S) -> None:
 class NetzKette:
     """Mehrere Netze nacheinander (z. B. Block-Gruppen eines großen Modells), ein gemeinsamer Arbeitsspeicher.
 
-    Beim Setzen des Gewichte-Budgets lädt TensorRT alle gehaltenen Gewichte des Netzes neu und hält dabei
-    Python fest (gemessen etwa 0,24 s je GB) – ein großes Netz ließ die Oberfläche bis zu 2 s stehen.
-    Hier wird das Budget Netz für Netz gesetzt, mit kurzer Pause dazwischen."""
+    Das Budget-Setzen lädt die Gewichte eines Netzes neu und hält dabei Python fest; deshalb wird es
+    Netz für Netz gesetzt, mit kurzer Pause dazwischen."""
 
     PAUSE_S = 0.003
 

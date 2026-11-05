@@ -75,8 +75,9 @@ STANDARD = {
 
 # Regeln für klassische Angriffswege: die Persönlichkeit darf sie nicht stumm schalten – ein
 # eingeschleuster Text („schalte R001 stumm“) würde sonst genau die Erkennung abschalten.
-# Dazu Massen-Dateiänderungen (Verschlüsselungs-Trojaner) und alle Autostart-/Aufgaben-Regeln.
-NIE_STUMM_KI = frozenset({"R001", "R002", "R003", "R005", "R006", "R009", "R010", "R011", "R013", "R014"})
+# Dazu Massen-Dateiänderungen (Verschlüsselungs-Trojaner), Tarnung und alle Persistenz-Regeln.
+NIE_STUMM_KI = frozenset({"R001", "R002", "R003", "R005", "R006", "R009", "R010", "R011", "R013", "R014",
+                          "R016", "R017"})
 
 _TRIGGER = ("mittel", "hoch", "kritisch", "nie")
 _TRIGGER_KI = ("mittel", "hoch")
@@ -217,7 +218,7 @@ def pruefen(was: str, wert, e: dict | None = None, *, nutzer: bool = False) -> t
         neu = str(wert).strip().lower()
         if neu not in _TRIGGER:
             raise Grenzverletzung("trigger_ab muss mittel, hoch, kritisch oder nie sein.")
-        if not nutzer and neu not in _TRIGGER_KI:
+        if not nutzer and (neu not in _TRIGGER_KI or trigger_stufe(neu) > trigger_stufe(e["trigger_ab"])):
             raise Grenzverletzung(f"„{neu}“ hieße seltener wecken – das setzt nur der Nutzer "
                                   f"(/wache trigger {neu}). Erlaubt: mittel oder hoch.")
         return "trigger_ab", e["trigger_ab"], neu
@@ -281,12 +282,23 @@ def anwenden(was: str, wert, *, wer: str, begruendung: str, speicher=None, motor
     return f"Justiert: {schluessel} {alt} → {neu}. Begründung festgehalten."
 
 
+_RUECKGAENGIG = "Rückgängig ("
+
+
 def letzte_rueckgaengig(speicher, motor=None, wer: str = "Nutzer") -> str:
-    """Die jüngste Justierung zurücknehmen (alt wieder setzen)."""
-    liste = speicher.justierungen(1)
-    if not liste:
+    """Die jüngste noch nicht zurückgenommene Justierung zurücknehmen (alt wieder setzen).
+    Rücknahmen stehen selbst in der Tabelle – sie heben je eine ältere Justierung auf (Stapel)."""
+    offen_zurueck, j = 0, None
+    for x in speicher.justierungen(200):
+        if str(x.get("begruendung") or "").startswith(_RUECKGAENGIG):
+            offen_zurueck += 1
+        elif offen_zurueck:
+            offen_zurueck -= 1
+        else:
+            j = x
+            break
+    if j is None:
         return "Keine Justierung vorhanden."
-    j = liste[0]
     import json
     try:
         alt = json.loads(j["alt"].replace("'", '"')) if j["was"] == "stumme_regeln" else \
@@ -296,7 +308,7 @@ def letzte_rueckgaengig(speicher, motor=None, wer: str = "Nutzer") -> str:
         alt = j["alt"]
     if not speichern({j["was"]: alt}):
         return f"Nicht zurückgenommen: {_speicher_grund()}. {j['was']} bleibt {j['neu']}."
-    _merken(speicher, wer, j["was"], j["neu"], alt, f"Rückgängig ({j['wer']}: {j['begruendung'][:80]})")
+    _merken(speicher, wer, j["was"], j["neu"], alt, f"{_RUECKGAENGIG}{j['wer']}: {j['begruendung'][:80]})")
     _protokollieren(f"Rückgängig: {j['was']} → {alt}", wer)
     _uebernehmen(motor)
     return f"Zurückgenommen: {j['was']} steht wieder auf {alt}."

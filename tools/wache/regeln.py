@@ -6,6 +6,7 @@ Grenzen – von der Persönlichkeit stumm geschaltet werden (`stumm`), nie gelö
 
 from __future__ import annotations
 
+import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
@@ -26,11 +27,9 @@ _VERDAECHTIGE_FLAGS = ["-enc", "-encodedcommand", "-e ", "-w hidden", "-windowst
                        "downloadstring", "downloadfile", "iex", "invoke-expression",
                        "frombase64string", "-noninteractive"]
 # NemiCLIs eigener PowerShell-Rahmen (actions.py `abfragen`/`befehl`, zeitplan.py): so beginnt
-# jede Kommandozeile, die NemiCLI selbst startet. Die Wache erkannte ihn nicht und schlug mit
-# R001 „Hoch“ an (-NoProfile = drei „verdächtige Flags“) – weckte die Persönlichkeit, die machte
-# `abfragen`, neuer Alarm … – eine Schleife falscher Urteile zu powershell.exe. Wer diesen
-# Rahmen fälscht, um durchzurutschen, muss ihn erst mal kennen – und das Kind sitzt dann trotzdem
-# unter einem fremden Elternprozess, was R002/Profil sehen.
+# jede Kommandozeile, die NemiCLI selbst startet. Ohne Ausnahme löste jede eigene Abfrage R001
+# aus und weckte die Persönlichkeit erneut. Ein gefälschter Rahmen unter fremdem Elternprozess
+# fällt weiter bei R002 und im Profil auf.
 EIGENER_RAHMEN = "$progresspreference='silentlycontinue'; $outputencoding = [console]::outputencoding"
 _EIGENE_ELTERN = {"python.exe", "pythonw.exe", "nemicli.exe"}
 
@@ -147,7 +146,7 @@ def subjekt_von(e: Ereignis) -> str:
 
 def subjekt_fuer(regel: str, e: Ereignis) -> str:
     """Subjekt aus Regel + Ereignis – dieselbe Zuordnung, die die Regeln selbst treffen.
-    Gebraucht, um Alarme aus älteren Datenbanken (ohne Subjekt) nachzurüsten."""
+    Gebraucht, um Alarme ohne Subjekt nachzurüsten."""
     if regel == "R004":
         return e.eltern or "?"
     if regel == "R008":
@@ -170,6 +169,7 @@ def _kuerzen(dq: deque, grenze: float) -> None:
 class Regelwerk:
     def __init__(self, fenster: int = 300, stumm: set[str] | None = None):
         self.fenster = fenster
+        self._lock = threading.RLock()
         self.stumm: set[str] = set(stumm or ())
         self._starts: dict[str, deque] = defaultdict(deque)
         self._conns: dict[str, deque] = defaultdict(deque)
@@ -184,6 +184,11 @@ class Regelwerk:
         self.sigma_laden()
 
     def pruefen(self, e: Ereignis) -> list[Alarm]:
+        # Motor und Inventar-Thread prüfen gleichzeitig; die Fenster-Zähler sind gemeinsamer Zustand.
+        with self._lock:
+            return self._pruefen(e)
+
+    def _pruefen(self, e: Ereignis) -> list[Alarm]:
         self._zustand(e)
         out = []
         for regel in self.regeln:
@@ -218,8 +223,8 @@ class Regelwerk:
             self._aufraeumen(jetzt, grenze)
 
     def _aufraeumen(self, jetzt: float, grenze: float) -> None:
-        """Gezielt nur Altes entfernen – früher wurde bei >500 Paaren alles geleert, und auf einem Rechner mit
-        Browser sah die Beaconing-Regel (R007) so nie sechs Verbindungen in Folge."""
+        """Gezielt nur Altes entfernen: alles zu leeren hieße, R007 sähe bei vielen Zielen nie sechs
+        Verbindungen in Folge."""
         self._seit_aufraeumen = 0
         for d in (self._starts, self._conns):
             for k in [k for k, dq in d.items() if not dq or dq[-1] < grenze]:

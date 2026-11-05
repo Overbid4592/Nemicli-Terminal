@@ -8,7 +8,7 @@ macht die Schwelle direkt zur Stellschraube für die Alarmrate.
 `side="right"` beim Einordnen ist kein Detail: identische Ereignisse erzeugen
 identische Rohwerte. Mit "left" bekäme so eine Gruppe den Rang ihres ersten
 Elements – ein Muster, das 20 % der Baseline ausmacht, gälte als maximal
-auffällig (im SIEM gemessen: 24 % Fehlalarme).
+auffällig.
 
 Zwei Instanzen laufen nebeneinander: Prozesse/Netz und Dateien.
 
@@ -136,14 +136,16 @@ class Detektor:
         if len(ereignisse) < 20:
             return {"ok": False, "grund": f"zu wenige Ereignisse ({len(ereignisse)})"}
         start = time.perf_counter()
-        if hasattr(self.merkmale, "anpassen"):
-            self.merkmale.anpassen(ereignisse)
-        X = np.array([self.merkmale.vektor(e) for e in ereignisse], dtype=np.float64)
-        sk = Skalierer().anpassen(X)
-        Xs = sk.anwenden(X)
-        wald = IsolationForest(baeume=100, stichprobe=256, zufall=42).anpassen(Xs)
-        referenz = np.sort(wald.rohwert(Xs))
+        # Unter dem Lock: `anpassen` ändert die Merkmale, die zum alten Wald nicht mehr passen –
+        # ein Training aus einem anderen Thread darf dazwischen nicht bewerten lassen.
         with self._lock:
+            if hasattr(self.merkmale, "anpassen"):
+                self.merkmale.anpassen(ereignisse)
+            X = np.array([self.merkmale.vektor(e) for e in ereignisse], dtype=np.float64)
+            sk = Skalierer().anpassen(X)
+            Xs = sk.anwenden(X)
+            wald = IsolationForest(baeume=100, stichprobe=256, zufall=42).anpassen(Xs)
+            referenz = np.sort(wald.rohwert(Xs))
             self._wald, self._skalierer, self._referenz = wald, sk, referenz
             self.trainiert = True
             self.stichprobe = len(ereignisse)
@@ -157,8 +159,8 @@ class Detektor:
     # -------------------------------------------------------------- Bewerten
 
     def bewerten(self, e: Ereignis) -> tuple[float, list[str]]:
-        v = self.merkmale.vektor(e)
         with self._lock:
+            v = self.merkmale.vektor(e)
             wald, sk, ref = self._wald, self._skalierer, self._referenz
         if wald is None or sk is None or ref is None or not len(ref):
             return self._kaltstart(v), self.merkmale.erklaeren(v)
@@ -204,8 +206,12 @@ class Detektor:
     # ------------------------------------------------------------ Persistenz
 
     def speichern(self, neue_version: bool = False) -> None:
-        """`neue_version`: nach einem Training – das bisherige Modell wird Vorversion."""
+        """`neue_version`: nach einem Training – das bisherige Modell wird Vorversion. Sonst bleibt eine
+        Datei, die ein anderer Prozess seit dem Laden getauscht hat (/wache ml zurueck), unangetastet."""
         try:
+            if (not neue_version and self.pfad.exists()
+                    and self.pfad.stat().st_mtime != self._geladen_mtime):
+                return
             with self._lock:
                 z = {"wald": self._wald.zustand() if self._wald else None,
                      "skalierer": self._skalierer.zustand() if self._skalierer else None,

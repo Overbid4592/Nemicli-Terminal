@@ -3,8 +3,8 @@
 Warum zwei? Ein Datei-Ereignis kennt keinen Verursacher-Prozess (watchdog sagt
 „eine Datei wurde angelegt“, nicht „wer“). Im Prozessmodell blieben 25 von 30
 Achsen leer – und der Isolation Forest isoliert genau das, was strukturell aus
-der Masse fällt: im SIEM galten 79 % der harmlosen Datei-Ereignisse als
-Anomalie. Deshalb ein eigener Satz für Dateien (Ordner, Endung, Name, Zeit, Rate).
+der Masse fällt: fast jedes Datei-Ereignis wäre Anomalie. Deshalb ein eigener
+Satz für Dateien (Ordner, Endung, Name, Zeit, Rate).
 
 Regeln, die aus gemessenen Fehlern stammen:
 - `extract()` ist eine reine Funktion: gleiches Ereignis, gleicher Profilstand
@@ -138,6 +138,22 @@ def _erklaeren(tabelle, namen, vektor, top=4) -> list[str]:
 # Prozess- und Netz-Ereignisse
 # ---------------------------------------------------------------------------
 
+def _systemordner() -> tuple[str, ...]:
+    """Windows- und Programmordner (klein, mit „\\“) – Windows liegt nicht immer auf C:."""
+    out = []
+    for var, standard in (("SystemRoot", r"C:\Windows"), ("ProgramFiles", r"C:\Program Files"),
+                          ("ProgramFiles(x86)", r"C:\Program Files (x86)"), ("ProgramW6432", "")):
+        p = os.environ.get(var) or standard
+        if p:
+            p = p.lower().rstrip("\\") + "\\"
+            if p not in out:
+                out.append(p)
+    return tuple(out)
+
+
+_SYSTEMORDNER = _systemordner()
+
+
 def _vollscan(baseline, pfad: str) -> list[float]:
     """[bekannt, neu, signiert] aus dem letzten Vollscan; ohne Vollscan 0."""
     if baseline is None or not pfad:
@@ -227,7 +243,7 @@ class ProzessMerkmale:
         for p in self.software:
             if low.startswith(p):
                 return 0.0
-        for sysdir in ("c:\\windows\\", "c:\\program files\\", "c:\\program files (x86)\\"):
+        for sysdir in _SYSTEMORDNER:
             if low.startswith(sysdir):
                 return 0.0
         return 1.0

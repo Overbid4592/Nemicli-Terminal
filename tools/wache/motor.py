@@ -33,17 +33,12 @@ Fehler in der Hauptschleife beenden den Motor nicht: sie werden protokolliert,
 der Durchlauf geht weiter. Häufen sie sich (FEHLER_GRENZE in FEHLER_FENSTER
 Sekunden), meldet `stand()["gestoert"]` den Grund, bis es wieder ruhig läuft.
 
-Verdichten und Dämpfen (ohne sie ist ein Großteil der offenen Alarme oft
-derselbe Vorgang): Regel + Subjekt ist der Schlüssel. Kommt derselbe Alarm
-innerhalb des Cooldowns wieder, wird am ersten der Zähler hochgesetzt („×37“)
-statt eine neue Zeile zu schreiben – und niemand wird erneut geweckt. Ausnahmen:
-Ist der neue Alarm schwerer oder der erste schon beurteilt, gibt es einen neuen.
-Wurde ein Paar in den letzten 30 Tagen `daempfen_ab`-mal als harmlos beurteilt
-(und nie als echt), meldet der Motor es nicht mehr, zählt es nur noch
-(`gedaempft` im Stand) – außer es ist kritisch oder schwerer als alles, was dazu
-harmlos war. Ist das Subjekt schon als „bekannt“ eingetragen, kommt der Alarm eine
-Stufe leiser – nicht, wenn das Programm diesmal aus Temp oder von außerhalb der
-installierten Software läuft.
+Verdichten und Dämpfen (Schlüssel: Regel + Subjekt): Derselbe Alarm innerhalb des
+Cooldowns zählt am ersten hoch („×37“), ohne neuen Weckruf – außer er ist schwerer
+oder der erste schon beurteilt. Nach `daempfen_ab` harmlos-Urteilen in 30 Tagen (nie
+echt) wird ein Paar nur noch gezählt, außer kritisch oder schwerer als bisher harmlos.
+Bekannte Subjekte kommen eine Stufe leiser, nicht aber aus Temp oder von außerhalb
+der installierten Software.
 """
 
 from __future__ import annotations
@@ -175,9 +170,8 @@ class Motor:
 
         self._profile_spiegeln()
         self.daempfung_aktualisieren()
-        # Was seit dem letzten Training reinkam, zählt weiter – sonst fängt der
-        # „alle 200“-Takt nach jedem Neustart bei 0 an und ein Tag mit drei
-        # Neustarts lernt nie.
+        # Was seit dem letzten Training reinkam, zählt weiter – sonst finge der
+        # Trainings-Takt nach jedem Neustart bei 0 an.
         try:
             zuletzt = float(self.speicher.meta("training_zuletzt", "0") or 0)
             if zuletzt:
@@ -192,8 +186,13 @@ class Motor:
     # --------------------------------------------------------------- Lebenslauf
 
     def start(self) -> None:
-        if self._worker and self._worker.is_alive():
+        if self._worker and self._worker.is_alive() and not self._stopp.is_set():
             return
+        # stop() wartet nur kurz; steckt der alte Durchlauf noch in einem Training, erst ihn zu Ende
+        # laufen lassen – sonst liefe er nach clear() weiter oder der neue Start fiele aus.
+        for t in (self._worker, self._wartung, self._besitzer):
+            if t is not None and t.is_alive():
+                t.join()
         self._stopp.clear()
         self.start_zeit = time.time()
         self.sensoren = [SensorThread(s, self._aufnehmen, self._sensor_fehler)
@@ -606,8 +605,11 @@ class Motor:
                 a.schwere = Schwere(int(a.schwere) - 1)
             self._zuletzt[key] = (a.id, a.zeit, roh)
             out.append(a)
-        if len(self._zuletzt) > 2000:
-            self._zuletzt.clear()
+        if len(self._zuletzt) > 2000:                     # nur Abgelaufenes vergessen, laufende Verdichtung bleibt
+            grenze = e.zeit - self.e["cooldown"]
+            self._zuletzt = {k: v for k, v in self._zuletzt.items() if v[1] >= grenze}
+            if len(self._zuletzt) > 2000:
+                self._zuletzt.clear()
         return out
 
     def _fremder_ort(self, e: Ereignis) -> bool:
@@ -884,13 +886,14 @@ class Motor:
 
     def stand(self) -> dict:
         laufzeit = time.time() - self.start_zeit if self.start_zeit else 0.0
+        gedaempft = self._gedaempft                 # die Wartung tauscht das Dict aus einem anderen Thread
         return {
             "laeuft": self.laeuft, "laufzeit": laufzeit, "verarbeitet": self.verarbeitet,
             "gespeichert": self.speicher.anzahl_ereignisse(), "alarme": self.alarme,
             "anomalien": self.anomalien, "profile": self.speicher.anzahl_profile(),
             "verdichtet": self.verdichtet,
-            "gedaempft": {f"{r}·{s}": (self._gedaempft[(r, s)][0], self.gedaempft_zaehler.get((r, s), 0))
-                          for r, s in sorted(self._gedaempft)},
+            "gedaempft": {f"{r}·{s}": (gedaempft[(r, s)][0], self.gedaempft_zaehler.get((r, s), 0))
+                          for r, s in sorted(gedaempft)},
             "neue_profile": self.neue_profile, "queue": self.queue.qsize(),
             "pro_sekunde": self.verarbeitet / laufzeit if laufzeit > 1 else 0.0,
             "sensoren": [{"name": t.sensor.name, "laeuft": t.laeuft, "ereignisse": t.ereignisse,

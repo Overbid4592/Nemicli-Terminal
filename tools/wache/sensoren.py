@@ -349,6 +349,7 @@ class DateiSensor:
                     sensor._merken("file_moved", e.src_path, getattr(e, "dest_path", ""))
 
         self._observer = Observer()
+        self.ueberwacht, self.fehlgeschlagen = [], []     # nach Pause/Fortsetzen nicht doppelt
         for p in self.pfade:
             try:
                 self._observer.schedule(_H(), p, recursive=False)

@@ -1,16 +1,9 @@
 """Schnell-Lesen: lange Prompt-Stücke rechnet ein TensorRT-Netz, die Antwort schreibt der GGUF-Motor.
 
-Beim Lesen vieler Token rechnen die FP4-/FP8-Kerne von TensorRT (rechengebunden) schneller als
-die Quant-Kerne des GGUF-Motors, beim Schreiben (ein Token je Schritt, speichergebunden) ist der
-GGUF-Motor im Vorteil. Beide teilen sich deshalb die Arbeit – und den KV-Cache:
-das Netz schreibt K und V direkt in die Caches des Baukasten-Modells (gleiche Form, gleicher Typ).
-
-Ablauf (`anbinden`, nach dem Laden einer Engine):
-  1. Einmessen: ein fester Text läuft durch das Modell, gemessen wird der Höchstwert jedes
-     Matrix-Eingangs (für die Skalen der Aktivierungen) – nur, wenn kein Netz gespeichert ist.
-  2. Bauen im Hintergrund: Gewichte aus der GGUF-Datei (CPU), als NVFP4/FP8/bf16 ins Netz.
-  3. Anbinden: `modell.schnell = Leser` – der Baukasten fragt ihn bei langen Stücken.
-Nicht abgedeckte Bauarten, LoRA, 8-Bit- oder geteilte KV-Caches: es rechnet der GGUF-Motor.
+Lesen ist rechengebunden (FP4-/FP8-Kerne von TensorRT schneller), Schreiben speichergebunden (GGUF-Motor
+schneller). Das Netz schreibt K und V direkt in die KV-Caches des Baukasten-Modells.
+`anbinden`: einmessen (nur ohne gespeichertes Netz), im Hintergrund bauen, `modell.schnell = Leser`.
+Nicht abgedeckte Bauarten, LoRA, gepackte oder geteilte KV-Caches: es rechnet der GGUF-Motor.
 """
 
 from __future__ import annotations
@@ -407,7 +400,8 @@ class Leser:
         if modell.n_ctx != n:
             return None
         caches = [l.cache for l in modell.layers]
-        if any(getattr(c, "int8", True) or c.geteilt or c.k.dtype != torch.bfloat16 for c in caches):
+        if any(getattr(c, "gepackt", getattr(c, "int8", True)) or c.geteilt or c.k.dtype != torch.bfloat16
+               for c in caches):
             return None
         if caches[0].k.shape[1] < n and self.raum is not None:
             self.raum(n)
@@ -497,9 +491,12 @@ def anbinden(engine, datei, fmt: str = "auto", warten: bool = False, fertig=None
         plan = bauplan(modell)
     except NichtMoeglich as exc:
         return str(exc)
-    c = modell.layers[0].cache
-    if getattr(c, "int8", False) or getattr(c, "geteilt", False):
-        return "8-Bit- oder geteilter Gesprächsspeicher (VRAM knapp) – es liest der GGUF-Motor"
+    # Dieselben Bedingungen wie Leser._caches: sonst würde gebaut, was nie liest
+    for c in (l.cache for l in modell.layers):
+        if getattr(c, "gepackt", getattr(c, "int8", True)) or getattr(c, "geteilt", False):
+            return "gepackter oder geteilter Gesprächsspeicher (VRAM knapp) – es liest der GGUF-Motor"
+        if getattr(getattr(c, "k", None), "dtype", None) != torch.bfloat16:
+            return "Gesprächsspeicher nicht in bfloat16 – es liest der GGUF-Motor"
     fmt = format_waehlen(plan, fmt)
     teile = {"v": VERSION, "fmt": fmt, "t_max": T_MAX, "gguf": _gguf_kennung(Path(datei)),
              "plan": json.dumps(plan, sort_keys=True)}

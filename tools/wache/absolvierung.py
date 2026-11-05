@@ -326,9 +326,11 @@ class Absolvierung:
         self._gespeichert = time.time()
 
     def stand(self) -> dict:
+        # Aus einem anderen Thread gelesen, während der Motor die Dicts ändert: erst kopieren.
+        pids, auftraege = list(self._pids.values()), list(self._auftraege.items())
         return {k: {"lernt": lernt(a), "kinder": len((self._bilder.get(k) or {}).get("kinder") or {}),
-                    "laufend": sum(1 for v in self._pids.values() if v[0] == k)}
-                for k, a in self._auftraege.items()}
+                    "laufend": sum(1 for v in pids if v[0] == k)}
+                for k, a in auftraege}
 
 
 def subjekt(key: str, name: str) -> str:

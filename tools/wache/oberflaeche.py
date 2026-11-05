@@ -1,14 +1,8 @@
 """Die gemeinsame Qt-Schicht von Kugel und Tray: EINE QApplication, das Theme,
 die Brücke in den GUI-Thread, das Bildschirmfoto.
 
-WARUM QT
-Kugel und Chatfenster waren tkinter – gut genug für den ersten Tag, aber eine
-Persönlichkeit, die auf dem Desktop lebt, verdient mehr als einen Canvas-Kreis
-mit Transparenzfarbe und ein graues Text-Widget. PySide6 (nur „Essentials“:
-QtCore/QtGui/QtWidgets) bringt echte Per-Pixel-Transparenz, Antialiasing,
-Schatten, Animationen, Markdown im Label und ein Tray-Symbol aus demselben
-Guss – pystray und Pillow fallen damit im Hintergrund-Prozess weg. Kein Node,
-kein npm, keine WebView: alles ist Python und signierte Qt-DLLs.
+PySide6 (nur QtCore/QtGui/QtWidgets): Per-Pixel-Transparenz, Antialiasing, Animationen,
+Markdown im Label und das Tray-Symbol aus einer Bibliothek – ohne WebView.
 
 REGELN
 - `anwendung()` im Hauptthread aufrufen, bevor irgendein Fenster entsteht.

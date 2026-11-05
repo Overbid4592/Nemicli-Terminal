@@ -98,8 +98,7 @@ def bekannt_schluessel(ereignis) -> list[tuple[str, str, str]]:
         p = (getattr(ereignis, "exe", "") or ereignis.prozess).lower()
         if ereignis.prozess.lower() in _SKRIPT_HOSTS and ereignis.eltern:
             # Ein Skript-Host ist nur zusammen mit seinem Elternprozess „bekannt“: powershell.exe
-            # aus NemiCLI ist etwas anderes als powershell.exe aus winword.exe. Früher galt
-            # „powershell.exe = harmlos“ pauschal – nach einem geratenen Urteil.
+            # aus NemiCLI ist etwas anderes als powershell.exe aus winword.exe.
             el = ereignis.eltern.lower()
             out.append((f"prozess:{p}<{el}", "prozess", f"{ereignis.prozess} (von {ereignis.eltern})"))
         else:
@@ -155,7 +154,7 @@ class Speicher:
         self._c.commit()
 
     def _nachruesten(self) -> None:
-        """Spalten, die später dazukamen, an bestehende Datenbanken anbauen.
+        """Später hinzugekommene Spalten an bestehende Datenbanken anbauen.
         ALTER TABLE hängt hinten an – genau die Reihenfolge, die Alarm.zeile() liefert."""
         ev = {r["name"] for r in self._c.execute("PRAGMA table_info(ereignisse)")}
         for spalte in ("start", "eltern_start"):
@@ -171,7 +170,7 @@ class Speicher:
             self._subjekte_nachtragen()
 
     def _subjekte_nachtragen(self) -> None:
-        """Alarme aus älteren Datenbanken haben kein Subjekt – aus dem Ereignis dahinter
+        """Alte Alarme ohne Subjekt: aus dem Ereignis dahinter
         nachholen, damit auch sie sich als Gruppe bewerten und fürs Dämpfen zählen lassen."""
         from .regeln import subjekt_fuer
         rows = self._c.execute(
@@ -224,9 +223,8 @@ class Speicher:
         return Ereignis.aus_zeile(r) if r else None
 
     def ereignisse_seit(self, seit: float, limit: int = 20_000) -> list[Ereignis]:
-        """Fürs Training: die NEUESTEN `limit` Ereignisse seit `seit`, aufsteigend sortiert.
-        (Mit ASC LIMIT – bei mehr als `limit` Ereignissen wären die
-        neuesten weggefallen und das Modell hätte mit dem ältesten Stand gelernt.)"""
+        """Fürs Training: die NEUESTEN `limit` Ereignisse seit `seit`, aufsteigend sortiert
+        (DESC LIMIT, dann umgedreht – sonst fielen bei Überlauf die neuesten weg)."""
         with self._lock:
             rows = self._c.execute(
                 "SELECT * FROM ereignisse WHERE zeit >= ? ORDER BY zeit DESC LIMIT ?",
@@ -371,14 +369,20 @@ class Speicher:
 
     def alarme_unbeurteilt(self, regel: str, subjekt: str = "", limit: int = 500) -> list[Alarm]:
         """Alle noch nicht beurteilten Alarme (offen/gesehen) einer Regel – wahlweise nur zu
-        einem Subjekt (Prozess, Elternprozess, Ziel, Pfad; Teilstring, Groß/klein egal)."""
-        sql = "SELECT * FROM alarme WHERE status IN ('offen', 'gesehen') AND regel = ?"
-        args: list = [regel]
-        if subjekt:
-            sql += " AND LOWER(subjekt) LIKE ?"; args.append(f"%{subjekt.lower()}%")
-        sql += " ORDER BY zeit DESC LIMIT ?"; args.append(limit)
+        einem Subjekt (Prozess, Elternprozess, Ziel, Pfad; Groß/klein egal). Gibt es Alarme mit genau
+        diesem Subjekt, nur diese – sonst Teilstring: ein Urteil soll nicht still Ähnliches mitnehmen."""
+        basis = "SELECT * FROM alarme WHERE status IN ('offen', 'gesehen') AND regel = ?"
+        ende = " ORDER BY zeit DESC LIMIT ?"
         with self._lock:
-            return [Alarm.aus_zeile(r) for r in self._c.execute(sql, args)]
+            if not subjekt:
+                return [Alarm.aus_zeile(r) for r in self._c.execute(basis + ende, (regel, limit))]
+            s = subjekt.lower()
+            genau = self._c.execute(basis + " AND LOWER(subjekt) = ?" + ende, (regel, s, limit)).fetchall()
+            if genau:
+                return [Alarm.aus_zeile(r) for r in genau]
+            muster = "%" + s.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%"
+            return [Alarm.aus_zeile(r) for r in self._c.execute(
+                basis + " AND LOWER(subjekt) LIKE ? ESCAPE '\\'" + ende, (regel, muster, limit))]
 
     def gedaempft(self, ab: int = 3, *, mit_schwere: bool = False,
                   jetzt: float | None = None) -> dict[tuple[str, str], int | tuple[int, int]]:
@@ -723,12 +727,8 @@ class Speicher:
             self._c.commit()
 
     def verdichten(self) -> None:
-        """WAL-Zwischendatei (wache.db-wal) in die Datenbank übernehmen.
-
-        SQLite macht das von selbst nur, wenn zwischendurch KEINE Verbindung
-        liest – im Dienst liest aber ständig jemand (Motor, Tray, Wecker). Ohne
-        diesen Anstoß wuchs die Zwischendatei auf mehrere MB. Es geht nichts
-        verloren: die Daten wandern nur von der Zwischendatei in die Hauptdatei."""
+        """WAL-Zwischendatei in die Datenbank übernehmen. SQLite kürzt sie von selbst nur, wenn
+        keine Verbindung liest – im Dienst liest ständig jemand."""
         with self._lock:
             try:
                 self._c.commit()

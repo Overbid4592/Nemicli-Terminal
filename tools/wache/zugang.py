@@ -89,7 +89,10 @@ def laeuft() -> dict | None:
     try:
         p = psutil.Process(pid)
         name = p.name().lower()
-        if p.is_running() and ("python" in name or "nemicli" in name):   # als exe: NemiCLI.exe
+        start = float(info.get("start") or 0)
+        # Später gestartet als die Wache selbst: Windows hat die PID neu vergeben.
+        neu_vergeben = bool(start) and p.create_time() > start + 5
+        if p.is_running() and not neu_vergeben and ("python" in name or "nemicli" in name):   # als exe: NemiCLI.exe
             info["hier"] = False
             info["still_s"] = max(0.0, time.time() - float(info.get("zuletzt") or info.get("start") or time.time()))
             return info

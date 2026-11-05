@@ -10,9 +10,8 @@ RAM-Kopie des Modells (NVFP4-Gewichte werden unverändert übernommen) und speic
 Ab dem nächsten Bild rechnet TensorRT die Blöcke; die Gewichte liegen im VRAM, soweit es frei
 ist (Weight-Streaming), nach dem Bild wieder nur im RAM.
 
-Die Blöcke sind auf mehrere Netze von je etwa GRUPPE_BYTES Gewichten verteilt (laufzeit.NetzKette):
-Das Budget-Setzen hält Python fest, bei einem einzigen 6-GB-Netz stand die Oberfläche bis zu 2 s.
-Zwischen den Netzen bleibt der Rest-Strom in float32 wie innerhalb eines Netzes.
+Die Blöcke sind auf mehrere Netze von je etwa GRUPPE_BYTES Gewichten verteilt (laufzeit.NetzKette),
+damit das Budget-Setzen Python nur kurz festhält. Zwischen den Netzen bleibt der Rest-Strom in float32.
 """
 
 from __future__ import annotations
@@ -359,8 +358,8 @@ def nach_bild(pfad) -> None:
 
 
 def entladen() -> None:
-    """Alle Netze freigeben – Stück für Stück: Beim Abbau hält TensorRT Python fest (alle Netze auf einmal
-    ließen die Oberfläche 4–5 s stehen). Je Netz erst der Kontext, dann Puffer, Caches und Gewichte."""
+    """Alle Netze freigeben, Stück für Stück (der Abbau hält Python fest): je Netz erst der Kontext,
+    dann Puffer, Caches und Gewichte."""
     with _lock:
         alt = list(_stand.values())
         _stand.clear()

@@ -1244,7 +1244,7 @@ class EinstellKarte(Flaeche):
         raster.setSpacing(6)
         self.knoepfe = []
         for i, o in enumerate(eintrag.get("optionen") or []):
-            k = Knopf(("✓ " if o.get("aktiv") else "") + str(o.get("text") or o.get("wert")), klein=True,
+            k = Knopf(str(o.get("text") or o.get("wert")) + ("  ✔️" if o.get("aktiv") else ""), klein=True,
                       mitte=True)
             k.akzent = bool(o.get("aktiv"))
             k.setToolTip(f"{eintrag.get('befehl')} {o.get('wert')}")
