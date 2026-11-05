@@ -759,21 +759,6 @@ async def persoenlichkeiten_menu(arg: str) -> None:
     if arg.lower() in ("neu", "new", "anlegen", "+"):
         await neue_persoenlichkeit()
         return
-    if arg.lower().split()[:1] == ["export"]:            # fürs Handy (NemiCLI-App)
-        import handyexport
-        rest = arg.split(maxsplit=1)[1] if " " in arg else ""
-        p = PS.resolve(rest) if rest else PS.active()
-        if p is None:
-            ui.warn(f"Keine Persönlichkeit gefunden, die zu '{rest}' passt.")
-            return
-        ziel = await asyncio.to_thread(handyexport.exportieren, p)
-        ui.success(f"📱 {p.name} fürs Handy: {ziel}")
-        ui.info("Die Datei aufs Handy kopieren (Kabel, Cloud, Mail) und in der NemiCLI-App „📥 Vom PC“ wählen.")
-        try:
-            os.startfile(ziel.parent)
-        except Exception:
-            pass
-        return
     if arg:                                      # direkt gesetzt: /persönlichkeiten <name>
         p = PS.resolve(arg)
         if p is None:
@@ -793,7 +778,6 @@ async def persoenlichkeiten_menu(arg: str) -> None:
         aktiv = PS.active().key
         opts = [(k, p.label + ("  ✔️" if k == aktiv else "")) for k, p in alle.items()]
         opts.append(("__neu__", "➕  Neue Persönlichkeit anlegen (ein paar Fragen)"))
-        opts.append(("__handy__", "📱  Aktive fürs Handy exportieren (NemiCLI-App)"))
         opts.append(("__ordner__", "📂  Ordner öffnen (Dateien von Hand bearbeiten)"))
         opts.append(("__cancel__", "Fertig"))
         wahl = await ask_confirm("Wer soll sprechen?  (Profil wählen → aktivieren · bearbeiten · löschen)", opts)
@@ -801,9 +785,6 @@ async def persoenlichkeiten_menu(arg: str) -> None:
             return
         if wahl == "__neu__":
             await neue_persoenlichkeit()
-            continue
-        if wahl == "__handy__":
-            await persoenlichkeiten_menu("export")
             continue
         if wahl == "__ordner__":
             PS.ensure_dir()
