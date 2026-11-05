@@ -842,7 +842,8 @@ $('#readBtn').onclick=()=>{
 $('#inspBtn') && ($('#inspBtn').onclick=()=>$('#inspector').classList.toggle('open'));
 $('#menuBtn') && ($('#menuBtn').onclick=()=>$('.side').classList.toggle('open'));
 $('#newChatBtn') && ($('#newChatBtn').onclick=()=>{ if(!busy) api('/newchat',{}); });
-$('#overlay').addEventListener('click',e=>{ if(e.target.id==='overlay') closeModal(); });
+/* Klick daneben wie „Schließen“: eine offene Rückfrage bekommt so ihre Antwort, statt bis zur Zeitgrenze zu warten */
+$('#overlay').addEventListener('click',e=>{ if(e.target.id==='overlay') $('#mCancel').click(); });
 
 loadReader(); connect();
 </script>

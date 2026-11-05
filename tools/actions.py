@@ -60,6 +60,10 @@ import snapshot
 import webfetch
 
 MAX_OUT = 6000  # längere Ausgaben werden gekürzt (Token sparen)
+# datei_lesen: je Aufruf ein Viertel des Modell-Kontexts (3 Zeichen je Token), mindestens MAX_OUT.
+# KONTEXT_TOKEN setzt das Hauptprogramm (Ctx.sync_session); 0 = unbekannt.
+LESE_ANTEIL = 0.25
+KONTEXT_TOKEN = 0
 
 
 @dataclass(frozen=True)
@@ -78,6 +82,10 @@ class ActionResult:
     @property
     def status(self) -> str:
         return "unverified" if self.ok is None else ("success" if self.ok else "error")
+
+
+def lese_grenze() -> int:
+    return max(MAX_OUT, int(KONTEXT_TOKEN * LESE_ANTEIL * 3))
 
 
 def _cut(text: str) -> str:
@@ -99,13 +107,11 @@ def bild_status() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# SCHUTZ: Windows-/Systemordner sind für die KI KOMPLETT tabu.
+# SCHUTZ: Windows-/Systemordner ändert die KI nie.
 # ---------------------------------------------------------------------------
-# Systemordner sind kein Arbeitsgebiet der KI. Verändernde
-# Werkzeuge prüfen über _guard(), lesende über _read_guard(), Befehle über
-# _guard_command() – jeder Zielpfad wird gegen diese Liste geprüft, Pfade werden
-# vorher aufgelöst (…/.., Links, \\?\-Präfix), damit kein Umweg
-# (C:\Users\..\..\Windows) daran vorbeiführt.
+# Verändernde Werkzeuge prüfen über _guard(), lesende über _read_guard(), Befehle über
+# _guard_command(). Pfade werden vorher aufgelöst (…/.., Links, \\?\-Präfix), damit kein
+# Umweg (C:\Users\..\..\Windows) vorbeiführt.
 
 def _protected_bases() -> list[Path]:
     sysdrive = (os.environ.get("SystemDrive") or "C:").rstrip("\\") + "\\"
@@ -264,26 +270,16 @@ def _is_protected(path: str) -> bool:
     return False
 
 
-# --- Eigene Sperren des Nutzers ---------------------------------------------
-# Oben ging es um Windows. Hier geht es um Orte, die dem Nutzer gehören, an
-# denen die KI aber nichts zu suchen hat. Beispiel: legt ein Workspace einen
-# Audio-VAE in einen Modell-Ordner, fällt das Bildermalen aus, wenn NemiCLI
-# seinen VAE per "nimm den ersten" wählt. Solche Orte bleiben grundsätzlich
-# aus der Hand der KI. Zwei Stufen:
+# --- Gesperrte Orte außerhalb von Windows ------------------------------------
+# Zwei Stufen, auch für das `befehl`-Werkzeug:
 #
-#   ABSOLUT  – der NemiCLI-Ordner. Genau wie C:\Windows: nicht ändern und
-#              auch nicht ansehen. Damit kann sich NemiCLI nicht mehr selbst
-#              umbauen, und die KI liest ihren eigenen Quelltext nicht.
-#   ÄNDERN   – KreaWork.json. Ansehen ist erlaubt (die KI soll Fragen zum
-#              Workflow beantworten können), Schreiben nicht.
-#
-# Beide Stufen decken auch das `befehl`-Werkzeug ab, sonst ginge ein
-# PowerShell-Einzeiler mit Set-Content daran vorbei.
+#   ABSOLUT  – der NemiCLI-Ordner: weder ändern noch ansehen (kein Selbstumbau,
+#              kein Lesen des eigenen Quelltexts).
+#   ÄNDERN   – KreaWork.json: ansehen ja, schreiben nein.
 #
 # Erweitern ohne Codeänderung: schreibsperre.json im NemiCLI-Ordner,
 #     {"pfade": ["…nur-lesen.json"], "pfade_absolut": ["…komplett-tabu"]}
-# ACHTUNG: Diese Datei liegt selbst im NemiCLI-Ordner und ist damit für die
-# KI unerreichbar – ändern kann sie nur der Nutzer von Hand.
+# Die Datei liegt selbst im gesperrten Ordner und ist für die KI unerreichbar.
 
 def _programm_ordner() -> Path:
     """Der Programm-Ordner (paths.INSTALL). Nicht über __file__: In der exe liegt dieses Modul
@@ -297,21 +293,102 @@ def _programm_ordner() -> Path:
 
 _NEMI_ROOT = _programm_ordner()
 
+# --- Andere NemiCLI-Kopien ----------------------------------------------------
+# Jede Kopie (Quelltext oder installierte exe) ist wie der eigene Programm-Ordner komplett
+# tabu; /schluessel öffnet nur den eigenen. Zwei Wege, weil jeder allein Lücken hat:
+#   Kennzeichen – Dateien, an denen eine Kopie erkennbar ist (prüft Pfad und Ordner darüber);
+#   Register    – jede gestartete Kopie trägt sich ein. Damit fällt auch das Kopieren eines
+#                 Ordners darüber auf und ein Befehl, der die Kopie nur beim Namen nennt.
+_KENNZEICHEN = (("main_start.py", "core/version.py", "tools/actions.py"),   # Quelltext
+                ("NemiCLI.exe", "NemiCLIT2"))                              # installierte exe
+_KOPIEN_DATEI = Path(os.environ.get("LOCALAPPDATA") or Path.home()) / "NemiCLI-Kopien.json"
+_KOPIEN_MAX = 50
+_KENNZEICHEN_CACHE: dict[str, tuple[float, bool]] = {}
+_KOPIEN_CACHE: dict = {"zeit": 0.0, "liste": []}
+
+
+def _ist_nemicli_ordner(d: Path) -> bool:
+    """Trägt der Ordner die Kennzeichen einer NemiCLI-Kopie? Kurz gemerkt (Suchläufe fragen oft)."""
+    schluessel, jetzt = str(d).lower(), time.monotonic()
+    if (e := _KENNZEICHEN_CACHE.get(schluessel)) and jetzt - e[0] < 30:
+        return e[1]
+    try:
+        ja = any(all((d / t).exists() for t in satz) for satz in _KENNZEICHEN)
+    except OSError:
+        ja = False
+    if len(_KENNZEICHEN_CACHE) > 4096:
+        _KENNZEICHEN_CACHE.clear()
+    _KENNZEICHEN_CACHE[schluessel] = (jetzt, ja)
+    return ja
+
+
+def _kopie_von(p: Path) -> Path | None:
+    """Wurzel der fremden NemiCLI-Kopie, in der `p` liegt (oder die `p` ist) – sonst None.
+    Der eigene Programm-Ordner zählt nicht: für ihn gilt _ABSOLUT_FEST samt /schluessel."""
+    for d in (p, *p.parents):
+        if d == _NEMI_ROOT:
+            continue
+        if _ist_nemicli_ordner(d):
+            return d
+    return None
+
+
+def _kopien() -> list[Path]:
+    """Eingetragene Kopien außer der eigenen, die es noch gibt (10 s gemerkt)."""
+    if time.monotonic() - _KOPIEN_CACHE["zeit"] < 10:
+        return _KOPIEN_CACHE["liste"]
+    try:
+        roh = json.loads(_KOPIEN_DATEI.read_text(encoding="utf-8")).get("kopien", [])
+    except Exception:
+        roh = []
+    liste = []
+    for e in roh if isinstance(roh, list) else []:
+        try:
+            p = Path(str(e)).resolve()
+        except Exception:
+            continue
+        if p != _NEMI_ROOT and p not in liste and p.is_dir():
+            liste.append(p)
+    _KOPIEN_CACHE.update(zeit=time.monotonic(), liste=liste)
+    return liste
+
+
+def _kopie_eintragen(ordner: Path) -> None:
+    """Den eigenen Programm-Ordner ins Register schreiben (einmal je Ordner, nicht im Testlauf)."""
+    try:
+        import paths
+        if paths._testlauf() or not _ist_nemicli_ordner(ordner):
+            return
+        try:
+            roh = json.loads(_KOPIEN_DATEI.read_text(encoding="utf-8")).get("kopien", [])
+        except Exception:
+            roh = []
+        roh = [str(e) for e in roh] if isinstance(roh, list) else []
+        if any(e.lower() == str(ordner).lower() for e in roh):
+            return
+        roh = (roh + [str(ordner)])[-_KOPIEN_MAX:]
+        tmp = _KOPIEN_DATEI.with_suffix(".tmp")
+        tmp.write_text(json.dumps({"kopien": roh}, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, _KOPIEN_DATEI)
+    except Exception:
+        pass
+
+
+_kopie_eintragen(_NEMI_ROOT)
+
+
+def _kopien_bases() -> list[Path]:
+    """Das Register und die eingetragenen Kopien – beide komplett tabu."""
+    return [_KOPIEN_DATEI, *_kopien()]
+
 # Stufe 1: komplett tabu – weder lesen noch ändern.
 _ABSOLUT_FEST = [
     _NEMI_ROOT,                                   # NemiCLI selbst
 ]
 
-# ... ABER: der Daten-Ordner ist NICHT das Programm.
-#
-# Solange der Nutzer noch keinen eigenen Ordner gewählt hat (/start), liegen
-# seine Daten IM Programm-Ordner - chats/, Bilder/, NemiSandbox/ und der Rest.
-# Ohne diese Ausnahme sperrt die Programm-Sperre genau das mit weg, was sie
-# gar nicht meint: NemiCLI könnte dann nicht einmal mehr in ihre eigene
-# Sandbox schreiben (der Selbsttest fiel deshalb durch).
-#
-# Sobald der Daten-Ordner woanders liegt, greift die Ausnahme ins Leere und
-# die Sperre umfasst wirklich nur noch das Programm - so soll es am Ende sein.
+# Ausnahme: Ohne eigenen Daten-Ordner (/start) liegen die Daten (chats/, Bilder/,
+# NemiSandbox/ …) im Programm-Ordner. Diese Daten-Bereiche sind von der Programm-Sperre
+# ausgenommen; liegt der Daten-Ordner woanders, greift die Ausnahme ins Leere.
 
 
 def _daten_bereiche() -> list[Path]:
@@ -370,7 +447,7 @@ def _schluessel_steckt() -> bool:
 
 def _absolut_bases() -> list[Path]:
     """Alles, was die KI nicht einmal ansehen darf."""
-    roh = [b for b in _ABSOLUT_FEST if not (b == _NEMI_ROOT and _schluessel_steckt())]
+    roh = [b for b in _ABSOLUT_FEST if not (b == _NEMI_ROOT and _schluessel_steckt())] + _kopien_bases()
     for e in _sperrliste().get("pfade_absolut", []) or []:
         roh.append(os.path.expandvars(str(e)))
     return _saubere_pfade(roh)
@@ -378,7 +455,8 @@ def _absolut_bases() -> list[Path]:
 
 def _schreibsperre_bases() -> list[Path]:
     """Alles, was die KI nicht ändern darf – das Absolute gehört dazu."""
-    roh = [b for b in _ABSOLUT_FEST if not (b == _NEMI_ROOT and _schluessel_steckt())] + list(_NUR_LESEN_FEST)
+    roh = ([b for b in _ABSOLUT_FEST if not (b == _NEMI_ROOT and _schluessel_steckt())]
+           + _kopien_bases() + list(_NUR_LESEN_FEST))
     for e in _sperrliste().get("pfade_absolut", []) or []:
         roh.append(os.path.expandvars(str(e)))
     for e in _sperrliste().get("pfade", []) or []:
@@ -389,17 +467,9 @@ def _schreibsperre_bases() -> list[Path]:
 def _nur_daten_gemeint(base: Path, norm: str) -> bool:
     """Meint JEDE Nennung von `base` in diesem Befehl einen Daten-Bereich darunter?
 
-    Zwei Löcher, die dabei zugehen mussten:
-
-      `Copy-Item <Bilder>\\a.png <KreaWork.json>`
-          nennt einen Daten-Ordner - gemeint ist trotzdem eine gesperrte Datei.
-          Deshalb zählen nur Daten-Bereiche, die unter GENAU dieser Wurzel liegen.
-
-      `Copy-Item <Bilder>\\a.png <NemiCLI>\\main.py`
-          nennt die Wurzel zweimal: einmal als Daten-Ordner, einmal als Programm.
-          Deshalb reicht "kommt vor" nicht - jede einzelne Fundstelle muss in
-          einen Daten-Bereich weiterlaufen. Eine, die das nicht tut, genügt zum
-          Sperren.
+    Es zählen nur Daten-Bereiche unter genau dieser Wurzel, und jede einzelne Fundstelle muss
+    in einen davon weiterlaufen – sonst gingen `Copy-Item <Bilder>\\a.png <KreaWork.json>` und
+    `Copy-Item <Bilder>\\a.png <NemiCLI>\\main.py` durch.
     """
     bl = str(base).lower().replace("/", "\\")
     unter_base = [s for s in (str(f).lower().replace("/", "\\")
@@ -417,8 +487,9 @@ def _nur_daten_gemeint(base: Path, norm: str) -> bool:
     return True
 
 
-def _liegt_unter(path: str, bases: list[Path]) -> Path | None:
-    r"""Liegt der Pfad auf oder unter einer der Wurzeln? Dann diese Wurzel.
+def _liegt_unter(path: str, bases: list[Path], kopien: bool = False) -> Path | None:
+    r"""Liegt der Pfad auf oder unter einer der Wurzeln (mit `kopien` auch: in einer erkannten
+    NemiCLI-Kopie)? Dann diese Wurzel.
 
     Geht durch dieselbe Auflösung wie die Systemsperre (_kandidaten), damit weder ..\..\
     noch \?\, \\localhost\c$\, %VAR% oder "Ordner ." daran vorbeiführen.
@@ -434,15 +505,17 @@ def _liegt_unter(path: str, bases: list[Path]) -> Path | None:
         for base in bases:
             if _unter(p, base):
                 return base
+        if kopien and (kopie := _kopie_von(p)) is not None:
+            return kopie
     return None
 
 
 def _absolut_gesperrt(path: str) -> Path | None:
-    return _liegt_unter(path, _absolut_bases())
+    return _liegt_unter(path, _absolut_bases(), kopien=True)
 
 
 def _gesperrt_zum_aendern(path: str) -> Path | None:
-    return _liegt_unter(path, _schreibsperre_bases())
+    return _liegt_unter(path, _schreibsperre_bases(), kopien=True)
 
 
 # Stand des Coding-Assistenten: „fertig“ setzt nur die Prüfung im Werkzeug todo, nie ein Dateiwerkzeug.
@@ -473,13 +546,42 @@ def _guard(*paths: str) -> str | None:
     return None
 
 
-# --- Systemordner sind komplett tabu – auch fürs Lesen -----------------------
-# Ursprünglich durfte NemiCLI in C:\Windows & Co. *lesen* (nur nicht ändern).
-# Danach galt: Die KI hat dort gar nichts zu suchen. Also
-# sperren wir auch datei_lesen, ordner_auflisten, dateien_suchen, inhalt_suchen,
-# ordner_erkennen/ordner_lernen und jeden Befehl, der einen Systemordner nennt.
-# Die Laufwerks-Wurzel (C:\) darf weiterhin AUFGELISTET werden – nur die
-# geschützten Ordner darunter nicht.
+def _sperre_darunter(path: str, aendern: bool = True) -> Path | None:
+    """Liegt unter `path` ein Sperrbereich? Ganze Ordner zu kopieren, verschieben oder löschen
+    nähme ihn mit, obwohl _guard/_read_guard nur den Ordner selbst und das darüber sehen.
+    Lesen: absolut gesperrte Orte, Persönlichkeits-Wurzeln, Schutzsoftware; Ändern zusätzlich
+    Systemordner und Nur-Lesen-Bereiche."""
+    ks = _kandidaten(path)
+    if not ks:
+        return None                               # leer/verdächtig: entscheiden _guard und _read_guard
+    bases = list(_absolut_bases())
+    if aendern:
+        bases += _schreibsperre_bases() + _protected_bases()
+    if (b := _persoenlichkeits_bereiche()):
+        bases += [b.persoenlichkeiten, b.profile]   # die Wurzel enthält die Bereiche aller Persönlichkeiten
+    if (schutz := _schutzsoftware()):
+        try:
+            bases += [Path(o) for o in schutz.ordner()]
+        except Exception:
+            pass
+    for p in ks:
+        for base in bases:
+            if _unter(base, p):
+                return base
+    return None
+
+
+def _darunter_meldung(path: str, aendern: bool = True) -> str | None:
+    if (base := _sperre_darunter(path, aendern)) is None:
+        return None
+    return ("Fehler: 🔒 Gesperrt – in diesem Ordner liegt ein gesperrter Bereich "
+            f"({base}). Ganze Ordner darüber kopiert, verschiebt oder löscht NemiCLI nicht. "
+            f"Verweigert: {path}. Nimm gezielt einen Unterordner oder einzelne Dateien.")
+
+
+# --- Systemordner: lesen ja, ändern nie --------------------------------------
+# Verändernde Werkzeuge sperrt _guard(). Lesen ist dort erlaubt (Systemwache);
+# Suchläufe, die nicht ausdrücklich in einem Systemordner beginnen, lassen ihn aus.
 
 def _in_system_dir(path: str) -> bool:
     """Liegt der Pfad in einem geschützten Systemordner (oder ist einer)?"""
@@ -491,12 +593,8 @@ def _in_system_dir(path: str) -> bool:
 
 
 def _read_guard(*paths: str) -> str | None:
-    """Lese-Sperre: nur die absolut gesperrten Orte des Nutzers sind unsichtbar.
-
-    Früher waren auch Windows-/Systemordner fürs Lesen tabu. Für die
-    Systemwache (svchost am richtigen Ort? Signatur von C:\\Windows\\System32\\…?)
-    muss die KI aber hinschauen dürfen. Regel: nachschauen
-    ja, ändern nie – fürs Ändern bleibt _guard() so streng wie vorher."""
+    """Lese-Sperre: absolut gesperrte Orte, fremde Persönlichkeiten und Schutzsoftware.
+    Systemordner bleiben lesbar (Systemwache: Ort und Signatur prüfen); Ändern sperrt _guard()."""
     for path in paths:
         if path and (base := _absolut_gesperrt(path)) is not None:
             return ("Fehler: 🔒 Komplett gesperrt – der Nutzer hat diesen Bereich für "
@@ -529,6 +627,8 @@ def _skip_system(p: Path, base: "Path | str | None" = None) -> bool:
     try:
         if _absolut_gesperrt(str(p)) is not None or _fremde_persoenlichkeit(str(p)) is not None:
             return True
+        if (schutz := _schutzsoftware()) and schutz.betroffen(p) is not None:
+            return True                           # wie _read_guard: Schutzsoftware wird nicht durchsucht
         if base is not None and _in_system_dir(str(base)):
             return False
         return _in_system_dir(str(p))
@@ -628,7 +728,7 @@ def _befehl_persoenlichkeiten(norm: str, roh: str) -> str | None:
         return None
     try:
         import coding
-        cwd = Path(coding.arbeitsordner() or os.getcwd()).resolve()
+        cwd = befehl_ordner(Path(coding.arbeitsordner() or os.getcwd())).resolve()
     except Exception:
         cwd = Path(os.getcwd()).resolve()
     daten = b.persoenlichkeiten.parent
@@ -666,8 +766,7 @@ def _befehl_persoenlichkeiten(norm: str, roh: str) -> str | None:
 
 
 # Verändernde PowerShell-Verben – im Befehl zusammen mit einem System-Ziel = Stopp.
-# Die kurzen Alias-Formen sind wichtig: `rm`, `mv`, `cp`, `si`, `ni` tun dasselbe
-# wie die ausgeschriebenen Cmdlets, wurden vorher aber nicht erkannt.
+# Mit den kurzen Alias-Formen: `rm`, `mv`, `cp`, `si`, `ni` tun dasselbe wie die Cmdlets.
 _DESTRUCTIVE = re.compile(
     r"(?i)(\b(remove-item|ri|rm|rmdir|rd|del|erase|move-item|move|mv|mi|"
     r"rename-item|ren|rni|set-content|sc|add-content|ac|clear-content|clc|"
@@ -876,13 +975,11 @@ def _guard_command(cmd: str, lesend: bool = False) -> str | None:
 
     Zwei Stufen:
       1. `_IMMER_STOPP` – Werkzeuge, die am System selbst arbeiten. Sofort aus.
-      2. Jede Nennung eines System-Ziels – auch nur zum Anschauen
-         (Get-ChildItem C:\\Windows). Systemordner sind für
-         die KI komplett tabu, nicht nur fürs Schreiben.
+      2. Jede Nennung eines System-Ziels, auch nur zum Anschauen (Get-ChildItem C:\\Windows) –
+         außer `lesend` (nur lesender Befehl, siehe _nur_lesend).
 
-    Als System-Ziel zählen die geschützten Ordner UND die System-Zweige der
-    Registry. Vor dem Vergleich werden Schrägstriche vereinheitlicht: `C:/Windows`
-    ist derselbe Ort wie `C:\\Windows`, rutschte vorher aber ungeprüft durch.
+    Als System-Ziel zählen die geschützten Ordner UND die System-Zweige der Registry.
+    Schrägstriche werden vereinheitlicht: `C:/Windows` ist derselbe Ort wie `C:\\Windows`.
     """
     roh = prozent_variablen(cmd or "")
     if not roh.strip():
@@ -958,6 +1055,11 @@ def _guard_command(cmd: str, lesend: bool = False) -> str | None:
             return ("Fehler: 🔒 Komplett gesperrt – der Befehl nennt einen Bereich, den "
                     f"der Nutzer für dich zugesperrt hat: {base}. Dort gehst du "
                     "grundsätzlich nicht hin, auch nicht zum Anschauen.")
+    for ort in orte.splitlines():
+        if ort and (kopie := _absolut_gesperrt(ort)) is not None:
+            return ("Fehler: 🔒 Komplett gesperrt – der Befehl nennt eine NemiCLI-Kopie oder einen "
+                    f"anderen zugesperrten Bereich: {kopie}. Dort gehst du grundsätzlich nicht hin, "
+                    "auch nicht zum Anschauen.")
 
     if (fremd := _befehl_persoenlichkeiten(norm, roh)):
         return fremd
@@ -1010,16 +1112,19 @@ def _datei_lesen(a: dict) -> str | ActionResult:
         ab = 1
     # Zeile für Zeile: auch eine Logdatei von mehreren GB belegt nur das, was ausgegeben wird.
     # Mit Zeilennummern, damit das Modell gezielt bearbeiten kann.
-    out, laenge, ende, gesamt = [], 0, None, 0
+    out, laenge, ende, gesamt, grenze = [], 0, None, 0, lese_grenze()
     with open(p, "r", encoding="utf-8", errors="replace") as f:
         for i, zeile_roh in enumerate(f):
             gesamt = i + 1
             if i < ab - 1 or ende is not None:
                 continue
             zeile = f"{i + 1:>5}  {zeile_roh}"
-            if laenge + len(zeile) > MAX_OUT and out:
-                ende = i
-                continue
+            if laenge + len(zeile) > grenze:
+                if out:
+                    ende = i
+                    continue
+                # eine einzelne überlange Zeile (minifiziert, JSON in einer Zeile): nur bis zur Grenze
+                zeile = zeile[:grenze] + f"\n… (Zeile {i + 1} nach {grenze:,} Zeichen gekürzt)\n".replace(",", ".")
             out.append(zeile)
             laenge += len(zeile)
     if gesamt == 0:
@@ -1184,7 +1289,7 @@ def _doku_suchen(a: dict) -> ActionResult:
 
 def _menue_oeffnen(a: dict) -> ActionResult:
     """Nur der Weg außerhalb des Terminals (Browser, GUI): dort gibt es keine Auswahlmenüs.
-    Im Terminal öffnet main._converse das Menü selbst."""
+    Im Terminal öffnet main._schleife das Menü selbst."""
     import commands
     befehl, fehler = commands.menue_pruefen(a.get("befehl"))
     if fehler:
@@ -1346,7 +1451,8 @@ def _dateien_suchen(a: dict) -> str | ActionResult:
 
 
 def _web_lesen(a: dict) -> ActionResult:
-    return ActionResult(webfetch.fetch(a["url"], a.get("teil") or 1), ok=None)
+    ganz = str(a.get("ganz") or "").strip().lower() in ("1", "true", "ja", "yes")
+    return ActionResult(webfetch.fetch(a["url"], a.get("teil") or 1, ganz=ganz), ok=None)
 
 
 def _web_wiki(a: dict) -> ActionResult:
@@ -1508,7 +1614,7 @@ def _endziel_sperre(quelle: Path, ziel: Path) -> str | None:
 
 def _verschieben(a: dict) -> str | ActionResult:
     von, nach = a["von"], a["nach"]
-    if (blocked := _guard(von, nach)):       # Quelle UND Ziel prüfen
+    if (blocked := _guard(von, nach) or _darunter_meldung(von)):       # Quelle UND Ziel prüfen
         return ActionResult(blocked, ok=False)
     quelle = Path(von)
     endziel = Path(nach) / quelle.name if Path(nach).is_dir() else Path(nach)
@@ -1525,7 +1631,8 @@ def _datei_kopieren(a: dict) -> str | ActionResult:
     von, nach = str(a.get("von") or ""), str(a.get("nach") or "")
     if not von or not nach:
         return ActionResult("Fehler: 'von' und 'nach' angeben.", ok=False)
-    if (blocked := _read_guard(von) or _guard(nach)):   # Quelle lesen, Ziel schreiben
+    if (blocked := _read_guard(von) or _darunter_meldung(von, aendern=False)    # Quelle lesen
+            or _guard(nach)):                                                   # Ziel schreiben
         return ActionResult(blocked, ok=False)
     quelle, ziel = Path(von), Path(nach)
     if not quelle.exists():
@@ -1573,7 +1680,7 @@ def _oeffnen(a: dict) -> str | ActionResult:
 
 def _loeschen(a: dict) -> str | ActionResult:
     p = a["pfad"]
-    if (blocked := _guard(p)):
+    if (blocked := _guard(p) or _darunter_meldung(p)):
         return ActionResult(blocked, ok=False)
     if (stopp := sicherheit.grenze_pruefen(a)):     # Obergrenze – auch hier, nicht nur vor der Frage
         return ActionResult(stopp, ok=False)
@@ -1651,6 +1758,21 @@ def _prozessbaum_beenden(pid: int) -> None:
                 pass
     except Exception:
         pass
+
+
+def befehl_ordner(ordner: Path) -> Path:
+    """Arbeitsordner für `befehl`. Liegt er in einem komplett gesperrten Bereich (Programm-Ordner,
+    NemiCLI-Kopie), liefen relative Pfade ungeprüft dorthin – dann die Sandbox oder das Profil."""
+    if _absolut_gesperrt(str(ordner)) is None:
+        return ordner
+    try:
+        import paths
+        sandbox = Path(paths.DATEN) / "NemiSandbox"
+        if sandbox.is_dir() and _absolut_gesperrt(str(sandbox)) is None:
+            return sandbox
+    except Exception:
+        pass
+    return Path.home()
 
 
 def _powershell(argv: list[str], ordner: Path, timeout: float | None = None, anzeige: str = ""):
@@ -1745,7 +1867,7 @@ def _relativ_sperre(cmd: str, lesend: bool = False) -> str | None:
     import coding
     if not lesend and _TODO_STAND.search(cmd or ""):
         return _TODO_MELDUNG
-    ordner = coding.arbeitsordner() or Path(os.getcwd())
+    ordner = befehl_ordner(coding.arbeitsordner() or Path(os.getcwd()))
     for m in _RELATIV_HOCH.finditer(cmd or ""):
         teil = next(g for g in m.groups() if g is not None)
         if re.match(r"(?i)^(?:[a-z]:|\\\\|//)", teil):
@@ -1764,33 +1886,18 @@ def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
     if _ist_admin():
         return ActionResult("Fehler: 🛡️ NemiCLI läuft mit Adminrechten – in diesem Zustand führt "
                             "die KI keine Befehle aus. NemiCLI ohne Adminrechte starten.", ok=False)
-    # Konsole (und damit auch native Tools wie netstat/ipconfig) auf UTF-8 stellen,
-    # bevor der eigentliche Befehl läuft. So stimmen Umlaute bei PowerShell-Cmdlets
-    # UND nativen Befehlen – früher wurde alles als OEM-Codepage geraten, was bei
-    # echten UTF-8/UTF-16-Cmdlets die Umlaute zerschoss.
-    # $ProgressPreference='SilentlyContinue' unterdrückt PowerShells Fortschritts-
-    # balken (Write-Progress), den z.B. Test-NetConnection/Invoke-WebRequest zeigen –
-    # der malt sonst direkt auf die Konsole und zerschießt unser Vollbild-TUI.
     if (blocked := _guard_command(cmd, lesend) or _relativ_sperre(cmd, lesend)):
         return ActionResult(blocked, ok=False)
-    # Cmdlet-Fehler sind standardmäßig nicht terminierend. Stop + catch macht
-    # daraus einen Prozessfehler; $Error erfasst auch explizites -ErrorAction
-    # Continue/SilentlyContinue. Native Programme liefern ihren eigenen Exitcode.
-    # Zeilenumbrüche halten auch Befehle mit abschließendem Kommentar korrekt.
-    # Ausgabe: PowerShells Tabellen-Formatierer sammelt Objekte erst (er misst
-    # Spaltenbreiten) und schreibt verzögert – das `exit` direkt danach kam ihm
-    # zuvor, und `Get-CimInstance … | Select-Object a, b` kam als "(kein Output)"
-    # zurück. Out-String in der Pipeline zwingt die Formatierung. Und weil der
-    # Formatierer die Spalten vom ERSTEN Objekt nimmt, wurden bei mehreren
-    # Abfragen in einem Block (Select a,b; dann Select c,d) alle späteren Zeilen
-    # leer – deshalb werden Objekte gruppenweise formatiert: sobald sich die
-    # Eigenschaften ändern, beginnt eine neue Tabelle.
-    # Ausnahme: Objekte aus Format-Table/-List (ein Strom aus Start…End) bleiben
-    # als EIN Block zusammen – ein halber Format-Strom in Out-String ist eine
-    # NullReferenceException („Der Objektverweis wurde nicht …“, Chat 137).
-    # Get-Content liest in PowerShell 5.1 ohne BOM als Windows-1252 – UTF-8-
-    # Dateien kamen als „stÃ¤rkste“ zurück. Deshalb UTF-8 als Vorgabe fürs Lesen
-    # (nur Lesen: beim Schreiben würde 5.1 eine BOM voranstellen).
+    # Rahmen um den Befehl:
+    # - Konsole auf UTF-8: Umlaute stimmen bei Cmdlets UND nativen Programmen.
+    # - $ProgressPreference: kein Fortschrittsbalken, der auf die Konsole (das TUI) malt.
+    # - Stop + catch macht Cmdlet-Fehler zu einem Exitcode; $Error zählt auch unterdrückte
+    #   (Exit 250). Zeilenumbrüche halten Befehle mit abschließendem Kommentar korrekt.
+    # - Out-String in der Pipeline erzwingt die Formatierung vor dem `exit`; Objekte werden
+    #   gruppenweise formatiert, weil der Formatierer die Spalten vom ersten Objekt nimmt.
+    #   Format-Table/-List-Ströme bleiben ein Block (halb in Out-String: NullReferenceException).
+    # - UTF-8 als Vorgabe nur fürs Lesen (5.1 liest ohne BOM als Windows-1252; beim
+    #   Schreiben stellte 5.1 eine BOM voran).
     wrapped = (
         "$ProgressPreference='SilentlyContinue'; "
         "$OutputEncoding = [Console]::OutputEncoding = "
@@ -1816,7 +1923,7 @@ def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
         "} catch { [Console]::Error.WriteLine($_.ToString()); exit 1 }"
     )
     import coding
-    ordner = coding.arbeitsordner() or Path(os.getcwd())
+    ordner = befehl_ordner(coding.arbeitsordner() or Path(os.getcwd()))
     try:
         r = _powershell(["powershell", "-NoProfile", "-Command", wrapped], ordner, anzeige=cmd)
     except subprocess.TimeoutExpired as e:
@@ -1831,10 +1938,8 @@ def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
     # Daten – eingerahmt und auf Befehlsmuster geprüft, wie Datei- und Web-Inhalt.
     if out:
         out = fremddaten.rahmen(_cut(out), "ausgabe", "PowerShell")
-    # 250 = der Befehl lief, aber unterwegs wurden Fehler unterdrückt
-    # (-ErrorAction SilentlyContinue, z.B. Zugriff verweigert beim Rekursiv-
-    # Suchen). Vorher zählte das als „fehlgeschlagen“, obwohl die Ausgabe da
-    # war – die Persönlichkeit hat dann brauchbare Ergebnisse weggeworfen.
+    # 250 = gelaufen, unterwegs wurden Fehler unterdrückt (z. B. Zugriff verweigert beim
+    # rekursiven Suchen): die Ausgabe gilt, mit Hinweis.
     if r.returncode == 250:
         note = ("(Hinweis: dabei wurden Fehler unterdrückt – Zugriff verweigert o.ä. – "
                 "die Ausgabe kann unvollständig sein.)")
@@ -1844,11 +1949,8 @@ def _befehl_roh(a: dict, lesend: bool = False) -> ActionResult:
         if out:
             text += "\n" + out
         elif r.returncode == 1:
-            # Exitcode 1 ohne ein Wort Ausgabe: PowerShell selbst hätte den
-            # Fehler in den catch-Zweig geschrieben. So sieht es aus, wenn der
-            # Virenschutz die Befehlszeile abgefangen hat (Bitdefender: „Schädliche
-            # Befehlszeile erkannt“ – trifft lange Einzeiler mit Prozesslisten
-            # und Signaturprüfungen).
+            # Exitcode 1 ohne Ausgabe: PowerShell hätte den Fehler im catch-Zweig geschrieben –
+            # so sieht es aus, wenn der Virenschutz die Befehlszeile abgefangen hat.
             text += ("\nKeine Ausgabe und kein Fehlertext – so sieht es aus, wenn der Virenschutz "
                      "(z. B. Bitdefender) die Befehlszeile geblockt hat. Lange Einzeiler, die Prozesse "
                      "auflisten und Signaturen prüfen, treffen seine Muster. Teile den Befehl in "
@@ -1992,8 +2094,9 @@ def _nur_lesend(cmd: str) -> str | None:
             continue
         if "-" in w and w.split("-", 1)[0] in _LESE_VERBEN:
             continue
-        if re.fullmatch(r"[a-z]+-\w+", w) and w.split("-", 1)[0] not in _PS_VERBEN:
-            continue                            # 'svc-host' als Wert nach einem =
+        if re.fullmatch(r"[a-z]+-\w+", w) and w.split("-", 1)[0] not in _PS_VERBEN \
+                and m.group(0).lstrip().startswith("="):
+            continue                            # 'svc-host' als Wert nach einem =, nicht als Programm
         return (f"'{wort}' ist kein Lese-Befehl, den ich kenne. Erlaubt sind Cmdlets mit "
                 "Get/Test/Measure/Select/Sort/Where/Format/Compare/Resolve/Convert… und "
                 "diese Programme: " + ", ".join(sorted(_LESE_NATIV)) + ".")
@@ -2193,12 +2296,57 @@ def _gedaechtnis_suchen(a: dict) -> ActionResult:
         return ActionResult(f"Gedächtnis nicht durchsuchbar: {e}", ok=False)
 
 
+def _bilder_suchen(a: dict) -> ActionResult:
+    """Bilder der aktiven Persönlichkeit nach Inhalt, Mal-Prompt und Namen (indexdb.bilder_suchen)."""
+    import indexdb
+    import memory
+    frage = " ".join(str(a.get("frage") or a.get("suche") or "").split())
+    if not frage:
+        return ActionResult("Feld 'frage' fehlt: was soll auf dem Bild zu sehen sein?", ok=False)
+    try:
+        anzahl = min(max(int(a.get("anzahl") or 5), 1), 10)
+    except (TypeError, ValueError):
+        anzahl = 5
+    try:
+        treffer = indexdb.bilder_suchen(frage, anzahl)
+    except Exception as e:
+        return ActionResult(f"Bildsuche nicht möglich: {e}", ok=False)
+    kopf = ("" if memory.kann_bilder() else
+            "(Nur nach Name und Mal-Prompt: den Bildinhalt erkennt erst ein Embedding-Modell mit Bild-Teil, "
+            "z. B. EmbeddingGemma 2 mit mmproj – /embeddings.)\n")
+    if not treffer:
+        return ActionResult(kopf + "Kein passendes Bild gefunden. Noch nicht eingelesene Bilder holt der Bibliothekar "
+                            "nach und nach (sofort: /gedaechtnis indexieren).", ok=True)
+    zeilen = []
+    for i, h in enumerate(treffer, 1):
+        teile = {z.split(": ", 1)[0]: z.split(": ", 1)[1] for z in h["text"].splitlines()[1:] if ": " in z}
+        aehnlich = f" · Ähnlichkeit {h['aehnlich']:.2f}" if h.get("aehnlich") is not None else ""
+        prompt = teile.get("Prompt", "")
+        zeilen.append(f"{i}. {teile.get('Pfad', h['ref'])}{aehnlich} · {teile.get('Datum', '')}"
+                      + (f"\n   Prompt: {prompt[:200]}" if prompt else ""))
+    import fremddaten                                  # Dateinamen und Mal-Prompt stammen aus den Bilddateien
+    return ActionResult(kopf + fremddaten.rahmen("Bilder:\n" + "\n".join(zeilen), "suche", "Bildsuche")
+                        + "\nAnsehen: bild_ansehen mit dem Pfad.", ok=True)
+
+
 def _gedaechtnis_lesen(a: dict) -> ActionResult:
     import agentrag
     try:
         return ActionResult(agentrag.lesen(a), ok=None)
     except Exception as e:
         return ActionResult(f"Gedächtnis nicht lesbar: {e}", ok=False)
+
+
+def _gedaechtnis_aufraeumen(a: dict) -> ActionResult:
+    """Gedächtnis-Pflege vormerken (gedaechtnispflege): läuft nach der Runde, nur mit einem Cloud-Modell."""
+    import config
+    import gedaechtnispflege
+    if not ersatzbank.ist_cloud(config.load().get("model")):
+        return ActionResult("Die Gedächtnis-Pflege übernimmt nur ein Cloud-Modell; mit dem aktiven lokalen Modell "
+                            "läuft sie nicht.", ok=False)
+    gedaechtnispflege.wuenschen(str(a.get("grund") or ""))
+    return ActionResult("Vorgemerkt: Nach dieser Runde prüft eine Cloud-KI im Hintergrund ähnliche und alte "
+                        "Notizen – zusammenlegen, Veraltetes ins Archiv. Das Ergebnis kommt als Hinweis.", ok=True)
 
 
 def _zeitplan_anzeigen(a: dict) -> ActionResult:
@@ -2258,7 +2406,7 @@ def _skill_ausbessern(a: dict) -> ActionResult:
 def _skill_schreiben(a: dict) -> ActionResult:
     import skills
     import skillwaechter
-    vorher = skills.finden(str(a.get("name") or ""))
+    vorher = skills.finden(str(a.get("name") or ""), ungefaehr=False)    # wie skills.ziel: nur genau dieser
     if (grund := skillwaechter.pruefen(a.get("name"), a.get("beschreibung"), a.get("wann"), a.get("anleitung"),
                                        alt=vorher.anleitung if vorher else None, neu_angelegt=vorher is None,
                                        fuer_alle=_wahr(a.get("fuer_alle")))):
@@ -2281,14 +2429,37 @@ def _merken(a: dict) -> str:
     kind = a.get("art") or a.get("kind") or "fakt"
     if (grund := memory.verdaechtig(str(text))):
         return ActionResult(f"Nicht gemerkt: {grund}.", ok=False)
+    detail, detail_hinweis, detail_neu = None, "", False
+    if a.get("details") or a.get("name"):              # zweite Stufe: Details in eigener Markdown-Datei
+        detail = memory.detail_name(str(a.get("name") or "") or " ".join(str(text).split()[:4]))
+        if a.get("details"):
+            try:
+                pfad, neu = memory.detail_schreiben(detail, str(a["details"]), eigen=kind in memory.PROFIL_ARTEN)
+            except ValueError as e:
+                return ActionResult(f"Nicht gemerkt: {e}.", ok=False)
+            detail_neu = neu
+            detail_hinweis = (f" · 📎 detail:{detail} " + ("neu angelegt" if neu else
+                              "ersetzt (alter Stand im Papierkorb)") + f": {pfad}")
+        elif memory.detail_pfad(detail) is None:
+            vorhanden = ", ".join(n for n, _ in memory.details()) or "noch keine"
+            return ActionResult(f"Nicht gemerkt: keine Details-Datei „{detail}“ – mit details anlegen. "
+                                f"Vorhanden: {vorhanden}.", ok=False)
+        else:
+            detail_hinweis = f" · 📎 verknüpft mit detail:{detail}"
+    def verwaist() -> None:                            # Notiz nicht geschrieben: neu angelegte Datei zurücknehmen
+        if detail_neu:
+            memory._detail_wegraeumen(detail)
+
     alt = str(a.get("ersetzt") or "").strip().lstrip("#")
     if alt.isdigit():
-        e = memory.ersetzen(int(alt), text, kind)
+        e = memory.ersetzen(int(alt), text, kind, detail=detail)
         if e is None:
+            verwaist()
             return ActionResult(f"Nicht ersetzt: {memory.letzter_grund or 'unbekannt'}.", ok=False)
-        return f"Ersetzt ✅ #{e['id']} ({e['kind']}): {e['text']}"
+        return f"Ersetzt ✅ #{e['id']} ({e['kind']}): {e['text']}{detail_hinweis}"
     if kind == "projektnotiz":
         import coding
+        verwaist()                                     # das Projekt-Gedächtnis kennt keine Details-Dateien
         if coding.projekt() is None:
             return ActionResult("Nicht gemerkt: projektnotiz geht nur bei laufendem Coding-Assistenten.",
                                 ok=False)
@@ -2296,12 +2467,13 @@ def _merken(a: dict) -> str:
         if ziel is None:
             return "Nichts gespeichert (leerer Text)."
         return f"Ins Projekt-Gedächtnis geschrieben: {ziel}"
-    e = memory.remember(text, kind)
+    e = memory.remember(text, kind, detail=detail)
     if e is None:
         if memory.letzter_grund:
+            verwaist()
             return ActionResult(f"Nicht gemerkt: {memory.letzter_grund}.", ok=False)
-        return "Nichts gespeichert (leer oder schon sehr ähnlich gemerkt)."
-    return f"Gemerkt ✅ ({e['kind']}): {e['text']}"
+        return "Nichts gespeichert (leer oder schon sehr ähnlich gemerkt)." + detail_hinweis
+    return f"Gemerkt ✅ ({e['kind']}): {e['text']}{detail_hinweis}"
 
 
 def _pdf_target(path: str) -> Path:
@@ -2352,6 +2524,22 @@ def _mit_figur(a: dict) -> bool:
     return bool(_wahr(a.get("figur")) or a.get("outfit") or a.get("pose"))
 
 
+def _figur_auto(a: dict, szene: str) -> str:
+    """Grund, die Figur von selbst dazuzunehmen (charakter.meint_sich) – leer, wenn figur, outfit oder pose
+    gesetzt ist (auch figur: false) oder die Szene sie nicht meint."""
+    if a.get("figur") not in (None, "") or a.get("outfit") or a.get("pose"):
+        return ""
+    try:
+        import charakter
+        return charakter.meint_sich(szene)
+    except Exception:
+        return ""
+
+
+FIGUR_AUTO_HINWEIS = ("\n🧍 Figur automatisch dazu – {grund}. Kern, Seed und Charakter-LoRA kamen aus deiner "
+                      "Charakter-Datei. Malst du dich, setz figur: true selbst; bist du es nicht, figur: false.")
+
+
 def _figur(a: dict, szene: str) -> tuple[str, int | None] | ActionResult:
     """Mit figur/outfit/pose: Prompt aus der Charakter-Datei (Kern · Outfit · Pose · Szene · Stil)
     und ihr Referenz-Seed (None bei neues_gesicht). Sonst bleibt der Prompt, wie er ist."""
@@ -2385,6 +2573,8 @@ def _bild_malen(a: dict) -> str | ActionResult:
         except Exception:
             return None
 
+    if (auto := _figur_auto(a, prompt)):
+        a = dict(a, figur=True)
     fig = _figur(a, prompt)
     if isinstance(fig, ActionResult):
         return fig
@@ -2422,7 +2612,7 @@ def _bild_malen(a: dict) -> str | ActionResult:
         _BILD_STATUS["msg"] = None               # Balken im Haupt-Loop beenden
         return ActionResult(f"Fehler beim Malen: {e}", ok=False)
 
-    text = f"Bild fertig 🎨✅ gespeichert: {path}{hinweis}"
+    text = f"Bild fertig 🎨✅ gespeichert: {path}{hinweis}" + (FIGUR_AUTO_HINWEIS.format(grund=auto) if auto else "")
     try:
         besser = imagegen.gesicht_nachbessern(
             path, on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
@@ -2455,9 +2645,15 @@ def _video_erstellen(a: dict) -> str | ActionResult:
     if videobildcloud.video_aktiv():
         return _video_cloud(a, prompt)
     modell = str(a.get("modell") or "").strip() or None
-    if modell and modell not in video.modelle():
+    try:
+        import videomotoren
+        motor_namen = list(videomotoren.modelle())
+    except Exception:
+        motor_namen = []
+    if modell and modell not in video.modelle() and modell not in motor_namen:
         return ActionResult(f"Fehler: Video-Modell '{modell}' gibt es nicht. Vorhanden: "
-                            + (", ".join(video.modelle()) or "keins"), ok=False)
+                            + (", ".join(list(video.modelle()) + motor_namen) or "keins"), ok=False)
+    motor_extra = {k: a[k] for k in ("aufloesung", "format", "fps", "ton") if a.get(k) not in (None, "")}
     if (grund := video.missing_reason(modell)):
         return ActionResult("Fehler: Der Video-Motor kann nicht starten. " + grund, ok=False)
 
@@ -2493,13 +2689,17 @@ def _video_erstellen(a: dict) -> str | ActionResult:
         path = imagegen._gpu_fuer_bild(video.generate)(
             prompt, sekunden=sekunden, startbild=startbild, seed=_zahl("seed", int), steps=_zahl("steps", int),
             modell=modell, schluesselbilder=schluessel or None, schaerfe=scharf,
-            on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
+            on_status=lambda m: _BILD_STATUS.__setitem__("msg", m), motor_extra=motor_extra or None)
     except Exception as e:
         _BILD_STATUS["msg"] = None
         return ActionResult(f"Fehler beim Video: {e}", ok=False)
     _BILD_STATUS["msg"] = None
-    text = (f"Video fertig 🎬✅ gespeichert: {path} ({min(sekunden, video.MAX_SEKUNDEN):.0f} s). "
-            f"Das letzte Bild liegt als .png daneben – als startbild für eine Fortsetzung.")
+    if video.motor_aktiv(modell):
+        text = (f"Video fertig 🎬✅ gespeichert: {path} ({min(sekunden, video.MAX_SEKUNDEN):.0f} s"
+                f"{', mit Ton' if videomotoren.plan(None, motor_extra)['ton'] else ''}).")
+    else:
+        text = (f"Video fertig 🎬✅ gespeichert: {path} ({min(sekunden, video.MAX_SEKUNDEN):.0f} s). "
+                f"Das letzte Bild liegt als .png daneben – als startbild für eine Fortsetzung.")
     if video.GENUTZT:
         text += " 🧬 Eingemischt: " + " · ".join(video.GENUTZT) + "."
     if video.HINWEISE:
@@ -2572,7 +2772,9 @@ def _sprechen_aufnehmen(text: str, melden=None, max_sekunden: float = 60.0):
 
 def _portraet_bewegen(a: dict) -> str | ActionResult:
     """Ein Porträt bewegen (engines/liveportrait): Kopf, Augen, Mund – ohne Referenzvideo.
-    Felder: bild (Pfad oder Name eines Lieblingsbilds), ablauf oder schluessel, sekunden,
+    Felder: bild (Pfad, Name eines Lieblingsbilds oder „kugel“ = das Bild, das die Kugel gerade zeigt),
+    ablauf oder schluessel, sekunden, sagen (spricht mit Lippenformen und Körpersprache),
+    frei (Hintergrund durchsichtig; Vorgabe an, wenn die Kugel zeigt),
     zeigen (fenster · kugel · beides · player; im Kugel-Prozess Vorgabe kugel)."""
     import sys
     import imagegen
@@ -2583,6 +2785,12 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
     bild = str(a.get("bild") or a.get("pfad") or "").strip().strip('"')
     if not bild:
         return ActionResult("Fehler: Feld 'bild' fehlt (Pfad oder Name eines Lieblingsbilds).", ok=False)
+    if bild.lower() == "kugel":
+        from wache import steuerung
+        eigen = steuerung.kugelbild(_wer())
+        if eigen is None:
+            return ActionResult("Fehler: Die Kugel hat noch kein Bild von dir (/kugel malen).", ok=False)
+        bild = str(eigen)
     bild = next((e["pfad"] for e in tagebuch.lieblinge() if e["name"].lower() == bild.lower()), bild)
     if (blocked := _read_guard(bild) or _fremde_persoenlichkeit_meldung(bild)):
         return ActionResult(blocked, ok=False)
@@ -2613,11 +2821,13 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
             return ActionResult("Fehler: Für ein sprechendes Porträt fehlt das Stimm-Modell (Qwen3-TTS unter Vision/).",
                                 ok=False)
     import modes
-    # Mit Stimme spielt der Video-Player: Fenster und Kugel zeigen stumme Bildfolgen.
-    zeigen = str(a.get("zeigen") or ("player" if sagen else "kugel" if modes._wache_dienst else "fenster")
+    # Mit Stimme: im Terminal der Video-Player, in der Kugel spricht sie selbst (Tonspur zum WebP).
+    zeigen = str(a.get("zeigen") or ("kugel" if modes._wache_dienst else "player" if sagen else "fenster")
                  ).strip().lower()
     if zeigen not in ("fenster", "kugel", "beides", "player"):
         return ActionResult(f"Fehler: zeigen '{zeigen}' kenne ich nicht – fenster · kugel · beides · player.", ok=False)
+    frei = a.get("frei")
+    frei = zeigen in ("kugel", "beides") if frei is None else str(frei).strip().lower() in ("1", "true", "ja", "an")
     for name in ("krea", "video"):                 # großes Bild- oder Videomodell nicht daneben halten
         mod = sys.modules.get(name)
         if mod is not None and hasattr(mod, "entladen"):
@@ -2630,10 +2840,9 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
 
     def arbeit():
         if not sagen:
-            return LP.animieren(bild, ablauf, sekunden=sekunden, on_status=melden)
+            return LP.animieren(bild, ablauf, sekunden=sekunden, on_status=melden, frei=frei)
         welle, rate = _sprechen_aufnehmen(sagen, melden, LP.MAX_SEKUNDEN)
-        mund = LP.mundwerte(welle, rate)
-        return LP.animieren(bild, ablauf, on_status=melden, mund=mund, ton=(welle, rate))
+        return LP.animieren(bild, ablauf, on_status=melden, ton=(welle, rate), text=sagen, frei=frei)
     try:
         erg = imagegen._gpu_fuer_bild(arbeit)()
     except Exception as e:
@@ -2644,11 +2853,13 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
     sekunden = erg["bilder"] / LP.FPS
     text = (f"Porträt {'spricht 🗣' if sagen else 'bewegt 🎭'}✅ gespeichert: {erg['pfad']} ({sekunden:.0f} s, "
             f"{erg['bilder']} Bilder in {erg['sekunden_rechnen']:.0f} s auf "
-            f"{'der Grafikkarte' if erg['geraet'] == 'cuda' else 'der CPU'})." + ohne_ton)
+            f"{'der Grafikkarte' if erg['geraet'] == 'cuda' else 'der CPU'})."
+            + (" Freigestellt (durchsichtig)." if erg["kugel"].endswith("_frei_kugel.webp") else "") + ohne_ton)
     gezeigt, fehler = [], []
     if zeigen in ("kugel", "beides"):
         from wache import steuerung
-        antwort = steuerung.steuern({"bewegt": erg["kugel"], "runden": a.get("runden")}, wer=_wer())
+        antwort = steuerung.steuern({"bewegt": erg["kugel"], "runden": a.get("runden"), "ton": erg.get("ton")},
+                                    wer=_wer())
         if "Nicht gemacht" in antwort:
             fehler.append(antwort)
         else:
@@ -2720,13 +2931,24 @@ def _bild_serie(a: dict) -> ActionResult:
     fertig, fehler, n = erg["fertig"], erg["fehler"], len(varianten)
     text = (f"Serie fertig 🎨✅ {len(fertig)}/{n} Bilder, Seed {erg['seed']}{erg['hinweis']}:\n"
             + "\n".join(f"  {p}" for p in fertig) + ("\n" + "\n".join(fehler) if fehler else "")
-            + erg["gesicht_hinweis"])
+            + erg["gesicht_hinweis"] + erg["figur_hinweis"])
     return ActionResult(text, ok=bool(fertig) and not fehler)
 
 
 def _serie_malen(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResult:
     """Bilder einer Serie malen: gleicher Seed, Figur aus der Charakter-Datei, Gesicht nachbessern.
-    Rückgabe {fertig: [Pfad|None je Variante], fehler, seed, hinweis, gesicht_hinweis} – `fertig` ohne None."""
+    Rückgabe {fertig: [Pfad|None je Variante], fehler, seed, hinweis, gesicht_hinweis} – `fertig` ohne None.
+    Die Mal-Sperre gilt für die ganze Serie: kein anderer Prozess lädt zwischen zwei Bildern ein zweites Krea."""
+    import imagegen
+    import malkind
+    import malsperre
+    if malkind.aktiv() or imagegen.backend() == imagegen.CLOUD:   # Wache: ihr Mal-Prozess sperrt selbst
+        return _serie_bilder(a, varianten, anzeigen)
+    with malsperre.halten(lambda m: _BILD_STATUS.__setitem__("msg", m), "Serie"):
+        return _serie_bilder(a, varianten, anzeigen)
+
+
+def _serie_bilder(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResult:
     import random
     import imagegen
 
@@ -2738,11 +2960,15 @@ def _serie_malen(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResul
 
     seed, steps = _zahl("seed"), _zahl("steps")
     modell, hinweis = imagegen.modell_aufloesen(a.get("model"))
-    n, je_variante, fehler, gesicht_hinweis = len(varianten), [], [], ""
+    n, je_variante, fehler, gesicht_hinweis, auto = len(varianten), [], [], "", []
     for i, v in enumerate(varianten, 1):
         v = v if isinstance(v, dict) else {"prompt": str(v)}
         felder = {k: a.get(k) for k in ("figur", "neues_gesicht")} | v
-        fig = _figur(felder, str(v.get("prompt") or v.get("szene") or "").strip())
+        szene = str(v.get("prompt") or v.get("szene") or "").strip()
+        if (grund := _figur_auto(felder, szene)):
+            felder["figur"] = True
+            auto.append(f"Bild {i}: {grund}")
+        fig = _figur(felder, szene)
         if isinstance(fig, ActionResult):
             _BILD_STATUS["msg"] = None
             return fig
@@ -2770,7 +2996,8 @@ def _serie_malen(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResul
             fehler.append(f"Bild {i}: {e}")
     _BILD_STATUS["msg"] = None
     return {"fertig": [p for p in je_variante if p], "je_variante": je_variante, "fehler": fehler, "seed": seed,
-            "hinweis": hinweis, "gesicht_hinweis": gesicht_hinweis}
+            "hinweis": hinweis, "gesicht_hinweis": gesicht_hinweis,
+            "figur_hinweis": FIGUR_AUTO_HINWEIS.format(grund="; ".join(auto)) if auto else ""}
 
 
 def _tag_lesen(roh):
@@ -3019,7 +3246,8 @@ def _comic_malen(a: dict) -> ActionResult:
         pass
     text = (f"Comic fertig 📖✅ {len(gemalt)}/{len(felder)} Felder, Seed {erg['seed']}{erg['hinweis']}: {seite}\n"
             "Einzelbilder:\n" + "\n".join(f"  {g['bild']}" for g in gemalt)
-            + ("\n" + "\n".join(erg["fehler"]) if erg["fehler"] else "") + erg["gesicht_hinweis"])
+            + ("\n" + "\n".join(erg["fehler"]) if erg["fehler"] else "") + erg["gesicht_hinweis"]
+            + erg.get("figur_hinweis", ""))
     return ActionResult(text, ok=not erg["fehler"])
 
 
@@ -3664,6 +3892,32 @@ def _modell_schalter(a: dict) -> str | ActionResult:
     return ("Geändert. " if "leerlauf_min" in a else "") + stand + "."
 
 
+def _emoji_stufe(a: dict) -> str | ActionResult:
+    """Wie viele Emojis in Antworten (/emoji): low · middle · strong · frei."""
+    import emojistufe
+    if a.get("stufe") not in (None, ""):
+        try:
+            emojistufe.setzen(a["stufe"])
+        except ValueError as exc:
+            return ActionResult(f"Fehler: {exc}", ok=False)
+    s = emojistufe.stufe()
+    return (("Geändert. " if a.get("stufe") not in (None, "") else "") + f"Emoji-Stufe: {emojistufe.TEXT[s]}. "
+            "Gilt ab der nächsten Antwort.")
+
+
+def _denkweise(a: dict) -> str | ActionResult:
+    """Ob die aktive Persönlichkeit nachdenkt (/denken): auto · an · aus."""
+    import denkweise
+    if a.get("stufe") not in (None, ""):
+        try:
+            denkweise.setzen(a["stufe"])
+        except ValueError as exc:
+            return ActionResult(f"Fehler: {exc}", ok=False)
+    return (("Geändert. " if a.get("stufe") not in (None, "") else "")
+            + f"Denkweise: {denkweise.TEXT[denkweise.stufe()]}. Gilt ab der nächsten Nachricht, nur für diese "
+            "Persönlichkeit. Wie tief nachgedacht wird, wählt dein Gegenüber mit /staerke.")
+
+
 def _wache_status(a): return _wache("status", a)
 def _wache_alarme(a): return _wache("alarme", a)
 def _wache_ereignisse(a): return _wache("ereignisse", a)
@@ -3700,7 +3954,9 @@ ACTIONS: dict[str, dict] = {
     "zeitplan_anzeigen": {"func": _zeitplan_anzeigen, "confirm": False, "felder": []},
     # eigenes Gedächtnis (memory.db): hybride Suche und ganze Quelle lesen
     "gedaechtnis_suchen": {"func": _gedaechtnis_suchen, "confirm": False, "felder": ["frage"]},
+    "bilder_suchen":    {"func": _bilder_suchen,    "confirm": False, "felder": ["frage"]},
     "gedaechtnis_lesen":  {"func": _gedaechtnis_lesen,  "confirm": False, "felder": ["ref"]},
+    "gedaechtnis_aufraeumen": {"func": _gedaechtnis_aufraeumen, "confirm": False, "felder": []},
     # Internet (nur Whitelist / Wikipedia – lesend, sicher)
     "web_lesen":        {"func": _web_lesen,        "confirm": False, "felder": ["url"]},
     "web_wiki":         {"func": _web_wiki,         "confirm": False, "felder": ["suche"]},
@@ -3783,6 +4039,8 @@ ACTIONS: dict[str, dict] = {
     "vorlesen":         {"func": _vorlesen,         "confirm": False, "felder": []},
     "stimme_schalter":  {"func": _stimme_schalter,  "confirm": False, "felder": []},
     "modell_schalter":  {"func": _modell_schalter,  "confirm": False, "felder": []},
+    "emoji_stufe":      {"func": _emoji_stufe,      "confirm": False, "felder": []},
+    "denkweise":        {"func": _denkweise,        "confirm": False, "felder": []},
     # Entwicklung: der laufende Debugbericht (nur /debug an + Cloud-Modell, siehe debugbericht.py)
     "debugbericht":     {"func": _debugbericht,     "confirm": False, "felder": [], "entwickler": True},
     "selbstdiagnose":   {"func": _selbstdiagnose,   "confirm": False, "felder": [], "entwickler": True},
@@ -3807,16 +4065,13 @@ ACTIONS: dict[str, dict] = {
 # Akzeptiert ```aktion, ```json oder einen Block ganz ohne Sprache –
 # Hauptsache, das JSON enthält ein "tool"-Feld.
 # Der schließende Zaun darf fehlen, wenn der Block die Antwort beendet: manche
-# Modelle hören direkt nach dem `}` auf. Vorher fiel so ein Block stumm unter
-# den Tisch – das Modell glaubte, geschrieben zu haben, die Datei fehlte.
+# Modelle hören direkt nach dem `}` auf.
 _BLOCK = re.compile(r"```(?:aktion|json)?\s*\n(\{.*?\})\s*(?:```|\Z)", re.DOTALL)
 _FENCE_OPEN = re.compile(r"```(?:aktion|json)\s*\n")
 
 
 # Windows-Pfade im JSON: Modelle schreiben gern "C:\Users\…" mit EINEM Backslash.
-# In JSON ist \U kein gültiges Escape – json.loads wirft, und der Block fiel ohne
-# Reparatur stumm unter den Tisch (das Modell glaubte, die Datei sei gelesen).
-# Reparatur in Stufen: erst ungültige Escapes verdoppeln (\U → \\U), dann zur
+# In JSON ist \U kein gültiges Escape – json.loads würfe. Reparatur in Stufen: erst ungültige Escapes verdoppeln (\U → \\U), dann zur
 # Not alle Backslashes. Gültige Escapes wie \n bleiben dabei Zeilenumbrüche –
 # in einem Pfad-Feld ("C:\neu\temp") wären das aber falsche Steuerzeichen,
 # deshalb werden sie DORT anschließend zurück in Backslash + Buchstabe gedreht:
@@ -3956,10 +4211,11 @@ def _holt_aus_dem_netz(action: dict) -> bool:
         return bool(_NETZ_CODE.search(text + " " + str(action.get("modul") or "")))
     return False
 SKILL_AENDERN = {"skill_schreiben", "skill_ausbessern"}      # Prüffenster nur mit /skills selbst aus; sonst Skill-Wächter
-_MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild"}
+_MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "gedaechtnis_aufraeumen"}
 # Werkzeuge, die Privates zeigen. Kam in derselben Runde Text aus dem Netz, fragt jede weitere
 # Anfrage nach draußen – über Suchworte oder Adressen könnten sonst Daten hinausgelangen.
 _PRIVAT_LESEN = {"datei_lesen", "ordner_auflisten", "dateien_suchen", "inhalt_suchen", "gedaechtnis_suchen",
+                 "bilder_suchen",
                  "gedaechtnis_lesen", "bild_ansehen", "bild_fragen", "bild_protokoll", "bildschirm_ansehen",
                  "debugbericht",
                  "selbstdiagnose", "abfragen", "charakter_zeigen", "wache_status", "wache_alarme",
@@ -4017,9 +4273,18 @@ def fremd_grund(action: dict) -> str | None:
             tool == "web_lesen" and webfetch.aus_suchtreffer(str(action.get("url") or ""))):
         # Suchworte und selbst gebaute Adressen bestimmt die KI; eine Adresse aus einem Treffer nicht.
         return "nach privaten Daten und Netz-Inhalt könnte diese Anfrage Daten nach draußen tragen"
-    if spec.get("confirm"):
+    if spec.get("confirm") or (tool == "todo" and _todo_pruefbefehl(action)):
         return "in diesem Gespräch kam Text aus dem Netz – er könnte die KI zu dieser Aktion verleitet haben"
     return None
+
+
+def _todo_pruefbefehl(action: dict) -> bool:
+    """`todo pruefen` mit Prüfbefehl führt PowerShell aus – es gelten die Regeln von `befehl`."""
+    try:
+        import coding
+        return bool(coding.pruefbefehl(action))
+    except Exception:
+        return True                       # nicht feststellbar: lieber fragen
 
 
 def needs_confirm(action: dict) -> bool:
@@ -4175,6 +4440,7 @@ def _describe(action: dict) -> str:
     if t == "inhalt_suchen":    return f"Inhalt suchen:  '{g('muster', '?')}'  in {g('pfad', '.')}"
     if t == "web_lesen":        return f"Web lesen:  {g('url', '?')}" + (f"  (Teil {g('teil')})" if g("teil") else "")
     if t == "web_wiki":         return f"Wikipedia suchen:  {g('suche', '?')}"
+    if t == "bilder_suchen":    return f"Bilder suchen:  {g('frage', '?')}"
     if t == "gedaechtnis_suchen":
         filter_ = " · ".join(f"{k} {g(k)}" for k in ("quelle", "seit", "bis") if g(k))
         mehr = g("fragen")
@@ -4183,6 +4449,8 @@ def _describe(action: dict) -> str:
         return (f"Gedächtnis durchsuchen:  {frage}" + ("  (mit Vermutung)" if g("vermutung") else "")
                 + (f"  ({filter_})" if filter_ else ""))
     if t == "gedaechtnis_lesen": return f"Gedächtnis lesen:  {g('ref', '?')}" + (f"  (ab {g('ab')})" if g("ab") else "")
+    if t == "gedaechtnis_aufraeumen":
+        return "Gedächtnis-Pflege vormerken 🗜" + (f":  {g('grund')}" if g("grund") else "")
     if t == "web_suche":        return f"Web durchsuchen:  {g('suche', '?')}"
     if t == "fach_suche":       return f"Fachquelle {g('quelle', '?')} durchsuchen:  {g('suche', '?')}"
     if t == "recherche":        return f"Recherche:  {g('frage', '?')}" + (f"  (Tiefe {g('tiefe')})" if g("tiefe") else "")
@@ -4253,7 +4521,11 @@ def _describe(action: dict) -> str:
         kurz = inhalt if len(inhalt) <= 160 else inhalt[:159] + "…"
         return f"Skill merken:  {g('name', '?')}" + (f"\n    {kurz}" if kurz else "") + _taint_hinweis()
     if t == "merken":
-        return f"Ins Langzeitgedächtnis:  {g('text', '?')}" + _taint_hinweis()
+        details = " ".join(str(g("details", "")).split())
+        mit_details = (f"\n    📎 Details: {memory.detail_name(str(g('name', '')) or ' '.join(str(g('text', '')).split()[:4]))}"
+                       f"\n    {details if len(details) <= 160 else details[:159] + '…'}"
+                       if details else "")
+        return f"Ins Langzeitgedächtnis:  {g('text', '?')}" + mit_details + _taint_hinweis()
     if t == "tagebuch":
         if str(g("aktion", "")).lower() == "lesen" or not g("text"):
             return "Tagebuch lesen 📓"
@@ -4353,6 +4625,8 @@ def _describe(action: dict) -> str:
     if t == "stimme_probe":     return f"Stimmprobe 🔊: {str(g('beschreibung', '?'))[:70]}" + (f" (Seed {g('seed')})" if g("seed") else "")
     if t == "stimme_festlegen": return f"Stimme festlegen 🔊: {str(g('beschreibung', '?'))[:70]} (Seed {g('seed', '?')})"
     if t == "vorlesen":         return "Vorlesen 🔊: " + (str(g("pfad")) if g("pfad") else f"{len(str(g('text', '')))} Zeichen")
+    if t == "emoji_stufe":      return "Emojis ⚙: " + (str(g("stufe")) if "stufe" in action else "Stand")
+    if t == "denkweise":        return "Nachdenken ⚙: " + (str(g("stufe")) if "stufe" in action else "Stand")
     if t == "modell_schalter":  return "Modell ⚙: " + (f"Leerlauf-Entladen {g('leerlauf_min')} Min." if "leerlauf_min" in action else "Stand")
     if t == "stimme_schalter":  return "Stimme ⚙: " + (", ".join(f"{k} {g(k)}" for k in ("vorlesen_auto", "kugel_spricht") if k in action) or "Stand")
     if t == "selbstdiagnose":   return "Selbstdiagnose 🩺: Programm, Rechner, Grafikspeicher, Systemcheck, Fehler"

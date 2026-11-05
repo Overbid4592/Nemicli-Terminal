@@ -120,22 +120,24 @@ def alle() -> list[Skill]:
     return eigene + [s for s in _aus(ordner(), True) if s.kennung not in kennungen]
 
 
-def finden(name: str) -> Skill | None:
-    """Nach Kennung, Name (ohne Groß/klein) oder ähnlichem Namen."""
+def finden(name: str, ungefaehr: bool = True) -> Skill | None:
+    """Nach Kennung, Name (ohne Groß/klein) oder – `ungefaehr` – ähnlichem Namen."""
     liste = alle()
     ziel = (name or "").strip()
     k = kennung(ziel)
     for s in liste:
         if s.kennung == k or s.name.casefold() == ziel.casefold():
             return s
+    if not ungefaehr:
+        return None
     treffer = difflib.get_close_matches(ziel.casefold(), [s.name.casefold() for s in liste], n=1, cutoff=0.8)
     return next((s for s in liste if treffer and s.name.casefold() == treffer[0]), None)
 
 
 def ziel(name: str, fuer_alle: bool = False) -> Path:
     """Vorhandener Skill bleibt, wo er ist; ein neuer kommt zur aktiven Persönlichkeit
-    oder – `fuer_alle` – zu den globalen."""
-    vorhanden = finden(name)
+    oder – `fuer_alle` – zu den globalen. Nur ein gleicher Name zählt: ein ähnlicher ist ein anderer Skill."""
+    vorhanden = finden(name, ungefaehr=False)
     if vorhanden is not None and vorhanden.fuer_alle == bool(fuer_alle):
         return vorhanden.pfad
     return (ordner() if fuer_alle else profil_ordner()) / kennung(name) / DATEI
@@ -265,7 +267,7 @@ def index_fuer_prompt() -> str:
 
 
 # -- Einstellung: darf NemiCLI selbst anlegen/ändern? --------------------------
-# Config `skills_pruefenster` (Standard aus). Der frühere Schalter `skills_selbst` gilt nicht mehr.
+# Config `skills_pruefenster` (Standard aus).
 
 def selbst() -> bool:
     try:

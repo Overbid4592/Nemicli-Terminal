@@ -414,9 +414,9 @@ function nutzlast(chat){
 }
 async function kiZug(){
   if (!spiel || spiel.ende || spiel.amZug !== spiel.ki) return;
-  const p = nutzlast('');
+  const p = nutzlast(''), partie = spiel;
   const d = await frage(p);
-  if (!d || !spiel) return;
+  if (!d || spiel !== partie) return;     // inzwischen neue Partie oder Menü: Antwort gehört zur alten
   gespraech.push({von:'du', text:'(Brett gezeigt, Zug gefragt)'});
   if (d.text){ msg('ki', d.text, KI); gespraech.push({von:'ki', text: d.text}); }
   if (d.zug && p.zuege.includes(d.zug)){
@@ -436,10 +436,11 @@ async function senden(){
   $('#text').value = '';
   msg('du', t, DU); gespraech.push({von:'du', text:t});
   const p = spiel ? nutzlast(t) : {spiel: '', brett: '', zuege: [], verlauf: [], gespraech: gespraech.slice(-8), chat: t, farbe_ki: ''};
+  const partie = spiel;
   const d = await frage(p);
   if (!d) return;
   if (d.text){ msg('ki', d.text, KI); gespraech.push({von:'ki', text:d.text}); }
-  if (spiel && d.zug && p.zuege.includes(d.zug)){ spiel.zieh(d.zug); sys(KI + ' zieht ' + d.zug); render(); }
+  if (spiel && spiel === partie && d.zug && p.zuege.includes(d.zug)){ spiel.zieh(d.zug); sys(KI + ' zieht ' + d.zug); render(); }
 }
 $('#senden').onclick = senden;
 $('#text').addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey && !e.isComposing){ e.preventDefault(); senden(); } });

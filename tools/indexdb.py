@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import threading
@@ -35,7 +36,6 @@ CHUNK = 900
 SCHNITT = 2                      # Fassung des Zerschneidens (1: alle 900 Zeichen hart); ältere werden nachgeschnitten
 NEU_SCHNEIDEN_JE_LAUF = 2        # so viele alt geschnittene Quellen je Bibliothekar-Lauf
 SEARCH_K = 8
-MIN_SCORE = 0.42
 BACKFILL_BATCH = 24
 UMWANDELN_JE_LAUF = 2000         # alte JSON-Vektoren je Bibliothekar-Lauf in float32 umschreiben
 SQL_WARTEN_S = 15.0              # so lange wartet ein Zugriff auf eine gerade schreibende Verbindung
@@ -52,6 +52,9 @@ NACHZUEGLER_CHATS = 3            # so viele zuletzt benutzte andere Chats holt d
 # holt nachvektorisieren nach). Ein Zähler statt eines Schalters: niemand muss zurücksetzen.
 _unterbrechung = 0
 _lauf_marke: int | None = None   # Zählerstand beim Start des laufenden after_turn (None = keiner läuft)
+SIGNAL_DATEI: Path | None = None  # Bibliothekar im eigenen Prozess (bibkind): Unterbrechen über diese Datei
+LOW = False                      # Low-Modus (bibkind): bei Chat oder Bild langsam weiter statt aufhören
+_langsam = False                 # Low-Modus: schon gedrosselt
 _chat_stand: dict[str, int] = {}  # Chat-Ref → Token beim letzten Einbetten (in dieser Sitzung)
 _nachgeholt: dict[str, str] = {}    # Chat-Ref → Stand („aktualisiert“) beim letzten Nachholen
 
@@ -66,10 +69,45 @@ def unterbrechen() -> None:
     """Neue Runde beginnt: ein laufender Bibliothekar hört nach dem aktuellen Stapel auf."""
     global _unterbrechung
     _unterbrechung += 1
+    if SIGNAL_DATEI is not None:
+        try:
+            SIGNAL_DATEI.touch()
+        except OSError:
+            pass
 
 
 def _unterbrochen() -> bool:
-    return _lauf_marke is not None and _lauf_marke != _unterbrechung
+    """Soll der laufende Lauf aufhören? Im Low-Modus nie – dann wird er gedrosselt und macht zwischen
+    den Häppchen eine Pause."""
+    if _lauf_marke is None:
+        return False
+    signal = _lauf_marke != _unterbrechung or (SIGNAL_DATEI is not None and SIGNAL_DATEI.exists())
+    if not LOW:
+        return signal
+    if signal:
+        import einbetttakt
+        _drosseln()
+        time.sleep(einbetttakt.LOW_PAUSE_S)
+    return False
+
+
+def _drosseln() -> None:
+    """Low-Modus: wenige Rechen-Threads und Leerlauf-Priorität, damit Chat und Bild Vorrang haben."""
+    global _langsam
+    if _langsam:
+        return
+    _langsam = True
+    import einbetttakt
+    try:
+        import torch
+        torch.set_num_threads(einbetttakt.LOW_KERNE)
+    except Exception:
+        pass
+    try:
+        import psutil
+        psutil.Process().nice(psutil.IDLE_PRIORITY_CLASS if os.name == "nt" else 19)
+    except Exception:
+        pass
 
 
 def _melden(text: str) -> None:
@@ -382,15 +420,16 @@ def _msg_text(msg: dict) -> str:
     return str(c or "").strip()
 
 
-def _upsert(kind: str, ref: str, texts: list[str]) -> int:
+def _upsert(kind: str, ref: str, texts: list[str], datum: str | None = None) -> int:
     """Texte einer Quelle zerschneiden und speichern – in Dokument-Reihenfolge (die Suche liefert die
-    Nachbarn eines Treffers mit). Rückgabe: neu eingebettete Brocken."""
+    Nachbarn eines Treffers mit). `datum`: Datum der Quelle, wenn schon bekannt. Rückgabe: neu
+    eingebettete Brocken."""
     pieces = []
     for t in texts:
         pieces.extend(_pieces(t))
     if not pieces:
         return 0
-    return _upsert_geordnet(kind, ref, pieces) or 0
+    return _upsert_geordnet(kind, ref, pieces, datum) or 0
 
 
 def _einbetten(texte: list[str]) -> list[list[float]] | None:
@@ -402,7 +441,8 @@ def _einbetten(texte: list[str]) -> list[list[float]] | None:
     try:
         if not memory.encoder_loaded():
             wohin = "auf die GPU" if memory.encoder_geraet() == "cuda" else "auf die CPU"
-            _melden(f"{_kontext} · lade Qwen3-Embedding {wohin} …" if _kontext else f"lade Qwen3-Embedding {wohin} …")
+            text = f"lade {memory.modell_name() or 'Embedding-Modell'} {wohin} …"
+            _melden(f"{_kontext} · {text}" if _kontext else text)
     except Exception:
         pass
     out: list[list[float]] = []
@@ -443,14 +483,16 @@ def _chat_ref(chat_id: int) -> str:
 
 
 def _profil_bedingung() -> tuple[str, list]:
-    """SQL: Chats anderer Persönlichkeiten ausblenden (chat:<Profil>:<Nr>, chatmd:<Profil>:…)."""
+    """SQL: Chats und Bilder anderer Persönlichkeiten ausblenden (chat:<Profil>:<Nr>, chatmd:<Profil>:…,
+    bild:<Profil>:…)."""
     try:
         import profilordner
         eigen = profilordner.aktiv()
     except Exception:
         return "", []
-    return ("(c.ref NOT GLOB 'chat:*:*' OR c.ref GLOB ?) AND (c.ref NOT GLOB 'chatmd:*:*' OR c.ref GLOB ?)",
-            [f"chat:{eigen}:*", f"chatmd:{eigen}:*"])
+    return ("(c.ref NOT GLOB 'chat:*:*' OR c.ref GLOB ?) AND (c.ref NOT GLOB 'chatmd:*:*' OR c.ref GLOB ?) "
+            "AND (c.ref NOT GLOB 'bild:*:*' OR c.ref GLOB ?)",
+            [f"chat:{eigen}:*", f"chatmd:{eigen}:*", f"bild:{eigen}:*"])
 
 
 def _aktives_profil() -> str | None:
@@ -462,16 +504,16 @@ def _aktives_profil() -> str | None:
 
 
 def _fremdes_profil(ref: str, aktiv: str | None = None) -> bool:
-    """Chat einer anderen Persönlichkeit? `aktiv` vorher einmal holen, wenn viele Refs geprüft werden –
+    """Chat oder Bild einer anderen Persönlichkeit? `aktiv` vorher einmal holen, wenn viele Refs geprüft werden –
     profilordner.aktiv() liest Einstellungen und Persönlichkeiten von der Platte."""
     teile = str(ref).split(":")
-    if teile[0] not in ("chat", "chatmd") or len(teile) < 3:
+    if teile[0] not in ("chat", "chatmd", "bild") or len(teile) < 3:
         return False
     aktiv = aktiv or _aktives_profil()
     return aktiv is not None and teile[1] != aktiv
 
 
-def ingest_chat(chat_id: int, title: str, prompts: list[str], messages: list) -> int:
+def ingest_chat(chat_id: int, title: str, prompts: list[str], messages: list, datum: str | None = None) -> int:
     global _kontext
     _kontext = f"Chat „{title[:24]}“" if title else "Chat"
     texts = []
@@ -491,21 +533,21 @@ def ingest_chat(chat_id: int, title: str, prompts: list[str], messages: list) ->
             texts.append("Nutzer: " + body)
         else:
             texts.append(body)
-    return _upsert("chat", _chat_ref(chat_id), texts)
+    return _upsert("chat", _chat_ref(chat_id), texts, datum)
 
 
 _ARTEN = {"skill": "Skill", "code": "Snippet", "bericht": "Bericht", "chatmd": "Chat-Mitschrift",
           "wissen": "Wissen"}
 
 
-def ingest_file(kind: str, path: Path, ref: str | None = None) -> int:
+def ingest_file(kind: str, path: Path, ref: str | None = None, datum: str | None = None) -> int:
     global _kontext
     try:
         text = path.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return 0
     _kontext = f"{_ARTEN.get(kind, kind)} {path.name}"
-    return _upsert(kind, ref or f"{kind}:{path.name}", [f"{path.name}\n{text}"])
+    return _upsert(kind, ref or f"{kind}:{path.name}", [f"{path.name}\n{text}"], datum)
 
 
 def ingest_note(note_id: int, text: str, kind: str = "fakt") -> int:
@@ -514,49 +556,70 @@ def ingest_note(note_id: int, text: str, kind: str = "fakt") -> int:
     return _upsert("note", f"note:{note_id}", [f"({kind}) {text}"])
 
 
-def ingest_chat_file(chat_id: int) -> int:
-    """Liest einen Chat aus der Chat-Datenbank (und eine alte NNN.md, falls da) und schreibt Vektoren in memory.db."""
+def _chat_datum(data: dict) -> str:
+    """Datum eines geladenen Chats wie _datum_fuer ('' wenn unbekannt)."""
+    return str(data.get("updated") or "")[:16]
+
+
+def ingest_chat_file(chat_id: int, data: dict | None = None) -> int:
+    """Liest einen Chat aus der Chat-Datenbank (und eine alte NNN.md, falls da) und schreibt Vektoren in memory.db.
+    `data`: der schon geladene Chat (spart das erneute Laden)."""
     try:
         import chatstore
     except Exception:
         return 0
-    data = chatstore.load(chat_id)
+    if data is None:
+        data = chatstore.load(chat_id)
     if not data:
         return 0
+    datum = _chat_datum(data)
     n = ingest_chat(
         data.get("id") or chat_id,
         data.get("title") or "",
         data.get("prompts") or [],
         data.get("messages") or [],
+        datum,
     )
     try:
         md = chatstore.md_path(chat_id)
         if md.exists():
             teile = chatstore.index_ref(chat_id).split(":")
-            n += ingest_file("chatmd", md, f"chatmd:{teile[1]}:{md.name}" if len(teile) == 3 else None)
+            n += ingest_file("chatmd", md, f"chatmd:{teile[1]}:{md.name}" if len(teile) == 3 else None, datum)
     except Exception:
         pass
     return n
 
 
-def chat_tokens(chat_id: int) -> int:
-    """Geschätzte Token aller gespeicherten Nachrichten des Chats (~4 Zeichen je Token)."""
+def _chat_laden(chat_id) -> dict:
     try:
         import chatstore
-        data = chatstore.load(int(chat_id)) or {}
+        return chatstore.load(int(chat_id)) or {}
     except Exception:
-        return 0
+        return {}
+
+
+def _tokens_von(data: dict) -> int:
     return sum(len(_msg_text(m)) for m in data.get("messages") or []) // 4
 
 
-def chat_faellig(chat_id: int, schritt: int = CHAT_SCHRITT) -> bool:
-    """Ist der Chat seit dem letzten Einbetten um `schritt` Token gewachsen?"""
-    return chat_tokens(chat_id) - _chat_stand.get(_chat_ref(chat_id), 0) >= schritt
+def chat_tokens(chat_id: int) -> int:
+    """Geschätzte Token aller gespeicherten Nachrichten des Chats (~4 Zeichen je Token)."""
+    return _tokens_von(_chat_laden(chat_id))
 
 
-def chat_einbetten(chat_id: int) -> int:
-    n = ingest_chat_file(int(chat_id))
-    _chat_stand[_chat_ref(chat_id)] = chat_tokens(chat_id)
+def chat_faellig(chat_id: int, schritt: int = CHAT_SCHRITT, data: dict | None = None) -> bool:
+    """Ist der Chat seit dem letzten Einbetten um `schritt` Token gewachsen? `data`: schon geladener Chat."""
+    if data is None:
+        data = _chat_laden(chat_id)
+    return _tokens_von(data) - _chat_stand.get(_chat_ref(chat_id), 0) >= schritt
+
+
+def chat_einbetten(chat_id: int, data: dict | None = None) -> int:
+    """Chat einbetten und seinen Stand merken. Geladen wird er dafür nur einmal."""
+    if data is None:
+        data = _chat_laden(chat_id)
+    n = ingest_chat_file(int(chat_id), data) if data else 0
+    _chat_stand[_chat_ref(chat_id)] = _tokens_von(data)
     return n
 
 
@@ -587,31 +650,97 @@ def ingest_all_notes() -> int:
     except Exception:
         return 0
     entries = mem.all_entries()
-    live = {f"note:{e['id']}" for e in entries}
+    details = mem.details() if hasattr(mem, "details") else []
+    live = {f"note:{e['id']}" for e in entries} | {f"detail:{name}" for name, _ in details}
     con = _connect()
-    have = [r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='note'")]
-    con.close()
-    for ref in have:
+    try:
+        drin = _hashes_je_ref(con, "note")
+    finally:
+        con.close()
+    for ref in drin:
         if ref not in live:
             drop_ref(ref)
-    n = 0
+    quellen: list[tuple[str, str, str]] = []       # (ref, Text, Kontext der Fortschrittsmeldung)
     for e in entries:
-        n += ingest_note(e["id"], e.get("text") or "", e.get("kind") or "fakt")
-    return n
+        text = e.get("text") or ""
+        if e.get("detail"):
+            text += f" (📎 detail:{e['detail']})"
+        quellen.append((f"note:{e['id']}", f"({e.get('kind') or 'fakt'}) {text}", f"Notiz {e['id']}"))
+    for name, pfad in details:                     # die Details der Notizen: ref detail:<name>
+        try:
+            inhalt = pfad.read_text(encoding="utf-8", errors="replace")
+        except Exception:
+            continue
+        quellen.append((f"detail:{name}", f"{pfad.name}\n{inhalt}", f"Details {pfad.name}"))
+    return sum(_wenn_geaendert("note", ref, text, drin, kontext) for ref, text, kontext in quellen)
+
+
+def _hashes_je_ref(con: sqlite3.Connection, *kinds: str) -> dict[str, list[tuple[str, int]]]:
+    """ref → [(hash, schnitt)] in Dokument-Reihenfolge, für alle Brocken der Arten in einer Abfrage."""
+    raus: dict[str, list[tuple[str, int]]] = {}
+    for ref, h, s in con.execute(f"SELECT ref, hash, schnitt FROM chunks WHERE kind IN ({','.join('?' * len(kinds))}) "
+                                 "ORDER BY rowid", kinds):
+        raus.setdefault(ref, []).append((h, s))
+    return raus
+
+
+def _wenn_geaendert(kind: str, ref: str, text: str, drin: dict, kontext: str) -> int:
+    """Wie _upsert für einen Text, aber eine unveränderte Quelle (gleiche Hashes und Schnitt-Fassung in `drin`,
+    siehe _hashes_je_ref) kostet keine Abfrage. Rückgabe: neu eingebettete Brocken."""
+    global _kontext
+    pieces = _pieces(text)
+    if not pieces or drin.get(ref) == [(h, SCHNITT) for h, _p in _reihe(kind, ref, pieces)]:
+        return 0
+    _kontext = kontext
+    return _upsert_geordnet(kind, ref, pieces) or 0
 
 
 def ingest_learned() -> int:
-    """Liest Skills und Code-Snippets von der Platte in memory.db."""
-    n = 0
+    """Liest Skills und Code-Snippets von der Platte in memory.db; geschrieben wird nur Geändertes."""
     try:
         import learn
-        for path, _t in learn.list_skills():
-            n += ingest_file("skill", path)
-        for path, _t in learn.list_snippets():
-            n += ingest_file("code", path)
+        dateien = [("skill", p) for p, _t in learn.list_skills()] + [("code", p) for p, _t in learn.list_snippets()]
+        con = _connect()
+        try:
+            drin = _hashes_je_ref(con, "skill", "code")
+        finally:
+            con.close()
     except Exception:
-        pass
+        return 0
+    n = 0
+    for kind, path in dateien:
+        try:
+            text = path.read_text(encoding="utf-8", errors="replace")
+            n += _wenn_geaendert(kind, f"{kind}:{path.name}", f"{path.name}\n{text}", drin,
+                                 f"{_ARTEN.get(kind, kind)} {path.name}")
+        except Exception:
+            continue
     return n
+
+
+def notiz_vektoren() -> dict:
+    """Notiz-Nr → normierter Vektor des aktiven Modells (erster Brocken von note:<Nr>) aus memory.db."""
+    kennung = _kennung()
+    if not kennung or not _db_path().exists():
+        return {}
+    try:
+        import numpy as np
+    except Exception:
+        np = None
+    con = _connect()
+    try:
+        zeilen = con.execute("SELECT ref, vec FROM chunks WHERE kind='note' AND ref GLOB 'note:*' AND vec_modell=? "
+                             "AND vec IS NOT NULL ORDER BY rowid", (kennung,)).fetchall()
+    finally:
+        con.close()
+    raus: dict = {}
+    for ref, roh in zeilen:
+        nr = ref.split(":", 1)[1]
+        if not nr.isdigit() or int(nr) in raus:
+            continue
+        if (v := _vektor(roh, np)) is not None:
+            raus[int(nr)] = v
+    return raus
 
 
 def _ref_vollstaendig(ref: str) -> bool:
@@ -632,9 +761,11 @@ def nachvektorisieren(limit: int = BACKFILL_BATCH) -> int:
     kennung = _kennung()
     if not kennung:
         return 0
+    ohne_bilder = " AND kind != 'bild'" if _bilder_sehen() else ""   # die bettet ingest_bilder als Bild ein
     con = _connect()
     rows = con.execute("SELECT hash, text FROM chunks WHERE rowid IN (SELECT rowid FROM chunks "
-                       "INDEXED BY idx_chunks_stand WHERE vec_modell != ? LIMIT ?)", (kennung, limit)).fetchall()
+                       f"INDEXED BY idx_chunks_stand WHERE vec_modell != ?{ohne_bilder} LIMIT ?)",
+                       (kennung, limit)).fetchall()
     con.close()
     if not rows:
         return 0
@@ -744,10 +875,8 @@ def _stand(schluessel: str, wert: str | None = None) -> str:
         con.close()
 
 
-def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
-    """Wie _upsert, aber die Brocken stehen danach in Dokument-Reihenfolge (rowid),
-    so liest gedaechtnis_lesen sie. Vorhandene Vektoren werden übernommen.
-    Rückgabe: neu eingebettete Brocken, None wenn sich nichts geändert hat."""
+def _reihe(kind: str, ref: str, pieces: list[str]) -> list[tuple[str, str]]:
+    """(hash, Brocken) in Reihenfolge, gleiche Brocken einer Quelle nur einmal."""
     reihe: list[tuple[str, str]] = []
     gesehen: set[str] = set()
     for p in pieces:
@@ -755,6 +884,15 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
         if h not in gesehen:
             gesehen.add(h)
             reihe.append((h, p))
+    return reihe
+
+
+def _upsert_geordnet(kind: str, ref: str, pieces: list[str], datum: str | None = None) -> int | None:
+    """Wie _upsert, aber die Brocken stehen danach in Dokument-Reihenfolge (rowid),
+    so liest gedaechtnis_lesen sie. Vorhandene Vektoren werden übernommen. `datum`: Datum der
+    Quelle, wenn schon bekannt (sonst _datum_fuer).
+    Rückgabe: neu eingebettete Brocken, None wenn sich nichts geändert hat."""
+    reihe = _reihe(kind, ref, pieces)
     con = _connect()
     try:
         alt = {h: (v, m, u, s) for h, v, m, u, s in con.execute(
@@ -768,12 +906,12 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
         return None
     neu = [(h, p) for h, p in reihe if h not in alt]
     if alt and list(alt) == hashes[:len(alt)]:    # nur hinten dazu (ein Chat wächst): anhängen
-        return _anhaengen(kind, ref, neu)
+        return _anhaengen(kind, ref, neu, datum)
     vecs = _einbetten([p for _h, p in neu]) if neu else None
     kennung = _kennung() if vecs else ""
     neue_vec = {h: vec_packen(vecs[i]) for i, (h, _p) in enumerate(neu) if vecs and i < len(vecs)}
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    datum = _datum_fuer(kind, ref) or now
+    datum = (_datum_fuer(kind, ref) if datum is None else datum) or now
     rows = []
     for h, p in reihe:
         if h in alt:
@@ -795,12 +933,12 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str]) -> int | None:
     return len(neu)
 
 
-def _anhaengen(kind: str, ref: str, neu: list[tuple[str, str]]) -> int:
+def _anhaengen(kind: str, ref: str, neu: list[tuple[str, str]], datum: str | None = None) -> int:
     """Neue Brocken hinter die vorhandenen einer Quelle (Reihenfolge bleibt, nichts wird umgeschrieben)."""
     vecs = _einbetten([p for _h, p in neu])
     kennung = _kennung() if vecs else ""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
-    datum = _datum_fuer(kind, ref) or now
+    datum = (_datum_fuer(kind, ref) if datum is None else datum) or now
     rows = []
     for i, (h, p) in enumerate(neu):
         v = vec_packen(vecs[i]) if vecs and i < len(vecs) else None
@@ -905,6 +1043,135 @@ def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
     return n
 
 
+# ---------------------------------------------------------------------------
+# Bilder der aktiven Persönlichkeit (Bildsuche)
+# ---------------------------------------------------------------------------
+# Kann das Embedding-Modell sehen (EmbeddingGemma 2 + mmproj), bekommt jedes Bild einen Bild-Vektor im selben Raum
+# wie Text – eine Suchfrage findet es nach Inhalt. Sonst bleibt der Text (Name, Datum, Mal-Prompt) für Stichworte
+# und einen Text-Vektor. Liegt ein Bild auch nachgebessert in Gesichtszuege/, zählt nur diese Fassung.
+
+BILD_ENDUNGEN = (".png", ".jpg", ".jpeg", ".webp")
+BILDER_JE_RUNDE = 12             # ≈ 45 s Prozessor je Bibliothekar-Lauf
+_PROMPT_MAX = 600
+
+
+def _bilder_sehen() -> bool:
+    try:
+        import memory
+        return memory.kann_bilder()
+    except Exception:
+        return False
+
+
+def _bild_dateien(wurzel: Path) -> list[Path]:
+    try:
+        alle = [p for p in wurzel.rglob("*") if p.suffix.lower() in BILD_ENDUNGEN and p.is_file()]
+    except OSError:
+        return []
+    nachgebessert = {p.name for p in alle if p.parent.name == "Gesichtszuege"}
+    return sorted((p for p in alle if p.parent.name == "Gesichtszuege" or p.name not in nachgebessert),
+                  key=lambda p: p.stat().st_mtime, reverse=True)          # neueste zuerst
+
+
+def _bild_text(p: Path) -> tuple[str, str]:
+    """(Text für Suche und Anzeige, Datum der Datei). Der Mal-Prompt steht bei NemiCLI-Bildern im PNG."""
+    st = p.stat()
+    datum = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+    prompt = ""
+    try:
+        from PIL import Image
+        with Image.open(p) as img:
+            prompt = " ".join(str(img.info.get("prompt") or "").split())[:_PROMPT_MAX]
+    except Exception:
+        pass
+    text = f"Bild {p.name}\nPfad: {p}\nDatum: {datum} · {st.st_size // 1024} KB"
+    return (text + (f"\nPrompt: {prompt}" if prompt else "")), datum
+
+
+def ingest_bilder(je_runde: int | None = BILDER_JE_RUNDE) -> int:
+    """Neue und geänderte Bilder der aktiven Persönlichkeit einlesen, verschwundene austragen."""
+    try:
+        import profilordner
+        profil = profilordner.aktiv()
+        wurzel = profilordner.ordner("Bilder", anlegen=False)
+    except Exception:
+        return 0
+    if not wurzel.is_dir():
+        return 0
+    sehen = _bilder_sehen()
+    kennung = _kennung() if sehen else ""
+    con = _connect()
+    try:
+        alt = {r: (h, m) for r, h, m in con.execute(
+            "SELECT ref, hash, vec_modell FROM chunks WHERE kind='bild' AND ref GLOB ?", (f"bild:{profil}:*",))}
+    finally:
+        con.close()
+    dateien = _bild_dateien(wurzel)
+    da = set()
+    offen: list[tuple[str, Path, str, str, str]] = []           # (ref, pfad, text, datum, hash)
+    for p in dateien:
+        ref = f"bild:{profil}:{p.relative_to(wurzel).as_posix()}"
+        da.add(ref)
+        try:
+            text, datum = _bild_text(p)
+        except OSError:
+            continue
+        h = _hash("bild", ref, text)
+        vorher = alt.get(ref)
+        if vorher and vorher[0] == h and (not sehen or vorher[1] == kennung):
+            continue
+        offen.append((ref, p, text, datum, h))
+    weg = [r for r in alt if r not in da]
+    if weg:
+        con = _connect()
+        try:
+            con.executemany("DELETE FROM chunks WHERE ref=?", [(r,) for r in weg])
+            con.commit()
+        finally:
+            con.close()
+    if je_runde is not None:
+        offen = offen[:je_runde]
+    global _kontext
+    n = 0
+    for i, (ref, p, text, datum, h) in enumerate(offen):
+        if _unterbrochen():
+            break
+        _kontext = f"Bild {p.name}"
+        _melden(f"Bilder {i}/{len(offen)}")
+        vec = None
+        if sehen:
+            vecs = None
+            try:
+                import memory
+                vecs = memory.bilder_einbetten([p])
+            except Exception:
+                pass
+            vec = vecs[0] if vecs else None
+        con = _connect()
+        try:
+            con.execute("DELETE FROM chunks WHERE ref=?", (ref,))
+            con.execute("INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (h, "bild", ref, text, vec_packen(vec) if vec else None,
+                         datetime.now().strftime("%Y-%m-%d %H:%M"), datum, kennung if vec else "", SCHNITT))
+            con.commit()
+        finally:
+            con.close()
+        n += 1
+    if n or weg:
+        _invalidate()
+    return n
+
+
+def bilder_suchen(frage: str, k: int = 5) -> list[dict]:
+    """Bilder der aktiven Persönlichkeit zu einer Frage: nach Inhalt (Bild-Vektor), Mal-Prompt und Namen.
+    Die Ähnlichkeit entscheidet; reine Stichwort-Treffer folgen danach – Wörter wie „Bild“ stehen in jedem
+    Eintrag und würden die Rangliste sonst verwässern."""
+    hits = suchen(frage, max(3 * k, 15), arten=("bild",), laden=True, lernen=False, nachsortieren=False)
+    hits.sort(key=lambda h: (h.get("aehnlich") is None, -(h.get("aehnlich") or 0.0), -h["score"]))
+    return hits[:k]
+
+
 def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
                chat_erzwingen: bool = False) -> int:
     """Bibliothekar nach der Runde: Dateien lesen → embedden → memory.db.
@@ -920,8 +1187,10 @@ def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
     _lauf_marke = None if alles else _unterbrechung
     n = 0
     try:
-        if chat_id and (alles or chat_erzwingen or chat_faellig(chat_id)):
-            n += chat_einbetten(int(chat_id))
+        if chat_id:
+            daten = None if (alles or chat_erzwingen) else _chat_laden(chat_id)
+            if daten is None or chat_faellig(chat_id, data=daten):
+                n += chat_einbetten(int(chat_id), daten)
         n += ingest_all_notes()
         n += ingest_learned()
         rueckstand = [
@@ -930,6 +1199,7 @@ def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
             lambda: nachvektorisieren(1_000_000 if alles else BACKFILL_BATCH),
             lambda: ingest_berichte(je_runde=None if alles else BERICHTE_JE_RUNDE)[0],
             lambda: ingest_wissen(None if alles else WISSEN_JE_RUNDE),
+            lambda: ingest_bilder(None if alles else BILDER_JE_RUNDE),
             lambda: neu_schneiden(1_000_000 if alles else NEU_SCHNEIDEN_JE_LAUF),
             lambda: vektoren_umwandeln(1_000_000 if alles else UMWANDELN_JE_LAUF) and 0,   # zählt nicht als neu
         ]
@@ -996,8 +1266,8 @@ def neu_schneiden(limit: int = NEU_SCHNEIDEN_JE_LAUF) -> int:
                 # chatmd:<Profil>:152.md gehört zu chat:<Profil>:152 – beide liest chat_einbetten
                 passt = (ref == eigen if kind == "chat" else
                          ref.rsplit(":", 1)[0] == eigen.replace("chat:", "chatmd:", 1).rsplit(":", 1)[0])
-                if passt and chatstore.load(nr):
-                    n += chat_einbetten(nr)
+                if passt and (daten := chatstore.load(nr)):
+                    n += chat_einbetten(nr, daten)
             elif kind in ("skill", "code"):
                 import learn
                 liste = learn.list_skills() if kind == "skill" else learn.list_snippets()
@@ -1041,6 +1311,7 @@ def backfill(limit: int = BACKFILL_BATCH, ausser: int | None = None) -> int:
                 data.get("title") or "",
                 data.get("prompts") or [],
                 data.get("messages") or [],
+                _chat_datum(data),
             ) else 0
     except Exception:
         pass
@@ -1143,6 +1414,12 @@ def _index_im_hintergrund() -> None:
             return
         _index_bau = threading.Thread(target=_index_nach_der_runde, name="nemi-index", daemon=True)
         _index_bau.start()
+
+
+def vorwaermen() -> None:
+    """Index im Hintergrund bereitlegen (beim Start, nach jedem Bibliothekar-Lauf). Sonst zahlt die erste
+    Suche danach Aufbau, Nachladen und den ersten Import von torch über die Modell-Kennung."""
+    _index_im_hintergrund()
 
 
 def _index_aktualisieren(voll_erlaubt: bool) -> dict | None:
@@ -1415,6 +1692,8 @@ def _filter_sql(arten, seit, bis, ref_praefix) -> tuple[str, list]:
     if arten:
         teile.append(f"c.kind IN ({','.join('?' * len(arten))})")
         werte += list(arten)
+    else:
+        teile.append("c.kind != 'bild'")         # Bilder nur in der Bildsuche
     if seit:
         teile.append("c.datum >= ?")
         werte.append(seit)
@@ -1438,6 +1717,8 @@ def _passt(meta_row: tuple, arten, seit, bis, ref_praefix, aktiv: str | None = N
         return False
     if arten and kind not in arten:
         return False
+    if not arten and kind == "bild":             # Bilder nur in der Bildsuche
+        return False
     if seit and (datum or "") < seit:
         return False
     if bis and (datum or "") > bis + " 99":
@@ -1449,7 +1730,13 @@ def _passt(meta_row: tuple, arten, seit, bis, ref_praefix, aktiv: str | None = N
 
 FRAGEN_MAX = 4                     # so viele Fassungen einer Suche (Multi-Query)
 VIELFALT = 0.75                    # MMR: Gewicht der Passung gegen die Nähe zu schon gewählten Treffern
-DOPPELT_AB = 0.95                  # so ähnlich (Kosinus) gilt ein Treffer als fast derselbe
+DOPPELT_WORTE_AB = 0.95            # ohne Vektoren: so viele gemeinsame Wörter = fast derselbe Treffer
+
+
+def schwelle(name: str) -> float:
+    """Kosinus-Schwelle (embedder.SCHWELLEN) des Modells, dessen Vektoren im Such-Index liegen."""
+    import embedder
+    return embedder.schwellen(_CACHE.get("kennung") or _kennung())[name]
 
 
 def _fragen_liste(frage) -> list[str]:
@@ -1462,8 +1749,36 @@ def _fragen_liste(frage) -> list[str]:
     return raus[:FRAGEN_MAX]
 
 
+# Suchanweisung (embedder.AUFGABEN) nach den durchsuchten Arten; gemischt: "gedaechtnis".
+_AUFGABE_JE_ARTEN = (("chat", {"chat", "chatmd"}), ("notizen", {"note"}), ("code", {"code", "skill"}),
+                     ("dokumente", {"wissen", "bericht"}))
+
+
+def _aufgabe(arten) -> str:
+    gewaehlt = set(arten or ())
+    for aufgabe, gruppe in _AUFGABE_JE_ARTEN:
+        if gewaehlt and gewaehlt <= gruppe:
+            return aufgabe
+    return "gedaechtnis"
+
+
+_MERK = threading.local()          # Stichwort-Treffer je guide_block: Vorab- und volle Suche teilen sie
+
+
+def _worte(con: sqlite3.Connection, f: str, arten, seit, bis, ref_praefix) -> list[tuple]:
+    merk = getattr(_MERK, "worte", None)
+    schluessel = (f, tuple(arten) if arten else None, seit, bis, tuple(ref_praefix) if ref_praefix else None)
+    if merk is not None and schluessel in merk:
+        return merk[schluessel]
+    zeilen = _stichwort_treffer(con, f, arten, seit, bis, ref_praefix)
+    if merk is not None:
+        merk[schluessel] = zeilen
+    return zeilen
+
+
 def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "",
-           ref_praefix=None, laden: bool = False, vermutung: str = "", lernen: bool = True) -> list[dict]:
+           ref_praefix=None, laden: bool = False, vermutung: str = "", lernen: bool = True,
+           nur_worte: bool = False, nachsortieren: bool = True) -> list[dict]:
     """Hybride Suche über memory.db.
 
     Stichworte (FTS5, BM25) finden exakte Begriffe; Vektoren finden Sinnverwandtes.
@@ -1474,13 +1789,14 @@ def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "
     Vielfalt: keine Nachbarn und Beinahe-Kopien derselben Stelle nebeneinander.
     `laden=True` lädt den Encoder notfalls (~6 s): nur für das Werkzeug der Persönlichkeit,
     nie im Prompt-Pfad. Ohne Vektoren oder Encoder bleibt die Stichwortsuche.
+    `nur_worte=True`: nur FTS, ohne Index und Encoder (Zwischenstand für den Prompt).
     Jeder Treffer trägt `aehnlich` (bester Kosinus, None ohne Vektor) und `rowid`."""
     fragen = _fragen_liste(frage)
     vermutung = " ".join(str(vermutung or "").split())
     if not fragen and not vermutung:
         return []
     uhr = time.perf_counter()
-    ix = _index(warten=laden)            # Prompt-Pfad: nie auf einen Neuaufbau warten
+    ix = None if nur_worte else _index(warten=laden)     # Prompt-Pfad: nie auf einen Neuaufbau warten
     uhr = _messen("Index", uhr)
     if ix is not None and not ix["meta"]:
         return []
@@ -1494,8 +1810,7 @@ def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "
         try:
             con = _connect()
             try:
-                listen = [_stichwort_treffer(con, f, arten, seit, bis, ref_praefix) for f in fragen
-                          if _fts_anfrage(f)]
+                listen = [_worte(con, f, arten, seit, bis, ref_praefix) for f in fragen if _fts_anfrage(f)]
             finally:
                 con.close()
         except sqlite3.Error:
@@ -1511,21 +1826,24 @@ def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "
         vektoren: list[tuple[list[float], str]] = []
         try:
             import memory
+            aufgabe = _aufgabe(arten)
             if laden:
-                vektoren += [(v, "sinn") for v in (memory._embed_texts(fragen, query=True) or [])] if fragen else []
+                vektoren += [(v, "sinn") for v in (memory._embed_texts(fragen, query=True, aufgabe=aufgabe)
+                                                   or [])] if fragen else []
                 if vermutung:              # wie ein Dokument einbetten: vergleicht Antwort mit Antwort
                     vektoren += [(v, "vermutung") for v in (memory._embed_texts([vermutung]) or [])]
             elif memory.encoder_loaded() and fragen:
-                vektoren += [(v, "sinn") for v in (memory.frage_einbetten(fragen[0]) or [])]
+                vektoren += [(v, "sinn") for v in (memory.frage_einbetten(fragen[0], aufgabe=aufgabe) or [])]
             else:
                 memory.warm_encoder()          # ab der nächsten Frage auch nach Bedeutung
         except Exception:
             vektoren = []
         uhr = _messen("Einbetten", uhr)
         aktiv = _aktives_profil()
+        kandidat_ab = schwelle("kandidat") if vektoren else 0.0
         for qv, art in vektoren:
             bewertet = []                # beste zuerst, gefiltert nur bis genug beisammen sind
-            for s, i in sorted(_scores(ix, qv, MIN_SCORE * 0.75), key=lambda x: -x[0]):
+            for s, i in sorted(_scores(ix, qv, kandidat_ab), key=lambda x: -x[0]):
                 if _passt(meta[i], arten, seit, bis, ref_praefix, aktiv):
                     bewertet.append((s, i))
                     if len(bewertet) >= KANDIDATEN:
@@ -1550,7 +1868,7 @@ def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "
             hits = rangliste.umsortieren(hits)
         except Exception:
             pass
-    if laden:                                # nur die Suche der Persönlichkeit, nie der Prompt-Pfad
+    if laden and nachsortieren:              # nur die Suche der Persönlichkeit, nie der Prompt-Pfad
         try:
             import reranker
             hits = reranker.nachsortieren(fragen[0] if fragen else vermutung, hits)
@@ -1572,27 +1890,33 @@ def _woerter(text: str) -> set[str]:
     return set(re.findall(r"\w{3,}", (text or "").casefold()))
 
 
-def _gleich(a: dict, b: dict, ix: dict | None) -> float:
-    """0..1: wie sehr b dasselbe sagt wie a (Kosinus der Vektoren, sonst gemeinsame Wörter)."""
+def _gleich(a: dict, b: dict, ix: dict | None) -> tuple[float, bool]:
+    """(Ähnlichkeit, aus Vektoren?): Kosinus der Vektoren, sonst Anteil gemeinsamer Wörter (0..1)."""
     va, vb = _vektor_von(ix, a["rowid"]), _vektor_von(ix, b["rowid"])
     if va is not None and vb is not None:
-        return max(0.0, float(va @ vb))
+        return float(va @ vb), True
     wa, wb = _woerter(a["text"]), _woerter(b["text"])
-    return len(wa & wb) / max(1, len(wa | wb))
+    return len(wa & wb) / max(1, len(wa | wb)), False
+
+
+def _kopie(a: dict, b: dict, ix: dict | None, kopie_ab: float) -> bool:
+    wert, vektor = _gleich(a, b, ix)
+    return wert >= (kopie_ab if vektor else DOPPELT_WORTE_AB)
 
 
 def _naehe(a: dict, b: dict, ix: dict | None) -> float:
     """0..1: wie sehr b zeigt, was a schon zeigt – direkte Nachbarn derselben Quelle zählen voll."""
     if a["ref"] == b["ref"] and abs(a["rowid"] - b["rowid"]) <= 1:
         return 1.0
-    return _gleich(a, b, ix)
+    return max(0.0, _gleich(a, b, ix)[0])
 
 
 def _vielfalt(hits: list[dict], k: int, ix: dict | None) -> list[dict]:
     """Maximal Marginal Relevance: der nächste Treffer ist der, der am besten passt und am wenigsten
-    zeigt, was schon gewählt ist. Beinahe-Kopien (ab DOPPELT_AB) fallen ganz weg."""
+    zeigt, was schon gewählt ist. Beinahe-Kopien (Schwelle „doppelt“) fallen ganz weg."""
     if len(hits) <= 1:
         return hits[:k]
+    kopie_ab = schwelle("doppelt")
     beste = max(h["score"] for h in hits) or 1.0
     gewaehlt: list[dict] = []
     rest = list(hits)
@@ -1602,7 +1926,7 @@ def _vielfalt(hits: list[dict], k: int, ix: dict | None) -> list[dict]:
             return VIELFALT * h["score"] / beste - (1 - VIELFALT) * naehe
         naechster = max(rest, key=wert)
         rest.remove(naechster)
-        if any(_gleich(g, naechster, ix) >= DOPPELT_AB for g in gewaehlt):
+        if any(_kopie(g, naechster, ix, kopie_ab) for g in gewaehlt):
             continue
         gewaehlt.append(naechster)
     return gewaehlt
@@ -1652,19 +1976,20 @@ def quelle_lesen(ref: str, max_zeichen: int = 12_000, ab: int = 1) -> dict | Non
             "ab": start, "weiter": weiter}
 
 
-def search(query: str, k: int = SEARCH_K) -> list[dict]:
+def search(query: str, k: int = SEARCH_K, nur_worte: bool = False) -> list[dict]:
     """Hybride Suche für den Prompt-Pfad (persona.build_system_prompt).
 
     Lädt NIE das Embedding-Modell nach: ist der Encoder kalt, wird er im
     Hintergrund vorgewärmt, und diese Frage läuft nur über die Stichwortsuche –
     der Chat wartet keine Sekunde."""
-    return suchen(query, k, laden=False)
+    return suchen(query, k, laden=False, nur_worte=nur_worte)
 
 
 GUIDE_K = 3                        # Vorgeschmack im Prompt – tiefer sucht die Persönlichkeit selbst
 
 
 VORHIN_K = 3                       # Treffer aus dem ausgelagerten Teil des laufenden Chats
+GUIDE_KANDIDATEN = 3 * GUIDE_K     # Vorrat: laufender Chat, Berichte und Kern-Gedächtnis fallen danach heraus
 
 
 def _laufender_chat() -> tuple[str, list[str], int]:
@@ -1682,17 +2007,17 @@ def _laufender_chat() -> tuple[str, list[str], int]:
         return "", [], 0
 
 
-def _vorhin_im_chat(query: str, ref: str, kontext: list[str]) -> list[dict]:
+_HERKUNFT = re.compile(r"^(?:(?:Nutzer|Nemi): |\[(?:Nutzer|Nemi)(?: › [^\]\n]*)?\] )")
+
+
+def _vorhin_im_chat(query: str, ref: str, kontext: list[str], nur_worte: bool = False) -> list[dict]:
     """Treffer aus dem laufenden Chat, die nicht mehr im Kontext stehen."""
     raus = []
-    for h in suchen(query, VORHIN_K * 4, arten=("chat",), ref_praefix=(ref + "$",)):
+    for h in suchen(query, VORHIN_K * 4, arten=("chat",), ref_praefix=(ref + "$",), nur_worte=nur_worte):
         text = h.get("text") or ""
         if text.startswith("Chat #"):                       # Titelzeile
             continue
-        for vorn in ("Nutzer: ", "Nemi: "):
-            if text.startswith(vorn):
-                text = text[len(vorn):]
-                break
+        text = _HERKUNFT.sub("", text, count=1)              # „Nutzer: “ oder „[Nutzer] “ (Folge-Brocken)
         probe = text.strip()[:200]
         if probe and any(probe in k for k in kontext):     # steht noch im Kontext
             continue
@@ -1700,6 +2025,12 @@ def _vorhin_im_chat(query: str, ref: str, kontext: list[str]) -> list[dict]:
         if len(raus) >= VORHIN_K:
             break
     return raus
+
+
+def _sicher(hits: list[dict], ab: float) -> list[dict]:
+    """Ohne Treffer, die nur nach Bedeutung passen (kein Stichwort) und unter `ab` liegen (Schwelle
+    „vorgeschmack“). Stichwort-Treffer und Treffer ohne Ähnlichkeitswert bleiben."""
+    return [h for h in hits if "wort" in (h.get("wie") or "") or h.get("aehnlich") is None or h["aehnlich"] >= ab]
 
 
 def _zeile(h: dict, memory) -> str:
@@ -1733,19 +2064,51 @@ def _zeiten_melden(zeiten: dict) -> None:
         pass
 
 
-def guide_block(query: str) -> str:
+VORAB = threading.local()          # persona._Suche setzt VORAB.melden: Zwischenstand nur aus Stichworten
+
+
+def guide_block(query: str, ausser: set[str] | None = None) -> str:
     """Die besten Treffer für den System-Prompt – ein Vorgeschmack. Wer mehr
     braucht, sucht mit gedaechtnis_suchen selbst. Hat der laufende Chat aufgeräumt,
-    kommen zuerst passende Stellen aus seinem ausgelagerten Teil."""
+    kommen zuerst passende Stellen aus seinem ausgelagerten Teil.
+    `ausser`: refs, die schon im Prompt stehen (Kern-Gedächtnis) – sie zählen nicht als Treffer.
+    Ist VORAB.melden gesetzt, bekommt es vor der vollen Suche den Block nur aus Stichworten
+    (ohne Index und Encoder, meist in Millisekunden fertig)."""
     _ZEITEN.messen = {}
+    _MERK.worte = {}
     uhr = time.perf_counter()
     try:
         ref, kontext, ausgelagert = _laufender_chat()
-        uhr = _messen("Chat", uhr)
-        vorhin = _vorhin_im_chat(query, ref, kontext) if ref and ausgelagert else []
-        hits = [h for h in search(query, GUIDE_K + VORHIN_K) if not (ref and h.get("ref") == ref)][:GUIDE_K]
+        _messen("Chat", uhr)
+        melden = getattr(VORAB, "melden", None)
+        if melden is not None:
+            try:
+                melden(_treffer_block(query, ref, kontext, ausgelagert, nur_worte=True, ausser=ausser))
+            except Exception:
+                pass
+        return _treffer_block(query, ref, kontext, ausgelagert, ausser=ausser)
     finally:
         _zeiten_melden(_ZEITEN.__dict__.pop("messen", None) or {})
+        _MERK.__dict__.pop("worte", None)
+
+
+def _treffer_block(query: str, ref: str, kontext: list[str], ausgelagert: int, nur_worte: bool = False,
+                   ausser: set[str] | None = None) -> str:
+    if nur_worte:
+        vorhin = _vorhin_im_chat(query, ref, kontext, nur_worte=True) if ref and ausgelagert else []
+        hits = search(query, GUIDE_KANDIDATEN, nur_worte=True)
+    else:
+        vorhin = _vorhin_im_chat(query, ref, kontext) if ref and ausgelagert else []
+        hits = search(query, GUIDE_KANDIDATEN)
+    # Berichte (Recherche, Zeitplan, Wache) bestehen aus Fremdinhalt: nie ungefragt in den Systemprompt –
+    # über gedaechtnis_suchen kommen sie mit Netz-Marke. Was schon im Prompt steht, zählt nicht.
+    weg = set(ausser or ()) | ({ref} if ref else set())
+    hits = [h for h in hits if h.get("kind") != "bericht" and h.get("ref") not in weg]
+    if not nur_worte:                  # unsichere Treffer nur nach Bedeutung: lieber keiner als ein falscher
+        ab = schwelle("vorgeschmack")
+        hits, vorhin = (_sicher(hits, ab)[:GUIDE_K], _sicher(vorhin, ab))
+    else:
+        hits = hits[:GUIDE_K]
     if not hits and not vorhin and not ausgelagert:
         return ""
     import memory                      # lazy, wie überall hier (Import-Kreis vermeiden)
@@ -1757,9 +2120,6 @@ def guide_block(query: str) -> str:
                   "ausgelagert. Brauchst du etwas von früher, such mit gedaechtnis_suchen und quelle "
                   "„aktuell“." + (" Passend zur Nachricht:" if vorhin else ""), ""]
         lines += [_zeile(h, memory) for h in vorhin] + [""]
-    # Berichte (Recherche, Zeitplan, Wache) bestehen aus Fremdinhalt: nie ungefragt in den Systemprompt –
-    # über gedaechtnis_suchen kommen sie mit Netz-Marke.
-    hits = [h for h in hits if h.get("kind") != "bericht"]
     if hits:
         lines += [
             "# 🧭 Was aus dem Gedächtnis zur aktuellen Frage passen könnte",

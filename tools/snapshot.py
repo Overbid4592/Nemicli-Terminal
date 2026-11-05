@@ -1,8 +1,7 @@
 """
 snapshot.py - Sicherung vor jeder Änderung: der Papierkorb von NemiCLI.
 
-Bevor loeschen, verschieben oder datei_schreiben läuft, entsteht ein kurzer
-Snapshot – geht etwas schief, gibt es ein Undo. Vor jeder verändernden Datei-Aktion landet der alte Stand
+Vor jeder verändernden Datei-Aktion landet der alte Stand
 in `Papierkorb/` (im Daten-Ordner, neben chats/ und learned/):
 
   loeschen          Datei/Ordner wird NICHT gelöscht, sondern in den Papierkorb
@@ -134,7 +133,8 @@ def wiederherstellen(eintrag: dict) -> str:
     if not kopie.exists():
         raise FileNotFoundError(f"Die Sicherung fehlt: {kopie}")
     if original.exists():
-        sichern(original, "undo")
+        if sichern(original, "undo") is None:
+            raise OSError(f"Der jetzige Stand von {original} ließ sich nicht sichern – nichts zurückgeholt.")
         if original.exists():            # sichern() kopiert bei Dateien nur
             if original.is_dir():
                 shutil.rmtree(original)

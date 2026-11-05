@@ -27,13 +27,12 @@ class WingetFehlt(RuntimeError):
 
 
 def _winget(argumente: list[str], timeout: float) -> tuple[int, str]:
+    """(Exitcode, Ausgabe). subprocess.TimeoutExpired nach `timeout` (winget ist dann beendet)."""
     try:
         r = subprocess.run(["winget", *argumente, *_GRUNDFLAGS], capture_output=True, timeout=timeout,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     except FileNotFoundError as exc:
         raise WingetFehlt("winget ist nicht installiert (App-Installer aus dem Microsoft Store).") from exc
-    except subprocess.TimeoutExpired:
-        return 1, f"winget hat nach {int(timeout)} s nicht geantwortet und wurde beendet – später noch einmal versuchen."
     roh = (r.stdout or b"") + (b"\n" + r.stderr if r.stderr else b"")
     return r.returncode, saeubern(roh.decode("utf-8", errors="replace"))
 
@@ -101,7 +100,8 @@ def installieren(paket_id: str) -> tuple[str, str]:
         code, text = _winget(["upgrade", "--id", paket_id, "--exact", "--silent", "--accept-package-agreements"],
                              UPDATE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
-        return "zeit", f"nach {UPDATE_TIMEOUT_S // 60} Minuten noch nicht fertig – winget läuft weiter im Hintergrund"
+        return "zeit", (f"nach {UPDATE_TIMEOUT_S // 60} Minuten nicht fertig – winget wurde beendet, ein schon "
+                        "gestarteter Installer kann noch weiterlaufen")
     rest = "\n".join(text.splitlines()[-4:])
     if code == 0:
         return "ok", rest

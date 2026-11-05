@@ -29,7 +29,6 @@ ANZAHL_MAX = 20
 SNIPPET = 420
 NACHBAR = 160                     # so viel vom Text davor und danach (Small-to-Big)
 NACHBARN_FUER = 5                 # die ersten so vielen Treffer bekommen ihn
-SCHWACH_AB = 0.5                  # bester Kosinus darunter (und kein Stichwort): schwache Treffer
 RELEVANZ_AB = 0.3                 # mit Reranker: beste Relevanz darunter = schwache Treffer
 
 # Quelle (wie die Persönlichkeit sie nennt) → Arten in memory.db und optionaler ref-Anfang.
@@ -165,7 +164,7 @@ def _schwach(treffer: list[dict]) -> bool:
     if any("wort" in (h.get("wie") or "") for h in treffer):
         return False
     werte = [h["aehnlich"] for h in treffer if h.get("aehnlich") is not None]
-    return not werte or max(werte) < SCHWACH_AB
+    return not werte or max(werte) < indexdb.schwelle("schwach")
 
 
 _WEITER_SUCHEN = ("Andere Worte oder Synonyme versuchen, mehrere Fassungen auf einmal in „fragen“ schicken, eine "
@@ -228,10 +227,29 @@ def _von_aussen(ref) -> bool:
     return False
 
 
+def _details_lesen(name: str) -> str:
+    """Details-Datei einer Notiz – direkt von der Platte (immer der neueste Stand); ohne Namen die Liste."""
+    import memory
+    vorhanden = memory.details()
+    if not name:
+        if not vorhanden:
+            return "Noch keine Details-Dateien. Anlegen: merken mit details (und name)."
+        return "📎 Details-Dateien:\n" + "\n".join(
+            f"- detail:{n} · {(p.read_text(encoding='utf-8', errors='replace').strip().splitlines() or [''])[0][:100]}"
+            for n, p in vorhanden)
+    text = memory.detail_lesen(name)
+    if text is None:
+        namen = ", ".join(f"detail:{n}" for n, _ in vorhanden) or "noch keine"
+        return f"Keine Details „{name}“. Vorhanden: {namen}"
+    return f"📎 Details {memory.detail_name(name)}\n" + fremddaten.rahmen(text, "datei", f"detail:{name}")
+
+
 def lesen(a: dict) -> str:
     ref = str(a.get("ref") or "").strip()
     if not ref:
         return "Kein ref angegeben – den ref aus einem Treffer von gedaechtnis_suchen nehmen (z. B. chat:152)."
+    if ref.lower().startswith("detail:") or ref.lower() == "detail":
+        return _details_lesen(ref.partition(":")[2].strip())
     try:
         ab = max(1, int(a.get("ab") or 1))
     except (TypeError, ValueError):

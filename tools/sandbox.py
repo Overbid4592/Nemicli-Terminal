@@ -152,6 +152,7 @@ if _WIN:
     _k32.SetInformationJobObject.argtypes = [w.HANDLE, ctypes.c_int, ctypes.c_void_p, w.DWORD]
     _k32.AssignProcessToJobObject.argtypes = [w.HANDLE, w.HANDLE]
     _k32.TerminateJobObject.argtypes = [w.HANDLE, w.UINT]
+    _k32.TerminateProcess.argtypes = [w.HANDLE, w.UINT]
     _k32.ResumeThread.argtypes = [w.HANDLE]
     _k32.WaitForSingleObject.argtypes = [w.HANDLE, w.DWORD]
     _k32.WaitForSingleObject.restype = w.DWORD
@@ -533,15 +534,20 @@ def ausfuehren(argv: list[str], ordner: Path, timeout: float = 60.0,
     for _ in range(3):                               # stdin, stdout, stderr
         lesen, schreiben = w.HANDLE(), w.HANDLE()
         if not _k32.CreatePipe(ctypes.byref(lesen), ctypes.byref(schreiben), ctypes.byref(sa), 0):
+            for h in (h for paar in rohre for h in paar):
+                _k32.CloseHandle(h)
             raise SandboxFehler(f"Pipe nicht anlegbar (Fehler {ctypes.get_last_error()}).")
         rohre.append((lesen, schreiben))
     (in_l, in_s), (out_l, out_s), (err_l, err_s) = rohre
+    kind_enden = [in_l, out_s, err_s, in_s]           # bis zum Start schließt sie der finally-Block
     for eigen in (in_s, out_l, err_l):               # eigene Enden nicht vererben
         _k32.SetHandleInformation(eigen, _HANDLE_FLAG_INHERIT, 0)
 
     cap = _SID_AND_ATTRIBUTES()
     cap_sid = ctypes.c_void_p()
     if not _adv.ConvertStringSidToSidW(_INTERNET_CLIENT, ctypes.byref(cap_sid)):
+        for h in (*kind_enden, out_l, err_l):
+            _k32.CloseHandle(h)
         raise SandboxFehler("Internet-Freigabe nicht erzeugbar.")
     cap.Sid, cap.Attributes = cap_sid.value, _SE_GROUP_ENABLED
     sc = _SECURITY_CAPABILITIES(_container_sid().value, ctypes.pointer(cap), 1, 0)
@@ -586,10 +592,12 @@ def ausfuehren(argv: list[str], ordner: Path, timeout: float = 60.0,
         finally:
             _k32.DeleteProcThreadAttributeList(liste)
             _k32.LocalFree(cap_sid)
-        for h in (in_l, out_s, err_s):                # gehören jetzt dem Kind
+        for h in kind_enden:                          # gehören jetzt dem Kind; in_s: keine Eingabe
             _k32.CloseHandle(h)
-        _k32.CloseHandle(in_s)                        # keine Eingabe
-        _k32.AssignProcessToJobObject(job, pi.hProcess)
+        kind_enden.clear()
+        if not _k32.AssignProcessToJobObject(job, pi.hProcess):     # ohne Job keine Speichergrenze
+            _k32.TerminateProcess(pi.hProcess, 1)
+            raise SandboxFehler(f"Job-Objekt nicht zuweisbar (Fehler {ctypes.get_last_error()}).")
         _k32.ResumeThread(pi.hThread)
 
         aus, feh = [], []
@@ -617,7 +625,7 @@ def ausfuehren(argv: list[str], ordner: Path, timeout: float = 60.0,
         return Ergebnis(None if (zu_lang or abgebrochen) else int(code.value),
                         text(aus), text(feh), zu_lang, abgebrochen)
     finally:
-        for h in (pi.hProcess, pi.hThread, out_l, err_l, job):
+        for h in (pi.hProcess, pi.hThread, out_l, err_l, job, *kind_enden):
             if h:
                 _k32.CloseHandle(h)
 

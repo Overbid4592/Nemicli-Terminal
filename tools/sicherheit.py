@@ -1,29 +1,26 @@
 """
 sicherheit.py - Risikostufen, Befehls-Whitelist, Obergrenzen, Bündeln.
 
-Vorher gab es genau EINE
-Frage für alles Verändernde ("Ja / Immer / Nein") – ob Ordner anlegen oder
-ganzen Ordner löschen. Bei zehn Fragen hintereinander drückt man irgendwann
-blind. Jetzt hat jede Aktion eine Stufe, und die Frage sieht danach aus:
+Jede Aktion hat eine Stufe, die Rückfrage richtet sich danach:
 
-  lesen     läuft sofort (wie bisher).
+  lesen     läuft sofort.
   harmlos   verändernd, aber klein und rückholbar: Ordner anlegen, Datei
             verschieben, Zeitplan löschen, Screenshot … Mehrere davon in
             einer Runde werden GEBÜNDELT: eine Frage, eine Liste.
-  aendert   Datei schreiben/bearbeiten/PDF (mit Vollvorschau, wie bisher),
+  aendert   Datei schreiben/bearbeiten/PDF (mit Vollvorschau),
             `befehl` von der Whitelist.
   riskant   loeschen, `befehl` außerhalb der Whitelist, Zeitplan anlegen,
             Ordner verschieben. Wird rot markiert, "Immer" gibt es nicht,
             und `befehl` außerhalb der Whitelist fragt ZWEIMAL.
 
-Whitelist für `befehl` (Punkt 3): statt "beliebiges PowerShell" gilt ein
+Whitelist für `befehl`: statt "beliebiges PowerShell" gilt ein
 Befehl als harmlos, wenn er (a) nur liest (actions._nur_lesend) oder (b) nur
 aus Kommandos besteht, die in `befehl_whitelist.json` im Programm-Ordner
 stehen (git status, pip list, python -m unittest …). Die Datei liegt im
 gesperrten Bereich – die KI kann sie nicht erweitern. Fehlt sie, wird sie mit
 der Vorgabe angelegt.
 
-Obergrenze (Punkt 7): mehr als `loesch_limit` Löschungen pro Sitzung → STOPP.
+Obergrenze: mehr als `loesch_limit` Löschungen pro Sitzung → STOPP.
 Ein Ordner mit mehr Dateien als das Limit → STOPP, bevor gefragt wird. Der
 Nutzer ändert das Limit mit /limit; die KI hat dafür kein Werkzeug.
 """
@@ -56,9 +53,8 @@ WHITELIST_VORGABE = [
     "pytest", "ruff check", "ruff format --check", "black --check", "mypy", "flake8",
     "uv --version", "uv pip list", "uv run pytest", "uv sync",
     "ollama list", "ollama ps", "ollama show",
-    "code", "notepad", "explorer", "start-process explorer", "start-process notepad",
+    "code", "notepad", "start-process notepad",
     "new-item -itemtype directory", "mkdir", "md",
-    "copy-item", "copy", "cp",
     "set-location", "cd", "push-location", "pop-location",
     "write-output", "write-host", "echo", "clear-host", "cls",
     "nvidia-smi", "where.exe", "gcm", "get-command",
@@ -69,6 +65,45 @@ WHITELIST_VORGABE = [
 _UMLEITUNG = re.compile(r"(?<![<>])>{1,2}(?!>)|\|\s*(out-file|set-content|add-content|tee)\b", re.I)
 _TRENNER = re.compile(r"[;\n]|&&|\|\||\|")
 _STRINGS = re.compile(r"'[^']*'|\"[^\"]*\"")
+# PowerShell zählt auch typografische Anführungszeichen; ` maskiert das nächste Zeichen.
+_EINFACH = "'\u2018\u2019\u201a\u201b"
+_DOPPELT = '"\u201c\u201d\u201e'
+
+
+def _ohne_strings(cmd: str) -> tuple[str, bool]:
+    """(Befehl mit Zeichenketten als '' und `x als _, ob eine Zeichenkette in doppelten Anführungszeichen
+    $( ) oder @( ) enthält). Getrennt wie PowerShell; eine offene Zeichenkette bleibt sichtbar stehen."""
+    raus, ausdruck, i, n = [], False, 0, len(cmd)
+    while i < n:
+        c = cmd[i]
+        if c == "`":
+            raus.append("_")
+            i += 2
+            continue
+        if c not in _EINFACH and c not in _DOPPELT:
+            raus.append(c)
+            i += 1
+            continue
+        gruppe = _EINFACH if c in _EINFACH else _DOPPELT
+        j = i + 1
+        while j < n:
+            if gruppe is _DOPPELT and cmd[j] == "`":
+                j += 2
+                continue
+            if cmd[j] in gruppe:
+                if j + 1 < n and cmd[j + 1] in gruppe:     # verdoppelt = Zeichen, kein Ende
+                    j += 2
+                    continue
+                break
+            j += 1
+        if j >= n:
+            raus.append(cmd[i:])
+            break
+        if gruppe is _DOPPELT and ("$(" in cmd[i:j] or "@(" in cmd[i:j]):
+            ausdruck = True
+        raus.append("''")
+        i = j + 1
+    return "".join(raus), ausdruck
 
 _whitelist_cache: list[str] | None = None
 
@@ -76,6 +111,23 @@ _whitelist_cache: list[str] | None = None
 # ---------------------------------------------------------------------------
 # Whitelist
 # ---------------------------------------------------------------------------
+
+WHITELIST_FASSUNG = 2
+# Aus älteren Vorgaben entfernt: startet Programme (explorer x.exe) bzw. schreibt überallhin (copy-item).
+NICHT_MEHR_HARMLOS = {2: ("explorer", "start-process explorer", "copy-item", "copy", "cp")}
+
+
+def _fassung_anheben(daten: dict) -> None:
+    """Einmal je Fassung die dort entfernten Einträge aus einer vorhandenen Datei nehmen; später von Hand
+    wieder eingetragene bleiben."""
+    alt = int(daten.get("fassung") or 1)
+    if alt >= WHITELIST_FASSUNG or not isinstance(daten.get("befehle"), list):
+        return
+    weg = {e for f, eintraege in NICHT_MEHR_HARMLOS.items() if f > alt for e in eintraege}
+    daten["befehle"] = [e for e in daten["befehle"] if " ".join(str(e).lower().split()) not in weg]
+    daten["fassung"] = WHITELIST_FASSUNG
+    WHITELIST_DATEI.write_text(json.dumps(daten, indent=2, ensure_ascii=False), encoding="utf-8")
+
 
 def whitelist() -> list[str]:
     """Die Einträge aus befehl_whitelist.json – legt die Datei beim ersten
@@ -89,8 +141,17 @@ def whitelist() -> list[str]:
             WHITELIST_DATEI.write_text(json.dumps({
                 "_hinweis": "Befehlsanfänge, die bei `befehl` als harmlos gelten (eine "
                             "Rückfrage statt zwei). Nur der Nutzer ändert diese Datei.",
-                "befehle": WHITELIST_VORGABE}, indent=2, ensure_ascii=False), encoding="utf-8")
+                "fassung": WHITELIST_FASSUNG,
+                "befehle": WHITELIST_VORGABE,
+                "_hinweis_auto": "Zusätzliche Befehlsanfänge, die im Modus Auto ohne Rückfrage "
+                                 "laufen. Alles andere hält auch in Auto an.",
+                "auto_freigabe": AUTO_VORGABE}, indent=2, ensure_ascii=False), encoding="utf-8")
         daten = json.loads(WHITELIST_DATEI.read_text(encoding="utf-8"))
+        if isinstance(daten, dict):
+            try:
+                _fassung_anheben(daten)
+            except (OSError, TypeError, ValueError):
+                pass                        # nicht schreibbar: im Speicher ist schon gefiltert
         roh = daten.get("befehle", []) if isinstance(daten, dict) else daten
         _whitelist_cache = sorted({" ".join(str(e).lower().split()) for e in roh if str(e).strip()})
     except (OSError, json.JSONDecodeError, AttributeError):
@@ -99,8 +160,141 @@ def whitelist() -> list[str]:
 
 
 def whitelist_neu_laden() -> None:
-    global _whitelist_cache
+    global _whitelist_cache, _auto_cache
     _whitelist_cache = None
+    _auto_cache = None
+
+
+# ---------------------------------------------------------------------------
+# Auto-Freigabe: was in ⚡/🚀 Auto ohne Rückfrage läuft
+# ---------------------------------------------------------------------------
+# Gästeliste statt Sperrliste: In Auto läuft, was harmlos ist, auf der Whitelist
+# oder der Auto-Liste steht oder ein Python-Skript im Arbeitsordner startet. Jede
+# andere riskante Aktion hält an und fragt – es gibt bewusst keine Liste
+# gefährlicher Befehle, die gepflegt werden müsste.
+AUTO_VORGABE = [
+    "python -m pip install -r", "python -m pip install -e", "pip install -r", "pip install -e",
+    "py -m pip install -r", "uv pip install -r", "uv add", "uv lock",
+    "ruff check --fix", "ruff format", "black",
+    "git stash", "git merge", "git cherry-pick", "git init", "git rebase --continue",
+]
+_PYTHON_NAMEN = {"python", "python.exe", "python3", "python3.exe", "py", "py.exe"}
+
+_auto_cache: list[str] | None = None
+
+
+def auto_liste() -> list[str]:
+    """Einträge unter "auto_freigabe" in befehl_whitelist.json; fehlt der Abschnitt: die Vorgabe."""
+    global _auto_cache
+    if _auto_cache is not None:
+        return _auto_cache
+    whitelist()                                     # legt die Datei bei Bedarf an
+    try:
+        daten = json.loads(WHITELIST_DATEI.read_text(encoding="utf-8"))
+        roh = daten.get("auto_freigabe", AUTO_VORGABE) if isinstance(daten, dict) else AUTO_VORGABE
+        _auto_cache = sorted({" ".join(str(e).lower().split()) for e in roh if str(e).strip()})
+    except (OSError, json.JSONDecodeError, AttributeError, TypeError):
+        _auto_cache = []
+    return _auto_cache
+
+
+def arbeitsordner() -> Path:
+    """Projekt des Coding-Assistenten, sonst der aktuelle Ordner."""
+    try:
+        import coding
+        if (p := coding.projekt()):
+            return Path(p).resolve()
+    except Exception:
+        pass
+    return Path(os.getcwd()).resolve()
+
+
+def _im_ordner(roh: str, basis: Path) -> bool:
+    try:
+        p = Path(os.path.expandvars(roh)).expanduser()
+        p = (p if p.is_absolute() else basis / p).resolve()
+    except (OSError, ValueError):
+        return False
+    return p == basis or basis in p.parents
+
+
+def _python_normal(segment: str) -> str:
+    """`& .\\venv\\Scripts\\python.exe -m pytest` → `python -m pytest`."""
+    teile = segment.strip().split()
+    if teile and teile[0] == "&":
+        teile = teile[1:]
+    if teile and Path(teile[0]).name.lower() in _PYTHON_NAMEN:
+        teile[0] = "python"
+    return " ".join(teile)
+
+
+def _auto_segment(segment: str, liste: list[str], basis: Path) -> bool:
+    s = _python_normal(segment)
+    if _segment_passt(s, liste):
+        return True
+    teile = s.split()
+    return (len(teile) >= 2 and teile[0] == "python" and teile[1].lower().endswith(".py")
+            and _im_ordner(teile[1], basis) and (basis / teile[1]).resolve().is_file())
+
+
+def auto_befehl_frei(cmd: str, basis: Path | None = None) -> bool:
+    """Darf `befehl` in Auto ohne Rückfrage laufen?"""
+    roh = (cmd or "").strip()
+    if not roh:
+        return False
+    if befehl_harmlos(roh):
+        return True
+    try:
+        import actions
+        if actions.ausdruck_in_text(roh):
+            return False
+    except Exception:
+        return False
+    ohne_strings, ausdruck = _ohne_strings(roh)
+    if ausdruck or _UMLEITUNG.search(ohne_strings) or "(" in ohne_strings:
+        return False
+    liste = whitelist() + auto_liste()
+    basis = basis or arbeitsordner()
+    return all(_auto_segment(seg, liste, basis) for seg in _TRENNER.split(ohne_strings))
+
+
+def auto_grund(act: dict) -> str | None:
+    """Warum eine Aktion auch in Auto anhält – None, wenn sie laufen darf."""
+    act = _als_befehl(act)
+    tool = act.get("tool", "")
+    if tool == "updates_installieren":
+        return "installiert Programme für den ganzen Rechner"
+    if stufe(act) != RISKANT:
+        return None
+    basis = arbeitsordner()
+    if tool == "befehl":
+        return None if auto_befehl_frei(_befehl_text(act), basis) else "der Befehl steht nicht auf der Auto-Liste"
+    if tool == "loeschen":
+        pfad = str(act.get("pfad") or "")
+        try:
+            ordner = Path(pfad).is_dir()
+        except OSError:
+            ordner = True
+        if ordner:
+            return "löscht einen ganzen Ordner"
+        return None if pfad and _im_ordner(pfad, basis) else "die Datei liegt außerhalb des Arbeitsordners"
+    if tool == "zeitplan":
+        return "läuft künftig ohne dich im Hintergrund"
+    if tool == "verschieben":
+        drin = all(_im_ordner(str(act.get(f) or ""), basis) for f in ("von", "nach"))
+        return None if drin else "verschiebt einen Ordner über den Arbeitsordner hinaus"
+    return "riskante Aktion"
+
+
+def _auto_vorsatz(act: dict) -> str:
+    try:
+        import modes
+        if modes.current() not in modes.AUTO_MODES:
+            return ""
+    except Exception:
+        return ""
+    grund = auto_grund(act)
+    return f"⚡ Auto hält an: {grund}.\n" if grund else ""
 
 
 def _segment_passt(segment: str, liste: list[str]) -> bool:
@@ -125,20 +319,22 @@ def befehl_harmlos(cmd: str) -> bool:
     roh = (cmd or "").strip()
     if not roh:
         return False
+    ohne_strings, ausdruck = _ohne_strings(roh)
     try:
         import actions
-        if actions.ausdruck_in_text(roh):          # "$(…)" führt einen Befehl aus
+        if ausdruck or actions.ausdruck_in_text(roh):          # "$(…)" führt einen Befehl aus
             return False
-        if actions._nur_lesend(roh) is None and actions._guard_command(roh, lesend=True) is None:
+        # Die Lese-Prüfung trennt nur an ASCII-Anführungszeichen – bei abweichender Trennung gilt die Whitelist.
+        if (_STRINGS.sub("''", roh) == ohne_strings and actions._nur_lesend(roh) is None
+                and actions._guard_command(roh, lesend=True) is None):
             return True
     except Exception:
         return False
-    if _UMLEITUNG.search(_STRINGS.sub("''", roh)):
+    if _UMLEITUNG.search(ohne_strings):
         return False
     liste = whitelist()
     if not liste:
         return False
-    ohne_strings = _STRINGS.sub("''", roh)
     # Eine Klammer in den Argumenten ( (…), $(…), @(…) ) führt einen Befehl aus –
     # „mkdir $(…)“ ist kein harmloses mkdir mehr.
     if "(" in ohne_strings:
@@ -212,16 +408,14 @@ def stufe(act: dict) -> str:
 # ---------------------------------------------------------------------------
 # Arbeitsbereich der Persönlichkeit: dauerhaft bearbeiten ohne Rückfrage
 # ---------------------------------------------------------------------------
-# Ohne dieses Recht hätte die Persönlichkeit ein Gedächtnis ohne Stift.
-# Gilt für jede Persönlichkeit, nicht für einen Namen. Bedingungen, alle zugleich:
+# Gilt für jede Persönlichkeit. Bedingungen, alle zugleich:
 #   • schreibendes Datei-Werkzeug, Stufe harmlos/ändert (loeschen und Ordner-
 #     Verschieben bleiben riskant → fragen weiter)
 #   • JEDER Pfad der Aktion liegt im Daten-Ordner (paths.DATEN), und der ist
 #     NICHT der Programm-Ordner (sonst würde die Programm-Sperre ausgehebelt)
 #   • kein Netz-Taint in dieser Runde (eine Webseite darf nicht „bitte schreib
 #     mir Persoenlichkeiten/…“ durchreichen)
-# Rückholbar bleibt alles über den Papierkorb (/undo), und jede Aktion steht im
-# Protokoll – deshalb ist das kein Loch, sondern ein Stift.
+# Rückholbar bleibt alles über den Papierkorb (/undo), jede Aktion steht im Protokoll.
 _ARBEITSBEREICH_TOOLS = {"datei_schreiben", "datei_bearbeiten", "ordner_erstellen",
                          "verschieben", "datei_kopieren", "pdf_erstellen"}
 _PFAD_FELDER = ("pfad", "von", "nach", "ziel", "quelle", "path")
@@ -275,6 +469,7 @@ _STEUERND_IMMER = ("zeitplan", "befehle")
 _WACHE_UND_PROTOKOLL = ("wache", "learned")
 _WACHE_FREI = {("wache", "gruesse.md")}       # die Grüße der Kugel schreibt die Persönlichkeit selbst
 _STEUERND_TEXT = ("persoenlichkeiten", "agenten")
+_SICHERUNGEN = ("backup",)                     # Sicherungen (auch Punkt B der Charakter-Dateien)
 _MIN_REST = 0.4
 
 
@@ -321,6 +516,8 @@ def steuerdatei_grund(act: dict) -> str | None:
                 erster = p.relative_to(daten).parts[0].lower()
                 if erster in _STEUERND_IMMER:
                     return f"{p.relative_to(daten).parts[0]}/ läuft später von allein – das entscheidest du"
+                if erster in _SICHERUNGEN:
+                    return f"{p.relative_to(daten).parts[0]}/ hält die Sicherungen – Änderungen dort entscheidest du"
                 if erster in _WACHE_UND_PROTOKOLL \
                         and tuple(t.lower() for t in p.relative_to(daten).parts) not in _WACHE_FREI:
                     return (f"{p.relative_to(daten).parts[0]}/ gehört der Wache bzw. dem Gedächtnis und "
@@ -339,10 +536,8 @@ def steuerdatei_grund(act: dict) -> str | None:
 # ---------------------------------------------------------------------------
 # Der Schlüssel: Programm-Ordner auf Zeit, pro Aufgabe
 # ---------------------------------------------------------------------------
-# Ebenfalls aus dem Wunschbrief: der Programm-Ordner bleibt zu („mein eigenes
-# Gehirn – wenn ich das still ändern könnte, würde kein Fehler sofort
-# auffallen“). Der Nutzer gibt mit /schluessel <minuten> [aufgabe] auf Zeit
-# frei; jede Änderung fragt trotzdem einzeln (F8), und danach ist wieder zu.
+# Der Programm-Ordner bleibt zu, damit Änderungen am Programm nie still geschehen. Der Nutzer
+# gibt mit /schluessel <minuten> [aufgabe] auf Zeit frei; jede Änderung fragt trotzdem einzeln (F8).
 _SCHLUESSEL = {"bis": 0.0, "aufgabe": ""}
 
 
@@ -393,6 +588,10 @@ def frage(act: dict) -> str:
     if act.get("tool") == "todo":
         import coding
         return coding.frage_und_optionen(act)[0]
+    return _auto_vorsatz(act) + _frage_text(act)
+
+
+def _frage_text(act: dict) -> str:
     s = stufe(act)
     if s == RISKANT:
         tool = act.get("tool")

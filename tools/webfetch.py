@@ -50,11 +50,8 @@ MAX_PDF_SEITEN = 60
 _CACHE_S = 600                    # so lange bleibt ein geladener Text für weitere Teile
 _CACHE: dict[str, tuple[float, str, str, int | str]] = {}   # schlüssel -> (zeit, quelle, text, tier)
 
-# Grenze PRO Suchtreffer. Ohne die frisst ein einziger geschwätziger Treffer
-# das ganze Budget: Bei der Suche nach GPT-6-Astra-Preisen lieferte Treffer 1
-# die komplette OpenAI-Preisseite – 6.832 Zeichen, 67 Tabellenzeilen –, und
-# MAX_OUT schnitt danach die Treffer 2 bis 5 einfach ab. Ein Schnipsel soll
-# neugierig machen und die Ampel zeigen; gelesen wird mit web_lesen.
+# Grenze je Suchtreffer, damit ein langer Treffer nicht das ganze MAX_OUT belegt und die
+# übrigen abschneidet. Ganz gelesen wird mit web_lesen.
 MAX_SNIPPET = 700
 # Aussagekräftiger User-Agent (Wikimedia verlangt das, sonst 403)
 _UA = {
@@ -375,6 +372,8 @@ class _Extract(HTMLParser):
         self.parts: list[str] = []
         self.kern: list[str] = []
         self.titel = ""
+        self.links: list[str] = []                 # href der sichtbaren Links (für Anhänge)
+        self.tabellen = 0
         self._stapel: list[tuple[str, bool, bool]] = []   # (tag, überspringt, ist Kern)
         self._skip = 0
         self._im_kern = 0
@@ -428,6 +427,10 @@ class _Extract(HTMLParser):
         self._im_kern += kern
         if self._skip:
             return
+        if tag == "a" and attrs.get("href"):
+            self.links.append(attrs["href"])
+        elif tag == "table":
+            self.tabellen += 1
         if tag in ("h1", "h2", "h3", "h4", "h5", "h6"):
             self._add("\n\n" + "#" * int(tag[1]) + " ")
         elif tag == "li":
@@ -475,6 +478,27 @@ def _html_zerlegen(html: str, nur_skripte: bool) -> _Extract:
 
 def _html_to_text(html: str) -> str:
     """Hauptinhalt einer Seite als Text; Titel davor."""
+    return _html_lesen(html)[0]
+
+
+# Endungen, bei denen ein Link auf eine Datei zeigt (ein Anhang), nicht auf eine weitere Seite
+_ANHANG_ENDUNGEN = (".pdf", ".md", ".txt", ".csv", ".json", ".yml", ".yaml", ".xml", ".log", ".zip", ".7z", ".rar",
+                    ".tar", ".gz", ".exe", ".msi", ".whl", ".docx", ".xlsx", ".pptx", ".epub", ".sha256")
+
+
+def _anhaenge(links: list[str], basis: str) -> list[str]:
+    raus = []
+    for href in links:
+        voll = urljoin(basis, href.strip())
+        pfad = urlparse(voll).path.lower()
+        if voll.lower().startswith("https://") and pfad.endswith(_ANHANG_ENDUNGEN) and voll not in raus:
+            raus.append(voll)
+    return raus[:30]
+
+
+def _html_lesen(html: str, basis: str = "") -> tuple[str, dict]:
+    """(Text, Angaben): Hauptinhalt mit Titel – dazu, was die Seite enthielt (Abschnitte, Tabellen,
+    Anhänge, entfernte unsichtbare Stellen), damit eine Lücke benannt werden kann statt still zu fehlen."""
     p = _html_zerlegen(html, nur_skripte=False)
     kern, alles = _saeubern(p.kern), _saeubern(p.parts)
     text = kern if len(kern) >= 400 else alles
@@ -486,7 +510,13 @@ def _html_to_text(html: str) -> str:
     text = f"# {titel}\n\n{text}" if titel and titel not in text[:300] else text
     if versteckt:
         text += f"\n\n[{versteckt} unsichtbar gemachte Textstellen der Seite nicht übernommen]"
-    return text
+    anhaenge = _anhaenge(p.links, basis) if basis else []
+    if anhaenge:                                   # Namen stammen von der Seite: bleiben im Fremd-Inhalt
+        text += ("\n\n## Anhänge auf der Seite (nicht mitgeladen – je einzeln mit web_lesen)\n"
+                 + "\n".join(f"- {a}" for a in anhaenge))
+    angaben = {"abschnitte": len(re.findall(r"(?m)^#{1,6} ", text)), "tabellen": p.tabellen,
+               "versteckt": versteckt, "anhaenge": len(anhaenge)}
+    return text, angaben
 
 
 def _pdf_text(daten: bytes) -> str:
@@ -509,6 +539,179 @@ def _dekodieren(daten: bytes, zeichensatz: str | None) -> str:
             except (LookupError, UnicodeDecodeError):
                 continue
     return daten.decode("cp1252", errors="replace")
+
+
+def http_fehler(status: int, url: str) -> str:
+    """Was ein Fehlercode für den Nutzer bedeutet – statt nur „404“."""
+    host = _host(url)
+    if status == 404:
+        grund = ("nicht gefunden. Möglich: Adresse falsch, Datei entfernt oder abgelaufen – oder sie ist nur mit "
+                 "Anmeldung sichtbar (GitHub zeigt private Inhalte und manche Anhänge als 404)")
+    elif status in (401, 407):
+        grund = "braucht eine Anmeldung – NemiCLI liest nur, was offen ist"
+    elif status == 403:
+        grund = ("Zugriff verweigert – gesperrt, nur mit Anmeldung, oder die Seite lässt automatische Abrufe nicht "
+                 "zu (oder ein Abruflimit ist erreicht)")
+    elif status == 410:
+        grund = "dauerhaft entfernt"
+    elif status == 429:
+        grund = "zu viele Anfragen – später noch einmal versuchen"
+    elif status == 451:
+        grund = "aus rechtlichen Gründen gesperrt"
+    elif 500 <= status < 600:
+        grund = "Fehler beim Server – meist vorübergehend, später noch einmal versuchen"
+    else:
+        grund = "die Seite hat den Abruf abgelehnt"
+    return f"❌ {host} meldet {status}: {grund}."
+
+
+def _netzfehler(e: Exception, url: str) -> str:
+    host = _host(url)
+    if isinstance(e, httpx.TimeoutException):
+        return f"❌ {host} antwortet nicht rechtzeitig (Zeitüberschreitung) – später noch einmal versuchen."
+    if isinstance(e, httpx.ConnectError):
+        return f"❌ Keine Verbindung zu {host} – offline, Name nicht auflösbar oder der Server ist nicht erreichbar."
+    return f"Fehler beim Laden: {e}"
+
+
+_TEXT_ENDUNGEN = (".md", ".txt", ".csv", ".json", ".yml", ".yaml", ".xml", ".log", ".py", ".toml", ".ini",
+                  ".cfg", ".sha256", ".rst")
+
+
+def _als_text_lesbar(daten: bytes, url: str, ctype: str) -> bool:
+    """Eine Datei ohne passenden Typ (application/octet-stream bei Anhängen) – ist sie trotzdem Text?"""
+    from urllib.parse import unquote
+    pfad = unquote(urlparse(url).path + " " + urlparse(url).query).lower()
+    if not (any(e in pfad for e in _TEXT_ENDUNGEN) or "octet-stream" in ctype):
+        return False
+    probe = daten[:8192]
+    if b"\x00" in probe:
+        return False
+    try:
+        probe.decode("utf-8")
+    except UnicodeDecodeError as fehler:
+        return fehler.start > len(probe) - 4         # nur ein abgeschnittenes Zeichen am Ende
+    return True
+
+
+# --- Offizielle Schnittstellen bekannter Plattformen ------------------------
+# Manche Seiten laden Wichtiges erst per Skript nach (Assets eines GitHub-Releases). Die API liefert dieselben
+# Daten vollständig. Nur für Seiten, die ohnehin erlaubt sind – die API-Adresse muss selbst erlaubt sein.
+
+def _api_adresse(url: str) -> tuple[str, str] | None:
+    """(API-URL, Art) für bekannte Seiten von GitHub, PyPI und npm – sonst None."""
+    u = urlparse(url)
+    host, teile = (u.hostname or "").lower(), [t for t in u.path.split("/") if t]
+    if host == "github.com" and len(teile) >= 2:
+        o, r = teile[0], teile[1]
+        if teile[2:4] == ["releases", "tag"] and len(teile) >= 5:
+            return f"https://api.github.com/repos/{o}/{r}/releases/tags/{'/'.join(teile[4:])}", "gh_release"
+        if teile[2:] == ["releases", "latest"]:
+            return f"https://api.github.com/repos/{o}/{r}/releases/latest", "gh_release"
+        if teile[2:] == ["releases"]:
+            return f"https://api.github.com/repos/{o}/{r}/releases?per_page=10", "gh_releases"
+        if len(teile) == 4 and teile[2] in ("issues", "pull") and teile[3].isdigit():
+            return f"https://api.github.com/repos/{o}/{r}/issues/{teile[3]}", "gh_issue"
+        if len(teile) == 2:
+            return f"https://api.github.com/repos/{o}/{r}", "gh_repo"
+    if host in ("pypi.org", "www.pypi.org") and len(teile) >= 2 and teile[0] == "project":
+        return f"https://pypi.org/pypi/{'/'.join(teile[1:3])}/json", "pypi"
+    if host in ("npmjs.com", "www.npmjs.com") and len(teile) >= 2 and teile[0] == "package":
+        name = "/".join(teile[1:3]) if teile[1].startswith("@") else teile[1]
+        return f"https://registry.npmjs.org/{name}", "npm"
+    return None
+
+
+def _groesse(n) -> str:
+    try:
+        n = float(n)
+    except (TypeError, ValueError):
+        return "?"
+    for einheit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or einheit == "GB":
+            return f"{n:.0f} {einheit}" if einheit == "B" else f"{n:.1f} {einheit}"
+        n /= 1024
+    return "?"
+
+
+def _gh_release(d: dict) -> str:
+    zeilen = [f"# {d.get('name') or d.get('tag_name') or 'Release'}",
+              f"Tag: {d.get('tag_name', '?')} · {'Vorabversion (pre-release)' if d.get('prerelease') else 'Release'}"
+              + (" · Entwurf" if d.get("draft") else "") + f" · veröffentlicht {str(d.get('published_at') or '?')[:10]}",
+              "", (d.get("body") or "(keine Beschreibung)").strip(), "", "## Dateien (Assets)"]
+    assets = d.get("assets") or []
+    for a in assets:
+        zeilen.append(f"- {a.get('name')} · {_groesse(a.get('size'))}"
+                      + (f" · {a['digest']}" if a.get("digest") else "")
+                      + f" · {a.get('browser_download_url', '')}")
+    if not assets:
+        zeilen.append("- keine angehängten Dateien")
+    zeilen.append("- dazu automatisch: Quellcode als zip und tar.gz")
+    return "\n".join(zeilen)
+
+
+def _api_text(art: str, d) -> str:
+    if art == "gh_release":
+        return _gh_release(d)
+    if art == "gh_releases":
+        return "\n\n---\n\n".join(_gh_release(r) for r in (d or [])[:10]) or "Keine Releases."
+    if art == "gh_issue":
+        art_name = "Pull Request" if d.get("pull_request") else "Issue"
+        return (f"# {art_name} #{d.get('number')}: {d.get('title', '')}\nStatus: {d.get('state', '?')} · "
+                f"{d.get('comments', 0)} Kommentare · von {(d.get('user') or {}).get('login', '?')}\n\n"
+                + (d.get("body") or "(kein Text)").strip())
+    if art == "gh_repo":
+        lizenz = (d.get("license") or {}).get("spdx_id") or "keine Angabe"
+        return (f"# {d.get('full_name')}\n{d.get('description') or ''}\n\n"
+                f"Sterne: {d.get('stargazers_count', 0)} · Forks: {d.get('forks_count', 0)} · offene Issues: "
+                f"{d.get('open_issues_count', 0)} · Lizenz: {lizenz} · Hauptzweig: {d.get('default_branch', '?')}\n"
+                f"Zuletzt geändert: {str(d.get('pushed_at') or '?')[:10]} · Themen: "
+                f"{', '.join(d.get('topics') or []) or '–'}\n"
+                f"README: https://raw.githubusercontent.com/{d.get('full_name')}/{d.get('default_branch', 'main')}/README.md")
+    if art == "pypi":
+        i = d.get("info") or {}
+        links = "\n".join(f"- {k}: {v}" for k, v in (i.get("project_urls") or {}).items())
+        return (f"# {i.get('name')} {i.get('version')}\n{i.get('summary') or ''}\n\nPython: "
+                f"{i.get('requires_python') or 'keine Angabe'} · Lizenz: {i.get('license') or 'keine Angabe'}\n"
+                + (f"Links:\n{links}\n" if links else "") + "\n" + (i.get("description") or "").strip())
+    if art == "npm":
+        neu = (d.get("dist-tags") or {}).get("latest", "?")
+        return (f"# {d.get('name')} {neu}\n{d.get('description') or ''}\n\nLizenz: {d.get('license') or 'keine Angabe'}"
+                f" · Versionen: {len(d.get('versions') or {})}\n\n" + (d.get("readme") or "").strip())
+    return json.dumps(d, ensure_ascii=False, indent=1)
+
+
+def _ueber_api(url: str) -> tuple[str, str, dict] | None:
+    """(Text, endgültige API-URL, Angaben) – None, wenn keine API passt oder sie scheitert (dann die Seite)."""
+    ziel = _api_adresse(url)
+    if ziel is None or _check(ziel[0]) is not None:
+        return None
+    try:
+        geladen = _laden(ziel[0])
+        if isinstance(geladen, str):
+            return None
+        final, _ctype, daten, zeichensatz = geladen
+        d = json.loads(_dekodieren(daten, zeichensatz))
+        text = _api_text(ziel[1], d)
+    except Exception:
+        return None
+    dateien = len(d.get("assets") or []) if isinstance(d, dict) and ziel[1] == "gh_release" else 0
+    return text, final, {"api": True, "abschnitte": len(re.findall(r"(?m)^#{1,6} ", text)), "anhaenge": dateien}
+
+
+def _lesebericht(angaben: dict, teile: int) -> str:
+    """Eigene Angaben (keine Fremddaten): was zum Inhalt gehörte – steht in der Quellzeile."""
+    stuecke = [f"{teile} Teil{'e' if teile != 1 else ''}"]
+    if angaben.get("api"):
+        stuecke.append("über die offizielle Schnittstelle geladen")
+    for schluessel, wort in (("abschnitte", "Abschnitte"), ("tabellen", "Tabellen"), ("anhaenge", "Anhänge/Dateien")):
+        if angaben.get(schluessel):
+            stuecke.append(f"{angaben[schluessel]} {wort}")
+    if angaben.get("versteckt"):
+        stuecke.append(f"{angaben['versteckt']} unsichtbare Stellen entfernt")
+    if angaben.get("pdf_seiten"):
+        stuecke.append(angaben["pdf_seiten"])
+    return "Lesebericht: " + " · ".join(stuecke)
 
 
 # --- Öffentliche Funktionen ------------------------------------------------
@@ -557,7 +760,8 @@ def _laden(url: str) -> tuple[str, str, bytes, str | None] | str:
                 if r.is_redirect:
                     url = urljoin(url, r.headers.get("location", ""))
                     continue
-                r.raise_for_status()
+                if r.status_code >= 400:
+                    return http_fehler(r.status_code, url)
                 if int(r.headers.get("content-length") or 0) > MAX_BYTES:
                     return f"❌ Seite ist größer als {MAX_BYTES // (1024 * 1024)} MB – nicht geladen."
                 daten = bytearray()
@@ -569,15 +773,34 @@ def _laden(url: str) -> tuple[str, str, bytes, str | None] | str:
     return f"❌ Mehr als {MAX_WEITERLEITUNGEN} Weiterleitungen – abgebrochen."
 
 
-def fetch(url: str, teil: int = 1) -> str:
-    """Lädt eine erlaubte HTTPS-Seite (HTML, Text, JSON, PDF) und gibt Teil `teil` als Text zurück."""
+GANZ_MAX = 8 * MAX_OUT            # „ganz“: so viel auf einmal, der Rest weiter in Teilen
+
+
+def fetch(url: str, teil: int = 1, ganz: bool = False) -> str:
+    """Lädt eine erlaubte HTTPS-Seite (HTML, Text, JSON, PDF) und gibt Teil `teil` als Text zurück –
+    mit `ganz` alles in einem Zug (bis GANZ_MAX Zeichen)."""
     url = url.strip()
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url        # ohne Schema -> immer HTTPS
     geladen = text_holen(url)
     if isinstance(geladen, str):
         return geladen
-    return _als_teil(*geladen, _zahl(teil), f"web_lesen mit url: {url}")
+    quelle, text, tier = geladen
+    if not ganz:
+        return _als_teil(quelle, text, tier, _zahl(teil), f"web_lesen mit url: {url}")
+    stuecke = _teile(text) or [""]
+    zusammen, n = "", 0
+    for s in stuecke:
+        if zusammen and len(zusammen) + len(s) > GANZ_MAX:
+            break
+        zusammen += ("\n\n" if zusammen else "") + s
+        n += 1
+    if n < len(stuecke):
+        quelle += (f"\nTeile 1–{n} von {len(stuecke)} in einem Zug – weiterlesen: web_lesen mit url: {url} und "
+                   f"teil: {n + 1}")
+    else:
+        quelle += "\nVollständig in einem Zug gelesen."
+    return _untrusted(quelle, zusammen, tier)
 
 
 def text_holen(url: str) -> tuple[str, str, int | str] | str:
@@ -586,7 +809,8 @@ def text_holen(url: str) -> tuple[str, str, int | str] | str:
     url = url.strip()
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
-    if (alt := _gemerkt(url)):
+    # Gemerktes nur, solange die Seite noch lesbar wäre (Allowlist und Schalter können sich geändert haben)
+    if (alt := _gemerkt(url)) and (fremdseiten_an() if alt[3] == FREMD_TIER else is_allowed(url)):
         return alt[1], alt[2], alt[3]
     if url.lower().startswith("https://") and not is_private(_host(url)) and not is_allowed(url) \
             and fremdseiten_an():
@@ -596,27 +820,43 @@ def text_holen(url: str) -> tuple[str, str, int | str] | str:
         quelle, text = geladen
         _merken(url, quelle, text, FREMD_TIER)
         return quelle, text, FREMD_TIER
+    angaben: dict = {}
     try:
-        geladen = _laden(url)
-        if isinstance(geladen, str):
-            return geladen
-        final, ctype, daten, zeichensatz = geladen
-        if "pdf" in ctype or daten[:5] == b"%PDF-":
-            text = _pdf_text(daten)
-            if not text.strip():
-                return "❌ PDF ohne Textebene (nur Bilder/Scan) – nichts zu lesen."
-        elif "html" in ctype or ("xml" in ctype and daten.lstrip()[:1] == b"<"):
-            text = _html_to_text(_dekodieren(daten, zeichensatz))
-        elif not ctype or ctype.startswith("text/") or "json" in ctype:
-            text = _dekodieren(daten, zeichensatz)
+        api = _ueber_api(url) if _check(url) is None else None
+        if api is not None:
+            text, final, angaben = api
         else:
-            return f"❌ Kein lesbares Format ({ctype.split(';')[0]})."
+            geladen = _laden(url)
+            if isinstance(geladen, str):
+                return geladen
+            final, ctype, daten, zeichensatz = geladen
+            if "pdf" in ctype or daten[:5] == b"%PDF-":
+                text = _pdf_text(daten)
+                if not text.strip():
+                    return "❌ PDF ohne Textebene (nur Bilder/Scan) – nichts zu lesen."
+                m = re.search(r"nur die ersten (\d+) von (\d+) Seiten", text)
+                angaben["pdf_seiten"] = (f"PDF: {m.group(1)} von {m.group(2)} Seiten gelesen" if m
+                                         else f"PDF: {text.count('[Seite ')} Seiten")
+            elif "html" in ctype or ("xml" in ctype and daten.lstrip()[:1] == b"<"):
+                text, angaben = _html_lesen(_dekodieren(daten, zeichensatz), final)
+            elif not ctype or ctype.startswith("text/") or "json" in ctype or _als_text_lesbar(daten, final, ctype):
+                text = _dekodieren(daten, zeichensatz)
+            else:
+                return (f"❌ Kein lesbares Format ({ctype.split(';')[0]}) – eine Datei, die kein Text, keine Seite "
+                        "und kein PDF ist (z. B. Programm oder Archiv). Nicht geladen.")
+    except httpx.HTTPError as e:
+        return _netzfehler(e, url)
     except Exception as e:
         return f"Fehler beim Laden: {e}"
     e = _match(final) or {}
     tier = e.get("tier", "?")
     note = e.get("note", "")
-    quelle = f"{final}  ·  Tier {tier} ({note})" if note else f"{final}  ·  Tier {tier}"
+    # Signierte Download-Adressen (Release-Dateien) tragen ein kurzlebiges Zugangs-Token – angezeigt wird die
+    # Adresse, die aufgerufen wurde, mit dem Server, der geliefert hat.
+    gezeigt = final if not urlparse(final).query or _host(final) == _host(url) else \
+        f"{url}  (geliefert von {_host(final)})"
+    quelle = f"{gezeigt}  ·  Tier {tier} ({note})" if note else f"{gezeigt}  ·  Tier {tier}"
+    quelle += "\n" + _lesebericht(angaben, len(_teile(text)))
     _merken(url, quelle, text, tier)
     return quelle, text, tier
 

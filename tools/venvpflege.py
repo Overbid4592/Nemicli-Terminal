@@ -29,9 +29,8 @@ from typing import Callable, Optional
 import uvsetup
 
 AUSSTEHEND = uvsetup.RUNTIME / "update_ausstehend.txt"
-# Früher von NemiCLI installiert, heute nicht mehr gebraucht (SD-Pipeline, transformers,
-# OpenCV – Gesichter findet jetzt das Seh-Modell; WebEngine/Addons – ausgebauter Browser, NemiCLI braucht
-# nur PySide6-Essentials). Bleiben, solange ein anderes Paket sie verlangt.
+# Pakete, die NemiCLI nicht mehr braucht (PySide6-Essentials genügt); bleiben, solange ein anderes
+# Paket sie verlangt.
 ALTLASTEN = ("transformers", "diffusers", "accelerate", "opencv-python", "pyside6-webengine", "pyside6-addons")
 _TORCH_FAMILIE = {"torch", "torchvision", "torchaudio", "torch-directml"}
 

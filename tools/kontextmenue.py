@@ -37,7 +37,11 @@ try:                    # nemicli.cmd + die Alive/Inbox-Dateien gehoeren zum
 except Exception:                        # der Starter liegt, nicht bei den Daten.
     INSTALL = Path(__file__).resolve().parent.parent
 ROOT = INSTALL                                         # Projektordner (neben main.py)
-SCREENSHOT_DIR = ROOT / "Bilder" / "Screenshots"
+try:                                     # Screenshots sind Daten (wie bildschirm_ansehen): sonst lägen sie im
+    from paths import DATEN as _DATEN    # Programm-Ordner, den die KI nicht ansehen darf
+except Exception:
+    _DATEN = INSTALL
+SCREENSHOT_DIR = Path(_DATEN) / "Bilder" / "Screenshots"
 
 # Registry-Orte (HKCU\Software\Classes\...): Ordner-Hintergrund, Desktop, Bilddateien
 _KEY_SCREEN = [r"Software\Classes\Directory\Background\shell\NemiCLI.Screenshot",

@@ -1,59 +1,28 @@
 """
 embedder.py - Qwen3-Embedding ohne sentence-transformers.
 
-WARUM ES DAS GIBT
-`sentence-transformers` scheitert auf diesem PC nicht an sich selbst, sondern
-an einem Import: es zieht `scikit-learn` mit, und sklearn bringt eine unsignierte
-DLL mit (`sparsefuncs_fast`). Windows Smart App Control blockiert die - der
-Import stirbt mit "Eine Anwendungssteuerungsrichtlinie hat diese Datei blockiert".
-Smart App Control abzuschalten ist eine Einbahnstrasse (zurueck geht es nur mit
-einer Windows-Neuinstallation), also wird hier nichts abgeschaltet.
-
-Das Modell selbst braucht sklearn ueberhaupt nicht. sentence-transformers macht
-fuer Qwen3-Embedding genau drei Dinge, und die stehen in den Konfigurationsdateien
-des Modells:
-
-    modules.json          Transformer -> Pooling -> Normalize
-    1_Pooling/config.json "pooling_mode_lasttoken": true
-    config_sentence_transformers.json   Query-Prompt fuer Suchanfragen
-
-Also: Text durchs Modell, den Vektor des LETZTEN echten Tokens nehmen, auf
-Laenge 1 normieren. Das ist alles. Dafuer reichen torch und transformers.
-
-WICHTIG - die Vektoren muessen zu den ALTEN passen. Im Gedaechtnis liegen
-bereits Vektoren, die sentence-transformers erzeugt hat. Waere diese Umsetzung
-auch nur beim Pooling anders, wuerde die Aehnlichkeitssuche stillschweigend
-Unsinn liefern. Deshalb prueft ein eigener Test die neuen Vektoren gegen
-die gespeicherten alten.
+sentence-transformers zieht scikit-learn mit, dessen unsignierte DLL Smart App Control
+blockieren kann. Nötig ist nur, was die Modell-Konfiguration vorgibt (modules.json,
+1_Pooling/config.json, config_sentence_transformers.json): Text durchs Modell, Pooling
+(letztes echtes Token), auf Länge 1 normieren – dafür reichen torch und transformers.
+Die Vektoren müssen zu den gespeicherten passen (eigener Test).
 """
 
 from __future__ import annotations
 
 import contextlib
+import re
 import threading
 from pathlib import Path
 
 
 def _sklearn_blockade_umgehen() -> bool:
-    """Setzt einen Platzhalter fuer sklearn, WENN das echte blockiert ist.
+    """Setzt einen Platzhalter für sklearn, wenn das echte sich nicht laden lässt.
 
-    `transformers` zieht sklearn beim Import mit - nicht weil es das Modell
-    braucht, sondern fuer eine einzige Funktion in der Textgenerierung:
-
-        generation/candidate_generator.py:29   from sklearn.metrics import roc_curve
-
-    Davor steht zwar `if is_sklearn_available()`, aber diese Pruefung
-    (import_utils.py:214) fragt nur, ob sklearn INSTALLIERT ist - nicht, ob es
-    sich laden laesst. Bei blockierter DLL sagt sie True, und der Import darunter
-    stirbt. Deshalb reicht es nicht, sklearn einfach nicht zu benutzen.
-
-    Der Platzhalter fuellt genau die drei Namen, die transformers beim Import
-    anfasst. Wird einer davon WIRKLICH aufgerufen, fliegt ein klarer Fehler statt
-    eines falschen Ergebnisses - NemiCLI ruft keinen davon je auf (roc_curve
-    gehoert zum spekulativen Dekodieren, das wir nicht nutzen; die anderen zu
-    Trainings-Metriken).
-
-    Laesst sich das echte sklearn laden, passiert hier NICHTS.
+    transformers importiert sklearn (roc_curve, spekulatives Dekodieren), sobald es
+    installiert ist – auch wenn die DLL blockiert ist. Der Platzhalter füllt nur die Namen,
+    die transformers beim Import anfasst; ein echter Aufruf wirft einen klaren Fehler.
+    Lässt sich sklearn laden, passiert nichts.
     """
     import importlib
     import importlib.machinery              # wird nicht von selbst mitgeladen
@@ -91,6 +60,37 @@ def _sklearn_blockade_umgehen() -> bool:
 QUERY_PROMPT = ("Instruct: Given a web search query, retrieve relevant passages "
                 "that answer the query\nQuery:")
 
+#: Suchanweisung je Aufgabe für Modelle mit der Qwen-Vorlage („Instruct: …\nQuery:“). Englisch, wie vom
+#: Modell empfohlen. Gilt nur für die Suchfrage – gespeicherte Vektoren bleiben gültig.
+AUFGABEN = {
+    "gedaechtnis": "Given a message from a conversation, retrieve notes, earlier conversation passages "
+                   "and documents that help to answer or continue it",
+    "notizen": "Given a question or message, retrieve stored facts and notes about the same topic",
+    "chat": "Given a question or message, retrieve earlier conversation passages about the same topic",
+    "dokumente": "Given a question, retrieve document passages that answer it",
+    "code": "Given a programming question, retrieve code snippets and instructions that solve it",
+}
+_QWEN_VORLAGE = re.compile(r"Instruct: .+\nQuery: ?", re.S)
+
+
+#: EmbeddingGemma („task: … | query: “): Aufgaben aus der Modellkarte; Code hat eine eigene, sonst Suche.
+_GEMMA_VORLAGE = re.compile(r"task: [^|]+\| query: ?")
+_GEMMA_AUFGABEN = {"code": "code retrieval"}
+
+
+def such_prompt(einstellungen: dict, aufgabe: str | None = None) -> str:
+    """Vorsatz einer Suchfrage: bei Qwen- und Gemma-Vorlage die Anweisung der Aufgabe, sonst die des Modells.
+    Ein eigener Such-Prompt (embedding.json) bleibt, wie er ist."""
+    p = einstellungen.get("query_prompt") or ""
+    if aufgabe not in AUFGABEN or einstellungen.get("prompt_eigen"):
+        return p
+    if _QWEN_VORLAGE.fullmatch(p):
+        return f"Instruct: {AUFGABEN[aufgabe]}\nQuery:"
+    if _GEMMA_VORLAGE.fullmatch(p):
+        return f"task: {_GEMMA_AUFGABEN.get(aufgabe, 'search result')} | query: "
+    return p
+
+
 #: Modelltypen, die wie Sprachmodelle von links nach rechts lesen: der Satz steckt
 #: im letzten Token. Alle anderen (BERT, XLM-R, MPNet …) mitteln über die Tokens.
 _DECODER = {"qwen2", "qwen3", "llama", "mistral", "gemma", "gemma2", "gemma3", "phi3", "gpt2"}
@@ -118,19 +118,33 @@ def _json(pfad: Path) -> dict | list | None:
 
 #: Such-Prompt je GGUF-Modellfamilie (`general.basename`) – GGUF-Dateien bringen
 #: die sentence-transformers-Dateien nicht mit. `embedding.json` im Ordner geht vor.
-_GGUF_PROMPTS = {"qwen3-embedding": QUERY_PROMPT}
+_GGUF_PROMPTS = {"qwen3-embedding": QUERY_PROMPT, "embeddinggemma": "task: search result | query: "}
+_GGUF_DOK_PROMPTS = {"embeddinggemma": "title: none | text: "}
 
 _GGUF_KOPF: dict = {}
 
 
+def _ist_mmproj(p: Path) -> bool:
+    return "mmproj" in p.name.lower()
+
+
 def gguf_datei(ordner) -> Path | None:
-    """Die GGUF-Datei eines Modell-Ordners: genau eine .gguf und keine safetensors
-    (ein Ordner mit model.safetensors läuft wie bisher über transformers)."""
+    """Die GGUF-Datei eines Modell-Ordners: genau eine .gguf (ohne Bild-/Audio-Teil mmproj) und keine
+    safetensors (ein Ordner mit model.safetensors läuft wie bisher über transformers)."""
     o = Path(ordner)
     if (o / "model.safetensors").is_file():
         return None
     try:
-        dateien = sorted(d for d in o.glob("*.gguf") if d.is_file())
+        dateien = sorted(d for d in o.glob("*.gguf") if d.is_file() and not _ist_mmproj(d))
+    except OSError:
+        return None
+    return dateien[0] if len(dateien) == 1 else None
+
+
+def mmproj_datei(ordner) -> Path | None:
+    """Der Bild-/Audio-Teil im Modell-Ordner (genau eine mmproj-….gguf), sonst None."""
+    try:
+        dateien = sorted(d for d in Path(ordner).glob("*.gguf") if d.is_file() and _ist_mmproj(d))
     except OSError:
         return None
     return dateien[0] if len(dateien) == 1 else None
@@ -148,7 +162,7 @@ def _gguf_kopf(datei: Path) -> dict:
             a = g.architecture
             _GGUF_KOPF[schluessel] = {
                 "arch": a,
-                "dim": g.get(f"{a}.embedding_length", "?"),
+                "dim": g.get(f"{a}.embedding_length_out") or g.get(f"{a}.embedding_length", "?"),
                 "schichten": g.get(f"{a}.block_count", "?"),
                 "vokabular": len(g.get("tokenizer.ggml.tokens") or []) or "?",
                 "pooling": POOLING.get(g.get(f"{a}.pooling_type"), ""),
@@ -166,7 +180,8 @@ def einstellungen_lesen(ordner) -> dict:
     Reihenfolge: `embedding.json` im Ordner (eigene Vorgaben) vor den
     sentence-transformers-Dateien (`1_Pooling/config.json`,
     `config_sentence_transformers.json`) vor der Vorgabe nach Modelltyp.
-    Rückgabe: pooling (last|mean|cls), query_prompt, dokument_prompt, max_tokens."""
+    Rückgabe: pooling (last|mean|cls), query_prompt, dokument_prompt, max_tokens, prompt_eigen
+    (Such-Prompt aus embedding.json)."""
     o = Path(ordner)
     cfg = _json(o / "config.json") or {}
     e = {"pooling": "", "query_prompt": "", "dokument_prompt": "", "max_tokens": MAX_TOKENS}
@@ -174,6 +189,7 @@ def einstellungen_lesen(ordner) -> dict:
         kopf = _gguf_kopf(datei)
         e["pooling"] = kopf["pooling"] or "last"
         e["query_prompt"] = _GGUF_PROMPTS.get(kopf["familie"], "")
+        e["dokument_prompt"] = _GGUF_DOK_PROMPTS.get(kopf["familie"], "")
         cfg = {"model_type": kopf["arch"], "max_position_embeddings": kopf["kontext"]}
     pool = _json(o / "1_Pooling" / "config.json") or {}
     if pool.get("pooling_mode_lasttoken"):
@@ -189,6 +205,7 @@ def einstellungen_lesen(ordner) -> dict:
     for k in ("pooling", "query_prompt", "dokument_prompt", "max_tokens"):
         if eigen.get(k) not in (None, ""):
             e[k] = eigen[k]
+    e["prompt_eigen"] = eigen.get("query_prompt") not in (None, "")
     if e["pooling"] not in ("last", "mean", "cls"):
         e["pooling"] = "last" if cfg.get("model_type") in _DECODER else "mean"
     grenze = cfg.get("max_position_embeddings")
@@ -207,6 +224,34 @@ def kennung(ordner) -> str:
     cfg = _json(Path(ordner) / "config.json") or {}
     teile = [str(cfg.get(k, "?")) for k in ("model_type", "hidden_size", "num_hidden_layers", "vocab_size")]
     return "-".join(teile + [einstellungen_lesen(ordner)["pooling"]])
+
+
+#: Kosinus-Schwellen der Suche. Jedes Modell verteilt seine Ähnlichkeiten anders: bei Qwen3-Embedding
+#: liegen unpassende Texte meist bei 0,1–0,3, bei EmbeddingGemma 2 bei 0,45–0,75.
+#:   kandidat      ab hier zählt ein Brocken für die Bedeutungs-Suche
+#:   schwach       bester Treffer darunter (ohne Stichwort): die Suche hat wohl nichts gefunden
+#:   doppelt       Beinahe-Kopie, fällt aus der Trefferliste
+#:   verschmelzen  /aufraeumen legt zwei Notizen zusammen (ohne KI)
+#:   pflege        ab hier legt die Gedächtnis-Pflege ein Paar der KI zur Prüfung vor
+#:   vorgeschmack  ein Treffer nur nach Bedeutung (ohne Stichwort) kommt erst ab hier ungefragt in den Prompt
+SCHWELLEN_VORGABE = {"kandidat": 0.315, "schwach": 0.5, "doppelt": 0.95, "verschmelzen": 0.90, "pflege": 0.70,
+                     "vorgeschmack": 0.315}
+#: Je Kennungs-Anfang. Gemessen auf deutsch/englischem Satz aus Notizen, Chat-Stellen, langen
+#: Brocken und Bildern (Bildsuche 6/6), so gewählt, dass Trefferquote und Fehlerquote denen von
+#: Qwen3-Embedding mit der Vorgabe entsprechen.
+SCHWELLEN = {
+    "gemma-embedding2-": {"kandidat": 0.66, "schwach": 0.71, "doppelt": 0.97, "verschmelzen": 0.93,
+                          "pflege": 0.85, "vorgeschmack": 0.71},
+}
+
+
+def schwellen(kennung: str | None) -> dict:
+    """Die Schwellen zum Modell mit dieser Kennung (unbekannt: SCHWELLEN_VORGABE)."""
+    for anfang, werte in SCHWELLEN.items():
+        if (kennung or "").startswith(anfang):
+            return {**SCHWELLEN_VORGABE, **werte}
+    return dict(SCHWELLEN_VORGABE)
+
 
 #: Obergrenze fuer die Token-Laenge. Gedaechtnis-Notizen sind kurze Saetze;
 #: die Grenze schuetzt nur davor, dass eine versehentlich riesige Notiz die
@@ -267,10 +312,11 @@ class Embedder:
         """Der Vektor des letzten ECHTEN Tokens je Text.
 
         Nicht einfach hidden[:, -1]: bei rechtsseitigem Auffuellen stehen dort
-        Fuell-Token. Die Maske sagt, wo der Text wirklich endet.
+        Fuell-Token. Die Maske sagt, wo der Text wirklich endet – auch bei
+        linksseitigem Auffuellen (so liefern manche Tokenizer aus).
         """
-        laengen = mask.sum(dim=1) - 1                     # Index des letzten Tokens
-        idx = laengen.clamp(min=0).to(hidden.device)
+        stellen = self._torch.arange(mask.size(1), device=mask.device)
+        idx = (mask.long() * stellen).argmax(dim=1).to(hidden.device)   # letzte Stelle mit Maske 1
         return hidden[self._torch.arange(hidden.size(0), device=hidden.device), idx]
 
     def _mittel(self, hidden, mask):
@@ -288,15 +334,16 @@ class Embedder:
 
     # -- oeffentlich ------------------------------------------------------
     def encode(self, texts, *, normalize_embeddings: bool = True,
-               prompt_name: str | None = None, batch_size: int = 8, **_ignored):
-        """Gibt eine Liste von Vektoren zurueck (je ein numpy-Array wie bei ST)."""
+               prompt_name: str | None = None, batch_size: int = 8, aufgabe: str | None = None, **_ignored):
+        """Gibt eine Liste von Vektoren zurueck (je ein numpy-Array wie bei ST).
+        `aufgabe` (AUFGABEN) wählt bei Suchfragen die Anweisung."""
         torch = self._torch
         if isinstance(texts, str):
             texts = [texts]
         texts = list(texts)
         if not texts:
             return []
-        vorsatz = (self.einstellungen["query_prompt"] if prompt_name == "query"
+        vorsatz = (such_prompt(self.einstellungen, aufgabe) if prompt_name == "query"
                    else self.einstellungen["dokument_prompt"])
         if vorsatz:
             texts = [vorsatz + t for t in texts]
@@ -326,46 +373,83 @@ class Embedder:
 
 
 class GGUFEmbedder:
-    """Embedding-Modell als GGUF über den eigenen Motor. Auf der GPU bleiben die
-    Gewichte gepackt; es bleibt auf dem Gerät, auf dem es geladen wurde (`to` wirkt
-    nicht – auf der CPU wären die Gewichte entpackt)."""
+    """Embedding-Modell als GGUF über den eigenen Motor. Kurze Texte rechnen gepackt in einem
+    Durchgang. `to` auf ein anderes Gerät lädt eine zweite Fassung dazu (auf der GPU bleiben die
+    Gewichte gepackt); `to` zurück schließt sie wieder, die Grundfassung bleibt geladen."""
 
     def __init__(self, ordner: str, *, device: str = "cuda", **_ignored):
-        from ggufengine.einbettung import Einbetter
-        datei = gguf_datei(ordner)
-        if datei is None:
+        self._datei = gguf_datei(ordner)
+        if self._datei is None:
             raise FileNotFoundError(f"keine eindeutige .gguf in {ordner}")
         self.einstellungen = einstellungen_lesen(ordner)
         self.kennung = kennung(ordner)
+        self._lock = threading.RLock()
+        self._grund = self._bauen(device)
+        self._zweit = None
+        self.device = self._grund.device.type
+
+    def _bauen(self, device):
+        from ggufengine.einbettung import Einbetter
         gpu = str(device).startswith("cuda")
         with (gpu_sperre() if gpu else contextlib.nullcontext()):
-            self._e = Einbetter(str(datei), "cuda" if gpu else "cpu",
-                                max_tokens=int(self.einstellungen["max_tokens"]))
-        self.device = self._e.device.type
-        self._lock = threading.RLock()
+            return Einbetter(str(self._datei), "cuda" if gpu else "cpu",
+                             max_tokens=int(self.einstellungen["max_tokens"]))
 
     def encode(self, texts, *, normalize_embeddings: bool = True,
-               prompt_name: str | None = None, **_ignored):
+               prompt_name: str | None = None, aufgabe: str | None = None, **_ignored):
         if isinstance(texts, str):
             texts = [texts]
-        vorsatz = (self.einstellungen["query_prompt"] if prompt_name == "query"
+        vorsatz = (such_prompt(self.einstellungen, aufgabe) if prompt_name == "query"
                    else self.einstellungen["dokument_prompt"])
-        gpu = self.device == "cuda"
+        with self._lock:
+            e = self._zweit or self._grund
+            vecs = e.vektoren([(vorsatz or "") + t for t in texts], normieren=normalize_embeddings,
+                              pooling=self.einstellungen["pooling"],
+                              sperre=gpu_sperre if e.device.type == "cuda" else None)
+        return [v.cpu().numpy() for v in vecs]
+
+    def kann_sehen(self) -> bool:
+        """Bilder einbetten möglich: Bauart mit Bild-Eingang und ein mmproj im Modell-Ordner."""
+        return (getattr(self._grund.model, "supports_images", False) and hasattr(self._grund.model, "eingabe")
+                and mmproj_datei(self._datei.parent) is not None)
+
+    def bilder(self, pfade, normalize_embeddings: bool = True) -> list:
+        """Bilder (Pfade) -> Vektoren im selben Raum wie die Texte; None für ein Bild, das sich nicht lesen
+        lässt. Der Bild-Teil wird beim ersten Mal dazugeladen."""
+        if not self.kann_sehen():
+            raise RuntimeError("dieses Embedding-Modell kann keine Bilder einbetten")
         raus = []
         with self._lock:
-            for t in texts:
-                with (gpu_sperre() if gpu else contextlib.nullcontext()):
-                    v = self._e.vektor((vorsatz or "") + t, normieren=normalize_embeddings,
-                                       pooling=self.einstellungen["pooling"])
-                    raus.append(v.cpu().numpy())
+            e = self._zweit or self._grund
+            if not e.kann_sehen():
+                with (gpu_sperre() if e.device.type == "cuda" else contextlib.nullcontext()):
+                    e.sehen_laden(str(mmproj_datei(self._datei.parent)))
+            for p in pfade:
+                try:
+                    with (gpu_sperre() if e.device.type == "cuda" else contextlib.nullcontext()):
+                        raus.append(e.bild_vektor(str(p), normieren=normalize_embeddings).cpu().numpy())
+                except Exception:
+                    raus.append(None)
         return raus
 
     def to(self, device):
+        ziel = "cuda" if str(device).startswith("cuda") else "cpu"
+        with self._lock:
+            if ziel == self._grund.device.type:
+                alt, self._zweit = self._zweit, None
+                if alt is not None:
+                    alt.close()
+            elif self._zweit is None:
+                self._zweit = self._bauen(ziel)
+            self.device = (self._zweit or self._grund).device.type
         return self
 
     def close(self):
         with self._lock:
-            self._e.close()
+            for e in (self._zweit, self._grund):
+                if e is not None:
+                    e.close()
+            self._zweit = None
 
 
 def config_pruefen(ordner: str) -> None:

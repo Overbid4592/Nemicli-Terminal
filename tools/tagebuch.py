@@ -116,7 +116,7 @@ def lesen(anzahl: int = 5, ab: int = 0) -> str:
     if not alle:
         return "Dein Tagebuch ist noch leer."
     anzahl = max(1, min(int(anzahl or 5), 30))
-    ab = max(0, int(ab or 0))
+    ab = min(max(0, int(ab or 0)), len(alle))
     teil = alle[max(0, len(alle) - ab - anzahl):len(alle) - ab]
     if not teil:
         return f"Keine älteren Einträge – das Tagebuch hat {len(alle)}."

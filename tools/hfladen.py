@@ -4,7 +4,8 @@ hfladen.py - GGUF-Modelle von Hugging Face holen (Downloader in /model).
 Nur die öffentliche API und die Dateien selbst; kein Login, keine gesperrten Modelle.
 Gezeigt wird nur, was der eigene Motor laden kann (Bauart aus den GGUF-Metadaten) und
 mindestens MIN_B Milliarden Parameter hat – MoE zählt nach Gesamtgröße, Gemmas „E…B“ nach
-der effektiven Größe im Namen. Jede Datei wird
+der effektiven Größe im Namen. Ausnahme: Bauarten mit `unter_4b` (Modell-Datenbank), Familien kleiner
+Spezialisten wie LFM3; sie stehen in der Größe „unter 4B“. Jede Datei wird
 beim Laden mit SHA-256 geprüft (Wert von Hugging Face) und erst danach unter
 ModelGGUF/<Name>/ abgelegt; ein abgebrochener Download wird fortgesetzt.
 """
@@ -23,9 +24,10 @@ from typing import Callable, Optional
 
 API = "https://huggingface.co/api"
 DATEI_URL = "https://huggingface.co/{repo}/resolve/{revision}/{pfad}"
-ANBIETER = ("unsloth", "bartowski", "ggml-org", "lmstudio-community")
+ANBIETER = ("unsloth", "bartowski", "ggml-org", "lmstudio-community", "LiquidAI")
 MIN_B = 4.0
 GROESSEN = {                      # Schlüssel: (von, bis) in Milliarden Parametern, Anzeige
+    "klein": (0.0, 4.0, "unter 4B (nur Ausnahmen wie LFM3)"),
     "4-8": (4.0, 8.0, "4–8B"),
     "8-15": (8.0, 15.0, "8–15B"),
     "15-35": (15.0, 35.0, "15–35B"),
@@ -37,7 +39,7 @@ _QUANT_VORZUG = ("Q4_K_M", "UD-Q4_K_XL", "Q4_K_S", "IQ4_XS", "IQ4_NL", "Q5_K_M",
 _MMPROJ_VORZUG = ("BF16", "F16", "F32")
 _MOE_NAME = re.compile(r"(?i)(?:[-_ ]A(\d+(?:\.\d+)?)B\b|\b\d+x\d+(?:\.\d+)?B\b|\bMoE\b)")
 _EFFEKTIV = re.compile(r"(?i)[-_]E(\d+(?:\.\d+)?)B\b")     # Gemma „E4B“: effektive Größe zählt
-_QUANT = re.compile(r"(?i)(UD-)?((?:I?Q\d(?:_[A-Z0-9]+)+)|Q\d_\d|BF16|F16|F32|MXFP4(?:_MOE)?)(?=\.gguf$|-)")
+_QUANT = re.compile(r"(?i)(UD-)?((?:(?:PT|[IPT])?Q\d(?:_[A-Z0-9]+)+)|Q\d_\d|BF16|F16|F32|MXFP4(?:_MOE)?)(?=\.gguf$|-)")
 _TEILDATEI = re.compile(r"-\d{5}-of-\d{5}\.gguf$")
 _BEIWERK = re.compile(r"(?i)(?:^|[/_.-])(?:mtp|imatrix|draft|eagle\d*)(?:[/_.-]|$)")   # Hilfsdateien, kein Modell
 WINDOWS_VRAM = int(1.7 * 2**30)       # belegt Windows selbst dauerhaft
@@ -149,6 +151,11 @@ def unterstuetzt() -> set[str]:
     return set(_bauarten())
 
 
+def ausnahme_unter_4b(bauart: str) -> bool:
+    """Darf ein Chat-Modell dieser Bauart unter MIN_B liegen (Modell-Datenbank, Merkmal `unter_4b`)?"""
+    return bool((_bauarten().get(bauart) or {}).get("unter_4b"))
+
+
 def ordnername(repo: str) -> str:
     name = repo.split("/")[-1]
     name = re.sub(r"(?i)[-_.]gguf$", "", name)
@@ -168,9 +175,10 @@ def _modell(eintrag: dict, bauarten: set[str]) -> Optional[Modell]:
     bauart, total = g.get("architecture"), g.get("total")
     if eintrag.get("gated") or eintrag.get("private") or not isinstance(total, int):
         return None
-    if "gguf" not in eintrag["id"].lower() or bauart not in bauarten or total < MIN_B * 1e9:
+    if "gguf" not in eintrag["id"].lower() or bauart not in bauarten:
         return None
-    if (e := _EFFEKTIV.search(eintrag["id"])) and float(e.group(1)) < MIN_B:
+    if not ausnahme_unter_4b(bauart) and (total < MIN_B * 1e9 or (
+            (e := _EFFEKTIV.search(eintrag["id"])) and float(e.group(1)) < MIN_B)):
         return None
     moe, aktiv = ist_moe(bauart, eintrag["id"])
     return Modell(repo=eintrag["id"], bauart=bauart, parameter=total, moe=moe, aktiv=aktiv,

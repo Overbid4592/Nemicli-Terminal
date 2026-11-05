@@ -25,6 +25,8 @@ except Exception:                                    # Selbsttest ohne Bootstrap
 
 ORDNER = _INSTALL / "Models" / "reranker"
 RERANK_KANDIDATEN = 16
+RERANK_BUDGET_S = 4.0              # danach bleiben die übrigen Kandidaten in der Reihenfolge der Fusion
+RERANK_SCHRITT = 2                 # Kandidaten je Aufruf, zwischen den Aufrufen wird die Zeit geprüft
 RERANK_ANTEIL = 0.75               # Gewicht des Rerankers gegen den Rang der Fusion
 GPU_FREI_AB = 2 * 2**30            # so viel freier Grafikspeicher, dann rechnet er auf der GPU
 NACHLAUF_S = 180.0
@@ -80,7 +82,9 @@ def _geraet() -> str:
         lokal = sys.modules.get("gguflokal")
         if lokal is not None and getattr(lokal, "_bild_tiefe", 0):
             return "cpu"
-        frei, _gesamt = torch.cuda.mem_get_info()
+        import vonsichaus                       # NVML: mem_get_info legt schon für die Frage einen CUDA-Kontext an
+        frei_mb = vonsichaus.vram_frei_mb()
+        frei = frei_mb * 2**20 if frei_mb is not None else torch.cuda.mem_get_info()[0]
         return "cuda" if frei >= GPU_FREI_AB else "cpu"
     except Exception:
         return "cpu"
@@ -161,6 +165,17 @@ def _nachlauf() -> None:
     _uhr.start()
 
 
+def _bewerten_begrenzt(r, frage: str, vorn: list[dict]) -> list[float]:
+    """Relevanz in Schritten bis RERANK_BUDGET_S; der erste Schritt läuft immer."""
+    ende = time.monotonic() + RERANK_BUDGET_S
+    werte: list[float] = []
+    for i in range(0, len(vorn), RERANK_SCHRITT):
+        werte += r.bewerten(frage, [h.get("text") or "" for h in vorn[i:i + RERANK_SCHRITT]])
+        if time.monotonic() >= ende:
+            break
+    return werte
+
+
 def nachsortieren(frage: str, treffer: list[dict]) -> list[dict]:
     """Die besten RERANK_KANDIDATEN nach Relevanz sortieren (Feld `relevanz` 0..1); der Rest folgt
     unverändert. Ohne Modell, ohne Frage oder bei einem Fehler: unverändert."""
@@ -179,9 +194,9 @@ def nachsortieren(frage: str, treffer: list[dict]) -> list[dict]:
                 gpuzustand.sicherstellen()
                 from ggufengine.models.common import GPU_SPERRE
                 with GPU_SPERRE:
-                    werte = r.bewerten(frage, [h.get("text") or "" for h in vorn])
+                    werte = _bewerten_begrenzt(r, frage, vorn)
             else:
-                werte = r.bewerten(frage, [h.get("text") or "" for h in vorn])
+                werte = _bewerten_begrenzt(r, frage, vorn)
         except Exception as exc:
             try:
                 import gpuzustand
@@ -193,6 +208,11 @@ def nachsortieren(frage: str, treffer: list[dict]) -> list[dict]:
         finally:
             _zuletzt = time.monotonic()
     _nachlauf()
+    if len(werte) < len(vorn):
+        _melden(f"Reranker: Zeitgrenze {RERANK_BUDGET_S:.0f} s – {len(werte)} von {len(vorn)} Treffern bewertet")
+        vorn, rest = vorn[:len(werte)], vorn[len(werte):] + rest
+    if not vorn:
+        return treffer
     # neuer score 0..1 – die Vielfalt-Stufe danach (MMR) sortiert nach ihm; der Rest bleibt darunter
     n = len(vorn)
     for i, (h, w) in enumerate(zip(vorn, werte)):

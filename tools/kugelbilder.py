@@ -113,7 +113,8 @@ def charakter_aussehen(name: str) -> tuple[str, int | None] | None:
         return None
     if not d:
         return None
-    beschreibung = " ".join(t for t in (charakter._satz(d["kern"]), charakter._satz(d["stil"])) if t)
+    beschreibung = " ".join(t for t in (charakter._satz(charakter.kern_erwachsen(d["kern"])),
+                                        charakter._satz(d["stil"])) if t)
     return beschreibung, d.get("seed_referenz")
 
 

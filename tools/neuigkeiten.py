@@ -89,7 +89,7 @@ def hinweis(wer: str) -> str:
     mehr = f"\n- … und {len(neu) - MAX_IN_NOTIZ} weitere" if len(neu) > MAX_IN_NOTIZ else ""
     return (lernschleife.HINWEIS_MARKE + "NemiCLI wurde aktualisiert. Neu seit deinem letzten Stand:\n"
             + liste + mehr + "\nDas kannst du jetzt. Erwähne es, wenn es passt oder der Nutzer fragt; "
-            "Einzelheiten zur Bedienung: anleitung_lesen mit thema \"nemicli\".")
+            "jederzeit nachlesen, was neu ist und wie es geht: anleitung_lesen mit thema \"neu\".")
 
 
 def vergessen(wer: str) -> None:

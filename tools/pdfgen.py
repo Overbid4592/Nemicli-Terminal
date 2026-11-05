@@ -1,10 +1,6 @@
 """
 pdfgen.py - Ein PDF-Generator in REINEM Python. Keine Fremd-Bibliothek.
 
-Warum das geht: Eine PDF-Datei ist im Kern ein Textformat – eine Folge von
-„Objekten", eine Querverweis-Tabelle (xref) und ein Trailer. Text, Linien und
-Bilder werden über einfache Operatoren in „Content-Streams" beschrieben.
-
 Dieses Modul kann:
   • Markdown -> PDF (Überschriften, Absätze, **fett**, *kursiv*, `code`,
     Listen, Code-Blöcke, Tabellen, Trennlinien, Seitenumbruch, Seitenzahlen)
@@ -185,7 +181,7 @@ def _png(data: bytes) -> dict | None:
     rgb = bytearray()
 
     def _samples(row_bytes: bytes):
-        """Liefert die Sample-Werte einer Zeile als 0..255 (skaliert je bd)."""
+        """Liefert die Sample-Werte einer Zeile als 0..255 (skaliert je bd); Palettenindizes unskaliert."""
         if bd == 8:
             return row_bytes
         if bd == 16:
@@ -193,9 +189,10 @@ def _png(data: bytes) -> dict | None:
         # bd < 8: Bits auspacken
         vals = []
         maxv = (1 << bd) - 1
+        faktor = 1 if ct == 3 else 255 // maxv
         for byte in row_bytes:
             for shift in range(8 - bd, -1, -bd):
-                vals.append(((byte >> shift) & maxv) * 255 // maxv)
+                vals.append(((byte >> shift) & maxv) * faktor)
         return vals
 
     for row in range(h):
@@ -353,8 +350,6 @@ class Document:
         wrapped: list[str] = []
         for ln in lines:
             ln = ln.replace("\t", "    ")
-            if not ln:
-                wrapped.append("")
             while len(ln) > max_chars:
                 wrapped.append(ln[:max_chars]); ln = ln[max_chars:]
             wrapped.append(ln)
@@ -430,10 +425,11 @@ class Document:
         scale = min(1.0, USABLE / info["w"])
         w = info["w"] * scale
         h = info["h"] * scale
-        # passt das Bild nicht mehr auf die Seite? -> neue Seite
-        if self.y + h > BOTTOM_LIMIT and h <= (BOTTOM_LIMIT - TOP):
+        # passt das Bild nicht mehr auf die Seite? -> neue Seite (auch bei Bildern höher als eine Seite,
+        # sonst würden sie auf den Rest gestaucht)
+        if self.y + h > BOTTOM_LIMIT and self.y > TOP:
             self._new_page()
-        # ggf. zusätzlich auf Resthöhe begrenzen
+        # ggf. zusätzlich auf Seitenhöhe begrenzen
         avail = BOTTOM_LIMIT - self.y
         if h > avail:
             f = avail / h
@@ -448,7 +444,6 @@ class Document:
               leading: float, indent: float = MARGIN, color=INK):
         self._para_color = color
         x_start = indent
-        space_w = _text_width(" ", size, False)
         # Wörter mit zugehörigem Stil sammeln
         words: list[tuple[str, str]] = []
         for text, style in runs:
@@ -648,6 +643,18 @@ _HR = re.compile(r"^\s*([-*_])\1{2,}\s*$")
 _QUOTE = re.compile(r"^\s*>\s?(.*)$")
 
 
+def _bild_gesperrt(p: Path) -> bool:
+    """Eingebettet wird nur, was auch datei_lesen lesen darf (Lese-Sperre aus actions)."""
+    try:
+        import actions
+    except Exception:                    # ohne NemiCLI drumherum gibt es keine Sperre
+        return False
+    try:
+        return actions._read_guard(str(p)) is not None
+    except Exception:
+        return True
+
+
 def markdown_to_pdf(markdown: str, out_path: str | Path,
                     titel: str = "", base_dir: str | Path | None = None) -> str:
     """Rendert Markdown in ein echtes PDF. Bildpfade dürfen relativ zu base_dir
@@ -715,7 +722,11 @@ def markdown_to_pdf(markdown: str, out_path: str | Path,
             p = Path(m.group(2).strip().strip('"'))
             if not p.is_absolute():
                 p = base / p
-            doc.image(p, m.group(1)); i += 1; continue
+            if _bild_gesperrt(p):
+                doc.paragraph(f"_[Bild gesperrt: {p.name}]_")
+            else:
+                doc.image(p, m.group(1))
+            i += 1; continue
 
         # Überschrift
         m = _H.match(stripped)

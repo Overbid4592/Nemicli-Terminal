@@ -1,30 +1,21 @@
 """
 protokoll.py - Aktions-Protokoll: was wann lief, dauerhaft, ohne Zutun.
 
-Bisher gab es drei Dinge, aber kein Protokoll: die Werkzeugbilanz nach jeder
-Runde (nur Anzeige), `learned/stats.json` (nur Zähler) und F12 (vollständig,
-aber nur wenn jemand drückt). Nach einem Vorfall konnte niemand nachsehen,
-was wann mit welchem Befehl gelaufen ist.
+Jede Aktion schreibt eine Zeile nach `learned/aktionen.log`:
 
-Jetzt schreibt jede Aktion eine Zeile nach `learned/aktionen.log`:
+    <Zeit> | ÄNDERT | befehl        | ausgeführt | <wer> | Befehl: git status
+    <Zeit> | liest  | datei_lesen   | ausgeführt | <wer> | Datei lesen: C:\\…\\main.py
+    <Zeit> | ÄNDERT | loeschen      | ABGELEHNT  | <wer> | Löschen: C:\\…\\x.txt
 
-    2026-09-15 14:02:11 | ÄNDERT | befehl        | ausgeführt | Nemi | Befehl: git status
-    2026-09-15 14:02:40 | liest  | datei_lesen   | ausgeführt | Nemi | Datei lesen: C:\\…\\main.py
-    2026-09-15 14:03:05 | ÄNDERT | loeschen      | ABGELEHNT  | Nemi | Löschen: C:\\…\\x.txt
-
-Auch lesende Aktionen stehen drin – bewusst. Lesen fragt nicht nach, und
-genau da könnte eine Prompt-Injection etwas auslösen. Im Protokoll fällt es
-auf. Helfer-Agenten schreiben mit, mit ihrem Namen.
+Auch lesende Aktionen stehen drin: Lesen fragt nicht nach, eine Prompt-Injection
+fiele sonst nicht auf. Helfer-Agenten schreiben mit ihrem Namen mit.
 
 Nur Namen und Beschreibungen, keine Inhalte. Die Datei ist Text, grep-bar,
 und dreht sich ab 5 MB (die alte wird zu aktionen.log.1).
 
-Damit nachvollziehbar ist, welches Ergebnis eine Aktion hatte, steht hinter der
-Beschreibung steht „→ Ergebnis: …“ – die erste Zeile dessen, was das Werkzeug
-zurückgab (gekürzt), bei Risiko-Aktionen ein „⚠RISIKO“ vor dem Werkzeug, und
-wenn im gelesenen Inhalt Befehlsmuster steckten, ein „⚠ Befehlsmuster“. Die
-WebUI und der Hintergrund-Lauf schreiben jetzt ebenfalls mit – vorher nur das
-Terminal.
+Hinter der Beschreibung steht „→ Ergebnis: …“ (erste Zeile der Rückgabe, gekürzt),
+vor riskanten Werkzeugen „⚠RISIKO“, bei Befehlsmustern im Inhalt „⚠ Befehlsmuster“.
+Terminal, WebUI und Hintergrund-Lauf schreiben mit.
 """
 
 from __future__ import annotations

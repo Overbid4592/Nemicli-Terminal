@@ -132,6 +132,10 @@ def _portraet_da() -> bool:
     return False
 
 
+def _lfm3_da() -> bool:
+    return bool(_ggufs(_INSTALL / "ModelGGUF" / "LFM3Familie" / "Text"))
+
+
 def _krea_ordner() -> Path:
     try:
         import krea
@@ -164,6 +168,39 @@ _WAN = ("unsloth/Wan2.2-TI2V-5B-GGUF", "b5c2a3816e7056e57e200f6be726fb36ce523b49
 _UMT5 = ("city96/umt5-xxl-encoder-gguf", "b535255bee98c2b0a59ea7c0ae2dcd0c6657b3b7")
 _UMT5_TOK = ("alibaba-pai/Wan2.1-Fun-1.3B-InP", "9bcbbcf673c0e6a996df6f3f25bee596ffa36d47")
 _LP = ("KlingTeam/LivePortrait", "82a4fa6735ca58432b6ce39301b4b9ee066dea47")
+
+# LFM3: je Mitglied ein Unterordner (gguflokal.familien); die Entscheider eine Ebene tiefer, sie chatten nicht
+_LFM3_LIZENZ = f"{HF}/LiquidAI/LFM3-1.7B-GGUF/blob/bad5729bba61d076fff20d2548e62526665af215/LICENSE"
+_LFM3_TEXT = ("LiquidAI/LFM3-1.7B-GGUF", "bad5729bba61d076fff20d2548e62526665af215")
+_LFM3_VL = ("LiquidAI/LFM3-VL-2B-GGUF", "b36554cfd35854b06429900131730cd80f092cdb")
+_LFM3_AUDIO = ("LiquidAI/LFM3-Audio-2B-GGUF", "02355c1a141e464a064f2ab2c276638dbcb7f38a")
+_LFM3_OMNI = ("LiquidAI/LFM3-Omni-2B-GGUF", "3d29af2ad166f8299c2d820937e47dc0add20ffc")
+_D1 = ("LiquidAI/d1-2B-GGUF", "e968f6575f0d4fad928312d7af15cad90fd365c0")
+_D1_OMNI = ("LiquidAI/d1-Omni-2B-GGUF", "c53ae0b1f92b17065e9158d34019c9ca1ea5bcf8")
+_LFM3_DATEIEN = (
+    (*_LFM3_TEXT, "Text", "LFM3-1.7B-Q8_0.gguf", 1846238496,
+     "8f6b24182258205e9e01e21f1f24a1f208c1e8115578825d202ce39976af20b6"),
+    (*_LFM3_VL, "VL", "LFM3-VL-2B-Q8_0.gguf", 1846238496,
+     "e138e54189a751d90ea8c0b236360490613ecd465d28d68fa6094d3db7fa6727"),
+    (*_LFM3_VL, "VL", "mmproj-LFM3-VL-2B-BF16.gguf", 378996032,
+     "8e75a88afc0e6a3bcd637becbe720447ea0794934b7b417a1f42d5cfe0d9c288"),
+    (*_LFM3_AUDIO, "Audio", "LFM3-Audio-2B-Q8_0.gguf", 1846236704,
+     "d4e36902ba8f0ee7b333596030a59d650f88ac76660b4d9ba5ff77c3c2258fc0"),
+    (*_LFM3_AUDIO, "Audio", "mmproj-LFM3-Audio-2B-Q8_0.gguf", 303811840,
+     "2b6648b1fd48af16aa0877b0592b144d15070783673e038a379fdbc51d40e365"),
+    (*_LFM3_OMNI, "Omni", "LFM3-Omni-2B-Q8_0.gguf", 1846240768,
+     "59118f661eaacb93d204723d76355b53347f0940b508c11412f6290fd49158d4"),
+    (*_LFM3_OMNI, "Omni", "mmproj-LFM3-Omni-2B-Q8_0.gguf", 506842528,
+     "8a25f9d1931244429de404fccacfb7fb933970a36aa5688d2f5069f29c6b27b1"),
+    (*_D1, "Entscheider/d1", "d1-2B-Q8_0.gguf", 1846240576,
+     "073313d92b53b0ac8193db6e906cb3c78a98183d244b15b7b8f5426115c6738c"),
+    (*_D1, "Entscheider/d1", "mmproj-d1-2B-Q8_0.gguf", 203031584,
+     "62cc6d74fd1e5b1d6b48518566bf4c0cfd2468079a0c096ea323b74eed01e0d1"),
+    (*_D1_OMNI, "Entscheider/d1-Omni", "d1-Omni-2B-Q8_0.gguf", 1846241184,
+     "aedf1a7c341b4281979423dbc39e9c3d3ad1da8834156c8e75af5399ca3b0861"),
+    (*_D1_OMNI, "Entscheider/d1-Omni", "mmproj-d1-Omni-2B-Q8_0.gguf", 326104096,
+     "31778160ac0ec70f9b59f296aa1c8e70cbd1eb7e3a3ff873d695aaa4c7b8d674"),
+)
 
 KATALOG: tuple[Teil, ...] = (
     Teil("gedaechtnis", "💾 Gedächtnis", "Suche nach Bedeutung in Chats, Notizen und Wissen", *_APACHE,
@@ -220,6 +257,12 @@ KATALOG: tuple[Teil, ...] = (
              ("retargeting_models/stitching_retargeting_module.pth", 2393098,
               "3652d5a3f95099141a56986aaddec92fadf0a73c87a20fac9a2c07c32b28b611"),
              ("landmark.onnx", 114666491, "31d22a5041326c31f19b78886939a634a5aedcaa5ab8b9b951a1167595d147db")))),
+    Teil("lfm3", "🧬 LFM3-Familie", "Team aus kleinen Modellen (Liquid AI, je um 2 B, Ausnahme von der 4B-Grenze): "
+         "Text chattet, VL sieht, Audio und Omni warten auf Hören und Sprechen, d1 auf Entscheidungen; geladen "
+         "wird nur, wer gebraucht wird. Danach /model → Lokal → LFM3Familie",
+         "LFM Open License v1.0 (privat frei, gewerblich bis 10 Mio. $ Jahresumsatz)", _LFM3_LIZENZ,
+         ziel=lambda: _INSTALL / "ModelGGUF" / "LFM3Familie", da=_lfm3_da,
+         dateien=tuple(Datei(repo, rev, pfad, g, s, unter) for repo, rev, unter, pfad, g, s in _LFM3_DATEIEN)),
     Teil("krea", "🎨 Krea 2 (Bilder malen)", "Diffusionsmodell im ComfyUI-Format, NVFP4 oder bf16, dazu "
          "text_encoders/ (Qwen3-VL-4B), vae/ und tokenizer/", "eigene Lizenz von Krea – vor dem Laden lesen",
          f"{HF}/krea/Krea-2-Turbo", ziel=_krea_ordner, da=_krea_da, link=f"{HF}/krea/Krea-2-Turbo"),

@@ -437,8 +437,8 @@ def neue_berichte() -> list[Path]:
     if BERICHTE.exists():
         neu = sorted((p for p in BERICHTE.glob("*.md") if p.stat().st_mtime > seit),
                      key=lambda p: p.stat().st_mtime)
-    # Marker = neuester Bericht (nicht "jetzt": Datei-Zeiten runden anders als
-    # die Uhr, und ein Bericht darf nicht zweimal als neu gelten).
+    # Marker = jetzt oder ein neuerer Bericht (Datei-Zeiten runden anders als die Uhr) –
+    # ein Bericht darf nicht zweimal als neu gelten.
     stand = max([seit, datetime.now().timestamp()] + [p.stat().st_mtime for p in neu])
     try:
         marker.parent.mkdir(parents=True, exist_ok=True)
