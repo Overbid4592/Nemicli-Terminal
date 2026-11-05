@@ -310,8 +310,9 @@ def braucht_bestaetigung(a: dict) -> bool:
     if aktion in _NUTZER_ENTSCHEIDET:
         return True
     if aktion == "pruefen":
-        # mit Prüfbefehl wie `befehl`; nur Seite: liest bloß (wie seite_ansehen); ohne beides urteilt der Nutzer
-        return not pruefseite(a)
+        # mit Prüfbefehl wie `befehl` (auch zusammen mit Seite); nur Seite: liest bloß (wie seite_ansehen);
+        # ohne beides urteilt der Nutzer
+        return bool(pruefbefehl(a)) or not pruefseite(a)
     return False
 
 

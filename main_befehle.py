@@ -21,10 +21,11 @@ async def hf_downloader() -> str | None:
     ram = profil.ram_mb
     ui.hf_willkommen(profil, H.gb(H.frei_auf_platte(gguflokal.ORDNER)), motor)
 
-    hinweise = {"4-8": "klein & flott", "8-15": "ausgewogen", "15-35": "stark", "35+": "sehr groß"}
+    hinweise = {"klein": "Team kleiner Spezialisten", "4-8": "klein & flott", "8-15": "ausgewogen",
+                "15-35": "stark", "35+": "sehr groß"}
     opts = []
     for key, (von, _, text) in H.GROESSEN.items():
-        ab = int(von * 1e9 * 4.9 / 8)
+        ab = int(max(von, 1.0) * 1e9 * 4.9 / 8)
         opts.append((key, f"{H.passt(ab, vram, ram)[0]}  {text}  ·  {hinweise[key]}  ·  ab ≈ {H.gb(ab)}"))
     legende = ("✅ passt in die Grafikkarte · ⚠ knapp · 🐢 teils im RAM · ❌ zu groß" if vram
                else "🐢 läuft auf der CPU · ❌ zu groß für den Arbeitsspeicher")
@@ -440,7 +441,8 @@ async def pick_model(current: str | None) -> str | None:
     if wahl == "gguf":
         opts = [(M.make_ref("gguf", name), gguflokal.beschreibung(name)) for name in lokale]
         opts.append(("__cancel__", "Zurück / Abbrechen"))
-        ref = await ask_suche(f"Welches lokale Modell?  (Kontext {gguflokal.kontext():,} Token, "
+        n = gguflokal.kontext() if gguflokal.kontext_einstellung() > 0 else 0
+        ref = await ask_suche(f"Welches lokale Modell?  (Kontext {f'{n:,} Token' if n else 'max'}, "
                               f"höchstens {gguflokal.tok_s() or '∞'} Token/s)".replace(",", "."), opts)
         return None if ref == "__cancel__" else ref
     if wahl == "ollama":
@@ -757,6 +759,21 @@ async def persoenlichkeiten_menu(arg: str) -> None:
     if arg.lower() in ("neu", "new", "anlegen", "+"):
         await neue_persoenlichkeit()
         return
+    if arg.lower().split()[:1] == ["export"]:            # fürs Handy (NemiCLI-App)
+        import handyexport
+        rest = arg.split(maxsplit=1)[1] if " " in arg else ""
+        p = PS.resolve(rest) if rest else PS.active()
+        if p is None:
+            ui.warn(f"Keine Persönlichkeit gefunden, die zu '{rest}' passt.")
+            return
+        ziel = await asyncio.to_thread(handyexport.exportieren, p)
+        ui.success(f"📱 {p.name} fürs Handy: {ziel}")
+        ui.info("Die Datei aufs Handy kopieren (Kabel, Cloud, Mail) und in der NemiCLI-App „📥 Vom PC“ wählen.")
+        try:
+            os.startfile(ziel.parent)
+        except Exception:
+            pass
+        return
     if arg:                                      # direkt gesetzt: /persönlichkeiten <name>
         p = PS.resolve(arg)
         if p is None:
@@ -774,8 +791,9 @@ async def persoenlichkeiten_menu(arg: str) -> None:
     while True:
         alle = PS.list_all()
         aktiv = PS.active().key
-        opts = [(k, ("✓  " if k == aktiv else "   ") + p.label) for k, p in alle.items()]
+        opts = [(k, p.label + ("  ✔️" if k == aktiv else "")) for k, p in alle.items()]
         opts.append(("__neu__", "➕  Neue Persönlichkeit anlegen (ein paar Fragen)"))
+        opts.append(("__handy__", "📱  Aktive fürs Handy exportieren (NemiCLI-App)"))
         opts.append(("__ordner__", "📂  Ordner öffnen (Dateien von Hand bearbeiten)"))
         opts.append(("__cancel__", "Fertig"))
         wahl = await ask_confirm("Wer soll sprechen?  (Profil wählen → aktivieren · bearbeiten · löschen)", opts)
@@ -783,6 +801,9 @@ async def persoenlichkeiten_menu(arg: str) -> None:
             return
         if wahl == "__neu__":
             await neue_persoenlichkeit()
+            continue
+        if wahl == "__handy__":
+            await persoenlichkeiten_menu("export")
             continue
         if wahl == "__ordner__":
             PS.ensure_dir()
@@ -831,6 +852,11 @@ class Ctx:
         else:
             ctx_max = pricing.context_window(self.model)
             self._ctx_merk = (self.model, jetzt, ctx_max)
+        try:
+            import actions
+            actions.KONTEXT_TOKEN = int(ctx_max or 0)           # datei_lesen liest so viel, wie passt
+        except Exception:
+            pass
         SESSION.update(model=self.model or "—",
                        strength=self.strength if self.strength_active() else None,
                        chat=self.current_chat,
@@ -846,6 +872,20 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
     haken = lambda an: "✓ " if an else "   "
     if cmd == "/modus":
         return [(k, f"{haken(k == modes.current())}{sym} {name}", None) for k, sym, name in modes.MODES]
+    if cmd == "/emoji":
+        import emojistufe
+        jetzt = emojistufe.stufe()
+        return ([(k, f"{haken(k == jetzt)}{emojistufe.TEXT[k]}", None) for k in (*emojistufe.STUFEN, emojistufe.FREI)]
+                + [("kuerzel", "   ⌨ Kürzel-Liste (Smileys & :kürzel:)", None)])
+    if cmd == "/denken":
+        import denkweise
+        jetzt = denkweise.stufe()
+        return [(k, f"{haken(k == jetzt)}{denkweise.TEXT[k]}", None) for k in denkweise.STUFEN]
+    if cmd == "/embeddingtimer":
+        import einbetttakt as ET
+        jetzt = ET.minuten()
+        return ([("aus" if not m else str(m), f"{haken(m == jetzt)}{ET.text(m)}", None) for m in ET.STUFEN]
+                + [("low an", "   🐢 Low-Modus an", None), ("low aus", "   🐢 Low-Modus aus", None)])
     if cmd == "/theme":
         return [(k, f"{haken(k == ui.current_theme())}{k}  · {p.get('label', k)}"
                  + ("  ✨ eigenes" if k not in ui.EINGEBAUT else ""), None) for k, p in ui.THEMES.items()]
@@ -859,10 +899,10 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
         kosten = lambda n: f"  ·  Gesprächsspeicher ~{n * pro_token / 2**30:.1f} GB" if pro_token else ""
         stufen = [n for n in gguflokal.KONTEXT_STUFEN if not grenze or n < grenze]
         eintraege = [("anzeigen", "   📊 Anzeigen – womit ist der Kontext gefüllt?", None)]
-        eintraege += [(str(n), f"{haken(n == aktuell)}{n // 1024}k{kosten(n)}"
-                       + ("  (Vorgabe)" if n == gguflokal.VORGABE_KONTEXT else ""), None) for n in stufen]
+        eintraege += [(str(n), f"{haken(n == aktuell)}{n // 1024}k{kosten(n)}", None) for n in stufen]
         if grenze:
-            eintraege.append(("max", f"{haken(grenze == aktuell)}max ({grenze // 1024}k){kosten(grenze)}", None))
+            eintraege.append(("max", f"{haken(grenze == aktuell)}max ({grenze // 1024}k){kosten(grenze)}  (Vorgabe)",
+                              None))
         return eintraege
     if cmd == "/embeddings":
         aktiv = memory.modell_name()
@@ -880,8 +920,15 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
                      ("{} --sekunden 20", "   🎬 Video erzeugen – 20 s", frage)]
         try:
             import video
-            akt = video.gewaehlt()
+            import videomotoren
+            motor = videomotoren.gewaehlt() if videomotoren.aktiv() else None
+            eintraege += [(f"modell {n}", f"{haken(n == motor)}🎞 Modell: {n} (Video mit Ton)", None)
+                          for n in videomotoren.modelle()]
+            akt = None if motor else video.gewaehlt()
             eintraege += [(f"modell {n}", f"{haken(n == akt)}🎞 Modell: {n}", None) for n in video.modelle()]
+            if videomotoren.modelle():
+                eintraege.append(("einstellungen", "   ⚙ Video-Einstellungen (Auflösung, Ton, Kacheln …)", None))
+            eintraege.append(("motorordner", "   📂 Video-Modelle-Ordner (LTX-2.5 … ablegen)", None))
         except Exception:
             pass
         try:
@@ -1038,11 +1085,115 @@ def _embedding_art(ordner) -> str:
     return "GGUF, gepackt auf der GPU" if embedder.gguf_datei(ordner) is not None else "safetensors (transformers)"
 
 
+def _schalter_an(cmd: str, basis: str) -> bool | None:
+    """Stand eines An/Aus-Schalters im Menü – None, wenn es keiner ist (dann bleiben beide Einträge)."""
+    try:
+        if cmd == "/kugel":
+            from wache import lebendig as LB
+            return {"auto": lambda: LB.auto_stand() is True, "vorne": LB.vorne_an}[basis]()
+        if cmd == "/debug":
+            import debugbericht as _DBG
+            return {"": _DBG.an, "motor": _DBG.motor_log_an}[basis]()
+        if (cmd, basis) == ("/reflektieren", "auto"):
+            import lernschleife
+            return lernschleife.an()
+        if (cmd, basis) == ("/skills", "selbst"):
+            import skills
+            return skills.selbst()
+        if (cmd, basis) == ("/kontextmenue", ""):
+            import kontextmenue
+            st = kontextmenue.status()
+            return bool(st.get("bildschirm") and st.get("bild"))
+        if (cmd, basis) == ("/uebung", ""):
+            return bool(config.load().get("uebung", True))
+        if (cmd, basis) == ("/auto", ""):
+            return bool(config.load().get("auto_stark"))
+        if (cmd, basis) == ("/embeddingtimer", "low"):
+            import einbetttakt
+            return einbetttakt.low()
+    except Exception:
+        return None
+    return None
+
+
+_SCHALTER_NAME = {("/kugel", "auto"): "✨ AUTO", ("/kugel", "vorne"): "📌 Immer vorne",
+                  ("/debug", ""): "🐞 Debugbericht – die KI kann hineinsehen (Cloud)",
+                  ("/debug", "motor"): "⚙ Motor-Log – jeder Prompt des lokalen Motors (groß, privat)",
+                  ("/reflektieren", "auto"): "🔁 Automatisch reflektieren (nach Korrekturen, Fehlern, größeren Aufgaben)",
+                  ("/skills", "selbst"): "🧩 Selbst anlegen/ändern ohne Rückfrage",
+                  ("/kontextmenue", ""): "🖱 Im Rechtsklick-Menü", ("/uebung", ""): "🎓 Übungsmodus",
+                  ("/auto", ""): "🧠 Auto-Stark",
+                  ("/embeddingtimer", "low"): "🐢 Low-Modus"}
+_SCHALTER_ZEICHEN = {("/embeddingtimer", "low"): ("aktiv 💚", "aus 🛑")}   # sonst ✔️ / 🛑
+
+
+def _wahl_stand(cmd: str) -> str | None:
+    """Aktive Stufe eines Menüs mit mehr als zwei Stufen (Wert wie im Menü) – None, wenn es keins ist."""
+    try:
+        if cmd == "/voice":
+            import stimme
+            return stimme.modus()
+        if cmd == "/subagenten":
+            import subagents
+            stufe = subagents.stufe()
+            return "off" if stufe in ("aus", "off") else stufe
+        if cmd == "/web":
+            import webfetch
+            return f"fremdseiten {webfetch.fremdseiten_modus()}"
+    except Exception:
+        return None
+    return None
+
+
+def _menue_aufbereiten(cmd: str, eintraege: list) -> list:
+    """Fürs Terminal-Menü, einheitlich: ein Eintrag je Schalter statt „… an“ und „… aus“ – ✔️ an, 🛑 aus, die
+    Wahl schaltet um; in Auswahl- und Stufen-Menüs steht ✔️ hinter dem Aktiven (statt „✓“ davor). Hinter „Motive
+    malen“ steht, wie viele Motive schon gemalt sind. Andere Stellen (⚙-Seite, Befehlsliste, menue_oeffnen)
+    bekommen die Einträge unverändert."""
+    werte = {z for z, _, _ in eintraege}
+    stufe = _wahl_stand(cmd)
+    raus, gesehen = [], set()
+    for z, t, frage in eintraege:
+        m = re.fullmatch(r"(?:(.*?) )?(an|aus|on|off)", z or "") if stufe is None else None
+        if m:
+            basis = m.group(1) or ""
+            paar = {f"{basis} {w}".strip() for w in ("an", "aus")}
+            stand = _schalter_an(cmd, basis) if paar <= werte else None
+            if stand is not None:
+                if basis not in gesehen:
+                    gesehen.add(basis)
+                    name = _SCHALTER_NAME.get((cmd, basis), t)
+                    an, aus = _SCHALTER_ZEICHEN.get((cmd, basis), ("✔️", "🛑"))
+                    raus.append((f"{basis} {'aus' if stand else 'an'}".strip(),
+                                 f"{name}  {an if stand else aus}", None))
+                continue
+        if cmd == "/kugel" and z == "motive {}":
+            t = t + _motive_stand()
+        if t.startswith("✓"):                       # Auswahl-Menü: aktiv
+            t = t[1:].strip() + "  ✔️"
+        elif stufe is not None and z == stufe:
+            t = t.strip() + "  ✔️"
+        else:
+            t = t.strip()                               # die Einrückung stand nur für das „✓“ davor
+        raus.append((z, t, frage))
+    return raus
+
+
+def _motive_stand() -> str:
+    try:
+        import kugelmotive as KM
+        from wache import steuerung as ST
+        da = set(ST.bilder(PS.active().name, outfit=False)) & set(KM.MOTIVE)
+        return f"  ·  {len(da)} von {len(KM.MOTIVE)} fertig"
+    except Exception:
+        return ""
+
+
 async def _untermenue(ctx: Ctx, cmd: str) -> str | None:
     """Zeigt die Auswahl und gibt den Zusatz zurück – None, wenn abgebrochen
     oder der Befehl keine Auswahl hat ("" = Befehl ohne Zusatz ausführen)."""
     import commands as C
-    eintraege = _untermenue_eintraege(ctx, cmd)
+    eintraege = _menue_aufbereiten(cmd, _untermenue_eintraege(ctx, cmd))
     if not eintraege:
         return ""
     optionen = [(str(i), anzeige) for i, (_, anzeige, _) in enumerate(eintraege)]
@@ -1111,7 +1262,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
     # Drag & Drop: Windows Terminal setzt nur den PFAD in die Eingabe. Text,
     # Markdown, Quelltext, PDF haengen wir als Daten an; Bilder holt sich
     # vision gleich danach; Binaeres (exe, zip, safetensors) bleibt liegen.
-    dateien = await asyncio.to_thread(anhang.anhaengen, text)     # PDF lesen kann dauern
+    dateien = await asyncio.to_thread(anhang.anhaengen, text, anhang.budget(ctx.model))   # PDF lesen kann dauern
     text = dateien["text"]
     if (h := anhang.hinweis(dateien)):
         for zeile in h.splitlines():
@@ -1145,6 +1296,7 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
             await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
             memory.release_encoder()
         lernen_planen(ctx, getippt, records, aus_dem_netz, pricing.weggefallen_holen(ctx.backend))
+        pflege_planen(ctx)
         if n_code:
             ui.info(f"🐍 {n_code} Code-Snippet(s) in den Wissensspeicher gelernt.")
         # Terminal-Antwort auch im offenen Browser spiegeln (Status & Hinweis)
@@ -1206,10 +1358,29 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                     ui.success(f"{memory.clear()} Erinnerung(en) gelöscht.")
                 else:
                     ui.info("Abgebrochen – nichts gelöscht.")
+        elif sub in ("archiv", "papierkorb"):
+            archiv = memory.archiv_liste(30)
+            if not archiv:
+                ui.info("Das Archiv ist leer.")
+            else:
+                ui.info(f"🗄 Archiv – die {len(archiv)} jüngsten (ersetzt, vergessen, zusammengelegt):")
+                for a in archiv:
+                    ui.console.print(f"  [dim]#{a.get('id')} · {a.get('archiviert', '?')} · {a.get('grund', '')}[/dim]"
+                                     f"  {a.get('text', '')}")
+                ui.info("Zurückholen: /gedaechtnis zurueck <nummer>")
+        elif sub.split()[:1] in (["zurueck"], ["zurück"], ["wiederherstellen"]):
+            rest = sub.split(maxsplit=1)
+            nr = rest[1].lstrip("#") if len(rest) > 1 else ""
+            e = memory.zurueckholen(int(nr)) if nr.isdigit() else None
+            if e is not None:
+                ui.success(f"Erinnerung #{nr} ist zurück: {e.get('text', '')}")
+                await bibliothekar(sofort=True)
+            else:
+                ui.warn("Nicht im Archiv. Nutzung: /gedaechtnis zurueck <nummer> (Nummern: /gedaechtnis archiv)")
         elif sub.startswith("vergiss") or sub.startswith("vergessen"):
             rest = sub.split(maxsplit=1)
-            if len(rest) > 1 and rest[1].isdigit() and memory.forget(int(rest[1])):
-                ui.success(f"Erinnerung #{rest[1]} vergessen.")
+            if len(rest) > 1 and rest[1].isdigit() and memory.vergessen(int(rest[1]), "von Hand vergessen"):
+                ui.success(f"Erinnerung #{rest[1]} vergessen (liegt im Archiv).")
             else:
                 ui.warn("Konnte das nicht. Nutzung: /gedaechtnis vergiss <nummer>")
         else:
@@ -1218,13 +1389,17 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                      if memory.embedding_ready()
                      else f"🔤 nur Stichworte – {memory.encoder_status()}")
             ui.info(f"🧠 Langzeitgedächtnis: {len(entries)} Erinnerung(en)  ·  Suche: {smart}")
+            if (statistik := persona.gedaechtnis_statistik()):
+                ui.info(f"⏱ {statistik}")
             if not entries:
                 ui.info("Noch nichts gemerkt. Sag z.B. 'merk dir, ich mag knappe Antworten' "
                         "oder NemiCLI merkt sich Wichtiges von selbst.")
             else:
                 for e in entries:
-                    ui.console.print(f"  [dim]#{e['id']} · {e['ts']} · {e['kind']}[/dim]  {e['text']}")
-                ui.info("Löschen: /gedaechtnis vergiss <nummer>  ·  alles: /gedaechtnis leeren")
+                    ui.console.print(f"  [dim]#{e['id']} · {e['ts']} · {e['kind']}[/dim]  {e['text']}"
+                                     + (f"  [dim]📎 {e['detail']}[/dim]" if e.get("detail") else ""))
+                ui.info("Löschen: /gedaechtnis vergiss <nummer>  ·  alles: /gedaechtnis leeren  ·  "
+                        "Archiv: /gedaechtnis archiv")
             try:
                 o = indexdb.offen()
                 ui.info(f"📚 Vektor-DB: {o['brocken']} Brocken · {o['ohne_vektor']} ohne Vektor · "
@@ -1235,17 +1410,30 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             except Exception:
                 pass
     elif cmd == "/aufraeumen":
+        import ersatzbank
         n = memory.count()
         if n < 2:
             ui.info("Zu wenig im Gedächtnis zum Aufräumen (mindestens 2 Notizen).")
+        elif ctx.backend is not None and ersatzbank.ist_cloud(ctx.model):
+            import gedaechtnispflege as GP
+            with ui.thinking("die KI prüft ähnliche und alte Notizen"):
+                erg = await GP.pflegen(ctx.backend, ctx.model, bauen=cloud_backend)
+            if erg.get("zusammen") or erg.get("veraltet"):
+                await bibliothekar(sofort=True)
+            ui.info("🗜 " + GP.bericht_text(erg))
+            for z in erg.get("zusammen") or []:
+                ui.console.print(f"  [dim]#{z['behalten']} + {', '.join('#' + str(w) for w in z['weg'])}[/dim]  "
+                                 f"{z['text']}")
+            for v in erg.get("veraltet") or []:
+                ui.console.print(f"  [dim]#{v['nr']} archiviert[/dim]  {v['grund']}")
         else:
             with ui.thinking("räume das Gedächtnis auf"):
                 r = await asyncio.to_thread(memory.consolidate)
-            await bibliothekar()
+            await bibliothekar(sofort=True)
             memory.release_encoder()
             if r["merged"]:
                 ui.success(f"🗜️ Aufgeräumt: {r['merged']} ähnliche Notiz(en) verschmolzen "
-                           f"({r['before']} → {r['after']}).")
+                           f"({r['before']} → {r['after']}). Zurückholen: /gedaechtnis archiv")
             else:
                 ui.info(f"Alles schon ordentlich – nichts zu verschmelzen ({n} Notizen).")
     elif cmd == "/reflektieren" and arg.split()[:1] == ["auto"]:
@@ -1297,7 +1485,43 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                        f"· {r['tokens']} Merkmale")
         ui.info("Bekannte Typen: " + ", ".join(foldersense.labels().values()))
     elif cmd == "/emoji":
-        ui.emoji_menu(emoji.EMOTICONS, emoji.SHORTCODES)
+        import emojistufe
+        wahl = arg.strip().lower()
+        if wahl in ("kuerzel", "kürzel", "liste"):
+            ui.emoji_menu(emoji.EMOTICONS, emoji.SHORTCODES)
+        elif emojistufe.normal(wahl):
+            try:
+                ui.success(f"Emojis: {emojistufe.TEXT[emojistufe.setzen(wahl)]} – gilt ab der nächsten Antwort.")
+            except ValueError as exc:
+                ui.error(str(exc))
+        else:
+            ui.info(f"Emojis: {emojistufe.TEXT[emojistufe.stufe()]} · /emoji low · middle · strong · frei · kuerzel")
+    elif cmd == "/denken":
+        import denkweise
+        wer = PS.active().name
+        if denkweise.normal(arg):
+            try:
+                ui.success(f"Denkweise von {wer}: {denkweise.TEXT[denkweise.setzen(arg)]} – gilt ab der nächsten "
+                           "Antwort.")
+            except ValueError as exc:
+                ui.error(str(exc))
+        else:
+            ui.info(f"Denkweise von {wer}: {denkweise.TEXT[denkweise.stufe()]} · /denken auto · an · aus")
+    elif cmd == "/embeddingtimer":
+        import einbetttakt as ET
+        teile = arg.lower().split()
+        try:
+            if teile and teile[0] == "low":
+                an = ET.low_setzen(teile[1] if len(teile) > 1 else None)
+                ui.success(ET.low_text(an))
+            elif teile and ET.normal(teile[0]) is not None:
+                m = ET.setzen(teile[0])
+                ui.success(f"Gedächtnis-Takt: {ET.text(m)}"
+                           + (" – Gesammeltes wird dann in einem Lauf eingebettet." if m else "."))
+            else:
+                ui.info(takt_stand() + " · /embeddingtimer aus · 15 · 30 · 45 · 60 · 90 · low")
+        except ValueError as exc:
+            ui.error(str(exc))
     elif cmd == "/name":
         await name_befehl(arg)
     elif cmd == "/skills":
@@ -1440,7 +1664,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                         f"eigenen Ordner unter {BB.ORDNER}.")
             else:
                 for n, _, _ in alle:
-                    ui.info(f"{'✓ ' if n == akt else '  '}{n}")
+                    ui.info(f"   {n}{'  ✔️' if n == akt else ''}")
                 zustand = "im Speicher" if BB.geladen() else "nicht geladen"
                 ui.info(f"👁 Bildbeschreiber: {akt} ({zustand}, ganz entladen nach {BB.NACHLAUF_S // 60} Min. "
                         "ohne Bild) · wählen: /vision <ordner> · restart · debug · protokoll · ordner")
@@ -1733,7 +1957,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
     elif cmd == "/modus":
         sub = arg.strip().lower()
         if not sub:
-            zeilen = [(("✓ " if k == modes.current() else "  ") + f"{sym} {n}",
+            zeilen = [(f"{sym} {n}" + ("  ✔️" if k == modes.current() else ""),
                        {"chat": "Gespräch & Planen – jede Aktion fragt, Merken frei",
                         "lesen": "alles lesen, nichts anrühren – Ändern gesperrt",
                         "normal": "Lesen sofort, Ändern mit Rückfrage (F8)",

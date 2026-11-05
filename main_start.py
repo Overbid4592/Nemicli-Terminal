@@ -73,6 +73,52 @@ def _start_gruss(ctx: "Ctx") -> None:
         pass
 
 
+async def _modell_aktivieren(ctx: "Ctx", ref: str) -> None:
+    ctx.backend, ctx.model = await switch_model(ref, ctx.backend, ctx.model, ctx.strength)
+    if _FORTSETZEN_NACH_MODELL[0] and ctx.backend is not None:
+        _FORTSETZEN_NACH_MODELL[0] = False
+        if not ctx.current_prompts and (weiter := _gespraech_fortsetzen(ctx)):
+            ui.info(f"📒 Euer Gespräch geht weiter: „{weiter['title']}“")
+    _kontext_neu_zaehlen(ctx)
+
+
+_MODELL_NACH_ZUG: list = [None]
+
+
+def _modell_nach_zug(ctx: "Ctx", ref: str) -> None:
+    """Modellwechsel, während TURN_LOCK belegt ist: gemerkt und ausgeführt, sobald er frei wird."""
+    erster = _MODELL_NACH_ZUG[0] is None
+    _MODELL_NACH_ZUG[0] = ref
+    ui.info(f"Modell {ref} wird aktiv, sobald die laufende Arbeit fertig ist.")
+    if not erster:
+        return
+
+    async def lauf() -> None:
+        async with TURN_LOCK:
+            neu, _MODELL_NACH_ZUG[0] = _MODELL_NACH_ZUG[0], None
+            if neu:
+                await _modell_aktivieren(ctx, neu)
+                ctx.sync_session()
+    aufgabe = asyncio.get_running_loop().create_task(lauf())
+    _LERN_AUFGABEN.add(aufgabe)
+    aufgabe.add_done_callback(_LERN_AUFGABEN.discard)
+
+
+def _bildmotor_waehlen(name: str) -> None:
+    """Ein Bild-Modell der eigenen Bild-Motoren wählen und sagen, was noch fehlt."""
+    import bildmotoren
+    bildmotoren.waehlen(name)
+    t = bildmotoren.teile(name)
+    v = bildmotoren.vorgaben(name)
+    b, h = v["groesse"]
+    cfg = f", CFG {v['cfg']:g}" if v.get("cfg", 1.0) > 1.0 else ""
+    ui.success(f"{bildmotoren.titel(name)}: {name}  ·  kein Negativ-Prompt, "
+               f"{bildmotoren.schritte(name)} Schritte{cfg}, {b}×{h}")
+    grund = bildmotoren.missing_reason(name)
+    if grund:
+        ui.warn(f"Noch nicht bereit – bis dahin malt Krea 2: {grund}")
+
+
 async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
     """Die Slash-Befehle, zweiter Teil der Kette (Rückgabe wie _befehl_ausfuehren)."""
     if cmd in ("/undo", "/rueckgaengig", "/papierkorb"):
@@ -103,6 +149,14 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                                veraendernd=True, wer="Nutzer")
         except Exception as exc:
             ui.error(f"Wiederherstellen fehlgeschlagen: {exc}")
+    elif cmd == "/anzeige":
+        wahl = arg.strip().lower()
+        if wahl in ui.ANZEIGE_STILE:
+            ui.anzeige_setzen(wahl)
+            ui.success("Werkzeuge erscheinen jetzt " + ("kompakt: ● Werkzeug(Ziel), darunter ⎿ Ergebnis."
+                                                       if wahl == "kompakt" else "mit Rahmen."))
+        else:
+            ui.info(f"Anzeige der Werkzeuge: {ui.anzeige()} · /anzeige kompakt  oder  /anzeige rahmen")
     elif cmd == "/limit":
         if arg.strip().isdigit():
             neu = sicherheit.setze_loesch_limit(int(arg))
@@ -123,14 +177,19 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
         if arg.strip():
             w = arg.strip()
             ui.info(f"'{w}' → " + ("harmlos (eine Frage)" if sicherheit.befehl_harmlos(w)
-                                   else "NICHT auf der Whitelist (fragt zweimal)"))
+                                   else "NICHT auf der Whitelist (fragt zweimal)")
+                    + " · Auto: " + ("läuft" if sicherheit.auto_befehl_frei(w) else "hält an"))
         else:
+            auto = sicherheit.auto_liste()
             ui.text_panel(
                 f"✅ Befehls-Whitelist ({len(liste)} Einträge) – {sicherheit.WHITELIST_DATEI}",
                 "Diese Befehlsanfänge gelten bei `befehl` als harmlos: eine Frage statt zwei.\n"
                 "Alles, was nur liest (wie bei `abfragen`), zählt automatisch dazu.\n"
                 "Bearbeiten: die JSON-Datei im Programm-Ordner – die KI kommt da nicht ran.\n\n"
-                + "\n".join(f"  • {e}" for e in liste))
+                + "\n".join(f"  • {e}" for e in liste)
+                + f"\n\n⚡ Auto-Liste ({len(auto)} Einträge, Abschnitt \"auto_freigabe\") – läuft im Modus "
+                  "Auto zusätzlich ohne Rückfrage, ebenso Python-Skripte im Arbeitsordner:\n\n"
+                + "\n".join(f"  • {e}" for e in auto))
     elif cmd == "/version":
         ui.kv_panel("NemiCLI", VER.report(model=ctx.model, persona=PS.active().name))
     elif cmd == "/selbsttest":
@@ -335,21 +394,18 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 ref = None if picked == "__cancel__" else picked
             else:
                 ui.warn(f"Unbekannt: '{arg}'. Tippe /model (ohne Text) für die Auswahl.")
-        if ref:
-            ctx.backend, ctx.model = await switch_model(ref, ctx.backend, ctx.model, ctx.strength)
-            if _FORTSETZEN_NACH_MODELL[0] and ctx.backend is not None:
-                _FORTSETZEN_NACH_MODELL[0] = False
-                if not ctx.current_prompts and (weiter := _gespraech_fortsetzen(ctx)):
-                    ui.info(f"📒 Euer Gespräch geht weiter: „{weiter['title']}“")
-            _kontext_neu_zaehlen(ctx)
+        if ref and TURN_LOCK.locked():       # ein Zug läuft (z. B. Menü der KI): erst danach wechseln
+            _modell_nach_zug(ctx, ref)
+        elif ref:
+            await _modell_aktivieren(ctx, ref)
     elif cmd == "/bild" and re.fullmatch(r"(?i)(schritte|steps)(\s+\d+)?", arg.strip()):
         import krea
         zahl = arg.split()[1] if len(arg.split()) > 1 else None
         if zahl is None:
             akt = krea.schritte()
-            opts = [(str(n), ("✓  " if n == akt else "   ") + f"{n} Schritte"
+            opts = [(str(n), f"{n} Schritte"
                      + {krea.SCHRITTE_MIN: "  · schnell", krea.DEFAULTS["steps"]: "  · Standard",
-                        krea.SCHRITTE_MAX: "  · am genauesten"}.get(n, ""))
+                        krea.SCHRITTE_MAX: "  · am genauesten"}.get(n, "") + ("  ✔️" if n == akt else ""))
                     for n in range(krea.SCHRITTE_MIN, krea.SCHRITTE_MAX + 1)]
             opts.append(("__cancel__", "Abbrechen"))
             zahl = await ask_confirm(
@@ -381,6 +437,10 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 ui.info(f"🟣 Krea 2 – kein Negativ-Prompt, CFG 1, {krea.schritte()} Schritte "
                         f"(/bild schritte ändert das). Modelle in {krea.krea_dir()}. "
                         "/bildmodel wechselt das Modell.")
+            elif akt_backend == "motor":
+                import bildmotoren
+                ui.info(f"{bildmotoren.titel()} – kein Negativ-Prompt, {bildmotoren.schritte()} Schritte. "
+                        f"Modelle in {bildmotoren.ordner()}. /bildmodel wechselt das Modell.")
             ui.info('Nutzung:  /bild <beschreibung>  [--steps 8] [--size 1024x1024] [--seed 123] '
                     '[--model name] [--ohne-gesicht]  ·  bei WebUI/ComfyUI auch [--neg "..."] [--cfg 7]')
             return None
@@ -449,6 +509,34 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             except Exception as e:
                 ui.error(f"Video fehlgeschlagen: {e}")
             return None
+        import videomotoren
+        if re.fullmatch(r"(?i)einstellungen?(\s+\S.*)?", arg.strip()):
+            teile_ = arg.split()
+            if len(teile_) >= 3:
+                try:
+                    neu = videomotoren.setzen(teile_[1].lower(), " ".join(teile_[2:]))
+                    ui.success(f"🎞 {teile_[1].lower()} = {neu} – dauerhaft gespeichert.")
+                except (ValueError, TypeError) as e:
+                    ui.warn(str(e))
+                return None
+            p = videomotoren.plan()
+            ui.info(f"🎞 Video-Motor-Einstellungen (wirksam: {p['breite']}×{p['hoehe']}, {p['fps']} Bilder/s, "
+                    f"Kacheln {p['kacheln_name']}, Grafikkarte {videomotoren.vram_gb():.0f} GB):")
+            for k, (vorgabe, erlaubt) in videomotoren.EINSTELLUNGEN.items():
+                w = videomotoren.einstellung(k)
+                zeige = ("✔️" if w else "🛑") if isinstance(vorgabe, bool) else (w if w not in (0, 0.0) else "Modell")
+                ui.info(f"   {k}: {zeige}" + (f"   ({' · '.join(map(str, erlaubt))})" if erlaubt else ""))
+            ui.info("Ändern: /video einstellungen <name> <wert>  (z. B. /video einstellungen ton aus)")
+            return None
+        if arg.strip().lower() in ("motorordner", "modelle-ordner"):
+            o = videomotoren.ordner_anlegen()
+            try:
+                os.startfile(str(o))
+            except Exception:
+                ui.info(str(o))
+            ui.info("Je Modell ein Unterordner, Text-Encoder und VAE nach text_encoders/ und vae/ "
+                    "(siehe LIES-MICH dort). Dann /video modell <name>.")
+            return None
         if re.fullmatch(r"(?i)modell(\s+\S.*)?", arg.strip()):
             alle = video.modelle()
             name = arg.split(None, 1)[1].strip() if len(arg.split(None, 1)) > 1 else ""
@@ -456,10 +544,17 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 try:
                     video.set_modell(name)
                     ui.success(f"🎬 Video-Modell: {name} – dauerhaft gespeichert.")
+                    if video.motor_aktiv() and (grund := videomotoren.missing_reason(name)):
+                        ui.warn(f"Noch nicht bereit: {grund}")
                 except ValueError as e:
                     ui.warn(str(e))
             else:
-                akt = video.gewaehlt()
+                motor = videomotoren.gewaehlt() if videomotoren.aktiv() else None
+                for n, m in videomotoren.modelle().items():
+                    fehlt = "  ⚠ unvollständig" if videomotoren.missing_reason(n) else ""
+                    ui.info(f"   🎞 {n}  ({videomotoren.BAUARTEN[m['bauart']].TITEL}, Video mit Ton){fehlt}"
+                            f"{'  ✔️' if n == motor else ''}")
+                akt = None if motor else video.gewaehlt()
                 for n, m in alle.items():
                     try:
                         fam = video.familie(video.dit_config(m))
@@ -467,7 +562,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                         art = f"{fam} · {f['size'][0]}×{f['size'][1]} · {f['fps']} Bilder/s"
                     except Exception as e:
                         art = f"nicht lesbar: {e}"
-                    ui.info(f"{'✓ ' if n == akt else '  '}{n}  ({'GGUF' if m['gguf'] else 'safetensors'}, {art})")
+                    ui.info(f"   {n}  ({'GGUF' if m['gguf'] else 'safetensors'}, {art}){'  ✔️' if n == akt else ''}")
                 ui.info("Wählen: /video modell <name>")
             return None
         if arg.strip().lower() in ("ordner", "oeffnen", "öffnen"):
@@ -483,6 +578,14 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             ui.info(grund)
             return None
         opts = _video_opts(arg)
+        if not opts["prompt"] and video.motor_aktiv():
+            p = videomotoren.plan()
+            ui.info(f"🎞 Video-Motor bereit – {videomotoren.gewaehlt()}: {p['breite']}×{p['hoehe']}, {p['fps']} "
+                    f"Bilder/s, Ton {'✔️' if p['ton'] else '🛑'}, bis {videomotoren.MAX_SEKUNDEN} s. "
+                    "Einstellungen: /video einstellungen")
+            ui.info('Nutzung:  /video <beschreibung (englisch, mit Geräuschen)>  [--sekunden 10] [--seed 123]  ·  '
+                    '/video modell [name]')
+            return None
         if not opts["prompt"]:
             t = video.teile()
             fam = video.FAMILIEN[video.familie(video.dit_config(t))]
@@ -531,6 +634,9 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
         import krea
         krea_models = krea.discover()
         krea_aktiv = krea.chosen_model() if akt_backend == "krea" else None
+        import bildmotoren
+        motor_models = bildmotoren.modelle()
+        motor_aktiv = bildmotoren.gewaehlt() if akt_backend == "motor" else None
         if arg:                                  # direkt gesetzt: /bildmodel <name>
             teile = arg.strip().lower().split()
             if teile and teile[0] == "cloud":
@@ -540,7 +646,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                     return None
                 try:
                     if len(teile) == 1:
-                        ui.info(f"☁ Bilder-Cloud mit Schlüssel: "
+                        ui.info("☁ Bilder-Cloud mit Schlüssel: "
                                 + (", ".join(VC.BILD[a]["titel"] for a in VC.bereit("bild")) or "keiner")
                                 + f"  ·  /bildmodel cloud {'|'.join(VC.BILD)}|aus · /bildmodel cloud neu")
                     else:
@@ -567,6 +673,10 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 krea.set_chosen_model(treffer[0])
                 ui.success(f"🟣 Bild-Modell (Krea 2): {treffer[0]}")
                 return None
+            treffer = [n for n in motor_models if arg.strip().lower() in n.lower()]
+            if len(treffer) == 1:
+                _bildmotor_waehlen(treffer[0])
+                return None
             treffer = [n for n in webui_models if arg.strip().lower() in n.lower()]
             if len(treffer) == 1:
                 sdwebui.set_chosen_model(treffer[0])
@@ -579,30 +689,36 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 config.update(bild_backend="comfy")
                 ui.success(f"🧩 Bild-Modell (ComfyUI): {treffer[0]}")
                 return None
-            ui.warn(f"Kein Modell gefunden, das zu '{arg}' passt (weder Krea 2 noch WebUI noch ComfyUI).")
+            ui.warn(f"Kein Modell gefunden, das zu '{arg}' passt (weder Krea 2, Bild-Modelle, WebUI noch ComfyUI).")
             return None
         opts = []
         for name in krea_models:
-            mark = "✓  " if (akt_backend == "krea" and name == krea_aktiv) else "   "
-            opts.append((f"krea::{name}", f"{mark}🟣 {name}  (Krea 2)"))
+            mark = "  ✔️" if (akt_backend == "krea" and name == krea_aktiv) else ""
+            opts.append((f"krea::{name}", f"🟣 {name}  (Krea 2){mark}"))
+        for name, m in motor_models.items():
+            mark = "  ✔️" if name == motor_aktiv else ""
+            symbol, _, art_titel = bildmotoren.titel(name).partition(" ")
+            fehlt = "  ⚠ unvollständig" if bildmotoren.missing_reason(name) else ""
+            opts.append((f"motor::{name}", f"{symbol} {name}  ({art_titel}){fehlt}{mark}"))
         for name, title in webui_models.items():
-            mark = "✓  " if (akt_backend == "webui" and name == webui_aktiv) else "   "
-            opts.append((f"webui::{name}", f"{mark}🌐 {name}  (WebUI)"))
+            mark = "  ✔️" if (akt_backend == "webui" and name == webui_aktiv) else ""
+            opts.append((f"webui::{name}", f"🌐 {name}  (WebUI){mark}"))
         for name, art in comfy_models.items():
-            mark = "✓  " if (akt_backend == "comfy" and name == comfy_aktiv) else "   "
+            mark = "  ✔️" if (akt_backend == "comfy" and name == comfy_aktiv) else ""
             # Getrennte Modelle (Krea/Qwen/Flux) sind KEINE Checkpoints –
             # dazu gehören CLIP und VAE als eigene Dateien.
             zusatz = "ComfyUI · geteilt" if art == "diffusion" else "ComfyUI"
-            opts.append((f"comfy::{name}", f"{mark}🧩 {name}  ({zusatz})"))
+            opts.append((f"comfy::{name}", f"🧩 {name}  ({zusatz}){mark}"))
         import videobildcloud as VC
         wolke = VC.gewaehlt("bild") if akt_backend == "cloud" else None
         for a in VC.bereit("bild"):
-            mark = "✓  " if a == wolke else "   "
-            opts.append((f"cloud::{a}", f"{mark}☁ {VC.BILD[a]['titel']} · {VC.modell(a)}  (Cloud)"))
+            mark = "  ✔️" if a == wolke else ""
+            opts.append((f"cloud::{a}", f"☁ {VC.BILD[a]['titel']} · {VC.modell(a)}  (Cloud){mark}"))
         if VC.ohne_schluessel("bild"):
             opts.append(("__cloudneu__", f"☁  Cloud-Anbieter hinzufügen  ·  Key eintragen "
                                          f"({len(VC.ohne_schluessel('bild'))})"))
         opts.append(("__ordner__", "📂  Krea-2-Ordner öffnen (Modelldateien ablegen)"))
+        opts.append(("__bmordner__", "📂  Bild-Modelle-Ordner öffnen (Z-Image, FLUX.2 … ablegen)"))
         opts.append(("__host__", f"🌐  WebUI-Adresse ändern  ({sdwebui.host()})"))
         opts.append(("__chost__", f"🧩  ComfyUI-Adresse ändern  ({comfyui.host()})"
                                   + ("" if comfy_da else "  – nicht erreichbar")))
@@ -611,12 +727,13 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             i = comfyui.info()
             ui.warn(f"🧩 ComfyUI {i['version']} läuft ({i['gpu']}, {i['vram_gb']} GB), "
                     "kennt aber keinen Checkpoint – leg eins in ComfyUIs models/checkpoints.")
-        if not krea_models and not webui_models and not comfy_models:
+        if not krea_models and not motor_models and not webui_models and not comfy_models:
             ui.warn(f"Noch kein Bild-Modell da. Krea-2-Dateien gehören nach:  {krea.krea_dir()}")
+            ui.info(f"… andere Bild-Modelle (Z-Image …) nach:  {bildmotoren.ordner()}")
             ui.info("… oder eine Forge/A1111-WebUI mit --api starten "
                     f"(erwartet unter {sdwebui.host()}).")
         wahl = await ask_suche("Welches Modell zum Bildermalen?  "
-                                 "(🟣 Krea 2 · 🌐 Forge/A1111 · 🧩 ComfyUI)", opts)
+                                 "(🟣 Krea 2 · 🟩 Z-Image · 🟦 FLUX.2 · 🟧 Qwen-Image · 🟪 FLUX.1 · 🟥 Chroma · 🌐 Forge/A1111 · 🧩 ComfyUI)", opts)
         if wahl == "__cancel__":
             return None
         if wahl == "__cloudneu__":
@@ -629,6 +746,15 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             except Exception:
                 ui.info(str(krea.krea_dir()))
             ui.info("Dateien reinlegen, dann nochmal /bildmodel – sie tauchen automatisch auf.")
+            return None
+        if wahl == "__bmordner__":
+            o = bildmotoren.ordner_anlegen()
+            try:
+                os.startfile(o)
+            except Exception:
+                ui.info(str(o))
+            ui.info("Je Modell ein Unterordner, Text-Encoder und VAE nach text_encoders/ und vae/ "
+                    "(siehe LIES-MICH dort). Dann nochmal /bildmodel.")
             return None
         if wahl == "__host__":
             neu = await ask_text(f"WebUI-Adresse (jetzt: {sdwebui.host()}):")
@@ -650,6 +776,8 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 ui.success(f"☁ Bilder jetzt aus der Cloud: {VC.waehlen('bild', name)}  ·  zurück: ein Krea-Modell wählen")
             except ValueError as e:
                 ui.warn(str(e))
+        elif art == "motor":
+            _bildmotor_waehlen(name)
         elif art == "krea":
             krea.set_chosen_model(name)
             ui.success(f"🟣 Bild-Modell (Krea 2): {name}  ·  kein Negativ-Prompt, CFG 1, "
@@ -738,14 +866,9 @@ def _start_nachricht() -> str | None:
 
 
 # ---------------------------------------------------------------------------
-# Hintergrund-Auftrag (Zeitplan): `main.py --auftrag <name>`
+# Hintergrund-Auftrag (Zeitplan): `main.py --auftrag <name>` – Modus „lesen“, ohne Freigaben,
+# die letzte Antwort wird der Bericht in Berichte/.
 # ---------------------------------------------------------------------------
-# Die Windows-Aufgabenplanung startet NemiCLI so – ohne Fenster, ohne Nutzer.
-# Die Persönlichkeit bekommt den Auftrag aus Zeitplan/<name>.json als Nachricht,
-# arbeitet ihn im Modus „lesen" ab (abfragen, datei_lesen, web_suche … laufen;
-# alles Ändernde ist gesperrt, da drückt niemand F8) und ihre letzte Antwort
-# wird als Bericht nach Berichte/ geschrieben. Beim nächsten normalen Start
-# zeigt main() die erste Zeile jedes neuen Berichts.
 
 async def _nie_freigeben(*_a, **_k):
     """Im Hintergrund gibt es keine Freigabe – jede Rückfrage ist ein Nein."""
@@ -816,12 +939,9 @@ async def auftrag_lauf(name: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Systemwache im Hintergrund: `main.py --wache`
+# Systemwache im Hintergrund: `main.py --wache` – Wecken wie ein Zeitplan-Auftrag (tools/wache),
+# Bericht in Berichte/Wache_….md.
 # ---------------------------------------------------------------------------
-# Sensoren, Regeln und Modell laufen in tools/wache; hier steht nur, wie die
-# aktive Persönlichkeit geweckt wird: derselbe Weg wie ein Zeitplan-Auftrag
-# (Modus lesen, keine Freigaben), plus die Wache-Werkzeuge zum Bewerten und
-# Justieren. Die letzte Antwort wird der Bericht in Berichte/Wache_….md.
 
 async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
     from wache import zugang as Z, justierung as J, werkzeuge as W
@@ -1368,6 +1488,28 @@ def wache_lauf() -> int:
             finally:
                 _freigabe_planen(KUGEL_MODELL_HALTEN_S)       # auch nach Fehlern: nicht im VRAM hängen
 
+    async def zuschauen(text: str, pfad: str) -> tuple[str, list[str], str]:
+        """Die Kugel schaut beim Spielen zu (Bildschirmfoto `pfad`). Ein Cloud-Modell, das Bilder sieht, bekommt
+        das Foto; ein lokales Modell oder der Bildbeschreiber nur, wenn genug Grafikspeicher frei ist – das
+        Spiel braucht ihn. Sonst bleibt sie still."""
+        import bildbeschreiber
+        import vonsichaus
+        ref = _migrate_ref(config.load().get("model"))
+        anbieter = M.split_ref(ref or "")[0]
+        prov = P.get(anbieter) if anbieter else None
+        lokal = anbieter in ("", "gguf", "ollama", "funke") or bool(getattr(prov, "keyless", False))
+        frei = vonsichaus.vram_frei_mb()
+        platz = frei is not None and frei >= vonsichaus.BILD_AB_MB
+        if _modell_sieht(ref) and (platz or not lokal):
+            return await chat(text, [pfad])
+        if platz and bildbeschreiber.zustaendig(ref) and bildbeschreiber.finden() is not None:
+            try:
+                block = bildbeschreiber.block(Path(pfad), await asyncio.to_thread(bildbeschreiber.beschreiben, Path(pfad)))
+            except Exception:
+                return "(still)", [], ""
+            return await chat(text + "\n\n" + block, [])
+        return "(still)", [], ""
+
     async def chat_neu() -> None:
         """„+ Neu“ im Kugel-Fenster: das Gespräch beginnt von vorn."""
         async with _lock():
@@ -1427,7 +1569,7 @@ def wache_lauf() -> int:
                            wer=name, ergebnis=antwort)
         return antwort, sorted(neue), plan.text_fuer_modell()
 
-    d = _dienst.Dienst(wecken, paths.INSTALL, chat=chat, chat_neu=chat_neu, name=PS.active().name,
+    d = _dienst.Dienst(wecken, paths.INSTALL, chat=chat, chat_neu=chat_neu, zuschauen=zuschauen, name=PS.active().name,
                        nutzer=PS.nutzername() or "du", mit_tray="--ohne-tray" not in sys.argv,
                        mit_kugel="--ohne-kugel" not in sys.argv, name_von=lambda: PS.active().name)
     print(f"[{time.strftime('%H:%M:%S')}] Wache läuft (PID {os.getpid()})")
@@ -1675,8 +1817,6 @@ async def main():
                 ui.info(f"🦙 Ollama läuft: {len(P.ollama_models())} Modell(e) – lokal, kein Key")
             if not provs and not P.get("ollama").available():
                 ui.info("Cloud: API-Key eintragen · Lokal: Modell von Hugging Face holen – beides unter /model.")
-    # Key-Schutz nur als einmaliges Ereignis melden (wenn gerade verschlüsselt wurde).
-    # Der dauerhafte „geschützt"-Hinweis steht jetzt unter /help (sauberer Start).
     try:
         import fehlerwaechter
         if hinweis := fehlerwaechter.hinweis_beim_start():
@@ -1715,8 +1855,7 @@ async def main():
     except Exception:
         pass
 
-    # Tipps stehen jetzt unter /help – Start bleibt sauber. Im Vollbild grüßt die Persönlichkeit
-    # auf der Startseite selbst.
+    # Im Vollbild grüßt die Persönlichkeit auf der Startseite selbst.
     with start.schritt("Gruß"):
         if tui is None:
             mascot.greet()
@@ -1728,6 +1867,8 @@ async def main():
     asyncio.get_running_loop().create_task(von_sich_aus_abholen())   # Nachrichten aus dem freien Moment
     with start.schritt("Sprüche"):
         _sprueche_im_hintergrund(ctx)
+    with start.schritt("Such-Index"):
+        indexdb.vorwaermen()         # im Hintergrund, weicht einer laufenden Runde: die erste Suche findet ihn fertig
     with start.schritt("Chrome-Brücke"):
         start_chrome_bridge(ctx)     # Chrome-Erweiterung: Empfang auf 127.0.0.1:9000
     with start.schritt("Skill-Wächter"):
@@ -1908,7 +2049,13 @@ if __name__ == "__main__":
     # Eigenes Terminal-Fenster: mit --fenster, oder NemiCLI.exe (Fenster-App) ohne Hintergrund-Auftrag.
     # Das Fenster startet NemiCLI selbst in einer Pseudokonsole – ohne Windows Terminal.
     _HINTERGRUND = ("--wache", "--vollscan", "--auftrag", "--sag", "--selftest", "--bild",
-                    "--systemcheck", "--kontext")
+                    "--systemcheck", "--kontext", "--malkind", "--bibliothekar")
+    if "--malkind" in sys.argv:          # Bilder der Wache in einem kurzen eigenen Prozess (engines/malkind.py)
+        import malkind
+        raise SystemExit(malkind.hauptprogramm(sys.argv[sys.argv.index("--malkind") + 1:]))
+    if "--bibliothekar" in sys.argv:     # Gedächtnis einbetten in einem eigenen Prozess (tools/bibkind.py)
+        import bibkind
+        raise SystemExit(bibkind.hauptprogramm(sys.argv[sys.argv.index("--bibliothekar") + 1:]))
     if "--kontext" in sys.argv:          # Rechtsklick-Menü: Screenshot / Bild / Antwort an NemiCLI
         import kontextmenue
         raise SystemExit(kontextmenue.main(sys.argv[sys.argv.index("--kontext") + 1:]))

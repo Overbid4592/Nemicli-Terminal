@@ -1,11 +1,6 @@
 """
-main.py - NemiCLI: ein schöner Chat im Terminal.  Cloud + Lokal.
-
-Normaler Text  -> Gespräch mit dem aktiven Modell.
-/befehle       -> Theme, Modell (Cloud/Lokal), Hilfe, beenden ...
-
-Cloud  = Anthropic (braucht ANTHROPIC_API_KEY in .env)
-Lokal  = Ollama auf diesem PC (kein Key nötig)
+main.py - NemiCLI: Chat im Terminal mit Cloud-Anbietern (Schlüssel in .env) oder lokalen Modellen.
+Normaler Text geht ans aktive Modell, /befehle steuern das Programm.
 """
 
 # main.py ist auf vier Dateien verteilt (siehe _teil_laden): Imports nutzen die Teile mit, Namen kommen von dort.
@@ -30,11 +25,7 @@ for _stream in (sys.stdout, sys.stderr):
     except Exception:
         pass
 
-# --- Bootstrap: die Kategorie-Ordner auf den Suchpfad legen ---------------
-# So bleiben alle bestehenden Imports (import ui, import chat, …) gültig,
-# obwohl die Module jetzt sauber in Unterordnern liegen.
-# Als gepackte exe (PyInstaller) liegen die Module schon flach im Bündel –
-# dann darf hier NICHTS an sys.path geschraubt werden.
+# --- Kategorie-Ordner auf den Suchpfad (in der exe liegen die Module flach im Bündel) ---
 _ROOT = Path(__file__).resolve().parent
 if not getattr(sys, "frozen", False):
     for _sub in ("core", "engines", "tools", "ui"):
@@ -159,6 +150,10 @@ def _uris_nach_temp(uris: list[str]) -> list:
         if not uri.startswith("data:") or "," not in uri:
             continue
         head, b64 = uri.split(",", 1)
+        try:
+            daten = base64.b64decode(b64)
+        except ValueError:                           # kaputte URI: dieses Bild überspringen
+            continue
         ext = ".png"
         if "jpeg" in head or "jpg" in head:
             ext = ".jpg"
@@ -166,7 +161,7 @@ def _uris_nach_temp(uris: list[str]) -> list:
             ext = ".webp"
         fd, name = tempfile.mkstemp(suffix=ext, prefix="nemi_vis_")
         try:
-            os.write(fd, base64.b64decode(b64))
+            os.write(fd, daten)
         finally:
             os.close(fd)
         out.append(Path(name))
@@ -225,10 +220,8 @@ async def _bilder_fuer_chat(model: str | None, text: str,
                         "Vision-Modell (Cloud oder ein Ollama-Modell mit 👁) – oder leg ein "
                         "Seh-Modell (.gguf + mmproj) in einen Ordner unter Vision/ (/vision).")
 MAX_STEPS = 12                  # Bremse für Aktions-Ketten pro Nutzer-Nachricht (keine Endlosschleife)
-# Solange in einer Runde NUR gelesen wurde (READ_TOOLS: datei_lesen, abfragen, web …),
-# gilt eine weitere Grenze: Die Systemwache liest ihre Anleitung in drei Stücken und
-# fragt dann acht Dinge ab – mit 12 war sie bei Schritt 2 am Ende (Chat 137). Sobald
-# eine ändernde Aktion dabei war, gilt wieder die kurze Bremse.
+# Runden nur mit Lese-Werkzeugen (READ_TOOLS) brauchen mehr Schritte (Anleitung in Stücken, mehrere
+# Abfragen); sobald etwas geändert wurde, gilt wieder MAX_STEPS.
 MAX_LESE_STEPS = 30
 # Im Coding-Assistenten zählt die Bremse pro Todo-Punkt: jeder Fortschritt (Punkt in
 # Arbeit, Punkt geprüft) setzt sie zurück. Darüber liegt eine feste Gesamtgrenze.
@@ -244,7 +237,7 @@ _FRAGE_HALT_NOTE = ("\n\n[System] 🟠 Eine Frage ist offen. Stell sie dem Nutze
 _DEDUPE_TOOLS = {"datei_lesen", "ordner_auflisten", "dateien_suchen", "inhalt_suchen",
                  "ordner_erkennen", "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
                  "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar", "wache_netz",
-                 "gedaechtnis_suchen", "gedaechtnis_lesen", "bild_protokoll"}
+                 "gedaechtnis_suchen", "gedaechtnis_lesen", "bild_protokoll", "bilder_suchen"}
 _STEP_LIMIT_NOTE = (
     "\n\n[System] ⏸ Du hast in dieser Runde die Obergrenze an Aktionen erreicht "
     f"({MAX_STEPS} mit Änderungen, {MAX_LESE_STEPS} nur lesend). Führe jetzt KEINE weitere Aktion aus. Fasse zusammen, was du "
@@ -279,8 +272,9 @@ CHARAKTER_BRUECKE = None        # Verbindung zur Charakter-Galerie (/charaktere)
 # Im GUI-Modus „Chat“ erlaubt: nichts am PC ändern – malen, Bilder ansehen, Gedächtnis, Skills (Prüffenster).
 CHAT_WERKZEUGE = frozenset({"plan", "bild_malen", "bild_serie", "portraet_bewegen", "charakter_zeigen",
                             "charakter_aendern",
-                            "bild_ansehen", "bild_fragen", "bild_protokoll",
-                            "gedaechtnis_suchen", "gedaechtnis_lesen", "merken", "tagebuch", "lieblingsbild",
+                            "bild_ansehen", "bild_fragen", "bild_protokoll", "bilder_suchen",
+                            "gedaechtnis_suchen", "gedaechtnis_lesen", "gedaechtnis_aufraeumen", "merken",
+                            "tagebuch", "lieblingsbild",
                             "profilbild",
                             "vorschau_schliessen",
                             "skill_laden", "skill_schreiben", "skill_ausbessern"})
@@ -345,14 +339,8 @@ def _update_session_meters(in_toks: int, out_toks: int) -> None:
 
 def _render(thinking_txt: str, answer: str, think_secs: float | None = None,
             note: str = "", *, done: bool = False):
-    """Antwort-Panel, bei Denk-Modellen mit gedimmtem Denk-Panel darüber.
-
-    Das Denk-Panel klappt sich VON SELBST zu, sobald die eigentliche Antwort
-    anfängt – sonst schiebt langes Nachdenken die Antwort vom Bildschirm.
-
-    `note` = eine dezente Info-Zeile GANZ OBEN (z.B. Auto-Stark hat auf das
-    große Modell umgeschaltet). Bleibt sichtbar, wird nicht zugeklappt.
-    """
+    """Antwort-Panel, darüber das Denk-Panel (klappt zu, sobald die Antwort beginnt) und
+    `note` als Info-Zeile ganz oben."""
     from rich.text import Text
     teile = []
     if note:
@@ -475,7 +463,10 @@ def _gegenprobe(antwort: str, records: list[dict]) -> tuple[str, list[str]] | No
 
 
 def _denkwerk_start(backend, denk) -> str:
-    """Denk-Hinweis fürs erste Senden der Runde; bei schweren Fragen eine Zeile für den Nutzer."""
+    """Denk-Hinweis fürs erste Senden der Runde; bei schweren Fragen eine Zeile für den Nutzer.
+    Der eigene Motor bekommt die Einschätzung selbst (denk_runde): ob er nachdenkt, hängt vom Chat-Format ab."""
+    if hasattr(backend, "denk_runde"):
+        backend.denk_runde = denk
     if denk is None or not hasattr(backend, "denk_hinweis"):
         return ""
     backend.denk_hinweis = denkwerk.hinweis(denk, bool(getattr(backend, "denkt_selbst", False)))
@@ -522,9 +513,10 @@ async def _menue_fuer_ki(act: dict) -> "actions.ActionResult":
             return actions.ActionResult(f"Menü {cmd}: der Nutzer hat ohne Auswahl geschlossen.", ok=True)
         zusatz = gewaehlt
     vorher = C.auswahl(cmd)
-    await handle_line(ctx, f"{cmd} {zusatz}".strip())
-    if not zusatz:                                   # Befehl ohne Auswahl (z. B. /appstore): einfach geöffnet
+    if not zusatz:                     # ohne Zusatz direkt ausführen – handle_line zeigte das Menü sonst noch einmal
+        await _befehl_ausfuehren(ctx, cmd, "", cmd)
         return actions.ActionResult(f"{cmd} ist geöffnet.", ok=True)
+    await handle_line(ctx, f"{cmd} {zusatz}")
     aktiv = [z for z, t, _ in C.auswahl(cmd) if t.lstrip().startswith("✓")]
     stand = f" Jetzt aktiv: {', '.join(aktiv)}." if aktiv and C.auswahl(cmd) != vorher else ""
     return actions.ActionResult(
@@ -547,10 +539,8 @@ def _close_records(records) -> None:
 
 
 # --- Freigabe einer Aktion (für Terminal, WebUI und Helfer dieselbe) --------
-# Risikostufe bestimmt Frage und
-# Optionen, `befehl` außerhalb der Whitelist fragt zweimal, Löschen hat eine
-# Obergrenze, harmlose Änderungen einer Runde werden gebündelt. Vorher stand
-# diese Logik dreimal im Code – und die WebUI schrieb kein Protokoll.
+# Risikostufe bestimmt Frage und Optionen, `befehl` außerhalb der Whitelist fragt zweimal,
+# Löschen hat eine Obergrenze, harmlose Änderungen einer Runde werden gebündelt.
 
 async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
                     frei: set | None = None, abgelehnt: set | None = None):
@@ -587,8 +577,7 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
         return "rejected", None
     confirm = (urteil == "ask" and not _immer_erlaubt(act) and not (frei and id(act) in frei))
     if confirm and sicherheit.arbeitsbereich(act):
-        # Der Stift der Persönlichkeit: im eigenen Daten-Ordner schreibt sie
-        # ohne Rückfrage. Protokoll + Papierkorb bleiben.
+        # Im eigenen Daten-Ordner ohne Rückfrage; Protokoll und Papierkorb bleiben.
         confirm = False
         act["_frei"] = "Arbeitsbereich"
         desc = actions.describe(act)
@@ -867,7 +856,7 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
     _DBG.ereignis(f"Runde: {len(user_text)} Zeichen, {len(images or [])} Bild(er)")
     notstopp.runde_aktiv(True)
     try:
-        await _converse(backend, user_text, images, records, denk)
+        await _schleife(backend, user_text, images, records, denk, _terminal_ausgabe())
         if notstopp.ausgeloest():
             await _nach_notstopp()
     finally:
@@ -926,14 +915,24 @@ def _ankunft_melden(ankunft: dict, denk_zeichen: int, gesamt: float) -> None:
     _DBG.ereignis("Schritt: " + " · ".join(teile + [f"fertig nach {gesamt:.1f} s"]), speicher=False)
 
 
-async def _converse(backend, user_text, images, records, denk=None) -> None:
-    """Ein Gespräch mit Aktions-Schleife: antworten → ggf. handeln → weiter.
-    images (base64-Data-URIs) werden nur beim ERSTEN Schritt mitgeschickt.
-    denk: Einschätzung des Denkwerks (Hinweis beim ersten Senden, Prüfer am Ende)."""
+_HINTERGRUND_TITEL = {"bild_serie": "🎨 male deine Serie", "video_erstellen": "🎬 erzeuge dein Video",
+                      "kugel_anziehen": "👗 male dein Kugel-Outfit", "backup_erstellen": "💾 sichere",
+                      "lora_trainieren": "🧬 trainiere deine LoRA",
+                      "coding_lora_trainieren": "🧠 trainiere das Coding-LoRA",
+                      "musik_machen": "🎵 komponiere deinen Song", "musik_cover": "🎵 spiele das Cover ein"}
+_FORTSCHRITT_WERKZEUGE = ("bild_malen", "bild_serie", "kugel_anziehen", "backup_erstellen", "video_erstellen")
+
+
+async def _schleife(backend, user_text, images, records, denk, aus: dict) -> None:
+    """Die Aktions-Schleife für Terminal und Fenster: antworten → ggf. handeln → weiter.
+    images (base64-Data-URIs) gehen nur beim ERSTEN Schritt mit. denk: Einschätzung des Denkwerks
+    (Hinweis beim ersten Senden, Prüfer am Ende). aus: Anzeige, Rückfragen und Ausführen mit Fortschritt
+    (_terminal_ausgabe / _web_ausgabe) – die Entscheidungen fallen hier, für beide gleich."""
     if (zeile := _denkwerk_start(backend, denk)):
-        ui.info(zeile)
+        aus["info"](zeile)
     next_input = user_text
     first = True
+    naechste_bilder: list = []
     seen: set[str] = set()                   # identische Lese-Aktionen nur einmal
     nur_gelesen = True                       # bisher nur Lese-Werkzeuge? -> längere Leine
     basis = 0                                # ab diesem Schritt zählt die Bremse
@@ -941,7 +940,8 @@ async def _converse(backend, user_text, images, records, denk=None) -> None:
     frage_halt = False
     gegenprobe_gemacht = False               # höchstens eine Gegenprobe je Runde
     block_nachgefragt = False                # unlesbarer Aktionsblock: höchstens einmal neu anfordern
-    gesamt = CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
+    gestupst = False                         # angekündigt, aber nichts aufgerufen: höchstens einmal je Runde
+    gesamt =CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
     for schritt in itertools.count():
         if notstopp.ausgeloest():            # Not-Stopp: kein weiterer Schritt
             return
@@ -955,186 +955,59 @@ async def _converse(backend, user_text, images, records, denk=None) -> None:
             next_input = next_input + _FRAGE_HALT_NOTE
         elif letzter:
             next_input = next_input + _STEP_LIMIT_NOTE
-        # 1) Antwort streamen (Denken + Text getrennt)
-        answer = ""
-        thinking_txt = ""
-        note = ""                        # dezente Info-Zeile (z.B. Auto-Stark)
-        usage = {"input": 0, "output": 0}
-        have_usage = False
-        seed = ui.new_verb_seed()
-        t0 = time.monotonic()
-        think = {"start": None, "secs": None}    # wie lange wurde nachgedacht?
-        last_paint = 0.0
-        ankunft = {"denken": None, "antwort": None, "stuecke": 0}   # ab Absenden, für den Debugbericht
 
-        def _tokens() -> int:
-            if have_usage and usage["output"]:
-                return usage["output"]
-            return (len(answer) + len(thinking_txt)) // 4   # Schätzung, bis echte Zahl da ist
-
-        def _view():
-            el = time.monotonic() - t0
-            verb = ui.verb_at(seed, el)
-            if thinking_txt or answer or note:
-                think_secs = think["secs"]
-                if think_secs is None and think["start"] is not None:
-                    think_secs = time.monotonic() - think["start"]
-                return Group(_render(thinking_txt, answer, think_secs, note),
-                             ui.stream_meter(verb, el, _tokens()))
-            return ui.working_meter(verb, el, _tokens())
-
-        # Den Stream in einer Hintergrund-Task konsumieren und Ereignisse in eine
-        # Queue legen. So kann die Live-Anzeige im Takt (alle 0.2s) aktualisiert
-        # werden – auch wenn gerade KEIN Token kommt (Zeit/Verb laufen weiter),
-        # und wir können nebenbei auf Esc lauschen.
-        queue: asyncio.Queue = asyncio.Queue()
-
+        # 1) Antwort holen (Denken + Text getrennt)
         imgs = images if first else (naechste_bilder or None)
         first = False
         naechste_bilder = []
-
-        async def _produce():
-            try:
-                async for ev in backend.stream(next_input, images=imgs):
-                    await queue.put(("ev", ev))
-            except Exception as exc:        # Fehler durchreichen
-                await queue.put(("err", exc))
-                return
-            await queue.put(("done", None))
-
-        producer = asyncio.create_task(_produce())
-        err = None
-        aborted = False
-        with ui.live_view(_view()) as live:
-            try:
-                while True:
-                    # Auch bei lückenlosem Tokenstrom reagieren. Im Vollbild
-                    # liest nur prompt_toolkit die Tastatur, nie parallel msvcrt.
-                    if _abbruch_taste():
-                        aborted = True
-                        break
-                    try:
-                        kind, payload = await asyncio.wait_for(queue.get(), timeout=0.2)
-                    except asyncio.TimeoutError:
-                        live.update(_view())      # Zeit/Verb weiterlaufen lassen
-                        continue
-                    if kind == "done":
-                        break
-                    if kind == "err":
-                        err = payload
-                        break
-                    ev = payload
-                    et = ev.get("type")
-                    if et == "usage":
-                        if "input" in ev:
-                            usage["input"] = ev["input"]
-                        if "output" in ev:
-                            usage["output"] = ev["output"]
-                        have_usage = True
-                    elif et == "thinking":
-                        if think["start"] is None:
-                            think["start"] = time.monotonic()
-                            ankunft["denken"] = think["start"] - t0
-                        ankunft["stuecke"] += 1
-                        thinking_txt += ev["text"]
-                    elif et == "note":
-                        note = ev["text"]        # dezente Info, nicht Teil der Antwort
-                    else:
-                        # erstes echtes Antwort-Zeichen -> Denkzeit steht fest
-                        if (ev["text"].strip() and think["start"] is not None
-                                and think["secs"] is None):
-                            think["secs"] = time.monotonic() - think["start"]
-                        if ankunft["antwort"] is None and ev["text"].strip():
-                            ankunft["antwort"] = time.monotonic() - t0
-                        answer += ev["text"]
-                    now = time.monotonic()
-                    if now - last_paint >= 1 / 12:
-                        live.update(_view())
-                        last_paint = now
-            except KeyboardInterrupt:              # Ctrl-C -> ebenfalls abbrechen
-                aborted = True
-
-        # Stream-Task sauber beenden
-        if not producer.done():
-            producer.cancel()
-            try:
-                await producer
-            except (asyncio.CancelledError, Exception):
-                pass
-        if err:
-            if ui.TUI is not None:
-                ui.TUI.set_thinking(thinking_txt, think["secs"], live=False)
-            raise err
-
-        elapsed = time.monotonic() - t0
-        _ankunft_melden(ankunft, len(thinking_txt), elapsed)
-        if think["start"] is not None and think["secs"] is None:
-            think["secs"] = time.monotonic() - think["start"]
-        out_toks = _tokens()
-        SESSION["tokens"] += out_toks
-        _update_session_meters(usage["input"], out_toks)
+        r = await aus["antworten"](backend, next_input, imgs)
+        if r is None:                        # Fehler schon gemeldet
+            return
+        SESSION["tokens"] += r["tokens"]
+        _update_session_meters(r["eingabe"], r["tokens"])
         try:
             stats.record_turn(SESSION.get("model"), PS.active().name, modes.current(),
-                              usage["input"], out_toks,
-                              pricing.cost(SESSION.get("model"), usage["input"], out_toks))
+                              r["eingabe"], r["tokens"],
+                              pricing.cost(SESSION.get("model"), r["eingabe"], r["tokens"]))
         except Exception:
             pass
-
-        # Bei Abbruch: Verlauf konsistent halten (Backend hat den User-Turn schon
-        # angehängt, aber keine Assistenten-Antwort) und hier stoppen.
-        if aborted:
-            if backend.messages and backend.messages[-1].get("role") == "user":
-                backend.messages.append(
-                    {"role": "assistant", "content": answer or "(abgebrochen)"})
-            if answer.strip() or thinking_txt:
-                ui.console.print(_render(thinking_txt, answer, think["secs"], done=True))
-            mitschrift.assistent(answer or "(abgebrochen)", thinking_txt, think["secs"])
-            mitschrift.notiz("⎋ Vom Nutzer abgebrochen.")
+        if r["abgebrochen"]:                 # ESC/Ctrl-C mitten in der Antwort
+            aus["abgebrochen"](backend, r)
             notstopp.ausloesen()
             return
 
-        acts, cleaned = actions.parse_actions(answer)
-        # die vollständige Antwort einmal sauber ausgeben (kein Stapeln mehr)
-        if cleaned:
-            display = cleaned
-        elif acts:
-            display = "⚙ (Aktion vorbereitet)"        # nur wenn wirklich eine Aktion folgt
-        else:
-            display = "_(leere Antwort – frag ruhig nochmal)_"
-        hoeren = bool(cleaned) and not acts and _voice_an()
-        if cleaned and not acts:
-            _LETZTE_ANTWORT[0] = cleaned
-        ui.console.print(_render(thinking_txt, _kurzfassung(cleaned) if hoeren else display,
-                                 think["secs"], note, done=True))
-        # Denktext gibt es NUR hier - in backend.messages steht er nicht.
-        mitschrift.assistent(display, thinking_txt, think["secs"])
-
-        # kleine Zusammenfassung (Tokens · Zeit · Tempo), wenn es echte Antwort gab
-        if cleaned:
-            tps = out_toks / elapsed if elapsed > 0.3 else None
-            ui.console.print(ui.done_meter(elapsed, out_toks, tps, usage["input"]))
-
+        acts, cleaned = actions.parse_actions(r["antwort"])
+        aus["antwort_zeigen"](r, acts, cleaned)
         if acts and notstopp.stop_runde():   # „STOP“-Runde: nur bestätigen, nichts ausführen
             for act in acts:
                 records.append({"tool": act.get("tool", "?"), "status": "not_run"})
-            ui.warn("⏹ " + notstopp.GESPERRT_TEXT)
+            aus["warn"]("⏹ " + notstopp.GESPERRT_TEXT)
             return
 
         # 2) Keine Aktion -> fertig
         if not acts:
-            if (hinweis := actions.unparsed_action_note(answer, acts)):
-                ui.warn(hinweis)             # Zaun da, JSON kaputt: nicht stumm schlucken
+            if (hinweis := actions.unparsed_action_note(r["antwort"], acts)):
+                aus["hinweis"](hinweis)      # Zaun da, JSON kaputt: nicht stumm schlucken
                 if not letzter and not block_nachgefragt:
                     block_nachgefragt = True     # die KI erfährt den Grund und schickt den Block neu
-                    ui.info("↻ Die KI bekommt den Grund und schickt die Aktion neu.")
-                    next_input = actions.unlesbar_fuer_ki(answer)
+                    aus["info"]("↻ Die KI bekommt den Grund und schickt die Aktion neu.")
+                    next_input = actions.unlesbar_fuer_ki(r["antwort"])
                     continue
+            if not letzter and not gestupst and (satz := denkwerk.ankuendigung(cleaned)):
+                gestupst = True              # „Ich male jetzt …“ ohne Aufruf: die KI hält Wort oder sagt es ehrlich
+                aus["info"]("🤝 Angekündigt, aber nichts aufgerufen – die KI bekommt einen Stups.")
+                import debugbericht as _DBG
+                _DBG.ereignis(f"Wort halten: {satz}", speicher=False)
+                _denkwerk_start(backend, denkwerk.nachfass_runde(satz))
+                next_input = denkwerk.nachfassen(satz)
+                continue
             if not letzter and not gegenprobe_gemacht and (gp := _gegenprobe(cleaned, records)):
                 gegenprobe_gemacht = True    # die KI sieht ihre Antwort noch einmal gegen die Ergebnisse
-                ui.info("🔎 Gegenprobe: " + gp[1][0])
+                aus["info"]("🔎 Gegenprobe: " + gp[1][0])
                 next_input = gp[0]
                 continue
-            if not letzter and (nachbessern := await _denkwerk_pruefen(backend, denk, cleaned, records, ui.info)):
+            if not letzter and (nachbessern := await _denkwerk_pruefen(
+                    backend, denk, cleaned, records, aus["info"], mit_stopp=aus["mit_stopp"])):
                 next_input = nachbessern     # ein unabhängiger Prüfer fand Fehler: die KI bessert nach
                 continue
             _vorlesen_auto(cleaned)
@@ -1142,8 +1015,8 @@ async def _converse(backend, user_text, images, records, denk=None) -> None:
         if letzter:                          # Limit erreicht: geplante Aktion nicht mehr starten
             for act in acts:
                 records.append({"tool": act.get("tool", "?"), "status": "not_run"})
-            ui.warn("🟠 Erst die offene Frage – die Aktion wartet auf deine Antwort."
-                    if frage_halt else _STEP_LIMIT_WARN)
+            aus["warn"]("🟠 Erst die offene Frage – die Aktion wartet auf deine Antwort."
+                        if frage_halt else _STEP_LIMIT_WARN)
             return
 
         # 3) Aktionen abarbeiten (Bestätigung bei verändernden)
@@ -1154,18 +1027,27 @@ async def _converse(backend, user_text, images, records, denk=None) -> None:
             fixed = actions.resolve_tool(raw_tool)
             if fixed and fixed != raw_tool:
                 act["tool"] = fixed
-                ui.info(f"(kleiner Tippfehler korrigiert: '{raw_tool}' → '{fixed}')")
+                aus["info"](f"(kleiner Tippfehler korrigiert: '{raw_tool}' → '{fixed}')")
+        if (erlaubt := aus["erlaubt"]) is not None:
+            chat = erlaubt is CHAT_WERKZEUGE
+            for act in [a for a in acts if a.get("tool") not in erlaubt]:
+                aus["hinweis"](("🔒 im Chat-Modus gesperrt: " if chat else "🔒 hier nicht freigegeben: ")
+                               + actions.describe(act))
+                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
+                ergebnisse.append(_CHAT_GESPERRT.format(tool=act.get("tool", "?")) if chat else
+                                  _FENSTER_GESPERRT.format(tool=act.get("tool", "?"), liste=", ".join(sorted(erlaubt))))
+            acts = [a for a in acts if a.get("tool") in erlaubt]
         acts, gesperrt = plan.zurueckweisen(acts, coding.aktiv())
         if gesperrt:
-            ui.warn("🟨 Mehr als ein Schritt – erst die Todo-Liste. Nicht ausgeführt: "
-                    + ", ".join(actions.describe(a).splitlines()[0] for a in gesperrt))
+            aus["hinweis"]("🟨 Mehr als ein Schritt – erst die Todo-Liste. Nicht ausgeführt: "
+                           + ", ".join(actions.describe(a).splitlines()[0] for a in gesperrt))
             for act in gesperrt:
                 records.append({"tool": act.get("tool", "?"), "status": "not_run"})
             ergebnisse.append(plan.sperr_text(gesperrt))
-        frei, abgelehnt = await _buendel_freigabe(acts, ask_confirm)
+        frei, abgelehnt = await _buendel_freigabe(acts, aus["frage"])
         for act in acts:
             tool = act.get("tool")
-            if notstopp.ausgeloest() or _abbruch_taste():   # Not-Stopp: Rest der Runde verwerfen
+            if notstopp.ausgeloest() or aus["abbruch"]():   # Not-Stopp: Rest der Runde verwerfen
                 notstopp.ausloesen()
                 records.append({"tool": tool, "status": "not_run"})
                 continue
@@ -1176,84 +1058,60 @@ async def _converse(backend, user_text, images, records, denk=None) -> None:
             if tool in _DEDUPE_TOOLS:
                 key = _action_key(act)
                 if key in seen:
-                    ui.info(f"↩ Wiederholung übersprungen: {actions.describe(act)}")
+                    aus["info"](f"↩ Wiederholung übersprungen: {actions.describe(act)}")
                     records.append({"tool": tool, "status": "not_run"})
                     ergebnisse.append(_result_feedback(
                         tool, actions.ActionResult(_DUPLICATE_NOTE, ok=None)))
                     continue
                 seen.add(key)
 
-            # --- Menü für den Nutzer öffnen: das Menü ist selbst die Rückfrage ---
-            if tool == "menue_oeffnen":
+            # --- Menü für den Nutzer öffnen (nur im Terminal): das Menü ist selbst die Rückfrage ---
+            if tool == "menue_oeffnen" and aus["menue"] is not None:
                 record = {"tool": tool, "status": "running"}
                 records.append(record)
-                res = await _menue_fuer_ki(act)
+                res = await aus["menue"](act)
                 _finish_record(record, res)
-                if res.ok is False:
-                    ui.console.print(ui.action_result(res.text, ok=False))
-                mitschrift.aktion(tool, actions.describe(act), res.text, res.ok)
+                if aus["mitschrift"]:
+                    mitschrift.aktion(tool, actions.describe(act), res.text, res.ok)
                 ergebnisse.append(_result_feedback(tool, res))
                 continue
 
             # --- Helfer-Agenten (max 5, parallel, nur auf Abruf) ---
             if tool == "subagenten":
-                async def _pruefe(titel, preview):
-                    return "yes" if await review_action_confirm(titel, preview) else "no"
-
-                execute = _helfer_executor(
-                    records,
-                    zeige_aktion=lambda d, c: ui.console.print(ui.action_request(d, c)),
-                    zeige_ergebnis=lambda t, ok, rc: ui.console.print(ui.action_result(t, ok=ok)),
-                    frage=ask_confirm, pruefe=_pruefe, warne=ui.warn)
-                ergebnisse.append(await _helfer_lauf(
-                    act, backend, records, execute,
-                    zeige_start=lambda hs: ui.console.print(ui.action_request(
-                        f"{len(hs)} Helfer-Agent(en) losschicken:\n"
-                        + "\n".join(f"    • {h['rolle']}: {h['aufgabe']}" for h in hs),
-                        confirm=False)),
-                    zeige_bericht=lambda i, h, b: ui.console.print(
-                        ui.subagent_panel(i, h["rolle"], h["aufgabe"], b)),
-                    frage=ask_confirm))
+                execute = _helfer_executor(records, **aus["helfer"])
+                ergebnisse.append(await _helfer_lauf(act, backend, records, execute, **aus["helfer_lauf"]))
                 continue
 
             # --- Recherche: planen → suchen → lesen → prüfen → Bericht ---
             if tool == "recherche":
-                ergebnisse.append(await _recherche_lauf(
-                    act, backend, records, melde=ui.info,
-                    plan_zeigen=lambda tf: ui.console.print(ui.action_request(_recherche_plan_text(tf), confirm=False)),
-                    abbruch=_stopp_taste))
+                ergebnisse.append(await _recherche_lauf(act, backend, records, **aus["recherche"]))
                 continue
 
-            vorher = set(AUTO_ALLOW)
-            lage, res = await _freigabe(
-                act, frage=ask_confirm, pruefe=review_action_confirm,
-                zeige_aktion=lambda d, c, a: ui.console.print(
-                    ui.action_request(d, c, kopf=sicherheit.kopf(a, c),
-                                      risiko=sicherheit.stufe(a) == sicherheit.RISKANT)),
-                wer=PS.active().name, frei=frei, abgelehnt=abgelehnt)
+            frei_vorher = set(AUTO_ALLOW)
+            lage, res = await _freigabe(act, frage=aus["frage"], pruefe=aus["pruefe"],
+                                        zeige_aktion=aus["zeige_aktion"], wer=PS.active().name,
+                                        frei=frei, abgelehnt=abgelehnt)
             if lage == "rejected":
-                ui.warn("Abgelehnt.")
-                mitschrift.aktion(tool, actions.describe(act), "Vom Nutzer abgelehnt.", False)
+                aus["warn"]("Abgelehnt.")
+                if aus["mitschrift"]:
+                    mitschrift.aktion(tool, actions.describe(act), "Vom Nutzer abgelehnt.", False)
                 records.append({"tool": tool, "status": "rejected"})
                 ergebnisse.append(_ABGELEHNT_TEXT.format(tool=tool))
                 continue
             if lage != "run":
-                ui.console.print(ui.action_result(res.text, ok=None if lage == "block" else res.ok))
+                aus["ergebnis"](res.text, None if lage == "block" else res.ok)
                 records.append({"tool": tool, "status": "not_run"})
                 ergebnisse.append(_result_feedback(tool, res))
                 continue
-            if AUTO_ALLOW - vorher:
-                ui.info(f"Aktionen vom Typ '{tool}' frage ich diese Sitzung nicht mehr ab.")
+            if AUTO_ALLOW - frei_vorher:
+                aus["info"](f"Aktionen vom Typ '{tool}' frage ich diese Sitzung nicht mehr ab.")
             record = {"tool": tool, "status": "running"}
             records.append(record)
+            vorher = _vorher_stand(act) if aus["diff"] else None
             beginn = time.monotonic()
             if tool not in modes.READ_TOOLS:
                 nur_gelesen = False
-            titel = {"bild_serie": "🎨 male deine Serie", "video_erstellen": "🎬 erzeuge dein Video",
-                     "kugel_anziehen": "👗 male dein Kugel-Outfit",
-                     "backup_erstellen": "💾 sichere", "lora_trainieren": "🧬 trainiere deine LoRA",
-                     "coding_lora_trainieren": "🧠 trainiere das Coding-LoRA",
-                     "musik_machen": "🎵 komponiere deinen Song", "musik_cover": "🎵 spiele das Cover ein"}.get(tool, "🎨 male dein Bild")
+            titel = _HINTERGRUND_TITEL.get(tool, "🎨 male dein Bild")
             if (getattr(actions, "ACTIONS", {}).get(tool, {}).get("hintergrund") and not act.get("warten")
                     and str(SESSION.get("model") or "").split(":")[0] not in ("", "gguf", "ollama")):
                 # Lange Werkzeuge laufen bei Cloud-Modellen nebenbei: der Nutzer redet weiter, die
@@ -1262,63 +1120,30 @@ async def _converse(backend, user_text, images, records, denk=None) -> None:
                 import hintergrund as HG
                 nr = HG.starten(tool, titel, lambda a=act: actions.run(a), PS.active().key)
                 res = actions.ActionResult(HG.start_text(nr), ok=True)
-            elif tool in ("bild_malen", "bild_serie", "kugel_anziehen", "backup_erstellen", "video_erstellen"):
-                # Bildmalen und Backup zeigen einen echten Ladebalken (Schritt i/n), genau
-                # wie die Befehle. Die Aktion läuft im Thread und meldet ihren
-                # Fortschritt über actions.bild_status() zurück.
-                run_task = asyncio.create_task(actions.run(act))
-                if (punkt := plan.aktuell()) is not None:
-                    titel = f"{titel[:1]} Todo {punkt['nr']}: {punkt['text'][:60]}"
-                with ui.live_view(ui.progress_panel(titel, "starte …")) as live:
-                    while not run_task.done():
-                        if _abbruch_taste():
-                            notstopp.ausloesen()
-                        stand = actions.bild_status() or "arbeite …"
-                        if notstopp.ausgeloest():   # schon bezahlter Strom: zu Ende rechnen, danach nichts mehr
-                            stand = f"⏹ Not-Stopp – rechnet noch zu Ende, danach nichts mehr · {stand}"
-                        live.update(ui.progress_panel(titel, stand))
-                        await asyncio.sleep(0.2)
-                res = await run_task
-            elif tool == "befehl" or coding.pruefbefehl(act):
-                res = await _befehl_live(act)
             else:
-                with ui.thinking("führe aus"):
-                    res = await _warten_mit_stopp(asyncio.create_task(actions.run(act)))
+                res = await aus["ausfuehren"](act, tool, titel)
             _finish_record(record, res)
             if tool not in modes.READ_TOOLS and tool not in ("plan", "todo", "coding_start") and res.ok:
                 notstopp.geaendert_merken(actions.describe(act))
             uris, res = await _bilder_aus_ergebnis(res, SESSION.get("model"))
-            if tool == "plan" and res.ok:
-                _plan_zeigen()
-            else:
-                web = tool in ("web_lesen", "web_wiki", "web_suche", "fach_suche")
-                anzeige = ui.anzeige_kurz(res.text) if web else res.text
-                ui.console.print(ui.action_result(anzeige, ok=res.ok, sekunden=time.monotonic() - beginn))
-                if tool in ("musik_machen", "musik_cover") and res.ok:
-                    ui.musik_karte_aus(res.text)        # Mini-Player: abspielen, Cover, Ordner
-                if plan.abhaken_nach(act, res.ok):          # Feld „abhaken“: sofort grün
-                    _plan_zeigen()
-            if tool in ("todo", "coding_start") and res.ok:
-                _todo_zeigen()
-                if str(act.get("aktion", "")).lower() == "frage":
-                    frage_halt = True
-            mitschrift.aktion(tool, actions.describe(act), res.text, res.ok)
+            abgehakt = False if tool == "plan" and res.ok else plan.abhaken_nach(act, res.ok)   # Feld „abhaken“
+            aus["nach_aktion"](act, tool, res, time.monotonic() - beginn, vorher, abgehakt, uris)
+            if tool in ("todo", "coding_start") and res.ok and str(act.get("aktion", "")).lower() == "frage":
+                frage_halt = True
+            if aus["mitschrift"]:
+                mitschrift.aktion(tool, actions.describe(act), res.text, res.ok)
             protokoll.schreibe(tool, actions.describe(act), record["status"],
                                veraendernd=actions.needs_confirm(act), wer=PS.active().name,
                                ergebnis=res.text, stufe=sicherheit.stufe(act))
-            if tool in ("bild_malen", "bild_serie") and res.ok:
-                _bild_vorschau(res.text)
             if uris:
                 naechste_bilder.extend(uris)
-                for pf in res.bilder[:2]:
-                    _bild_vorschau(str(pf), title=f"angesehen: {Path(pf).name}")
-            ergebnisse.append(_result_feedback(tool, res, _werkzeug_beobachten(tool, act, res, ui.info)))
+            ergebnisse.append(_result_feedback(tool, res, _werkzeug_beobachten(tool, act, res, aus["info"])))
 
         # 4) Ergebnisse zurück ans Modell, nächster Schritt
         if notstopp.ausgeloest():
             return
         if ersatzbank.wechsel_offen():
-            ui.warn(ersatzbank.MELDUNG)
+            aus["warn"](ersatzbank.MELDUNG)
             return
         if any(a.get("tool") != "plan" for a in acts) and (stand := plan.kurzstand()):
             ergebnisse.append(stand)
@@ -1326,7 +1151,367 @@ async def _converse(backend, user_text, images, records, denk=None) -> None:
         if (neu := (coding.marke(), plan.marke())) != marke:  # Todo-Fortschritt: Bremse beginnt neu
             marke, basis, nur_gelesen = neu, schritt + 1, True
 
-    ui.warn(_STEP_LIMIT_WARN)                # Rückfall – normalerweise endet die Extra-Runde oben
+    aus["warn"](_STEP_LIMIT_WARN)            # Rückfall – normalerweise endet die Extra-Runde oben
+
+
+async def _terminal_antworten(backend, next_input, imgs) -> dict:
+    """Antwort streamen mit Live-Anzeige (Denken, Text, Zeit, Tokens); ESC oder Ctrl-C bricht ab."""
+    answer = ""
+    thinking_txt = ""
+    note = ""                        # dezente Info-Zeile (z.B. Auto-Stark)
+    usage = {"input": 0, "output": 0}
+    have_usage = False
+    seed = ui.new_verb_seed()
+    t0 = time.monotonic()
+    think = {"start": None, "secs": None}    # wie lange wurde nachgedacht?
+    last_paint = 0.0
+    ankunft = {"denken": None, "antwort": None, "stuecke": 0}   # ab Absenden, für den Debugbericht
+
+    def _tokens() -> int:
+        if have_usage and usage["output"]:
+            return usage["output"]
+        return (len(answer) + len(thinking_txt)) // 4   # Schätzung, bis echte Zahl da ist
+
+    def _view():
+        el = time.monotonic() - t0
+        verb = ui.verb_at(seed, el)
+        if thinking_txt or answer or note:
+            think_secs = think["secs"]
+            if think_secs is None and think["start"] is not None:
+                think_secs = time.monotonic() - think["start"]
+            return Group(_render(thinking_txt, answer, think_secs, note),
+                         ui.stream_meter(verb, el, _tokens()))
+        return ui.working_meter(verb, el, _tokens())
+
+    # Den Stream in einer Hintergrund-Task konsumieren und Ereignisse in eine
+    # Queue legen. So kann die Live-Anzeige im Takt (alle 0.2s) aktualisiert
+    # werden – auch wenn gerade KEIN Token kommt (Zeit/Verb laufen weiter),
+    # und wir können nebenbei auf Esc lauschen.
+    queue: asyncio.Queue = asyncio.Queue()
+
+    async def _produce():
+        try:
+            async for ev in backend.stream(next_input, images=imgs):
+                await queue.put(("ev", ev))
+        except Exception as exc:        # Fehler durchreichen
+            await queue.put(("err", exc))
+            return
+        await queue.put(("done", None))
+
+    producer = asyncio.create_task(_produce())
+    err = None
+    aborted = False
+    with ui.live_view(_view()) as live:
+        try:
+            while True:
+                # Auch bei lückenlosem Tokenstrom reagieren. Im Vollbild
+                # liest nur prompt_toolkit die Tastatur, nie parallel msvcrt.
+                if _abbruch_taste():
+                    aborted = True
+                    break
+                try:
+                    kind, payload = await asyncio.wait_for(queue.get(), timeout=0.2)
+                except asyncio.TimeoutError:
+                    live.update(_view())      # Zeit/Verb weiterlaufen lassen
+                    continue
+                if kind == "done":
+                    break
+                if kind == "err":
+                    err = payload
+                    break
+                ev = payload
+                et = ev.get("type")
+                if et == "usage":
+                    if "input" in ev:
+                        usage["input"] = ev["input"]
+                    if "output" in ev:
+                        usage["output"] = ev["output"]
+                    have_usage = True
+                elif et == "thinking":
+                    if think["start"] is None:
+                        think["start"] = time.monotonic()
+                        ankunft["denken"] = think["start"] - t0
+                    ankunft["stuecke"] += 1
+                    thinking_txt += ev["text"]
+                elif et == "note":
+                    note = ev["text"]        # dezente Info, nicht Teil der Antwort
+                else:
+                    # erstes echtes Antwort-Zeichen -> Denkzeit steht fest
+                    if (ev["text"].strip() and think["start"] is not None
+                            and think["secs"] is None):
+                        think["secs"] = time.monotonic() - think["start"]
+                    if ankunft["antwort"] is None and ev["text"].strip():
+                        ankunft["antwort"] = time.monotonic() - t0
+                    answer += ev["text"]
+                now = time.monotonic()
+                if now - last_paint >= 1 / 12:
+                    live.update(_view())
+                    last_paint = now
+        except KeyboardInterrupt:              # Ctrl-C -> ebenfalls abbrechen
+            aborted = True
+
+    # Stream-Task sauber beenden
+    if not producer.done():
+        producer.cancel()
+        try:
+            await producer
+        except (asyncio.CancelledError, Exception):
+            pass
+    if err:
+        if ui.TUI is not None:
+            ui.TUI.set_thinking(thinking_txt, think["secs"], live=False)
+        raise err
+
+    elapsed = time.monotonic() - t0
+    _ankunft_melden(ankunft, len(thinking_txt), elapsed)
+    if think["start"] is not None and think["secs"] is None:
+        think["secs"] = time.monotonic() - think["start"]
+    return {"antwort": answer, "denken": thinking_txt, "denk_s": think["secs"], "note": note,
+            "eingabe": usage["input"], "tokens": _tokens(), "sekunden": elapsed, "abgebrochen": aborted}
+
+
+def _terminal_ausgabe() -> dict:
+    """Ausgabe-Adapter der Schleife fürs Terminal: Kästen, Live-Anzeige, ESC, Menüs, Mitschrift (F12)."""
+
+    def abgebrochen(backend, r) -> None:
+        # Verlauf konsistent halten: das Backend hat den User-Turn schon angehängt, aber keine Antwort.
+        if backend.messages and backend.messages[-1].get("role") == "user":
+            backend.messages.append({"role": "assistant", "content": r["antwort"] or "(abgebrochen)"})
+        if r["antwort"].strip() or r["denken"]:
+            ui.console.print(_render(r["denken"], r["antwort"], r["denk_s"], done=True))
+        mitschrift.assistent(r["antwort"] or "(abgebrochen)", r["denken"], r["denk_s"])
+        mitschrift.notiz("⎋ Vom Nutzer abgebrochen.")
+
+    def antwort_zeigen(r, acts, cleaned) -> None:
+        # die vollständige Antwort einmal sauber ausgeben (kein Stapeln mehr)
+        if cleaned:
+            display = cleaned
+        elif acts:
+            display = "⚙ (Aktion vorbereitet)"        # nur wenn wirklich eine Aktion folgt
+        else:
+            display = "_(leere Antwort – frag ruhig nochmal)_"
+        hoeren = bool(cleaned) and not acts and _voice_an()
+        if cleaned and not acts:
+            _LETZTE_ANTWORT[0] = cleaned
+        ui.console.print(_render(r["denken"], _kurzfassung(cleaned) if hoeren else display,
+                                 r["denk_s"], r["note"], done=True))
+        # Denktext gibt es NUR hier - in backend.messages steht er nicht.
+        mitschrift.assistent(display, r["denken"], r["denk_s"])
+        if cleaned:                          # Tokens · Zeit · Tempo, wenn es echte Antwort gab
+            tps = r["tokens"] / r["sekunden"] if r["sekunden"] > 0.3 else None
+            ui.console.print(ui.done_meter(r["sekunden"], r["tokens"], tps, r["eingabe"]))
+
+    async def menue(act):
+        res = await _menue_fuer_ki(act)
+        if res.ok is False:
+            ui.console.print(ui.action_result(res.text, ok=False))
+        return res
+
+    async def pruefe_helfer(titel, preview):
+        return "yes" if await review_action_confirm(titel, preview) else "no"
+
+    async def ausfuehren(act, tool, titel):
+        if tool in _FORTSCHRITT_WERKZEUGE:
+            # Bildmalen und Backup zeigen einen echten Ladebalken (Schritt i/n), genau wie die Befehle.
+            # Die Aktion läuft im Thread und meldet ihren Fortschritt über actions.bild_status() zurück.
+            run_task = asyncio.create_task(actions.run(act))
+            if (punkt := plan.aktuell()) is not None:
+                titel = f"{titel[:1]} Todo {punkt['nr']}: {punkt['text'][:60]}"
+            with ui.live_view(ui.progress_panel(titel, "starte …")) as live:
+                while not run_task.done():
+                    if _abbruch_taste():
+                        notstopp.ausloesen()
+                    stand = actions.bild_status() or "arbeite …"
+                    if notstopp.ausgeloest():   # schon bezahlter Strom: zu Ende rechnen, danach nichts mehr
+                        stand = f"⏹ Not-Stopp – rechnet noch zu Ende, danach nichts mehr · {stand}"
+                    live.update(ui.progress_panel(titel, stand))
+                    await asyncio.sleep(0.2)
+            return await run_task
+        if tool == "befehl" or coding.pruefbefehl(act):
+            return await _befehl_live(act)
+        with ui.thinking("führe aus"):
+            return await _warten_mit_stopp(asyncio.create_task(actions.run(act)))
+
+    def nach_aktion(act, tool, res, sekunden, vorher, abgehakt, uris) -> None:
+        if tool == "plan" and res.ok:
+            _plan_zeigen()
+        else:
+            web = tool in ("web_lesen", "web_wiki", "web_suche", "fach_suche")
+            ui.console.print(ui.action_result(ui.anzeige_kurz(res.text) if web else res.text, ok=res.ok,
+                                              sekunden=sekunden))
+            if vorher is not None and res.ok:
+                _diff_zeigen(act, vorher)
+            if tool in ("musik_machen", "musik_cover") and res.ok:
+                ui.musik_karte_aus(res.text)        # Mini-Player: abspielen, Cover, Ordner
+            if abgehakt:                            # Feld „abhaken“: sofort grün
+                _plan_zeigen()
+        if tool in ("todo", "coding_start") and res.ok:
+            _todo_zeigen()
+        if tool in ("bild_malen", "bild_serie") and res.ok:
+            _bild_vorschau(res.text)
+        if uris:
+            for pf in res.bilder[:2]:
+                _bild_vorschau(str(pf), title=f"angesehen: {Path(pf).name}")
+
+    return {
+        "antworten": _terminal_antworten, "abgebrochen": abgebrochen, "antwort_zeigen": antwort_zeigen,
+        "info": ui.info, "warn": ui.warn, "hinweis": ui.warn,
+        "ergebnis": lambda text, ok: ui.console.print(ui.action_result(text, ok=ok)),
+        "frage": ask_confirm, "pruefe": review_action_confirm,
+        "zeige_aktion": lambda d, c, a: ui.console.print(
+            ui.action_request(d, c, kopf=sicherheit.kopf(a, c),
+                              risiko=sicherheit.stufe(a) == sicherheit.RISKANT, act=a)),
+        "helfer": {"zeige_aktion": lambda d, c: ui.console.print(ui.action_request(d, c)),
+                   "zeige_ergebnis": lambda t, ok, rc: ui.console.print(ui.action_result(t, ok=ok)),
+                   "frage": ask_confirm, "pruefe": pruefe_helfer, "warne": ui.warn},
+        "helfer_lauf": {"zeige_start": lambda hs: ui.console.print(ui.action_request(
+                            f"{len(hs)} Helfer-Agent(en) losschicken:\n"
+                            + "\n".join(f"    • {h['rolle']}: {h['aufgabe']}" for h in hs), confirm=False)),
+                        "zeige_bericht": lambda i, h, b: ui.console.print(
+                            ui.subagent_panel(i, h["rolle"], h["aufgabe"], b)),
+                        "frage": ask_confirm},
+        "recherche": {"melde": ui.info, "abbruch": _stopp_taste,
+                      "plan_zeigen": lambda tf: ui.console.print(
+                          ui.action_request(_recherche_plan_text(tf), confirm=False))},
+        "menue": menue, "ausfuehren": ausfuehren, "nach_aktion": nach_aktion,
+        "abbruch": _abbruch_taste, "erlaubt": None, "mit_stopp": True, "mitschrift": True, "diff": True,
+    }
+
+
+def _web_ausgabe(emit, confirm, erlaubt=None) -> dict:
+    """Ausgabe-Adapter der Schleife für WebUI und Fenster: strukturierte Ereignisse über emit(dict),
+    Rückfragen über confirm(frage, optionen) (async). Derselbe Verlauf, dasselbe Modell wie im Terminal."""
+
+    async def antworten(backend, next_input, imgs):
+        answer = ""
+        thinking_txt = ""
+        usage = {"input": 0, "output": 0}
+        have_usage = False
+        t0 = time.monotonic()
+        try:
+            async for ev in backend.stream(next_input, images=imgs):
+                et = ev.get("type")
+                if et == "usage":
+                    usage["input"] = ev.get("input", usage["input"])
+                    usage["output"] = ev.get("output", usage["output"])
+                    have_usage = True
+                elif et == "thinking":
+                    thinking_txt += ev["text"]
+                    emit({"t": "thinking", "delta": ev["text"]})
+                elif et == "note":
+                    emit({"t": "note", "text": ev["text"]})   # dezente Info, nicht Teil der Antwort
+                else:
+                    answer += ev["text"]
+                    emit({"t": "answer", "delta": ev["text"]})
+        except Exception as exc:
+            emit({"t": "error", "text": f"Fehler bei der Antwort: {exc}"})
+            return None
+        tokens = usage["output"] if (have_usage and usage["output"]) else (len(answer) + len(thinking_txt)) // 4
+        return {"antwort": answer, "denken": thinking_txt, "denk_s": None, "note": "", "eingabe": usage["input"],
+                "tokens": tokens, "sekunden": time.monotonic() - t0, "abgebrochen": False}
+
+    def antwort_zeigen(r, acts, cleaned) -> None:
+        emit({"t": "answer_end",
+              "clean": cleaned if cleaned else (None if acts else ""),
+              "input": r["eingabe"], "output": r["tokens"],
+              "elapsed": round(r["sekunden"], 2),
+              "tps": round(r["tokens"] / r["sekunden"], 1) if r["sekunden"] > 0.3 else None})
+
+    async def pruefe(titel, preview):
+        return (await confirm(titel, [("yes", "Gezeigten Inhalt freigeben"), ("no", "Ablehnen")],
+                              preview=preview)) == "yes"
+
+    async def ausfuehren(act, tool, titel):
+        if tool in _FORTSCHRITT_WERKZEUGE:
+            # Gleicher Ladebalken wie im Terminal: Aktion im Thread, Fortschritt über actions.bild_status().
+            run_task = asyncio.create_task(actions.run(act))
+            last = None
+            while not run_task.done():
+                msg = actions.bild_status() or "arbeite …"
+                if msg != last:
+                    last = msg
+                    emit(_web_progress(msg))
+                await asyncio.sleep(0.2)
+            res = await run_task
+            emit({"t": "progress_end"})
+            return res
+        return await actions.run(act)
+
+    def nach_aktion(act, tool, res, sekunden, vorher, abgehakt, uris) -> None:
+        emit({"t": "action_result", "ok": res.ok, "text": res.text, "returncode": res.returncode})
+
+    note = lambda t: emit({"t": "note", "text": t})       # noqa: E731
+    warn = lambda t: emit({"t": "warn", "text": t})       # noqa: E731
+    return {
+        "antworten": antworten, "abgebrochen": lambda backend, r: None, "antwort_zeigen": antwort_zeigen,
+        "info": note, "warn": warn, "hinweis": note,
+        "ergebnis": lambda text, ok: emit({"t": "action_result", "ok": ok, "text": text}),
+        "frage": confirm, "pruefe": pruefe,
+        "zeige_aktion": lambda d, c, a: emit({"t": "action", "desc": d, "needs_confirm": c,
+                                              "risiko": sicherheit.stufe(a) == sicherheit.RISKANT,
+                                              "stufe": sicherheit.stufe(a)}),
+        "helfer": {"zeige_aktion": lambda d, c: emit({"t": "action", "desc": d, "needs_confirm": c}),
+                   "zeige_ergebnis": lambda t, ok, rc: emit({"t": "action_result", "ok": ok, "text": t,
+                                                             "returncode": rc}),
+                   "frage": confirm,
+                   "pruefe": lambda titel, preview: confirm(
+                       titel, [("yes", "Gezeigten Inhalt freigeben"), ("no", "Ablehnen")], preview=preview),
+                   "warne": warn},
+        "helfer_lauf": {"zeige_start": lambda hs: emit({
+                            "t": "action", "needs_confirm": False,
+                            "desc": f"{len(hs)} Helfer-Agent(en) losschicken:\n"
+                                    + "\n".join(f"• {h['rolle']}: {h['aufgabe']}" for h in hs)}),
+                        "zeige_bericht": lambda i, h, b: emit({
+                            "t": "action_result", "ok": None,
+                            "text": f"🤝 {subagents.label(i, h)} – {h['aufgabe']}\n\n{b}"}),
+                        "frage": confirm},
+        "recherche": {"melde": note, "plan_zeigen": lambda tf: note(_recherche_plan_text(tf))},
+        "menue": None, "ausfuehren": ausfuehren, "nach_aktion": nach_aktion,
+        "abbruch": lambda: False, "erlaubt": erlaubt, "mit_stopp": False, "mitschrift": False, "diff": False,
+    }
+
+
+_DIFF_WERKZEUGE = ("datei_schreiben", "datei_bearbeiten")
+_DIFF_MAX_BYTES = 1_000_000
+
+
+def _diff_pfad(act: dict) -> Path | None:
+    roh = act.get("pfad")
+    if act.get("tool") not in _DIFF_WERKZEUGE or not isinstance(roh, str) or not roh.strip():
+        return None
+    return Path(os.path.expandvars(roh)).expanduser()
+
+
+def _datei_text(p: Path) -> str | None:
+    try:
+        if not p.is_file() or p.stat().st_size > _DIFF_MAX_BYTES:
+            return None
+        return p.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+
+
+def _vorher_stand(act: dict) -> tuple[bool, str | None] | None:
+    """(Datei gab es schon, alter Inhalt) für den Diff nach einer Dateiänderung – sonst None."""
+    try:
+        if (p := _diff_pfad(act)) is None:
+            return None
+        return p.is_file(), _datei_text(p)
+    except OSError:
+        return None
+
+
+def _diff_zeigen(act: dict, vorher: tuple[bool, str | None]) -> None:
+    war_da, alt = vorher
+    if war_da and alt is None:                   # zu groß oder kein Text: kein Diff
+        return
+    try:
+        p = _diff_pfad(act)
+        if p is not None and (d := ui.diff_anzeige(str(p), alt if war_da else None, _datei_text(p))):
+            ui.console.print(d)
+    except Exception as exc:                     # Anzeige darf den Ablauf nie stören
+        import debugbericht as _DBG
+        _DBG.fehler("diff_anzeige", exc)
 
 
 async def _befehl_live(act: dict) -> "actions.ActionResult":
@@ -1387,263 +1572,13 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
     user_text += _runde_beobachten(lambda t: emit({"t": "note", "text": t}))
     notstopp.runde_aktiv(True)
     try:
-        await _web_converse(backend, user_text, images, emit, confirm, records, erlaubt, denk)
+        await _schleife(backend, user_text, images, records, denk, _web_ausgabe(emit, confirm, erlaubt))
     finally:
         notstopp.runde_aktiv(False)
         if hasattr(backend, "denk_hinweis"):
             backend.denk_hinweis = ""
         _close_records(records)
         emit({"t": "receipt", "records": records})
-
-
-async def _web_converse(backend, user_text, images, emit, confirm, records, erlaubt=None, denk=None) -> None:
-    """Kopflose Variante von converse() fürs WebUI.
-
-    Gleiche Aktions-Schleife, aber statt ins Terminal zu rendern, gibt sie
-    strukturierte Ereignisse via emit(dict) an den Browser und fragt
-    Bestätigungen via confirm(frage, optionen)->wahl (async). Nutzt dieselben
-    Werkzeuge/Backends wie das Terminal – derselbe Verlauf, dasselbe Modell.
-    """
-    if (zeile := _denkwerk_start(backend, denk)):
-        emit({"t": "note", "text": zeile})
-    next_input = user_text
-    first = True
-    seen: set[str] = set()
-    nur_gelesen = True
-    gegenprobe_gemacht = False
-    block_nachgefragt = False
-    # Gleiche Grenzen wie im Terminal: Coding und Serien brauchen mehr Schritte; Not-Stopp gilt auch hier.
-    gesamt = CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
-    for schritt in itertools.count():
-        if notstopp.ausgeloest():
-            return
-        if plan.aktuell() is not None:
-            gesamt = max(gesamt, SERIE_MAX_STEPS)
-        if schritt > gesamt:
-            break
-        letzter = schritt >= max(_schritt_grenze(nur_gelesen), gesamt if gesamt > MAX_LESE_STEPS else 0)
-        if letzter:
-            next_input = next_input + _STEP_LIMIT_NOTE
-        answer = ""
-        thinking_txt = ""
-        usage = {"input": 0, "output": 0}
-        have_usage = False
-        t0 = time.monotonic()
-        imgs = images if first else (naechste_bilder or None)
-        first = False
-        naechste_bilder = []
-        try:
-            async for ev in backend.stream(next_input, images=imgs):
-                et = ev.get("type")
-                if et == "usage":
-                    usage["input"] = ev.get("input", usage["input"])
-                    usage["output"] = ev.get("output", usage["output"])
-                    have_usage = True
-                elif et == "thinking":
-                    thinking_txt += ev["text"]
-                    emit({"t": "thinking", "delta": ev["text"]})
-                elif et == "note":
-                    emit({"t": "note", "text": ev["text"]})   # dezente Info, nicht Teil der Antwort
-                else:
-                    answer += ev["text"]
-                    emit({"t": "answer", "delta": ev["text"]})
-        except Exception as exc:
-            emit({"t": "error", "text": f"Fehler bei der Antwort: {exc}"})
-            return
-
-        elapsed = time.monotonic() - t0
-        out_toks = usage["output"] if (have_usage and usage["output"]) \
-            else (len(answer) + len(thinking_txt)) // 4
-        SESSION["tokens"] += out_toks
-        _update_session_meters(usage["input"], out_toks)
-        try:
-            stats.record_turn(SESSION.get("model"), PS.active().name, modes.current(),
-                              usage["input"], out_toks,
-                              pricing.cost(SESSION.get("model"), usage["input"], out_toks))
-        except Exception:
-            pass
-        acts, cleaned = actions.parse_actions(answer)
-        emit({"t": "answer_end",
-              "clean": cleaned if cleaned else (None if acts else ""),
-              "input": usage["input"], "output": out_toks,
-              "elapsed": round(elapsed, 2),
-              "tps": round(out_toks / elapsed, 1) if elapsed > 0.3 else None})
-
-        if acts and notstopp.stop_runde():   # „STOP“-Runde: nur bestätigen, nichts ausführen
-            for act in acts:
-                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
-            emit({"t": "warn", "text": "⏹ " + notstopp.GESPERRT_TEXT})
-            return
-        if not acts:
-            if (hinweis := actions.unparsed_action_note(answer, acts)):
-                emit({"t": "note", "text": hinweis})
-                if not letzter and not block_nachgefragt:
-                    block_nachgefragt = True
-                    emit({"t": "note", "text": "↻ Die KI bekommt den Grund und schickt die Aktion neu."})
-                    next_input = actions.unlesbar_fuer_ki(answer)
-                    continue
-            if not letzter and not gegenprobe_gemacht and (gp := _gegenprobe(cleaned, records)):
-                gegenprobe_gemacht = True
-                emit({"t": "note", "text": "🔎 Gegenprobe: " + gp[1][0]})
-                next_input = gp[0]
-                continue
-            if not letzter and (nachbessern := await _denkwerk_pruefen(
-                    backend, denk, cleaned, records, lambda t: emit({"t": "note", "text": t}), mit_stopp=False)):
-                next_input = nachbessern
-                continue
-            _vorlesen_auto(cleaned)
-            return
-        if letzter:
-            for act in acts:
-                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
-            emit({"t": "warn", "text": _STEP_LIMIT_WARN})
-            return
-
-        ergebnisse = []
-        for act in acts:
-            raw_tool = act.get("tool")
-            fixed = actions.resolve_tool(raw_tool)
-            if fixed and fixed != raw_tool:
-                act["tool"] = fixed
-        if erlaubt is not None:
-            chat = erlaubt is CHAT_WERKZEUGE
-            for act in [a for a in acts if a.get("tool") not in erlaubt]:
-                emit({"t": "note", "text": ("🔒 im Chat-Modus gesperrt: " if chat else "🔒 hier nicht freigegeben: ")
-                      + actions.describe(act)})
-                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
-                ergebnisse.append(_CHAT_GESPERRT.format(tool=act.get("tool", "?")) if chat else
-                                  _FENSTER_GESPERRT.format(tool=act.get("tool", "?"), liste=", ".join(sorted(erlaubt))))
-            acts = [a for a in acts if a.get("tool") in erlaubt]
-        acts, gesperrt = plan.zurueckweisen(acts, coding.aktiv())
-        if gesperrt:
-            emit({"t": "note", "text": "🟨 Mehr als ein Schritt – erst die Todo-Liste. Nicht ausgeführt: "
-                  + ", ".join(actions.describe(a).splitlines()[0] for a in gesperrt)})
-            for act in gesperrt:
-                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
-            ergebnisse.append(plan.sperr_text(gesperrt))
-        frei, abgelehnt = await _buendel_freigabe(acts, confirm)
-        for act in acts:
-            tool = act.get("tool")
-            if notstopp.ausgeloest():                       # Not-Stopp gilt auch in den Fenstern
-                records.append({"tool": tool, "status": "not_run"})
-                continue
-            if ersatzbank.wechsel_offen():                  # Modell herausgefiltert: nichts mehr ausführen
-                records.append({"tool": tool, "status": "not_run"})
-                continue
-
-            if tool in _DEDUPE_TOOLS:
-                key = _action_key(act)
-                if key in seen:
-                    emit({"t": "note", "text": f"↩ Wiederholung übersprungen: {actions.describe(act)}"})
-                    records.append({"tool": tool, "status": "not_run"})
-                    ergebnisse.append(_result_feedback(
-                        tool, actions.ActionResult(_DUPLICATE_NOTE, ok=None)))
-                    continue
-                seen.add(key)
-
-            if tool == "subagenten":
-                execute = _helfer_executor(
-                    records,
-                    zeige_aktion=lambda d, c: emit({"t": "action", "desc": d, "needs_confirm": c}),
-                    zeige_ergebnis=lambda t, ok, rc: emit(
-                        {"t": "action_result", "ok": ok, "text": t, "returncode": rc}),
-                    frage=confirm,
-                    pruefe=lambda titel, preview: confirm(
-                        titel, [("yes", "Gezeigten Inhalt freigeben"), ("no", "Ablehnen")],
-                        preview=preview),
-                    warne=lambda t: emit({"t": "warn", "text": t}))
-                ergebnisse.append(await _helfer_lauf(
-                    act, backend, records, execute,
-                    zeige_start=lambda hs: emit({
-                        "t": "action", "needs_confirm": False,
-                        "desc": f"{len(hs)} Helfer-Agent(en) losschicken:\n"
-                                + "\n".join(f"• {h['rolle']}: {h['aufgabe']}" for h in hs)}),
-                    zeige_bericht=lambda i, h, b: emit({
-                        "t": "action_result", "ok": None,
-                        "text": f"🤝 {subagents.label(i, h)} – {h['aufgabe']}\n\n{b}"}),
-                    frage=confirm))
-                continue
-
-            if tool == "recherche":
-                ergebnisse.append(await _recherche_lauf(
-                    act, backend, records, melde=lambda t: emit({"t": "note", "text": t}),
-                    plan_zeigen=lambda tf: emit({"t": "note", "text": _recherche_plan_text(tf)})))
-                continue
-
-            async def _web_pruefe(titel, preview):
-                return (await confirm(
-                    titel, [("yes", "Gezeigten Inhalt freigeben"), ("no", "Ablehnen")],
-                    preview=preview)) == "yes"
-
-            lage, res = await _freigabe(
-                act, frage=confirm, pruefe=_web_pruefe,
-                zeige_aktion=lambda d, c, a: emit({
-                    "t": "action", "desc": d, "needs_confirm": c,
-                    "risiko": sicherheit.stufe(a) == sicherheit.RISKANT,
-                    "stufe": sicherheit.stufe(a)}),
-                wer=PS.active().name, frei=frei, abgelehnt=abgelehnt)
-            if lage == "rejected":
-                emit({"t": "warn", "text": "Aktion abgelehnt."})
-                records.append({"tool": tool, "status": "rejected"})
-                ergebnisse.append(_ABGELEHNT_TEXT.format(tool=tool))
-                continue
-            if lage != "run":
-                emit({"t": "action_result", "ok": None if lage == "block" else res.ok,
-                      "text": res.text})
-                records.append({"tool": tool, "status": "not_run"})
-                ergebnisse.append(_result_feedback(tool, res))
-                continue
-
-            record = {"tool": tool, "status": "running"}
-            records.append(record)
-            if tool not in modes.READ_TOOLS:
-                nur_gelesen = False
-            if (getattr(actions, "ACTIONS", {}).get(tool, {}).get("hintergrund") and not act.get("warten")
-                    and str(SESSION.get("model") or "").split(":")[0] not in ("", "gguf", "ollama")):
-                import hintergrund as HG
-                titel = {"bild_serie": "🎨 male deine Serie", "video_erstellen": "🎬 erzeuge dein Video",
-                         "kugel_anziehen": "👗 male dein Kugel-Outfit",
-                         "lora_trainieren": "🧬 trainiere deine LoRA",
-                         "coding_lora_trainieren": "🧠 trainiere das Coding-LoRA",
-                         "musik_machen": "🎵 komponiere deinen Song", "musik_cover": "🎵 spiele das Cover ein"}.get(tool, tool)
-                nr = HG.starten(tool, titel, lambda a=act: actions.run(a), PS.active().key)
-                res = actions.ActionResult(HG.start_text(nr), ok=True)
-            elif tool in ("bild_malen", "bild_serie", "kugel_anziehen", "backup_erstellen", "video_erstellen"):
-                # Gleicher Ladebalken wie im Terminal: Aktion im Thread,
-                # Fortschritt über actions.bild_status() an den Browser.
-                run_task = asyncio.create_task(actions.run(act))
-                last = None
-                while not run_task.done():
-                    msg = actions.bild_status() or "arbeite …"
-                    if msg != last:
-                        last = msg
-                        emit(_web_progress(msg))
-                    await asyncio.sleep(0.2)
-                res = await run_task
-                emit({"t": "progress_end"})
-            else:
-                res = await actions.run(act)
-            _finish_record(record, res)
-            plan.abhaken_nach(act, res.ok)
-            uris, res = await _bilder_aus_ergebnis(res, SESSION.get("model"))
-            if uris:
-                naechste_bilder.extend(uris)
-            emit({"t": "action_result", "ok": res.ok, "text": res.text,
-                  "returncode": res.returncode})
-            protokoll.schreibe(tool, actions.describe(act), record["status"],
-                               veraendernd=actions.needs_confirm(act), wer=PS.active().name,
-                               ergebnis=res.text, stufe=sicherheit.stufe(act))
-            ergebnisse.append(_result_feedback(
-                tool, res, _werkzeug_beobachten(tool, act, res, lambda t: emit({"t": "note", "text": t}))))
-
-        if ersatzbank.wechsel_offen():
-            emit({"t": "warn", "text": ersatzbank.MELDUNG})
-            return
-        if any(a.get("tool") != "plan" for a in acts) and (stand := plan.kurzstand()):
-            ergebnisse.append(stand)
-        next_input = _ergebnisse_verbinden(ergebnisse)
-
-    emit({"t": "warn", "text": _STEP_LIMIT_WARN})
 
 
 async def do_reflect(ctx: "Ctx") -> list[tuple[str, str]]:
@@ -1655,7 +1590,7 @@ async def do_reflect(ctx: "Ctx") -> list[tuple[str, str]]:
             ui.error(f"Reflexion fehlgeschlagen: {e}")
             return []
     if saved:
-        await bibliothekar(ctx.current_chat)
+        await bibliothekar(ctx.current_chat, sofort=True)
         memory.release_encoder()
     return saved
 

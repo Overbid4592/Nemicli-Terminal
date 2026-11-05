@@ -186,6 +186,8 @@ def _sicht(text: str, was: str, ab: int, grenze: int) -> str:
         aus, laenge = [], 0
         for z in rest:
             if laenge + len(z) + 1 > grenze:
+                if not aus:                               # eine Zeile allein zu lang: gekürzt, sonst ginge es nie weiter
+                    aus.append(z[:grenze] + " … [Zeile gekürzt]")
                 break
             aus.append(z)
             laenge += len(z) + 1

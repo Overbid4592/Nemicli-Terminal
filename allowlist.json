@@ -926,6 +926,24 @@
       "note": "Raw-Dateien, ungefiltert"
     },
     {
+      "domain": "api.github.com",
+      "tier": 2,
+      "category": "code_host",
+      "note": "GitHub-Schnittstelle: dieselben Daten wie github.com (Releases mit Dateien, Repos, Issues)"
+    },
+    {
+      "domain": "release-assets.githubusercontent.com",
+      "tier": 2,
+      "category": "code_host",
+      "note": "Dateien von GitHub-Releases (Weiterleitung von github.com/…/releases/download)"
+    },
+    {
+      "domain": "objects.githubusercontent.com",
+      "tier": 2,
+      "category": "code_host",
+      "note": "Dateien und Anhänge von github.com (Weiterleitung)"
+    },
+    {
       "domain": "sr.ht",
       "tier": 2,
       "category": "code_host",

@@ -186,9 +186,11 @@ def setup_bauen() -> Path | None:
     arbeit = ROOT / "build" / "setup"
     arbeit.mkdir(parents=True, exist_ok=True)
     paket = arbeit / "nutzlast.zip"
+    sys.path.insert(0, str(ROOT / "installer"))
+    from aufspielen import PROGRAMMTEILE           # das Setup nimmt nur diese an (z. B. kein ModelGGUF/, Vision/)
     with zipfile.ZipFile(paket, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for f in sorted(ZIEL.rglob("*")):
-            if f.is_file():
+            if f.is_file() and f.relative_to(ZIEL).parts[0] in PROGRAMMTEILE:
                 z.write(f, f.relative_to(ZIEL).as_posix())
     name = f"NemiCLI-Setup-{build}"
     icon = ROOT / "nemicli.ico"

@@ -46,16 +46,35 @@ def _rechtsklick() -> str:
 
 AN_AUS = (("an", "An"), ("aus", "Aus"))
 
+
+def _low() -> bool:
+    import einbetttakt
+    return einbetttakt.low()
+
+
+def _kugel_auto() -> str:
+    from wache import lebendig
+    stand = lebendig.auto_stand()
+    return "auto an" if stand is True else "auto aus" if stand is False else ""
+
 # (Bereich, Befehl, Titel, Erklärung, feste Optionen oder None = aus dem Befehls-Menü, aktiver Wert, nur diese Werte)
 EINTRAEGE: list[tuple] = [
     (EINFACH, "/voice", "🔊 Stimme", "Wann die Persönlichkeit vorliest.",
      (("an", "Jede Antwort"), ("knopf", "Nur auf Anfrage"), ("aus", "Aus")), _stimme, None),
     (EINFACH, "/modus", "🧭 Arbeitsweise", "Was die KI ohne Rückfrage tun darf.", None, None, None),
+    (EINFACH, "/denken", "🧭 Nachdenken", "Ob die Persönlichkeit vor dem Antworten nachdenkt.", None, None,
+     ("auto", "an", "aus")),
     (EINFACH, "/staerke", "🧠 Denkstufe", "Wie gründlich das Modell nachdenkt.", None, None, None),
     (EINFACH, "/theme", "🎨 Farben im Terminal", "Farbschema des Terminals.", None, None, None),
+    (EINFACH, "/emoji", "😊 Emojis", "Wie viele Emojis die Persönlichkeit nimmt.", None, None,
+     ("low", "middle", "strong", "frei")),
     (PROFI, "/kontext", "📏 Kontext (lokales Modell)", "Wie viel vom Gespräch das Modell im Blick hat.",
      None, None, None),
     (PROFI, "/embeddings", "🧩 Gedächtnis-Modell", "Modell für die Suche im Gedächtnis.", None, None, None),
+    (PROFI, "/embeddingtimer", "⏱ Gedächtnis-Takt", "Wie oft das Gesammelte ins Gedächtnis eingebettet wird.",
+     None, None, ("aus", "15", "30", "45", "60", "90")),
+    (PROFI, "/embeddingtimer", "🐢 Gedächtnis: Low-Modus", "Bei Chat und Bild langsam weiterrechnen statt pausieren.",
+     (("low an", "An"), ("low aus", "Aus")), lambda: "low an" if _low() else "low aus", None),
     (PROFI, "/reflektieren", "🪞 Selbst reflektieren", "Nach Korrekturen, Fehlern und größeren Aufgaben lernen.",
      (("auto an", "An"), ("auto aus", "Aus")), _reflektieren, None),
     (PROFI, "/skills", "🧩 Skills selbst anlegen", "Neue Skills ohne Rückfrage anlegen und ändern.",
@@ -67,6 +86,10 @@ EINTRAEGE: list[tuple] = [
     (PROFI, "/web", "🌐 Seiten außerhalb der Allowlist", "Fremde Seiten über Ollama lesen.",
      (("fremdseiten frei", "Frei"), ("fremdseiten fragen", "Nachfragen"), ("fremdseiten aus", "Aus")),
      _fremdseiten, None),
+    (EINFACH, "/kugel", "✨ Kugel: AUTO", "Freier Moment, Begrüßen, Leben, Musik und Zuschauen auf einmal.",
+     (("auto an", "An"), ("auto aus", "Aus")), lambda: _kugel_auto(), None),
+    (EINFACH, "/kugel", "📌 Kugel: immer vorne", "Über allen Fenstern bleiben.",
+     (("vorne an", "An"), ("vorne aus", "Aus")), lambda: "vorne " + _schalter("kugel_vorne", True), None),
     (PROFI, "/kugel", "🌈 Kugel: freier Moment", "Ab und zu selbst etwas sagen oder malen.",
      (("impuls an", "An"), ("impuls aus", "Aus")), lambda: "impuls " + _schalter("kugel_impuls", False), None),
     (PROFI, "/kugel", "👋 Kugel: Begrüßen", "Nach längerer Pause begrüßen.",
@@ -76,6 +99,9 @@ EINTRAEGE: list[tuple] = [
      (("leben an", "An"), ("leben aus", "Aus")), lambda: "leben " + _schalter("kugel_leben", True), None),
     (PROFI, "/kugel", "🎵 Kugel: Musik spüren", "Auf Musik reagieren.",
      (("musik an", "An"), ("musik aus", "Aus")), lambda: "musik " + _schalter("kugel_musik", True), None),
+    (PROFI, "/kugel", "🎮 Kugel: beim Spielen zuschauen", "Ab und zu aufs Spiel schauen und etwas dazu sagen.",
+     (("zuschauen an", "An"), ("zuschauen aus", "Aus")), lambda: "zuschauen " + _schalter("kugel_zuschauen", False),
+     None),
     (PROFI, "/kontextmenue", "🖱 Rechtsklick-Menü", "NemiCLI im Rechtsklick-Menü von Windows.",
      AN_AUS, _rechtsklick, None),
     (PROFI, "/debug", "🐞 Debugbericht", "Bericht, in den die Cloud-KI hineinsehen kann.", None, None,

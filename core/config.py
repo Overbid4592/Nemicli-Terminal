@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import re
 import shutil
 import threading
 import time
@@ -97,7 +98,9 @@ def save(data: dict) -> bool:
     """Sicher speichern: Zwischendatei, dann tauschen; die bisherige Fassung bleibt als .bak.
     Ist die Datei gerade von einem anderen Prozess offen (die Wache liest sie oft), wird der
     Tausch kurz wiederholt und zuletzt direkt geschrieben. False + Hinweis, wenn nichts ging."""
-    global letzter_fehler
+    global letzter_fehler, _GELESEN
+    # Gleich große Fassung im selben Zeittakt hätte dieselbe Kennung: der eigene Stand gilt sofort.
+    _GELESEN = None
     tmp = _FILE.with_name(f"{_FILE.name}.{os.getpid()}.tmp")       # je Prozess eigene (Hauptprogramm, Wache)
     try:
         tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -113,6 +116,7 @@ def save(data: dict) -> bool:
                     tmp.unlink(missing_ok=True)
                     break
                 time.sleep(0.05)
+        _GELESEN = None
         letzter_fehler = ""
         return True
     except Exception as e:
@@ -219,6 +223,15 @@ def decrypt_env() -> None:
                 os.environ.pop(name, None)
 
 
+def _env_wert(roh: str) -> str:
+    """Wert einer .env-Zeile wie python-dotenv: ohne Anführungszeichen, ungequotet ohne „ # Kommentar“."""
+    roh = roh.strip()
+    if roh[:1] in ("'", '"'):
+        ende = roh.find(roh[0], 1)
+        return roh[1:ende] if ende > 0 else roh[1:]
+    return re.sub(r"\s+#.*", "", roh).strip()
+
+
 def secure_existing_keys() -> int:
     """Wandelt im .env noch im Klartext liegende API-Keys einmalig in den
     verschlüsselten Umschlag um (os.environ behält den Klartext). Gibt zurück,
@@ -236,12 +249,12 @@ def secure_existing_keys() -> int:
         if not s or s.startswith("#") or "=" not in s:
             continue
         name, _, val = line.partition("=")
-        name, val = name.strip(), val.strip()
+        name, val = name.strip(), _env_wert(val)
         if _is_secret(name) and val and not keyvault.is_encrypted(val):
             enc = keyvault.encrypt(val)
             if enc:
                 lines[i] = f"{name}={enc}"
-                os.environ[name] = val          # Klartext bleibt live
+                os.environ[name.removeprefix("export ").strip()] = val          # Klartext bleibt live
                 changed = True
                 n += 1
     if changed:

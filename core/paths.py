@@ -1,30 +1,14 @@
 """
 paths.py - Wo liegt was?  (Ein Ort, alle Module fragen hier.)
 
-ZWEI WURZELN, und das ist der ganze Punkt dieser Datei:
+  INSTALL - der Programm-Ordner: Quelltext, nemicli.config.json, .env, .runtime,
+            requirements.txt. Hier wird so wenig geschrieben wie möglich.
+  DATEN   - der Daten-Ordner: Chats, Bilder, Modelle, Gelerntes, Persönlichkeiten.
 
-  INSTALL - der Programm-Ordner. Hier liegt NemiCLI selbst: Quelltext,
-            nemicli.config.json, .env, .runtime, requirements.txt.
-            Hier wird so wenig geschrieben wie möglich.
-
-  DATEN   - der NemiCLI-Ordner des Nutzers. Chats, Bilder, Modelle, das
-            Gelernte, die Persönlichkeiten. Alles, was wächst.
-
-Früher war das derselbe Ordner. Das ging so lange gut, bis der
-Programm-Ordner umzog (Desktop -> AppData) - dabei blieb das venv auf der
-Strecke, und genauso hätte es das ganze Gedächtnis erwischen können. Deshalb
-jetzt getrennt: das Programm darf umziehen, neu gebaut oder als exe gepackt
-werden, ohne dass die Daten das mitmachen müssen.
-
-Wo DATEN liegt, entscheidet der NUTZER - über das Fenster beim ersten Start
-oder jederzeit mit /start. Der Pfad steht in nemicli.config.json unter
-"daten_ordner". Steht dort nichts, bleibt alles beim Alten (DATEN = INSTALL);
-es geht also nichts kaputt, wenn die Einstellung fehlt.
-
-  ROOT ist nur ein anderer Name für DATEN. Alle Module, die
-  `from paths import ROOT` machen, meinen ihre Daten - die mussten deshalb
-  nicht angefasst werden. Nur die Handvoll Stellen, die wirklich das PROGRAMM
-  meinen, holen sich INSTALL.
+Getrennt, damit das Programm umziehen, neu gebaut oder als exe gepackt werden kann,
+ohne die Daten mitzunehmen. DATEN steht in nemicli.config.json unter "daten_ordner"
+(Fenster beim ersten Start oder /start); fehlt der Eintrag, gilt DATEN = INSTALL.
+ROOT ist ein anderer Name für DATEN.
 
 Sonderfall exe (PyInstaller): der Code steckt dann in `_internal/` bzw. in
 einem Temp-Ordner (sys._MEIPASS) - da darf NICHTS gespeichert werden, das ist
@@ -193,7 +177,7 @@ def asset(name: str) -> Path:
 # ===========================================================================
 
 # Ordner, die immer da sein sollen.
-_DIRS = ("Models", "Models/Krea2", "Bilder", "chats",
+_DIRS = ("Models", "Models/Krea2", "Models/Bildmodelle", "Models/Videomodelle", "Bilder", "chats",
          "learned", "learned/snippets", "learned/skills", "NemiSandbox", "Befehle",
          "Gespraeche", "Wissen")
 
@@ -221,7 +205,8 @@ mehrzeilige PowerShell direkt aus. Skripte hier darfst du jederzeit löschen.
 
 _MODELS_README = """=== Was in diesen Ordner gehoert ===
 
-Krea2/   Dateien fuer den Bild-Motor Krea 2 (/bild). Erklaerung im Ordner.
+Krea2/        Dateien fuer den Bild-Motor Krea 2 (/bild). Erklaerung im Ordner.
+Bildmodelle/  weitere Bild-Modelle (Z-Image ...), je Modell ein Unterordner.
 
 Sprachmodelle, Bildbeschreiber und Embeddings liegen NICHT hier, sondern
 im Programm-Ordner von NemiCLI:
@@ -247,6 +232,9 @@ Ein Unterordner je Modell. Darin:
 Beispiel:
   ModelGGUF/Gemma4/gemma-4-E4B-it-Q4_K_M.gguf
   ModelGGUF/Gemma4/mmproj-gemma-4-E4B-it-BF16.gguf
+
+Familien: ein Ordner ohne eigene .gguf, darin je Modell ein Unterordner.
+  ModelGGUF/LFM3Familie/Text/...   erscheint als "LFM3Familie-Text"
 
 Am einfachsten: /model huggingface. NemiCLI zeigt nur Modelle, die der Motor
 laden kann (ab 4B Parameter), prueft jede Datei mit SHA-256 und legt sie
@@ -343,6 +331,16 @@ def ensure_layout() -> None:
     _write_once(DATEN / "Models" / "LIES-MICH.txt", _MODELS_README)
     _write_once(DATEN / "Models" / "Krea2" /
                 "LIES-MICH – hier Krea-2-Dateien ablegen.txt", _KREA_README)
+    try:
+        from bildmotoren import LIES_MICH as _bm_text
+        _write_once(DATEN / "Models" / "Bildmodelle" / "LIES-MICH.txt", _bm_text)
+    except Exception:
+        pass
+    try:
+        from videomotoren import LIES_MICH as _vm_text
+        _write_once(DATEN / "Models" / "Videomodelle" / "LIES-MICH.txt", _vm_text)
+    except Exception:
+        pass
     _write_once(DATEN / "Bilder" / "LIES-MICH.txt", _BILDER_README)
     _write_once(DATEN / "Befehle" / "LIES-MICH.txt", _BEFEHLE_README)
     _write_once(DATEN / "Gespraeche" / "LIES-MICH.txt", _GESPRAECHE_README)

@@ -20,7 +20,8 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     Qwen3.5 (Gated DeltaNet), Ling 3.0 und DeepSeek V2/V3/R1 samt Kimi K2 (`deepseek2`: Multi-Head-Latent-
     Attention, der Gesprächsspeicher hält nur den komprimierten Teil).
   - **Alle gängigen GGUF-Formate:** Q4_0 … Q8_0, K-Quants (Q2_K–Q6_K), die IQ-Familie (IQ1_S … IQ4_XS,
-    IQ4_NL) und MXFP4 – beim Auspacken bitgenau wie die Referenz aus llama.cpp. Eigene CUDA-Kernel rechnen
+    IQ4_NL), MXFP4 sowie ternäre und 1-Bit-Formate (TQ1_0, TQ2_0, Q1_0, Q2_0 und die PrismML-Typen PQ2_0 und
+    PTQ1_0, z. B. Ternary Bonsai) – beim Auspacken bitgenau wie die Referenz aus llama.cpp. Eigene CUDA-Kernel rechnen
     für ein Token direkt auf den gepackten Blöcken (übersetzt beim ersten Gebrauch mit NVRTC aus dem
     PyTorch-Paket, kein CUDA-Toolkit nötig). Gemma 4 26B-A4B: ~45 Token/s.
   - **MoE-Experten im RAM, automatisch** (Config `gguf_experten`: `auto` · `vram` · `ram`): Passt ein
@@ -61,7 +62,12 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     oder NemiCLI reicht sie selbst nach – beim passenden Stichwort oder beim ersten Werkzeug dazu.
   - **Weniger Halluzinieren:** nach einem Werkzeug-Aufruf ist Schluss (kein erfundenes Ergebnis
     dahinter), und eine **Floskel-Bremse** verhindert, dass die KI immer denselben Satz aus ihren
-    eigenen früheren Antworten wiederholt – nur am Wortanfang, damit keine Tippfehler entstehen.
+    eigenen früheren Antworten wiederholt – nur am Wortanfang, damit keine Tippfehler entstehen;
+    Werkzeug-Aufrufe und Code bleiben frei (Namen dürfen sich wiederholen).
+  - **Passende Sampling-Werte je Modell:** Temperatur, top_p, top_k und min_p kommen aus der Modelldatei
+    (`general.sampling.*`), sonst aus der Modell-Datenbank (`ggufengine/daten/sampling.json`, je Familie,
+    getrennt für Denken an und aus), sonst gelten 0,8 · 0,95 · 40 · min_p 0,05. Eigene Werte gehen vor:
+    `gguf_sampling` in der Config, z. B. `{"temperature": 0.7}`.
   - **Tempo-Grenze** `gguf_tok_s` (Standard **30 Token/s**) – schont die Karte, die GPU wartet
     zwischen den Schritten. `gguf_denken` (Denkmodus, Standard aus).
   - **`/kontext`**: Auswahl 8k · 16k · 32k · 64k · 128k · max (die Grenze des Modells) – mit dem
@@ -70,10 +76,13 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     Passt die Stufe neben dem Modell nicht in den freien VRAM, nimmt der Motor automatisch die
     größte, die passt, und sagt es. Der Gesprächsspeicher **wächst mit** (4k-Schritte) – ein kurzer
     Chat belegt nur so viel VRAM, wie er braucht.
-  - **`/kontext 8bit` · `/kontext 16bit`** (auch im Menü): Gesprächsspeicher in 8 Bit braucht etwa
-    halb so viel VRAM je Token (wie `q8_0` bei llama.cpp), ist in langen Chats aber langsamer
-    (Granite 4.2 8B bei 9k Kontext: 22 statt 37 Token/s). Standard 16 Bit. Nach langem Einlesen gibt
-    der Motor seinen Zwischenspeicher wieder frei (~1 GB).
+  - **Gesprächsspeicher in Stufen, automatisch:** passt der Kontext nicht ganz in den VRAM, nimmt der
+    Motor 8 Bit (53 % des Platzes, wie `q8_0` bei llama.cpp), dann 6 Bit (Schlüssel 8 Bit, Werte 4 Bit,
+    41 %), dann 4 Bit (28 %) – erst danach wandern Schichten in den RAM. 4-Bit-Werte werden vorher mit
+    einer festen Zufallsdrehung geglättet und auf die 16 Lloyd-Max-Stufen gerundet (Idee aus TurboQuant).
+    Gemessen über 300 Token nach 3.000 Token Text (KL zur 16-Bit-Antwort): Qwen3.5-9B 0,0005 · 0,002 ·
+    0,005, GLM-4.6V-Flash 0,0008 · 0,0012 · 0,020. Abschaltbar mit `gguf_kv_4bit: false` (dann nur 16 und
+    8 Bit). Nach langem Einlesen gibt der Motor seinen Zwischenspeicher wieder frei (~1 GB).
   - **Beim Bildermalen** geht das Sprachmodell in den RAM (~1 s), das Bildmodell hat die GPU
     allein, danach kommt es zurück (~1 s) – das Gespräch läuft ohne Neulesen weiter.
   - **Sehen 👁:** liegt eine mmproj-Datei im Modell-Ordner, sieht das Modell Bilder
@@ -207,9 +216,34 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   was schon gemalt ist, `/kugel malen <nummer|bereich>` oder `alle` malt die fehlenden – gleiche Figur und
   gleicher Seed wie die Grundbilder, 10 Schritte je Bild. Alle Bilder liegen in `Persoenlichkeiten/<Name>/`.
   Sie wählt frei formuliert („isst Popcorn“), das passende Bild wird gesucht.
+  Malt die Wache (Kugel, freier Moment, Kugel-Gespräch), rechnet ein eigener kurzer Prozess: er bleibt für
+  eine Serie offen und endet danach – die Wache hält so keinen Grafikspeicher fest.
   **Freier Moment** (`/kugel impuls an`): statt fester Grüße bekommt sie alle 1–3 Stunden einen Moment für
   sich und entscheidet selbst – etwas sagen, malen, ihr Bild wechseln oder still bleiben. Nicht nachts,
   nicht bei Vollbild (Spiel, Präsentation). Solange sie im Hintergrund arbeitet, leuchtet die Kugel 🌈.
+  **Lebendig** (`/kugel leben`): Rechtsklick = anstupsen (sie hüpft, kichert), langsam drüberstreichen = sie
+  genießt es (Herzchen), wild hin und her = ihr wird schwindelig (Sternchen). Sie neigt sich leicht zum
+  Mauszeiger, atmet morgens verschlafen und abends ruhig, gähnt nachts und morgens. Läuft länger ein Spiel,
+  Code, ein Video – oder ist es still –, zeigt sie ein passendes Motiv, falls es gemalt ist; was sie selbst
+  als Stimmung wählt, geht vor. Motive blenden weich ineinander über. Hat sie ein Schlafanzug-Outfit, zieht
+  sie es nachts an und morgens das von vorher. Während sie im Fenster antwortet, denkt sie sichtbar, danach
+  nickt sie.
+  **✨ AUTO** (`/kugel auto an|aus`): schaltet freien Moment, Begrüßen, Desktop-Leben, Musik und Zuschauen auf
+  einmal – im `/kugel`-Menü ist das ein Eintrag; die einzelnen Schalter gibt es weiter als Befehl. Hinter
+  „Motive malen“ steht, wie viele schon gemalt sind („91 von 400 fertig“). Überhaupt zeigen die Menüs im
+  Terminal jeden An/Aus-Schalter als einen Eintrag: ✔️ an, 🛑 aus, Enter schaltet um (Kugel, Debugbericht,
+  Motor-Log, Reflektieren, Skills, Übung, Rechtsklick-Menü, Auto-Stark). In Auswahl- und Stufen-Menüs (Theme,
+  Modell, Stimme, Helfer, Persönlichkeit, Bild-Modell, Krea-Schritte …) und auf der Seite ⚙ steht ✔️ hinter dem,
+  was gerade aktiv ist.
+  Erinnerungen kommen immer. **📌 Immer vorne** (`/kugel vorne`, Vorgabe an): sie bleibt über allen Fenstern,
+  NemiCLI holt sie im Takt zurück, wenn ein anderes Fenster sich davorschiebt; aus = ein normales Fenster.
+  **🎮 Spiel-Begleiterin** (`/kugel zuschauen an`, Vorgabe aus): läuft ein Spiel (Steam, Epic, GOG, Xbox …
+  oder Vollbild), schaut sie alle paar Minuten auf den Bildschirm und sagt etwas, wenn es spannend ist –
+  dann auch, wenn NemiCLI offen ist. Das Foto sieht ein Cloud-Modell mit Bild-Eingang; ein lokales Modell
+  oder der Bildbeschreiber nur, wenn genug Grafikspeicher frei ist – sonst bleibt sie still. Das Foto wird
+  danach gelöscht. **Strg+Alt+N** öffnet ihr Fenster jederzeit, auch über dem Spiel: Fragen dazu („Wo finde
+  ich …?“) schlägt sie im Netz nach. Im exklusiven Vollbild zeigt Windows nichts darüber – im Spiel
+  „Randloses Fenster“ wählen.
 - **Anleitungen** (`Agenten/*.md`): Arbeitsanweisungen, die die Persönlichkeit selbst abarbeitet. Jede
   `.md` dort steht ab der nächsten Antwort im Prompt (Pfad + erste Zeile); passt eine, liest sie sie und
   folgt ihr. Nichts fest verdrahtet – neue Datei, neue Fähigkeit.
@@ -252,6 +286,11 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Persoenlichkeiten …) schreibt und bearbeitet die Persönlichkeit **ohne Rückfrage** – alles im
   Protokoll, Überschriebenes im Papierkorb. Löschen fragt weiter; bei Netz-Inhalt in der Runde
   fragt auch das Schreiben. Der Programm-Ordner bleibt zu.
+- **Jede NemiCLI-Kopie ist zu:** nicht nur der laufende Programm-Ordner, auch jeder andere
+  Quelltext- oder exe-Ordner von NemiCLI – weder ansehen noch ändern, auch nicht per `befehl`.
+  Erkannt an seinen Dateien und am Register `%LOCALAPPDATA%` → `NemiCLI-Kopien.json`, in das sich
+  jede gestartete Kopie einträgt. `befehl` läuft nie in so einem Ordner (sonst in `NemiSandbox`).
+  `/schluessel` öffnet nur den eigenen Programm-Ordner.
 - **Schlüssel auf Zeit** (`/schluessel 30 Aufgabe`): öffnet den Programm-Ordner für die KI für
   eine konkrete Aufgabe – jede Änderung fragt trotzdem einzeln, danach ist automatisch wieder zu.
 - **Fremddaten sind markiert:** Datei-Inhalte, Suchtreffer, PowerShell-Ausgaben und Webseiten
@@ -341,10 +380,13 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   passende Erinnerungen (`learned/memory.db`, lokal, `/gedaechtnis`). Das Modell liegt im Programm-Ordner
   unter `Models/embeddings/<Name>/` und wird mit `/embeddings` gewählt
   (Qwen3-Embedding-0.6B als GGUF, z. B. `Qwen3-Embedding-0.6B-Q8_0.gguf`); es läuft im eigenen GGUF-Motor –
-  ohne transformers; ein safetensors-Ordner geht weiter, wenn transformers selbst installiert ist. Auf der
-  **GPU, wenn eine da ist** (Config `embedding_geraet`: auto · cuda · cpu), sonst CPU. Nach jeder
+  ohne transformers; ein safetensors-Ordner geht weiter, wenn transformers selbst installiert ist. Bei
+  `auto` (Config `embedding_geraet`: auto · cuda · cpu) liegt es im **RAM** und belegt keinen Grafikspeicher;
+  große Aufträge bekommen für ihre Dauer eine GPU-Fassung. Kurze Texte rechnen gepackt in einem Durchgang,
+  Suchfragen tragen eine Anweisung je Aufgabe (Notizen, Chat, Dokumente, Code) und bleiben gemerkt. Nach jeder
   Antwort räumt der **Bibliothekar** im Hintergrund ein (Chat, Notizen, Skills, Berichte → Vektoren)
-  – sichtbar als 📚-Balken in der Statuszeile, ohne den Chat zu blockieren; `/gedaechtnis indexieren`
+  – sichtbar als 📚-Balken in der Statuszeile, ohne den Chat zu blockieren: er rechnet in einem eigenen
+  Prozess mit niedriger Priorität, der danach endet und seinen Speicher mitnimmt. `/gedaechtnis indexieren`
   holt einen Rückstand auf einmal nach.
   - **So sucht es:** Stichworte (BM25) und Vektoren, per RRF vereint. Texte sind an Absätzen, Sätzen,
     Code-Blöcken und Überschriften geschnitten, jeder Brocken trägt seine Herkunft; alte Brocken werden im
@@ -368,9 +410,16 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 ### 👁 Sehen & 🎨 Malen
 - **Dateien reinziehen (Drag & Drop):** Datei aus dem Explorer ins Terminal ziehen, Enter – fertig.
   Geht auch im eigenen NemiCLI-Fenster; Emojis kommen dort über das Emoji-Feld (**Win + .**) oder Einfügen.
+  Dort fügt **Strg+V** auch einen Screenshot ein (als PNG abgelegt, nach 7 Tagen aufgeräumt) und im
+  Explorer kopierte Dateien als Pfade.
+  Dateien kommen **ganz** an, solange sie in die Hälfte des Modell-Kontexts passen (bei großen Cloud-
+  Modellen mehrere hunderttausend Zeichen); mehrere Dateien teilen sich den Platz. Was nicht passt, liest
+  die KI mit `datei_lesen` weiter – das liest je Aufruf ein Viertel des Modell-Kontexts (bei großen
+  Cloud-Modellen fast jede Datei am Stück, sonst in Stücken mit `ab`).
   **Text, Markdown, Quelltext, HTML/CSS, JSON, CSV, Logs** (alles, was sich als Text lesen lässt – die
   Endung ist egal, entschieden wird am Inhalt) hängen als Daten an der Nachricht; **PDF** wird per
-  `pypdf` ausgelesen, seitenweise; **Bilder in jedem Format**, das PIL öffnet (TIFF, ICO, HEIC, PSD …
+  `pypdf` ausgelesen, seitenweise; **Word, Excel, PowerPoint und LibreOffice** (docx, xlsx, pptx, odt, ods,
+  odp) als Text, Tabellen zeilenweise mit Tabs; **Bilder in jedem Format**, das PIL öffnet (TIFF, ICO, HEIC, PSD …
   werden vor dem Senden nach PNG gewandelt). Mehrere auf einmal gehen. Binäres (exe, zip,
   safetensors, gguf …) bleibt liegen, mit kurzer Ansage. Ein **Ordner** kommt als Listing an (eine
   Ebene, Ordner zuerst, mit Größen; `node_modules` & Co. nur gezählt). Dateiinhalt gilt wie Web-Inhalt
@@ -395,9 +444,62 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   geladen. Krea 2 ist **der** Bild-Motor (`/bildmodel` → 🟣); eine gewählte WebUI oder ComfyUI malt
   nur, solange sie erreichbar ist, sonst springt Krea ein. In der exe kommt torch aus dem venv
   neben der exe (extlibs). RTX 5060 Ti: ~1,2 s/Schritt, ~23 s/Bild.
+- **Weitere Bild-Motoren** (`engines/bildmotoren/`): andere Bild-Modelle neben Krea 2, je Bauart ein eigener
+  Motor; Krea 2 bleibt unverändert. Ordner `Models/Bildmodelle/` (Daten- oder Programmordner): je Modell ein
+  Unterordner mit der Modelldatei, Text-Encoder und VAE geteilt in `text_encoders/` und `vae/` (oder im
+  Modellordner), `tokenizer/` nur für Text-Encoder als safetensors. Die **Bauart erkennt NemiCLI an den
+  Tensornamen**, nicht am Dateinamen; Text-Encoder und VAE an ihrer Form.
+  - **Formate:** safetensors in bf16/fp16, FP8 (auch „scaled“ und „fp8_mixed“), NVFP4 (auf RTX 50xx über die
+    FP4-Kerne, sonst entpackt), int8 (ohne Drehung) und GGUF Q2_K…Q8_0 (bleibt gepackt, rechnet über die Kerne
+    des GGUF-Motors); ComfyUI-Namen, ganze Checkpoints und diffusers-Namen (auch in Teilen). int8 mit Drehung
+    („convrot“) wird mit Grund abgelehnt.
+  - **Jeder Rechner:** bf16 ab RTX 30, fp16 auf älteren Karten (die VAE dann in float32), ohne CUDA die CPU.
+    Passt das Netz nicht ganz in den freien Grafikspeicher (2,5 GB bleiben frei), bleiben so viele Blöcke
+    auf der Karte wie Platz ist; die übrigen werden je Schritt aus dem RAM nachgeschoben, der nächste schon
+    während der aktuelle rechnet. Gewichte liegen fest im RAM; nach 5 Minuten Ruhe wird geräumt
+    (`bild_motor_entladen`, Sekunden). Malt Krea 2, räumen die Bild-Motoren ihren RAM und umgekehrt.
+  - **Prüfung:** Bekannte Dateien (offizielle Quellen auf Hugging Face, Liste je Bauart) werden vor dem ersten
+    Laden per SHA-256 geprüft, einmal je Dateistand (`.geprueft.json`); falsche Größe oder Prüfsumme sperrt die
+    Datei. Unbekannte Dateien (eigene Abwandlungen) laufen, gelten aber als ungeprüft.
+  - **🟩 Z-Image** (Tongyi-MAI, z. B. Z-Image-Turbo, 6 B): Qwen3-4B als Text-Encoder (Zustand nach der
+    vorletzten Schicht; safetensors selbst gerechnet oder als GGUF über den eigenen Motor, Tokenizer dann aus
+    der Datei), Single-Stream-DiT mit Rausch- und Kontext-Verfeinerern, 3-Achsen-RoPE, Flux-VAE. Turbo:
+    9 Schritte (4–30 über `bild_zimage_schritte`), ohne CFG, feste Zeitverschiebung 3.0, 1024×1024. Gegen
+    diffusers geprüft (Netz, Zeitplan, VAE) und gegen transformers (Text-Encoder).
+  - **🟦 FLUX.2** (Black Forest Labs, z. B. FLUX.2 klein 4B/9B): Qwen3 als Text-Encoder (4B: Qwen3-4B, 9B:
+    Qwen3-8B – passend zur Kontextbreite des Modells ausgewählt), Zustände nach Schicht 9, 18 und 27
+    nebeneinander, Prompt auf 512 Token aufgefüllt (die Auffüllung sieht kein Token); 5+20 bzw. 8+24
+    Doppel-/Einzel-Blöcke mit gemeinsamer Modulation, 4-Achsen-RoPE; FLUX.2-VAE mit 32 Kanälen und
+    BatchNorm-Werten. klein: 4 Schritte ohne CFG; Fassungen mit „base“ im Namen 50 Schritte mit CFG 4.
+    Zeitverschiebung nach Bildgröße und Schrittzahl. Original-, ComfyUI-, FP8- (BFL), GGUF- und
+    diffusers-Dateien. Gegen diffusers geprüft (Netz, Zeitplan, VAE, Latent-Rückrechnung).
+  - **🟧 Qwen-Image** (Alibaba Qwen, auch Qwen-Image-2512, 20 B): MMDiT mit 60 Doppel-Blöcken, Text-Encoder
+    Qwen2.5-VL-7B (Sprachteil, Zustand nach der Schluss-Norm ohne die Systemvorlage), RoPE um die Bildmitte,
+    VAE wie Krea 2 (wird auch in `Models/Krea2/vae/` gefunden). 30 Schritte (4–60) mit „echtem“ CFG 4 gegen
+    einen leeren Prompt und Norm-Ausgleich, 1328×1328; Zeitverschiebung nach Bildgröße, letzter Schritt auf
+    0,02 gestreckt. ComfyUI-Dateien (bf16, FP8 – dort auch Bias und Normen in FP8 –, NVFP4) und GGUF. Gegen
+    diffusers geprüft (Netz, Zeitplan, Packen, CFG) und gegen transformers (Qwen2-Text-Encoder).
+  - **🟪 FLUX.1** (Black Forest Labs: dev, schnell und Abwandlungen wie FLUX.1 Krea dev): T5-XXL (Kontext,
+    dev 512 / schnell 256 Token aufgefüllt) und CLIP-L (gepoolter Vektor) als Text-Encoder, 19 Doppel- und 38
+    Einzel-Blöcke mit eigener Modulation je Block, Flux-VAE (`ae.safetensors`, wie Z-Image). dev erkennt NemiCLI
+    an der Guidance-Einbettung: 28 Schritte, Guidance 3,5, Zeitverschiebung nach Bildgröße; schnell: 4 Schritte.
+    T5 als safetensors (auch FP8 „scaled“) oder GGUF; Tokenizer in `tokenizer_t5/` (tokenizer.json) und
+    `tokenizer_clip/` (vocab.json + merges.txt). Gegen diffusers geprüft (Netz mit Original-, diffusers- und
+    GGUF-Namen) und gegen transformers (T5, CLIP, CLIP-Tokenizer).
+  - **🟥 Chroma** (lodestones, z. B. Chroma1-HD): FLUX.1-Blöcke ohne eigene Modulation – alle Modulationen
+    kommen aus einem kleinen Netz („Approximator“) aus Zeit und Index –, kein CLIP. T5 mit Maske; im DiT sind
+    die Text-Token hinter dem ersten Auffüll-Token ausgeblendet. 35 Schritte mit CFG 5 gegen einen leeren
+    Prompt, feste Zeitverschiebung 3.0. Original- (auch GGUF) und diffusers-Namen; gegen diffusers geprüft.
+  - **Text-Encoder Qwen3** als safetensors oder GGUF durch denselben Nachbau (GGUF-Namen wie llama.cpp,
+    Tokenizer aus der Datei) – beide Wege schieben Schichten bei wenig Grafikspeicher nach.
+  - Wahl über `/bildmodel` (🟩, „⚠ unvollständig“ wenn Zubehör fehlt; Menüpunkt „Bild-Modelle-Ordner öffnen“).
+    Fehlt etwas, malt Krea 2. Umzeichnen (`vorlage`), Gesichter nachmalen und die Charakter-LoRA bleiben bei Krea 2.
 - **Charakter-Datei je Persönlichkeit** (`/charakter`): `Profile/<Name>/<name>.json` mit Kern-Look,
   festem Seed, Stil, Outfits, Posen und Regeln. `bild_malen` mit `figur: true` (+ `outfit`, `pose`) baut
   daraus den Prompt und nimmt den Seed – gleiche Figur in jedem Bild; `neues_gesicht` würfelt neu.
+  Vergisst die KI `figur`, nimmt NemiCLI die Figur von selbst dazu, wenn der Prompt sie meint – ihr Name,
+  „me/myself/selfie“ oder mehrere Merkmale ihres Aussehens zusammen mit einer Person; Landschaften, Tiere
+  oder andere Menschen bleiben ohne. `figur: false` schaltet es aus. Im Ergebnis steht „🧍 Figur automatisch dazu“.
   `bild_serie` malt bis zu 30 Varianten in einem Auftrag mit gleichem Seed. Die KI pflegt die Datei
   mit `charakter_aendern` (du bestätigst), von Hand per `/charakter oeffnen`.
 - **Gesichter nachmalen (Krea 2):** Nach `/bild` und `bild_malen` sucht das **Seh-Modell** aus
@@ -423,6 +525,25 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Nur `127.0.0.1:7860`; NemiCLI startet die WebUI nicht.
 
 ### 🎬 Video, 🎭 Porträt & 🎵 Musik
+- **Video-Motoren mit Ton** (`engines/videomotoren/`): moderne Video-Modelle neben Wan 2.2, je Bauart ein eigener
+  Motor; Wan 2.2 bleibt unverändert. Ordner `Models/Videomodelle/`: je Modell ein Unterordner, Zubehör geteilt in
+  `text_encoders/` und `vae/`. Bauart und Zubehör erkennt NemiCLI an den Dateien. Wahl über `/video modell`, im
+  Menü ✔️ hinter dem aktiven; `video.generate` leitet dann weiter, `/video`, `video_erstellen` und Hintergrund-Läufe
+  gelten für beide.
+  - **🎞 LTX-2.5** (Lightricks, 22 B): Gemma 4 12B als Text-Encoder (alle 49 Zustände, Fenster- und globale
+    Schichten, Tokenizer und Video-/Ton-Projektion aus der LTX-Datei), Text-Verbinder mit Registern, Video-und-Ton-
+    Transformer (Ton→Video- und Video→Ton-Attention, Gates je Kopf, split-RoPE), Faltungs-VAE (1 Latent = 8 Bilder,
+    32×32 Pixel; Aufbau aus dem Dateikopf), Ton-VAE mit BigVGAN-Vocoder und Erweiterung auf 48 kHz Stereo. Erst
+    kodiert Gemma beide Prompts und wird freigegeben, dann kommt das Video-Modell – nie beide zugleich im RAM.
+    „distilled“: 8 feste Rauschstufen ohne CFG; „dev“: Zeitplan nach Videogröße, CFG für Bild (3) und Ton (7).
+    Jeder Teil gegen diffusers bzw. transformers geprüft, ein ganzes Video mit Ton durch die Weiche.
+  - **Einstellungen** (`/video einstellungen [name wert]`, Config `video_motor_*`): Auflösung (auto · 480p · 720p ·
+    1080p; AUTO unter 11 GB 480p, sonst 720p), Format (hochkant · quer · quadrat), Bilder/s (24–50), Schritte und
+    CFG (0 = Vorgabe des Modells), Ton ✔️/🛑, VAE-Kacheln (auto · klein · mittel · groß · aus – AUTO nach
+    Grafikspeicher), Speicher (auto · schnell · sparsam). Die KI kann Auflösung, Format, Bilder/s und Ton auch nur
+    für ein Video setzen.
+  - Noch nicht: die neue Diffusions-VAE von LTX-2.5 (die Faltungs-Fassung `…-video-vae-conv` wird gebraucht), die
+    Upscaler, Start- und Schlüsselbilder (dafür Wan 2.2), int8 „convrot“.
 - **Eigener Video-Motor** (`engines/video.py`, `/video`, Werkzeug `video_erstellen`): Wan 2.2 TI2V 5B als
   GGUF, Text-Encoder umT5 als GGUF, alles in torch nachgebaut. 704×1024 hochkant, 24 Bilder/s, Clips à 5 s
   aneinander bis 20 s. Ein **Startbild** (z. B. von Krea 2) hält die Figur, **Schlüsselbilder** (eines je 5 s,
@@ -484,6 +605,14 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   laufen im Browser; die Persönlichkeit bekommt Brett und erlaubte Züge, wählt selbst und redet dazu.
 
 ### 🎭 Oberfläche & Persönlichkeit
+- **📱 Fürs Handy** (`/persönlichkeiten export [name]`, auch im Menü): legt die aktive Persönlichkeit als
+  `<Name>.nemicli.json` in `Export/` – Name, Wesen (Platzhalter eingesetzt) und Profilbild (verkleinert). Die
+  NemiCLI-App (eigenes Projekt `NemiAPPStudio/`, Android) liest sie über „📥 Vom PC“ ein.
+- **Emojis nach Maß** (`/emoji low · middle · strong · frei`): low = selten, höchstens eins; middle =
+  ab und zu; strong = gerne und lebendig. Welche Emojis passen, wählt die KI aus dem Inhalt – nie in
+  Code oder Pfaden. Ohne Einstellung (frei) entscheidet die Persönlichkeit. Einfach sagen („nimm
+  weniger Emojis“) reicht, die KI stellt es selbst um (Werkzeug `emoji_stufe`). `/emoji kuerzel` zeigt
+  die Smiley-Kürzel. Auch auf der Seite ⚙ Einstellungen.
 - **Desktop-Fenster** (`/gui`): eine ruhige, dunkle Oberfläche fürs Auge – reines PySide6, selbst
   gezeichnet, **kein HTML, CSS oder JavaScript**. Das Terminal bleibt der Motor: Modell, Werkzeuge,
   Gedächtnis und Chats laufen dort, das Fenster zeigt an und schickt Eingaben. Beide sehen denselben

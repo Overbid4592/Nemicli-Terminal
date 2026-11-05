@@ -76,13 +76,16 @@ def befund(art: str, text: str, einzelheiten: str = "") -> None:
                "art": art, "text": text}
     with _sperre:
         liste = befunde() + [eintrag]
+        pfad = befunde_pfad()
+        teil = pfad.with_suffix(f".{os.getpid()}.tmp")             # Hauptprogramm und Wache schreiben hierher
         try:
-            pfad = befunde_pfad()
-            teil = pfad.with_suffix(".tmp")
             teil.write_text(json.dumps(liste[-BEFUNDE_MAX:], ensure_ascii=False, indent=1), encoding="utf-8")
             teil.replace(pfad)
         except OSError:
-            pass
+            try:
+                teil.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------

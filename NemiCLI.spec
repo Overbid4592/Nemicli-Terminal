@@ -52,6 +52,12 @@ HIDDEN += ["main_dienste", "main_befehle", "main_start"]
 # Porträt-Motor (LivePortrait-Nachbau) – Paket unter engines/
 HIDDEN += ["liveportrait"] + ["liveportrait." + f.stem for f in sorted((ROOT / "engines" / "liveportrait").glob("*.py"))
                               if f.stem != "__init__"]
+# Weitere Bild-Motoren (Z-Image …) – Paket unter engines/
+HIDDEN += ["bildmotoren"] + ["bildmotoren." + f.stem for f in sorted((ROOT / "engines" / "bildmotoren").glob("*.py"))
+                             if f.stem != "__init__"]
+# Video-Motoren (LTX-2.5 …) – Paket unter engines/
+HIDDEN += ["videomotoren"] + ["videomotoren." + f.stem for f in sorted((ROOT / "engines" / "videomotoren").glob("*.py"))
+                              if f.stem != "__init__"]
 # Musik-Motor (ACE-Step 1.5) – Paket unter engines/, Fenster für /musik
 HIDDEN += ["musik", "musik_fenster"] + ["musik." + f.stem for f in sorted((ROOT / "engines" / "musik").glob("*.py"))
                                         if f.stem != "__init__"]
@@ -97,7 +103,7 @@ HIDDEN = sorted(set(HIDDEN))
 
 # Mitgelieferte Dateien (Daten, kein Code).
 DATAS = [(str(ROOT / "allowlist.json"), ".")]
-for extra in ("README.md", "CHANGELOG.md", ".env.example", "requirements.txt", "nemicli.ico"):
+for extra in ("README.md", "CHANGELOG.md", "LICENSE", ".env.example", "requirements.txt", "nemicli.ico"):
     if (ROOT / extra).exists():
         DATAS.append((str(ROOT / extra), "."))
 DATAS.append((str(ROOT / "engines" / "liveportrait" / "LIZENZ.txt"), "liveportrait"))   # MIT-Hinweis des Originals

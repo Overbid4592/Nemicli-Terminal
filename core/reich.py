@@ -1,12 +1,7 @@
 """
 reich.py - Wo soll der NemiCLI-Ordner liegen?  (Fenster + Umzug)
 
-WARUM ES DAS GIBT
-Früher lagen Programm und Daten im selben Ordner. Dann zog das
-Programm um (Desktop -> AppData) und das venv blieb auf der Strecke. Genauso
-hätte es die Chats, Bilder und das Gelernte erwischen können. Seitdem trennt
-paths.py die beiden Wurzeln - und HIER entscheidet der Nutzer, wo seine
-Hälfte liegen soll.
+paths.py trennt Programm und Daten; hier wird gewählt, wo die Daten liegen.
 
 WIE ES ABLÄUFT
   1. Beim allerersten Start (und jederzeit über /start) geht ein Fenster auf.

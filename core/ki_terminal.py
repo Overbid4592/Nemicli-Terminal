@@ -15,6 +15,7 @@ import threading
 _ADRESSE = os.environ.pop("NEMICLI_KI_PIPE", "")
 _SCHLUESSEL = os.environ.pop("NEMICLI_KI_KEY", "")
 WARTESCHLANGE = 4000
+TEXT_MAX = 150_000                 # Zeichen je Ausgabe: auch als JSON (bis 6 Bytes je Zeichen) unter 1 MB
 _schlange: queue.Queue = queue.Queue(maxsize=WARTESCHLANGE)
 _zustand = {"faden": None, "weg": False}
 _sperre = threading.Lock()
@@ -54,11 +55,13 @@ def _schicken(ereignis: dict) -> None:
 
 
 def start(befehl: str, ordner: str = "") -> None:
-    _schicken({"t": "start", "befehl": befehl, "ordner": ordner})
+    _schicken({"t": "start", "befehl": befehl[:TEXT_MAX], "ordner": ordner})
 
 
 def ausgabe(text: str, fehler: bool = False) -> None:
     if text:
+        if len(text) > TEXT_MAX:
+            text = text[:TEXT_MAX] + " … [gekürzt]\n"
         _schicken({"t": "aus", "text": text, "fehler": fehler})
 
 

@@ -42,10 +42,13 @@ def anlegen() -> int:
         f"$z = New-SelfSignedCertificate -Type CodeSigningCert -Subject '{ZERTIFIKAT}' "
         r"-CertStoreLocation Cert:\CurrentUser\My -KeyAlgorithm RSA -KeyLength 3072 "
         f"-HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears({JAHRE})",
-        f"Export-Certificate -Cert $z -FilePath '{cer}' | Out-Null",
-        r"Import-Certificate -FilePath '" + str(cer) + r"' -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null",
-        r"Import-Certificate -FilePath '" + str(cer) + r"' -CertStoreLocation Cert:\CurrentUser\Root | Out-Null",
-        f"Remove-Item '{cer}'",
+        "try {",
+        f"  Export-Certificate -Cert $z -FilePath '{cer}' | Out-Null",
+        r"  Import-Certificate -FilePath '" + str(cer) + r"' -CertStoreLocation Cert:\CurrentUser\TrustedPublisher | Out-Null",
+        r"  Import-Certificate -FilePath '" + str(cer) + r"' -CertStoreLocation Cert:\CurrentUser\Root | Out-Null",
+        # Vertrauen abgelehnt: Zertifikat wieder weg, sonst meldet der nächste Aufruf „schon da“
+        r"} catch { Remove-Item ('Cert:\CurrentUser\My\' + $z.Thumbprint) -ErrorAction SilentlyContinue; throw }",
+        f"finally {{ Remove-Item '{cer}' -ErrorAction SilentlyContinue }}",
         '"$($z.Thumbprint)"',
     ])
     r = _ps(skript)

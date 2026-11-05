@@ -75,7 +75,8 @@ def db_pfad(ort: Path | None = None) -> Path:
     soll = ort / f"chat_{_name(ort)}.db"
     if not soll.exists() and ort != CHATS_DIR:
         # Nach dem Umbenennen einer Persönlichkeit heißt die Datei im (mitgezogenen) Ordner noch wie früher.
-        alte = [p for p in ort.glob("chat_*.db") if p.is_file()]
+        alte = [p for p in ort.glob("chat_*.db") if p.is_file()
+                and not p.name.startswith("chat_backup_") and ".kaputt-" not in p.name]
         if len(alte) == 1:
             return alte[0]
     return soll
@@ -264,15 +265,52 @@ def zusammenfuehren(alt: list, neu: list) -> list:
     (die ersten Nachrichten von `neu` = die letzten von `alt`) oder ist `neu` ein Stück
     daraus (letzte Runde zurückgenommen), bleibt der ausgelagerte Anfang erhalten.
     Sonst (Verlauf geändert, anderer Chat) gilt `neu`."""
+    i = _versatz(alt, neu)
+    return neu if i is None else alt[:i] + neu
+
+
+def _versatz(alt: list, neu: list) -> int | None:
+    """Ab welcher Stelle von `alt` setzt `neu` fort (siehe zusammenfuehren) – None, wenn nirgends."""
     if not alt or not neu:
-        return neu
+        return None
     for i in range(len(alt)):
         if alt[i] != neu[0]:
             continue
         rest = len(alt) - i
         if (rest <= len(neu) and alt[i:] == neu[:rest]) or alt[i:i + len(neu)] == neu:
-            return alt[:i] + neu
-    return neu
+            return i
+    return None
+
+
+def _bildlos(zeile: str, ersatz: str) -> str:
+    """Zeile mit jedem Bild und jedem Bild-Platzhalter als „<bild>“ – zum Vergleich."""
+    try:
+        m = json.loads(zeile)
+    except ValueError:
+        return zeile
+    if not isinstance(m, dict) or not isinstance(m.get("content"), list):
+        return zeile
+    teile = ["<bild>" if isinstance(t, dict) and (t.get("type") in ("image_url", "image") or t.get("text") == ersatz)
+             else t for t in m["content"]]
+    return json.dumps({**m, "content": teile}, ensure_ascii=False, sort_keys=True)
+
+
+def _bilder_behalten(alt: list[str], neu: list[str]) -> list[str]:
+    """Hat der Kontext alte Bilder durch den Platzhalter ersetzt (pricing.bilder_begrenzen), bleibt in der
+    Datenbank die gespeicherte Zeile mit dem Bild."""
+    try:
+        from pricing import BILD_ERSATZ as ersatz
+    except Exception:
+        return neu
+    marke = json.dumps(ersatz, ensure_ascii=False)
+    if not alt or not any(marke in z for z in neu):
+        return neu
+    ka, kn = [_bildlos(z, ersatz) for z in alt], [_bildlos(z, ersatz) for z in neu]
+    i = _versatz(ka, kn)
+    if i is None:
+        return neu
+    return [alt[i + j] if marke in z and i + j < len(alt) and ka[i + j] == kn[j] else z
+            for j, z in enumerate(neu)]
 
 
 def _stand_schluessel(chat_id: int) -> str:
@@ -288,7 +326,8 @@ def save(chat_id: int, messages: list, prompts: list[str], model: str, stand: st
     c = _verbinden(_ordner_fuer(chat_id))
     try:
         zeilen, bilder = _als_zeilen(list(messages))
-        zeilen = zusammenfuehren(_gespeichert(c, chat_id), zeilen)        # gleiche Nachricht = gleiche Zeile
+        alt = _gespeichert(c, chat_id)
+        zeilen = zusammenfuehren(alt, _bilder_behalten(alt, zeilen))       # gleiche Nachricht = gleiche Zeile
         _schreiben(c, chat_id, [], prompts, model, datetime.now().strftime("%Y-%m-%d %H:%M"),
                    zeilen=zeilen, bilder=bilder)
         if stand:

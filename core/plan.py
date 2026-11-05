@@ -32,8 +32,8 @@ MAX_TEXT = 160
 FREI = {"plan", "coding_start", "todo", "anleitung_lesen", "menue_oeffnen"}
 # Begleiten im Gespräch: kein Arbeitsschritt, also auch ohne Liste frei. wache_bewerten ist ein Urteil
 # in der Antwort (oft mehrere hintereinander), kein Projektschritt.
-BEGLEITEN = {"merken", "kugel", "erinnern", "vorlesen", "stimme_schalter", "modell_schalter", "aufgaben", "lora", "coding_lora",
-             "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen", "wache_bewerten"}
+BEGLEITEN = {"merken", "kugel", "erinnern", "vorlesen", "stimme_schalter", "modell_schalter", "emoji_stufe", "aufgaben", "lora", "coding_lora",
+             "denkweise", "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen", "wache_bewerten"}
 EINZELN = 1                   # so viele Arbeitsschritte je Nachricht laufen ohne Liste
 
 SPERR_TEXT = (

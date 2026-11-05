@@ -55,32 +55,53 @@ COMMAND_LIST: list[Cmd] = [
         "(ohne Schlüssel, ohne Werkzeuge und Bilder; du/Sie, Länge und Emojis wählbar)."),
     Cmd("/staerke", "Denk-Stärke oder Denkbudget wählen", "[stufe]",
         "Zeigt die passenden Stufen für dein Modell. Bei Kimi steuern sie das "
-        "gemeinsame Tokenbudget für Denken und Antwort."),
+        "gemeinsame Tokenbudget für Denken und Antwort. Eigener Motor: das Denk-Budget "
+        "(schnell 1.024 · normal 8.192 · stark 16.384 · max ohne Grenze)."),
+    Cmd("/denken", "Ob die KI nachdenkt – je Persönlichkeit 🧭", "auto · an · aus",
+        "auto (Vorgabe): denkt nach, wenn es etwas bringt – bei kniffligen Fragen und bei Bitten, etwas zu tun "
+        "(malen, zeigen, lesen, nochmal probieren); Plaudern bleibt schnell. an: vor jeder Antwort. aus: nie. "
+        "Gilt für jedes Modell: schaltbares Nachdenken (eigener Motor) wird eingeschaltet, sonst gibt das Denkwerk "
+        "den Denkanstoß. Jede Persönlichkeit merkt sich ihre eigene Denkweise. Wie tief: /staerke. "
+        "Kündigt die KI etwas an („ich male jetzt …“), ohne es aufzurufen, bekommt sie einmal einen Stups 🤝."),
     Cmd("/theme", "Farbschema wechseln", "[name]"),
+    Cmd("/anzeige", "Werkzeug-Anzeige: kompakt oder mit Rahmen", "kompakt · rahmen",
+        "kompakt (Vorgabe): eine Zeile „● Befehl(git status)“, darunter eingerückt „⎿ Ergebnis“; "
+        "nach einer Dateiänderung ein rot/grüner Diff mit Zeilennummern. Im Vollbild klappt ein Klick "
+        "die ganze Ausgabe auf. rahmen: die bisherigen Kästen. Rückfragen bleiben immer groß."),
     Cmd("/modus", "Arbeitsmodus: chat · lesen · normal · auto · autoan (Shift+Tab)", "[name]",
         "💬 Chatten (alles fragt, Merken frei) · 👁 Nur Lesen (Ändern gesperrt) · "
         "⚙ Normal (Ändern fragt) · ⚡ Auto (ohne Rückfragen im Ordner, 5-min-Zünder) · "
         "🚀 Auto ON (wie Auto, bleibt an bis zum Umschalten). "
-        "Shift+Tab schaltet durch."),
-    Cmd("/persönlichkeiten", "Persönlichkeit wählen oder eigene anlegen 🎭", "[name · neu]",
+        "In beiden Auto-Modi läuft Riskantes nur von der Gästeliste (/whitelist): sonst hält "
+        "NemiCLI an und fragt. Shift+Tab schaltet durch."),
+    Cmd("/persönlichkeiten", "Persönlichkeit wählen oder eigene anlegen 🎭", "[name · neu · export [name]]",
         "🎭 Wer spricht? Ohne Name: Menü (eingebaute Nemi + deine eigenen). "
         "'/persönlichkeiten neu' legt per Fragen eine neue an – als Markdown-Datei "
-        "in Persoenlichkeiten/, die du frei umschreiben kannst. Gilt sofort, bleibt gespeichert."),
+        "in Persoenlichkeiten/, die du frei umschreiben kannst. Gilt sofort, bleibt gespeichert. "
+        "'/persönlichkeiten export' legt die aktive (oder die genannte) als Datei fürs Handy in Export/ – "
+        "die NemiCLI-App liest sie über „📥 Vom PC“ ein: Name, Wesen und Profilbild."),
     Cmd("/bild", "Bild erzeugen 🎨 (Krea 2 · WebUI · ComfyUI)", "<beschreibung> | schritte",
         "Malt ein Bild mit dem aktiven Motor. '/bild schritte' stellt die Krea-2-Schritte "
         "dauerhaft ein (8 bis 16, Auswahl mit Enter)."),
     Cmd("/video", "Video erzeugen 🎬 (eigener Motor, bis 20 s)",
         "<beschreibung> [--sekunden 10] [--start bild.png] [--seed 1] [--schaerfe mittel] | modell [name] | "
-        "cloud [google|xai|runway|fal|minimax|luma|aus|neu] | ordner",
-        "🎬 Erzeugt ein Video mit dem eigenen Video-Motor (Wan 2.2 TI2V): 24 Bilder/s, Clips à 5 s aneinander "
+        "einstellungen [name wert] | cloud [google|xai|runway|fal|minimax|luma|aus|neu] | ordner | motorordner",
+        "🎞 Video-Motoren mit Ton (LTX-2.5: Dateien in Models/Videomodelle/<Name>/, Gemma 4 mit Projektion in "
+        "text_encoders/, Faltungs-VAE und Ton-VAE in vae/; `/video modell <name>` wählt, `/video einstellungen` zeigt "
+        "und ändert Auflösung (auto/480p/720p/1080p), Format, Bilder/s, Schritte, CFG, Ton ✔️/🛑, VAE-Kacheln, "
+        "Speicher – AUTO nach Grafikspeicher ab 8 GB; `/video motorordner` öffnet den Ordner) ODER "
+        "🎬 der eigene Video-Motor Wan 2.2 TI2V: 24 Bilder/s, Clips à 5 s aneinander "
         "bis 20 s. Ein Startbild (z. B. von /bild) hält die Figur; das letzte Bild liegt als .png daneben – "
         "Startbild für eine Fortsetzung. Modelle in VideoGen/<Name>/ (.gguf + VAE), geteilt: text_encoders/, tokenizer/. "
         "Ohne Zusatz: Menü (Video 5/10/20 s, Modell wählen, Ordner öffnen). `/video cloud google|xai|runway|fal`: "
         "Videos aus der Cloud statt lokal (Google bis 10 s, xAI bis 15 s, Runway 5/10 s, MiniMax H3 bis 15 s, Luma Ray 3.2 5/10 s, fal.ai je nach Modell; mit "
         "Startbild; ohne Schlüsselbilder, Seed, Schärfe), `/video cloud neu` richtet einen Anbieter mit Schlüssel ein, "
         "`/video cloud aus` zurück."),
-    Cmd("/bildmodel", "Bild-Modell wählen 🎨 (Krea 2, externe WebUI/ComfyUI oder Cloud)", "[name|cloud …]",
-        "🟣 Krea 2 (eigene Pipeline) ODER 🌐 Modelle einer laufenden Forge/A1111-WebUI bzw. "
+    Cmd("/bildmodel", "Bild-Modell wählen 🎨 (Krea 2, Z-Image, FLUX.2, WebUI/ComfyUI oder Cloud)", "[name|cloud …]",
+        "🟣 Krea 2 (eigene Pipeline) ODER weitere eigene Bild-Motoren (🟩 Z-Image, 🟦 FLUX.2 klein, 🟧 Qwen-Image, "
+        "🟪 FLUX.1, 🟥 Chroma; Dateien in Models/Bildmodelle/<Name>/, Zubehör laut LIES-MICH im Ordner; "
+        "bf16/FP8/NVFP4 oder GGUF; Menüpunkt 'Bild-Modelle-Ordner öffnen') ODER "
+        "🌐 Modelle einer laufenden Forge/A1111-WebUI bzw. "
         "🧩 ComfyUI ODER ☁ Cloud ohne Grafikkarte (OpenAI, Google, xAI, Together mit dem Schlüssel von /model; "
         "Black Forest Labs/FLUX.2, Ideogram, Runway, fal.ai, Stability, Recraft, Replicate, Luma mit eigenem Schlüssel – "
         "'/bildmodel cloud neu' richtet ihn ein; "
@@ -91,14 +112,27 @@ COMMAND_LIST: list[Cmd] = [
         "(NVIDIA: pip3 install torch torchvision --index-url …/cu132)."),
     Cmd("/wissen", "Zeigt, was NemiCLI gelernt hat"),
     Cmd("/gedaechtnis",
-        "Langzeitgedächtnis ansehen/löschen · `indexieren` = Vektor-Rückstand jetzt aufholen"),
+        "Langzeitgedächtnis ansehen/löschen · `indexieren` = Vektor-Rückstand jetzt aufholen · "
+        "`archiv` = Ersetztes und Vergessenes · `zurueck <Nr>` = aus dem Archiv zurückholen",
+        "",
+        "indexieren holt alles auf einmal nach – auf der GPU, wenn genug frei ist (höchstens 25 % des "
+        "Grafikspeichers, Config embedding_vram_anteil), sonst auf der CPU."),
+    Cmd("/embeddingtimer", "Wann das Gedächtnis eingebettet wird ⏱ · Low-Modus",
+        "aus · 15 · 30 · 45 · 60 · 90 · low [an|aus]",
+        "Takt in Minuten (Vorgabe 30): NemiCLI sammelt, was ins Gedächtnis soll, und bettet es höchstens so oft "
+        "in einem Lauf ein. aus = nach jeder Runde. Aufgeräumter Kontext (/compact) und /gedaechtnis indexieren "
+        "laufen immer sofort. 🐢 Low-Modus (Vorgabe an): bei Chat oder Bild rechnet der Bibliothekar langsam "
+        "weiter – nur CPU, zwei Kerne, Leerlauf-Priorität – statt aufzuhören; aus = er pausiert."),
     Cmd("/embeddings", "Embedding-Modell fürs Gedächtnis 🧬: wählen · Hugging Face",
         "[<Ordner>|huggingface]",
         "🧬 Welches Modell aus Models/embeddings die Texte fürs Gedächtnis in Vektoren "
         "umrechnet: ein Ordner mit safetensors (transformers) oder mit genau einer .gguf "
-        "(eigener Motor, gepackt auf der GPU). 'huggingface' öffnet die Modellsuche."),
+        "(eigener Motor, gepackt auf der GPU). Qwen3-Embedding und EmbeddingGemma 2 (klein, ~310 MB in Q8; "
+        "eine mmproj-….gguf daneben ist der Bild-Teil und stört nicht). Ein Wechsel rechnet das Gedächtnis "
+        "nach und nach neu um. 'huggingface' öffnet die Modellsuche."),
     Cmd("/reflektieren", "Über das Gespräch nachdenken & Lehren merken 🪞 · auto an|aus", "[auto an|aus]"),
-    Cmd("/aufraeumen", "Gedächtnis verdichten: doppelte Notizen verschmelzen 🗜"),
+    Cmd("/aufraeumen", "Gedächtnis verdichten: mit Cloud-KI ähnliche und alte Notizen prüfen, sonst doppelte "
+        "verschmelzen (alles ins Archiv) 🗜"),
     Cmd("/start", "📁 Wo dein NemiCLI-Ordner liegt (Chats, Bilder, Modelle)", "",
         "📁 Öffnet das Fenster, in dem du deinen NemiCLI-Ordner wählst – den Ort "
         "für Chats, Bilder, Modelle und alles Gelernte. Der ist absichtlich vom "
@@ -137,7 +171,7 @@ COMMAND_LIST: list[Cmd] = [
         "ändern kann auch die KI (charakter_aendern, mit Bestätigung)."),
     Cmd("/kugel", "Schwebekugel 🔮: Gesicht der Persönlichkeit malen, ansehen, entfernen",
         "[malen [beschreibung|bereich|alle] · motive · impuls an|aus · ankommen an|aus · leben an|aus · "
-        "musik an|aus · erinnerungen · weg · ordner]",
+        "musik an|aus · zuschauen an|aus · auto an|aus · vorne an|aus · erinnerungen · weg · ordner]",
         "🔮 Ohne Bild ist die Kugel eine Kugel. `/kugel malen` lässt die aktive Persönlichkeit sich "
         "selbst beschreiben und malt vier Stimmungsbilder (neutral, froh, ernst, denkt) mit festem "
         "Seed über den Bild-Motor, stellt sie frei und legt sie in Persoenlichkeiten/<Name>/ ab. "
@@ -147,10 +181,21 @@ COMMAND_LIST: list[Cmd] = [
         "sie entscheidet selbst, ob sie etwas sagt, malt oder still bleibt; das steht auch im NemiCLI-Chat, und schaust "
         "du nicht hin, kommt ein Hinweis neben der Uhr. Malen nur, wenn mehr als 5 GB Grafikspeicher frei sind. `/kugel ankommen` (Vorgabe an): kommst du nach "
         "mindestens 3 Stunden zurück, gibt es vielleicht eine Begrüßung an der Kugel. `/kugel leben` (Vorgabe an): "
-        "sie schläft, wenn du weg bist, gähnt nachts, freut sich übers Streicheln (Maus kreisen) und setzt sich ab "
+        "sie schläft, wenn du weg bist, gähnt nachts und morgens, freut sich übers Streicheln (Maus kreisen, langsam "
+        "drüberstreichen), kichert beim Anstupsen (Rechtsklick), wird schwindelig, wenn man wild hin und her fährt, "
+        "neigt sich zum Mauszeiger, zeigt ein passendes Motiv zu dem, was du machst (Spiel, Code, Video, Langeweile), "
+        "zieht nachts ihren Schlafanzug an, wenn sie einen hat, und setzt sich ab "
         "und zu auf die Kante des aktiven Fensters. `/kugel musik` (Vorgabe an): läuft Musik länger, sagt sie ab und zu "
-        "etwas zum Lied (Spotify, YouTube, VLC …). Was ihre Figur trägt, wählt sie selbst (Outfits). Bilder und Dateien kannst du ihr auf die Kugel ziehen. "
+        "etwas zum Lied (Spotify, YouTube, VLC …). `/kugel zuschauen an` (Vorgabe aus): läuft ein Spiel, schaut sie "
+        "alle paar Minuten auf den Bildschirm und sagt etwas, wenn es spannend ist (Cloud-Modell mit Bild-Eingang; "
+        "lokal nur, wenn genug Grafikspeicher frei ist) – sie ist dann auch beim Spielen da, wenn NemiCLI offen ist. "
+        "Strg+Alt+N öffnet ihr Fenster jederzeit, auch über einem Spiel: Fragen zum Spiel schlägt sie im Netz nach "
+        "(Config kugel_frage_taste, \"aus\" schaltet ab; kugel_zuschauen_min = Minuten zwischen zwei Blicken). "
+        "Im exklusiven Vollbild zeigt Windows nichts darüber – „Randloses Fenster“ im Spiel wählen. Was ihre Figur trägt, wählt sie selbst (Outfits). Bilder und Dateien kannst du ihr auf die Kugel ziehen. "
         "`/kugel erinnerungen` zeigt offene Erinnerungen („erinnere mich in 20 Minuten an …“). "
+        "`/kugel auto an|aus` schaltet Freier Moment, Begrüßen, Desktop-Leben, Musik und Zuschauen auf einmal "
+        "(die einzelnen Schalter gibt es weiter); Erinnerungen kommen immer. `/kugel vorne` (Vorgabe an): die Kugel "
+        "bleibt über allen Fenstern, NemiCLI holt sie zurück, wenn etwas sie verdeckt – aus: ein normales Fenster. "
         "`/kugel weg` = zurück zur Kugel."),
     Cmd("/wache", "Systemwache 🛡: Sensoren, Regeln, lernendes Modell – im Hintergrund",
         "[status · alarme · start · stop · …]",
@@ -206,8 +251,9 @@ COMMAND_LIST: list[Cmd] = [
         "Nur du änderst es: '/limit 50'. Die KI hat dafür kein Werkzeug."),
     Cmd("/whitelist", "Befehls-Whitelist ✅: welche `befehl`-Kommandos als harmlos gelten", "[befehl]",
         "✅ `befehl` fragt einmal, wenn das Kommando nur liest oder auf der Whitelist steht "
-        "(git status, pip list …) – sonst zweimal, rot markiert. '/whitelist git push' prüft "
-        "einen Befehl. Die Liste liegt in befehl_whitelist.json im Programm-Ordner."),
+        "(git status, pip list …) – sonst zweimal, rot markiert. Im Modus Auto laufen dazu die "
+        "Einträge der Auto-Liste und Python-Skripte im Arbeitsordner; alles andere hält an. "
+        "'/whitelist git push' prüft einen Befehl. Die Liste liegt in befehl_whitelist.json im Programm-Ordner."),
     Cmd("/update", "Aktualisieren ⬇: venv prüfen – Lücken, fehlende Pakete, Updates", "",
         "⬇ Prüft das venv neben NemiCLI gegen requirements.txt und die Bild-Bausteine: fehlt etwas, "
         "passt eine Version nicht, stimmt der torch-Bau nicht zur Grafikkarte, gibt es erlaubte Updates? "
@@ -295,28 +341,30 @@ COMMAND_LIST: list[Cmd] = [
         "liegt in chrome-erweiterung/ (chrome://extensions → Entwicklermodus → Entpackte "
         "Erweiterung laden). NemiCLI hört dafür NUR auf 127.0.0.1 (Port aus der Config, "
         "Standard 9000) und verlangt den Geheimschlüssel. '/chrome neu' würfelt ihn neu."),
-    Cmd("/emoji", "Smiley- & Emoji-Kürzel anzeigen"),
+    Cmd("/emoji", "Wie viele Emojis die KI nimmt · Kürzel-Liste", "low · middle · strong · frei · kuerzel",
+        "low: selten, höchstens eins · middle: ab und zu · strong: gerne und lebendig, aber passend · "
+        "frei (Vorgabe): die Persönlichkeit entscheidet. kuerzel: Smileys & :kürzel: zum Tippen."),
     Cmd("/nemi", "Maskottchen sagt was 💬"),
     Cmd("/uebung", "Übungsmodus: im Leerlauf selbst üben & lernen 🎓", "an · aus · jetzt",
         "🎓 Übungsmodus: im Leerlauf (~10 min) baut & testet NemiCLI Code "
         "in NemiSandbox/ und lernt daraus. 'aus' bleibt gespeichert – auch nach Neustart"),
-    Cmd("/kontext", "Kontext 📊: wie voll (Anleitung, Gedächtnis, Skills, Nachrichten) · lokal: 25k (Vorgabe) "
-        "· 8k … 128k · max",
-        "[anzeigen|8k|16k|25k|32k|64k|128k|max]",
+    Cmd("/kontext", "Kontext 📊: wie voll (Anleitung, Gedächtnis, Skills, Nachrichten) · lokal: max (Vorgabe) "
+        "· 8k … 128k",
+        "[anzeigen|8k|16k|32k|64k|128k|max]",
         "📊 Zeigt, womit der Kontext gefüllt ist – wie /context bei Claude Code. Beim lokalen Modell "
-        "stellt es außerdem ein, wie viele Token es hält (Vorgabe 25k). Ist er nach einer Antwort zu drei "
+        "stellt es außerdem ein, wie viele Token es hält (Vorgabe max: so viel, wie das Modell kann). Ist er nach einer Antwort zu drei "
         "Vierteln voll, räumt NemiCLI im Hintergrund auf (Doppelpuffer, Preview; eigener Motor und lokales "
         "Ollama): die KI schreibt einen „Stand des Gesprächs“ (Ziel, Wünsche, Erledigtes, Fehler, Offenes, "
         "nächster Schritt, Fakten – dazu deine Nachrichten wörtlich), die ältesten Nachrichten wandern ins "
         "Gedächtnis und bleiben auffindbar, die neuesten bleiben. Der Stand wird mit dem Chat gespeichert. "
         "Bei Ollama gilt der Kontext, mit dem Ollama das Modell geladen hat. "
         "Alles andere entscheidet NemiCLI beim Laden selbst, damit der eingestellte Kontext ganz gilt: "
-        "passt alles in die Grafikkarte, bleibt es dort; sonst erst der Gesprächsspeicher in 8 Bit (halber "
-        "Platz), dann wandern Schichten in den RAM (Hybrid, über PCIe, langsamer) – bei MoE-Modellen bleiben "
+        "passt alles in die Grafikkarte, bleibt es dort; sonst wird erst der Gesprächsspeicher kleiner: 8 Bit "
+        "(halber Platz), 6 Bit, 4 Bit (gut ein Viertel, Werte vorher gedreht), dann wandern Schichten in den RAM (Hybrid, über PCIe, langsamer) – bei MoE-Modellen bleiben "
         "die meistgebrauchten Experten in der Grafikkarte (Experten-Lager, lernt im Gespräch mit), zuletzt ein "
         "Teil des Gesprächsspeichers. Die Anzeige zeigt, was gewählt wurde."),
     Cmd("/charaktere", "Charakter-Galerie 🎭: fertige Persönlichkeiten übernehmen oder eigene erschaffen", "",
-        "🎭 Eigenes Fenster: 9 fertige Persönlichkeiten mit Porträt zum Ansehen und Übernehmen – oder eine eigene erschaffen: Geschlecht (weiblich, männlich, nichtbinär), Alter (ab 18), bis zu 8 Eigenschaften; die KI schreibt Vorschläge, Krea malt je ein Porträt. Beim Ansehen hilft ✨ die KI, ein Feld zu verbessern (Wesen, Aussehen, Stil), 🎨 malt neu (gleiches oder neues Gesicht). Übernehmen legt die Persönlichkeit an, dazu im Profil die Charakter-Datei (Aussehen, fester Seed) und das Porträt als Profilbild – und macht sie aktiv. „Meinen Charakter verbessern“ öffnet die Charakter-Datei der aktiven Persönlichkeit. Auch als /galerie."),
+        "🎭 Eigenes Fenster: 9 fertige Persönlichkeiten mit Porträt zum Ansehen und Übernehmen – oder eine eigene erschaffen, auf zwei Wegen. 💬 Frei mit der KI: erzählen, wie man ihn sich vorstellt, ganz in eigenen Worten ohne Auswahllisten; die KI fragt locker nach und schreibt einen Steckbrief (Aussehen, Wesen, Eigenheiten & Stil) mit, den man selbst ändern kann – daraus 6 Varianten. ⚡ Schnell: Geschlecht (weiblich, männlich, nichtbinär) und Alter (ab 18, getippt), Aussehen (Haare mit Farbwahl, Augenfarbe, Busen/Brust, Taille, Po; die Körperform wird errechnet und lässt sich ändern), bis zu 8 Eigenschaften und eigene Wünsche; die KI schreibt 6 Varianten mit genau diesem Aussehen, Krea malt je ein Porträt. Schritt-Leiste oben, rechts der Steckbrief; 💬 „Mit der KI reden“: erzählen, wie man sich den Charakter vorstellt – die KI stellt die Felder ein, alles bleibt per Klick änderbar, ↺ nimmt ihre letzte Änderung zurück. Beim Ansehen hilft ✨ die KI, ein Feld zu verbessern (Wesen, Aussehen, Kleidung, Stil), 🎨 malt neu (gleiches oder neues Gesicht), 👗 ändert die Angaben zum Aussehen. Zum Schluss schlägt die KI 6 Namen vor (🎲 neue) – oder ein eigener. Übernehmen legt die Persönlichkeit an, dazu im Profil die Charakter-Datei (Aussehen, fester Seed) und das Porträt als Profilbild – und macht sie aktiv. „Meinen Charakter verbessern“ öffnet die Charakter-Datei der aktiven Persönlichkeit (auch die Angaben zum Aussehen). Auch als /galerie."),
     Cmd("/compact", "Gespräch jetzt zusammenfassen 📌 (Stand des Gesprächs) · zeigen", "[jetzt|zeigen]",
         "📌 Wie /compact bei Claude Code: die KI fasst das bisherige Gespräch im „Stand des Gesprächs“ zusammen "
         "(Ziel, Wünsche, Erledigtes, Fehler & Lösungen, Offenes, nächster Schritt, Fakten – deine Nachrichten "
@@ -486,15 +534,10 @@ UNTERMENUES: dict[str, list[tuple[str, str, str | None]]] = {
         ("malen {}", "🎨 Gesicht malen lassen", "Wie soll sie aussehen? (leer = aus der Charakter-Datei, sonst beschreibt sie sich selbst)"),
         ("motive", "🖼 Motive: 20 Bereiche, was schon gemalt ist", None),
         ("motive {}", "🎨 Motive malen", "Bereich (Nummer oder Name) oder alle"),
-        ("impuls an", "🌈 Freier Moment an", None),
-        ("impuls aus", "Freier Moment aus", None),
-        ("ankommen an", "👋 Begrüßen nach längerer Pause an", None),
-        ("ankommen aus", "Begrüßen nach längerer Pause aus", None),
-        ("leben an", "🐾 Desktop-Leben an", None),
-        ("leben aus", "Desktop-Leben aus", None),
-        ("musik an", "🎵 Musik spüren an", None),
-        ("musik aus", "Musik spüren aus", None),
-        ("erinnerungen", "⏰ Offene Erinnerungen", None),
+        ("auto an", "✨ AUTO an", None),
+        ("auto aus", "✨ AUTO aus", None),
+        ("vorne an", "📌 Immer vorne an", None),
+        ("vorne aus", "📌 Immer vorne aus", None),
         ("weg", "⚪ Zurück zur Kugel", None),
         ("ordner", "📁 Ordner öffnen", None),
     ],
@@ -506,6 +549,10 @@ UNTERMENUES: dict[str, list[tuple[str, str, str | None]]] = {
     "/schluessel": [
         ("{}", "🔑 Programm-Ordner auf Zeit öffnen", "Wie viele Minuten? (danach optional die Aufgabe)"),
         ("aus", "🔒 Schlüssel abziehen", None),
+    ],
+    "/anzeige": [
+        ("kompakt", "● Kompakt (Werkzeug-Zeile, ⎿ Ergebnis, Diff)", None),
+        ("rahmen", "▢ Mit Rahmen (bisherige Kästen)", None),
     ],
     "/limit": [
         ("", "🛑 Lösch-Limit anzeigen", None),
@@ -575,7 +622,7 @@ Gefällt kein Farbschema: mit theme_erstellen ein eigenes entwerfen (themes_eige
 danach /theme mit menue_oeffnen öffnen.
 Nur der Nutzer selbst – nenne ihm den Weg:
 - Im Desktop-Fenster (/gui) unter ⚙ Einstellungen per Klick: Stimme, Arbeitsweise, Denkstufe, Farben; unter
-  „Für Profis“ Kontext, Gedächtnis-Modell, Reflektieren, Skills, Übung, Helfer, Fremdseiten, Kugel,
+  „Für Profis“ Kontext, Gedächtnis-Modell, Gedächtnis-Takt, Reflektieren, Skills, Übung, Helfer, Fremdseiten, Kugel,
   Rechtsklick-Menü, Debugbericht
 - Modell, Cloud-Key: /model → „Cloud-Anbieter hinzufügen“ (Key wird verschlüsselt gespeichert)
 - Lösch-Limit /limit · Befehls-Whitelist /whitelist (befehl_whitelist.json) · Projekt für die
@@ -585,7 +632,11 @@ Nur der Nutzer selbst – nenne ihm den Weg:
   Protokoll learned/aktionen.log
 - Lokales Modell holen: /model → „Modell von Hugging Face holen“ (oder /model huggingface) –
   Größe und MoE wählen, landet in ModelGGUF/<Name>/; danach /model → Lokal.
-  Gedächtnis-Modelle: Models/embeddings (/embeddings)
+  Modell-Familie: ModelGGUF/<Familie>/<Mitglied>/ (Ordner ohne eigene .gguf) erscheint in /model → Lokal
+  als ein Team (🧬): es chattet das Mitglied ohne Bild-Teil, bei Bildern sieht das Mitglied mit Bild-Teil
+  (der Seher wird nur dafür geladen); jedes Mitglied ist auch einzeln wählbar („Familie-Mitglied“).
+  Gedächtnis-Modelle: Models/embeddings (/embeddings); wann eingebettet wird: /embeddingtimer (Takt
+  aus/15–90 min, Low-Modus); Config embedding_vram_anteil (Prozent VRAM für den Bibliothekar, Vorgabe 25)
 - Charakter-LoRA beim Malen (Krea 2, nur wenn die Persönlichkeit selbst im Bild ist): Config-Schlüssel
   bild_lora (Vorgabe an) und bild_lora_staerke (Vorgabe 1.0); Bilder mit LoRA laufen ohne TensorRT
 - Mausrad-Tempo im Vollbild: Config-Schlüssel scroll_zeilen (Zeilen je Raste, 1–20, Vorgabe 4),
@@ -619,12 +670,14 @@ def auswahl(name: str) -> list[tuple[str, str, str | None]]:
 
 # Werkzeug menue_oeffnen: Die KI öffnet ein Auswahlmenü, der Nutzer wählt selbst.
 # Sicherheit, Modus und Arbeitsordner bleiben beim Nutzer.
-# /compact braucht TURN_LOCK, den der Zug der KI selbst hält (asyncio.Lock ist nicht wiedereintrittsfähig).
+# /compact und /uebung brauchen TURN_LOCK, den der Zug der KI selbst hält (asyncio.Lock ist nicht
+# wiedereintrittsfähig).
 MENUE_GESPERRT = {"/schluessel", "/schlüssel", "/limit", "/whitelist", "/sandbox", "/modus", "/auto",
-                  "/wache", "/code", "/compact", "/restart", "/neustart"}
+                  "/wache", "/code", "/compact", "/uebung", "/restart", "/neustart"}
 # /appstore öffnet nur das Store-Fenster – Bauen, Entfernen und debugAI löst dort der Nutzer selbst aus.
-MENUE_EIGENE = {"/theme", "/staerke", "/kontext", "/embeddings", "/model", "/bildmodel", "/video", "/debug",
-                "/vision", "/appstore"}
+MENUE_EIGENE = {"/theme", "/emoji", "/staerke", "/denken", "/kontext", "/embeddings", "/embeddingtimer", "/model",
+                "/bildmodel",
+                "/video", "/debug", "/vision", "/appstore"}
 MENUE_UNTERPUNKTE = {"/bild": {"schritte"}, "/model": {"huggingface", "ersatz"}}   # Zusatz öffnet ein weiteres Menü
 
 

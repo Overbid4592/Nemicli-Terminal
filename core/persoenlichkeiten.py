@@ -366,10 +366,24 @@ def remove_line(p: Persoenlichkeit, index: int) -> None:
         _write_lines(p, lines)
 
 
+def _eindeutiger_name(name: str) -> str:
+    """`name` – oder mit Zahl, wenn sein Profil-Ordner schon einer anderen Persönlichkeit gehört
+    (sonst teilten beide Chats, Bilder und Skills)."""
+    try:
+        from profilordner import ordnername
+    except ImportError:
+        return name
+    belegt = {ordnername(q.name).lower() for q in list_all().values()}
+    neu, n = name, 2
+    while ordnername(neu).lower() in belegt:
+        neu, n = f"{name} {n}", n + 1
+    return neu
+
+
 def duplicate(p: Persoenlichkeit, name: str) -> Path:
     """Kopie unter neuem Namen – auch von Nemi (so wird die Eingebaute editierbar)."""
     DIR.mkdir(parents=True, exist_ok=True)
-    name = name.strip() or f"{p.name} Kopie"
+    name = _eindeutiger_name(name.strip() or f"{p.name} Kopie")
     if p.path is not None:
         lines = p.path.read_text(encoding="utf-8").splitlines()
         i = _find(lines, "# ")
@@ -488,6 +502,7 @@ def vorlage(name: str, kurz: str, geschlecht: str = "n", ton: str = "locker") ->
 def create(name: str, kurz: str, geschlecht: str = "n", ton: str = "locker") -> Path:
     """Legt Persoenlichkeiten/<slug>.md an (überschreibt nie – hängt eine Zahl an)."""
     DIR.mkdir(parents=True, exist_ok=True)
+    name = _eindeutiger_name(name.strip())
     key = slug(name)
     if key == NEMI_KEY:
         key = "nemi-2"

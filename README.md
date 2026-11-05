@@ -35,7 +35,7 @@ Bildbeschreiber und Gedächtnis laufen im eigenen GGUF-Motor, Bilder malt die ei
 >
 > 🎂 **Geburtstag: 19. Juni 2026.** An diesem Morgen kam die Frage, woraus Claude Code besteht – zwei Stunden später lief der erste Chat. Vorläufer war Nemi (V1/V2, Desktop- und Android-Apps) ab März 2026. `/version` zeigt das Alter.
 
-### 🔢 Aktuelle Version: 9.23 Alpha – und ein kleiner Zählfehler
+### 🔢 Aktuelle Version: 9.47 Alpha – und ein kleiner Zählfehler
 
 Ehrlich gesagt: Wir haben uns verzählt. 😅 Nach **8.9** haben wir einfach mit **8.10, 8.11 … 8.23**
 weitergemacht – und dabei vergessen, dass vorne irgendwann die **9** dran ist. Eine Version 9 gab es
@@ -56,8 +56,8 @@ Alles ausführlich: **[docs/Funktionen.md](docs/Funktionen.md)**
 
 | Bereich | Was es kann |
 |---|---|
-| 🧠 **Eigener GGUF-Motor** | Lokale Modelle ohne Server, reines Python + torch im NemiCLI-Prozess. Gemma 4, Qwen3.5/3.6 (auch MoE), Qwen3-Next, Qwen3-VL, Llama 3/4, Mistral/Ministral, Phi, Granite 4 (Hybrid), Nemotron-H, Falcon-H1, LFM2, DeepSeek, Kimi Linear, Ling 3.0 u. a.; alle gängigen Formate bis IQ1; MoE-Experten bei Bedarf im RAM, das Experten-Lager sortiert auch während der Antwort nach (Gemma 4 26B-A4B bis zu 80 % schneller); spekulatives Dekodieren (n-Gramm, MTP bei Qwen 3.5/3.6) mit gleicher Antwort; Präfix-Cache (Folgerunden in ~0,1 s); `/kontext`: Vorgabe 25k, bis 128k mit VRAM-Automatik oder mit Gesprächsspeicher im RAM, Anzeige wie voll der Kontext ist; volle Gespräche werden als „Stand des Gesprächs“ zusammengefasst |
-| 👁 **Sehen** | Cloud, Ollama und eigener Motor (mmproj: Gemma 4, Qwen3.5/Qwen3-VL, Pixtral). Jedes Modell ohne Sehen – lokal, Ollama oder Cloud – bekommt Hilfe vom **Bildbeschreiber** (`Vision/`, wählbar mit `/vision`); ein Seh-Protokoll je Persönlichkeit merkt sich, welches Bild beschrieben wurde |
+| 🧠 **Eigener GGUF-Motor** | Lokale Modelle ohne Server, reines Python + torch im NemiCLI-Prozess. Gemma 4, Qwen3.5/3.6 (auch MoE), Qwen3-Next, Qwen3-VL, Llama 3/4, Mistral/Ministral, Phi, Granite 4 (Hybrid), Nemotron-H, Falcon-H1, LFM2, LFM3, DeepSeek, Kimi Linear, Ling 3.0 u. a.; alle gängigen Formate bis IQ1, dazu ternäre und 1-Bit-Modelle (TQ1_0, TQ2_0, Q1_0, Q2_0 und die PrismML-Typen PQ2_0/PTQ1_0 – z. B. Ternary Bonsai 8B mit gut 2 GB); MoE-Experten bei Bedarf im RAM, das Experten-Lager sortiert auch während der Antwort nach (Gemma 4 26B-A4B bis zu 80 % schneller); spekulatives Dekodieren (n-Gramm, MTP bei Qwen 3.5/3.6) mit gleicher Antwort; Präfix-Cache (Folgerunden in ~0,1 s); `/kontext`: Vorgabe max (so viel, wie das Modell kann), wird es voll, räumen Doppelpuffer und `/compact` auf; VRAM-Automatik (Gesprächsspeicher 16 → 8 → 6 → 4 Bit, 4-Bit-Werte gedreht wie bei TurboQuant) oder mit Gesprächsspeicher im RAM, Anzeige wie voll der Kontext ist; volle Gespräche werden als „Stand des Gesprächs“ zusammengefasst |
+| 👁 **Sehen** | Cloud, Ollama und eigener Motor (mmproj: Gemma 4, Qwen3.5/Qwen3-VL, Pixtral, LFM3-VL). Jedes Modell ohne Sehen – lokal, Ollama oder Cloud – bekommt Hilfe vom **Bildbeschreiber** (`Vision/`, wählbar mit `/vision`); ein Seh-Protokoll je Persönlichkeit merkt sich, welches Bild beschrieben wurde |
 | 🔎 **Denkt mit** | NemiCLI sagt der KI, was sich seit ihrem letzten Blick geändert hat (Dateien mit den geänderten Zeilen, Ordner, Modell, Persönlichkeit, lange Pausen), und prüft jede fertige Antwort gegen das, was wirklich passiert ist – „Erledigt!“ trotz Fehlschlag fällt auf, die KI denkt noch einmal nach (Gegenprobe). Dazu die Denk-Gewohnheit: erwarten, vergleichen, Fakt von Vermutung trennen |
 | 🧭 **Denkwerk** | Nachdenken für jedes Modell, automatisch: Jede Nachricht wird eingeschätzt (einfach, mittel, schwer). Bei mittleren denkt die KI Schritt für Schritt, bei schweren zerlegt sie die Aufgabe, probiert zwei bis drei Lösungswege, verwirft schwache und prüft das Ergebnis selbst. Modelle ohne eigenes Nachdenken denken dafür in `<think>` (erscheint als 💭), Denk-Modelle nutzen ihr eigenes. Schwere Antworten sieht danach ein unabhängiger **⚖️ Prüfer** durch; findet er Fehler, bessert die KI nach. „Denk gründlich nach“ oder „kurz und knapp“ in der Nachricht gehen vor |
 | 🔊 **Stimme** | Lokal mit Qwen3-TTS im eigenen Motor (~3 GB VRAM, schneller als Echtzeit): jede Persönlichkeit entwirft ihre Stimme mit dir aus einer Beschreibung, liest auf Wunsch vor (Text, Markdown, PDF), die Kugel spricht ihre Sprechblasen; Esc stoppt. Die Stimme steht als `voice` in der Charakter-Datei; Proben unter 150 Hz (Männerbereich) spielen nicht, Config `stimme_min_hz` |
@@ -68,8 +68,8 @@ Alles ausführlich: **[docs/Funktionen.md](docs/Funktionen.md)**
 | 🛡 **Systemwache** | Hintergrund-Wächter mit 17 Regeln (jede mit ihrer MITRE-ATT&CK-Technik, u. a. umbenannte Windows-Werkzeuge über die Versionsdaten), einem eigenen **Sigma-Leser** (6 mitgelieferte Regeln, weitere als `.yml` in `Wache/sigma/`), lesbaren **Ereignisprotokollen** (neuer Dienst oder neue Aufgabe → Inventar sofort neu, dauerhafte WMI-Abos), eigenem Isolation Forest und einem Folgen-Netz (GRU), das ungewöhnliche Abläufe in Prozess-Ketten erkennt (erst im Schattenmodus, scharf nur über `/wache dl warnen`); weckt die Persönlichkeit ab 5–20 ungeprüften Alarmen, sie prüft und urteilt selbst. Gehärtet gegen schleichendes Anlernen: gelernt wird erst nach 24 h und nie aus offenen Alarmen, „harmlos“ gilt nur für genau dieses Programm, Modelle mit Versionen zum Zurückdrehen. Vollscan (höchstens 3 neue pro Woche) mit jeder Festplatte bis in die Partitionen, Download-Herkunft, zusätzlichen Datenströmen (ADS) und nicht lesbaren Ordnern samt Grund |
 | 🌐 **Netzwächter** | Wer steckt hinter einer Adresse? Name, Besitzer laut Adressregister, ob NemiCLI sie selbst nutzt und wofür – einfach die Firewall-Meldung einfügen. Dazu ein Netz-Modell (ML) für einzelne Verbindungen und Netz-Folgen (DL) für Abfolge und Takt je Programm, beide erst im Schattenmodus (`/wache netz warnen`) |
 | 💾 **Gedächtnis** | Chats, Fakten, Lehren, Skills, Wissen-Ordner; hybride Suche (Stichworte + Vektoren), geschnitten an Absätzen, Sätzen, Code-Blöcken und Kapiteln; die KI sucht selbst – mit mehreren Fassungen und einer vermuteten Antwort, bekommt den Text davor und danach, keine Doppelungen, ehrliches „schwach gefunden“; mit einem Reranker-Modell (z. B. Qwen3-Reranker-0.6B als .gguf in `Models/reranker/<Name>/`) sortiert ein Cross-Encoder die besten Treffer nach echter Relevanz; die Reihenfolge lernt NemiCLI aus dem, was die KI wirklich liest; lernt nach Korrekturen von selbst, Skills bessern sich nach Problemen selbst nach (Strichliste je Skill), Kontext ohne Ende (AutoContextCleaner) |
-| 🎨 **Bilder** | Eigene Krea-2-Pipeline (NVFP4 auf RTX 50xx), Gesichter nachmalen, Charakter-Datei für eine feste Figur, Serien bis 30 Bilder, Comics mit Sprechblasen; **Charakter-LoRA**: die Persönlichkeit bringt Krea bei, wie sie aussieht (greift nur, wenn sie sich selbst malt); optional Forge-WebUI oder ComfyUI · ☁ ohne Grafikkarte auch aus der Cloud (12 Anbieter: OpenAI, Google, xAI, Black Forest Labs/FLUX.2, Ideogram, Runway, fal.ai, Stability AI, Recraft, Together, Replicate, Luma – `/bildmodel cloud …`, Menü mit 🔍 Suchen, neuer Anbieter mit Schlüssel: `/bildmodel cloud neu`) |
-| 🎬 **Video** | Eigener Video-Motor (Wan 2.2 TI2V 5B als GGUF, umT5 als GGUF): bis 20 s, 24 Bilder/s, Clips à 5 s aneinander, ein Startbild von Krea 2 hält die Figur, Charakter-LoRA hält das Gesicht; Werkzeug `video_erstellen`, `/video`. Bei Cloud-Modellen läuft es **im Hintergrund** – weiterreden, Stand rechts neben der Eingabe, Fertigmeldung automatisch. Dazu der **Tagesrückblick**: die Bilder des Tages als Video mit ihrer Stimme · ☁ auch aus der Cloud (Google Gemini Omni, xAI Grok Imagine, Runway Gen-4.5, MiniMax H3, Luma Ray 3.2, fal.ai mit Veo/Kling … – `/video cloud …`, `/video cloud neu`) |
+| 🎨 **Bilder** | Eigene Krea-2-Pipeline (NVFP4 auf RTX 50xx), dazu weitere eigene Bild-Motoren: **🟩 Z-Image**, **🟦 FLUX.2 klein** (4B/9B), **🟧 Qwen-Image**, **🟪 FLUX.1** (dev/schnell) und **🟥 Chroma** (safetensors bf16/FP8/NVFP4 oder GGUF Q2–Q8, läuft auch mit wenig Grafikspeicher – Blöcke werden aus dem RAM nachgeschoben), Gesichter nachmalen, Charakter-Datei für eine feste Figur, Serien bis 30 Bilder, Comics mit Sprechblasen; **Charakter-LoRA**: die Persönlichkeit bringt Krea bei, wie sie aussieht (greift nur, wenn sie sich selbst malt); optional Forge-WebUI oder ComfyUI · ☁ ohne Grafikkarte auch aus der Cloud (12 Anbieter: OpenAI, Google, xAI, Black Forest Labs/FLUX.2, Ideogram, Runway, fal.ai, Stability AI, Recraft, Together, Replicate, Luma – `/bildmodel cloud …`, Menü mit 🔍 Suchen, neuer Anbieter mit Schlüssel: `/bildmodel cloud neu`) |
+| 🎬 **Video** | **🎞 LTX-2.5 – Video mit Ton** (Lightricks, Juli 2026): Bild und Stereo-Ton (48 kHz) aus einem Prompt, bis 20 s, als safetensors oder GGUF; ab 8 GB Grafikspeicher – AUTO wählt Auflösung (480p/720p/1080p) und VAE-Kacheln nach der Karte, alles andere (Format, Bilder/s, Schritte, CFG, Ton ✔️/🛑, Speicher) unter `/video einstellungen` · Eigener Video-Motor (Wan 2.2 TI2V 5B als GGUF, umT5 als GGUF): bis 20 s, 24 Bilder/s, Clips à 5 s aneinander, ein Startbild von Krea 2 hält die Figur, Charakter-LoRA hält das Gesicht; Werkzeug `video_erstellen`, `/video`. Bei Cloud-Modellen läuft es **im Hintergrund** – weiterreden, Stand rechts neben der Eingabe, Fertigmeldung automatisch. Dazu der **Tagesrückblick**: die Bilder des Tages als Video mit ihrer Stimme · ☁ auch aus der Cloud (Google Gemini Omni, xAI Grok Imagine, Runway Gen-4.5, MiniMax H3, Luma Ray 3.2, fal.ai mit Veo/Kling … – `/video cloud …`, `/video cloud neu`) |
 | 🗣 **Porträt** | Eigener Porträt-Motor (LivePortrait): ein Bild bewegt sich – lächeln, zwinkern, nicken – und **spricht** mit ihrer Stimme (MP4 mit Ton, bis 60 s), im kleinen Fenster oder in der Kugel |
 | 🎭 **Charakter-Galerie** | Fenster `/charaktere`: 9 fertige Persönlichkeiten mit Porträt zum Übernehmen – oder eine eigene erschaffen: Geschlecht (weiblich, männlich, nichtbinär), Alter ab 18, bis zu 8 Eigenschaften; die KI schreibt Vorschläge, Krea malt je ein Porträt. ✨ lässt die KI ein Feld verbessern, 🎨 malt neu (gleiches oder neues Gesicht). Übernehmen legt die Persönlichkeit an, im Profil die Charakter-Datei mit festem Seed (gleiches Gesicht in jedem Bild) und das Porträt als Profilbild |
 | 🎵 **Musik** | Eigener Musik-Motor (ACE-Step 1.5 als GGUF): „Mach mir einen Sommer-Song“ – die KI schreibt Stil und Liedtext, der Song-Planer plant Aufbau und Melodie, 48 kHz Stereo bis 4 Minuten, jeder Song mit Titel. **Cover:** einen vorhandenen Song (auch MP3/M4A/FLAC) im anderen Stil neu einspielen. Fenster `/musik` zum Wünschen, Ausarbeiten und Komponieren |
@@ -129,9 +129,11 @@ wird **kopiert, nie gelöscht**.
 | Lokales Sprachmodell | `ModelGGUF/<Name>/` im Programm-Ordner | `/model huggingface`: Größe wählen, nur ladbare Modelle ab 4B, SHA-256-Prüfung, fortsetzbar. Eine `mmproj-*.gguf` daneben = Modell sieht |
 | Bildbeschreiber | `Vision/<Name>/` im Programm-Ordner | kleines sehendes Modell (.gguf + mmproj) für jedes Modell ohne Sehen; je Modell ein Ordner, Wahl mit `/vision` |
 | Stimme | `Vision/<Name>/` im Programm-Ordner | Qwen3-TTS-Talker (VoiceDesign) + 12-Hz-Tokenizer als GGUF |
-| Gedächtnis-Embeddings | `Models/embeddings/<Name>/` im Programm-Ordner | `/embeddings`; GGUF läuft im eigenen Motor, auf der GPU wenn vorhanden |
+| Gedächtnis-Embeddings | `Models/embeddings/<Name>/` im Programm-Ordner | `/embeddings`; GGUF läuft im eigenen Motor, bei `auto` im RAM; große Aufträge kurz auf der GPU |
 | Krea 2 (Bilder) | `Models/Krea2/` im Daten-Ordner | Modell, `text_encoders/`, `vae/`, `tokenizer/`; `/bildmodel` |
+| Weitere Bild-Modelle (Z-Image, FLUX.2 klein, Qwen-Image, FLUX.1, Chroma) | `Models/Bildmodelle/` (Daten- oder Programm-Ordner) | je Modell ein Unterordner mit der `.safetensors`/`.gguf`; geteilt: `text_encoders/` (Qwen3-4B, für klein 9B Qwen3-8B, für Qwen-Image Qwen2.5-VL-7B, für FLUX.1 T5-XXL + CLIP-L), `tokenizer_t5/` und `tokenizer_clip/` für FLUX.1, `vae/` (`ae.safetensors`, `flux2-vae.safetensors`, `qwen_image_vae.safetensors` – auch aus dem Krea-Ordner), `tokenizer/` (nur bei safetensors-Text-Encoder); Bauart wird an der Datei erkannt, bekannte Dateien per SHA-256 geprüft; `/bildmodel` |
 | TensorRT-RTX (Zusatz, NVIDIA RTX) | `Models/TensorRT-RTX/` im Programm-Ordner | entpackten SDK-Ordner von [developer.nvidia.com/tensorrt-rtx](https://developer.nvidia.com/tensorrt-rtx) hineinlegen – siehe unten |
+| Video mit Ton (LTX-2.5) | `Models/Videomodelle/` (Daten- oder Programm-Ordner) | je Modell ein Unterordner mit dem Transformer (`.safetensors` oder `.gguf`); geteilt: `text_encoders/` (`gemma4-12b-with-proj-ltx-2.5…`), `vae/` (`ltx-2.5-video-vae-conv…` und `ltx-2.5-audio-vae…`); `/video modell`, `/video motorordner` |
 | Video (Wan 2.2 TI2V, Turbo, Fun InP als GGUF) | `VideoGen/` im Programm-Ordner (wie `Vision/`); je Modell ein Unterordner (`.gguf` + VAE), Liste siehe unten | `<Modell>/` mit `.gguf` und `Wan2.2_VAE.safetensors`, geteilt: `text_encoders/` (umT5 GGUF), `tokenizer/`; `/video` |
 | Musik (ACE-Step 1.5) | `Models/Musik/` oder `Models/Music/` (Daten- oder Programm-Ordner) | `acestep-v15-turbo-*.gguf`, `Qwen3-Embedding-0.6B-*.gguf` (Textleser), `vae-*.gguf`, optional `acestep-5Hz-lm-*.gguf` (Song-Planer); jede Datei vor dem ersten Laden per SHA-256 geprüft; `/musik` |
 | Porträt (LivePortrait) | `Models/LivePortrait/` (Daten- oder Programm-Ordner) | die fünf `.pth`-Netze + `landmark.onnx`; nur mit passender SHA-256 gelesen, einmal nach safetensors umgeschrieben |
@@ -221,7 +223,7 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | Befehl | Was es tut |
 |---|---|
 | `/model [name\|huggingface\|ersatz]` | Modell wählen, Cloud-Key eintragen, lokales Modell von Hugging Face holen, Ersatzbank (bis 2 Cloud-Modelle) |
-| `/kontext [anzeigen\|8k…128k\|max\|8bit\|16bit]` | 📊 Womit der Kontext gefüllt ist (wie `/context` bei Claude Code); lokal: Größe, Vorgabe 25k |
+| `/kontext [anzeigen\|8k…128k\|max]` | 📊 Womit der Kontext gefüllt ist (wie `/context` bei Claude Code); lokal: Größe, Vorgabe max |
 | `/staerke [stufe]` | Denkstufe/Budget: `schnell` · `normal` · `stark` · `max` |
 | `/auto [an\|aus]` | Auto-Stark (Ollama): bei schweren Fragen aufs große Gemma |
 | `/persönlichkeiten [name\|neu]` | Wer spricht? Wählen oder neu anlegen (auch `/persona`) |
@@ -246,10 +248,11 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | Befehl | Was es tut |
 |---|---|
 | `/bild [prompt\|schritte]` | Bild malen (Krea 2, WebUI oder ComfyUI) · Krea-Schritte 8–16 |
-| `/video <beschreibung> [--sekunden 10] [--start bild.png]` | 🎬 Video mit dem eigenen Motor: 704×1024 hochkant (Seitenverhältnis wie Krea 2), 24 Bilder/s, Clips à 5 s bis 20 s |
+| `/video <beschreibung> [--sekunden 10] [--start bild.png]` | 🎬 Video mit dem eigenen Motor: 704×1024 hochkant (Seitenverhältnis wie Krea 2), 24 Bilder/s, Clips à 5 s bis 20 s · 🎞 mit LTX-2.5 auch mit Ton |
+| `/video modell [name]` · `/video einstellungen [name wert]` | 🎞 Video-Modell wählen (Wan 2.2 oder LTX-2.5) · Einstellungen der Video-Motoren mit AUTO |
 | `/charaktere` | 🎭 Charakter-Galerie: Vorlagen ansehen und übernehmen, eigene erschaffen (Geschlecht, Alter ab 18, bis zu 8 Eigenschaften), ✨ von der KI verbessern lassen, „Meinen Charakter verbessern“ für die aktive Persönlichkeit |
 | `/musik` | 🎵 Musik-Fenster: Wunsch eintippen, ✨ Ausarbeiten (Stil, Liedtext, Tempo), 🎵 Komponieren, 🎙 Als Cover – oder einfach der KI sagen, welchen Song sie machen soll |
-| `/bildmodel [name]` | Bild-Motor wählen (`webui-adresse` ändert den Host) |
+| `/bildmodel [name]` | Bild-Motor wählen: 🟣 Krea 2, 🟩 Z-Image, 🟦 FLUX.2, 🟧 Qwen-Image, 🟪 FLUX.1, 🟥 Chroma, WebUI, ComfyUI, Cloud (`webui-adresse` ändert den Host) |
 | `/charakter [oeffnen]` | 🧬 Charakter-Datei: feste Figur der Persönlichkeit |
 | `/kugel [malen …\|motive\|impuls\|leben\|musik\|erinnerungen\|weg\|ordner]` | 🔮 Schwebekugel: Gesicht und Motive malen, freier Moment, Desktop-Leben, Musik spüren, Erinnerungen |
 
@@ -290,7 +293,7 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | `/debug [aus\|an\|motor an\|aus]` | 🐞 Debugbericht läuft immer: Grafikspeicher und Arbeitsspeicher je Prozess (auch festgenagelter RAM und die größten RAM-Nutzer aller Programme), Modelle laden/entladen, Fehler – eine Datei je Start unter `Debugbericht/`; mit einem Cloud-Modell liest die KI ihn selbst („Was sagt der Debug gerade?“) und schreibt ihre Auswertung nach `Berichte/`. **Selbstdiagnose 🩺:** „Prüf dich mal“ – die Cloud-KI sieht sich in einem Zug an (Version, Rechner, Grafikspeicher je Prozess, Systemcheck, letzte Fehler) und legt den Befund als `Berichte/Diagnose_<Datum>.md` ab. **Fehler-Wächter:** erkennt Hänger und Bremsen (mit der Stelle im Code), Arbeit, die beim Entladen nicht aufhört, Abstürze und ein unsauberes Ende früherer Starts, wiederholte Fehler und ungültige Werte – als „⚠ BEFUND“ im Bericht und in der Selbstdiagnose |
 | `/spiel` | Schach · Mühle · Dame · TicTacToe gegen die Persönlichkeit |
 | `/appstore [<app> \| debug <app> \| liste]` | 🛍 Apps aus HTML/CSS/JS in **NemiView**, NemiCLIs eigener Engine (eigener JavaScript-Interpreter, HTML, CSS, Layout, Zeichnen – kein Chrome, kein Internet, keine Grafikkarte); die KI nutzt ihre Funktionen (`app_aufrufen`) und prüft sie (`app_pruefen`); 🐞 debugAI in jeder App: sagen was stört, auf die Stelle tippen, danach vorher → nachher mit Behalten oder Zurück; der Store zeigt kleine Kacheln (Klick öffnet, Rechtsklick → debugAI), **➕ Neue App** lässt die KI eine App aus einer kurzen Beschreibung bauen |
-| `/theme` · `/emoji` · `/nemi` · `/statistik [reset]` | Farben · Emoji-Kürzel · Maskottchen · Nutzung |
+| `/theme` · `/emoji` · `/nemi` · `/statistik [reset]` | Farben · Emojis (low/middle/strong/frei, Kürzel) · Maskottchen · Nutzung |
 | `/restart` | 🔄 NemiCLI **und** Wache neu starten, im selben Fenster – nach Updates oder als Notbremse, wenn etwas hängt (greift sofort, auch mitten in der Arbeit). Nur über die eigene Eingabe, nie durch die KI. Nach `/update` und Installationen fragt NemiCLI selbst „Jetzt neu starten?“ |
 | `/help` · `/exit` | Hilfe · Beenden |
 
@@ -367,21 +370,25 @@ Sicherheitslücken bitte privat melden: [SECURITY.md](SECURITY.md).
 
 ```
 NemiCli/
-├─ main.py                Chat-Schleife, Aktions-Logik, Befehle, Start
+├─ main.py                Chat-Schleife und Aktions-Logik; lädt die drei Teile unten in denselben Namensraum
+├─ main_dienste.py · main_befehle.py · main_start.py   Dienste · Slash-Befehle · Start
 ├─ start.bat · nemicli.cmd Starter
 ├─ core/                  Persona, Befehle, Modi, Config, Keys, Pfade, Coding-Assistent
-├─ engines/               Chat-Motoren, Krea 2, Video-Motor, Bildbeschreiber, WebUI/ComfyUI, Systemcheck
+├─ engines/               Chat-Motoren, Krea 2, weitere Bild-Motoren (bildmotoren/), Video-Motor, Video-Motoren mit Ton (videomotoren/), Bildbeschreiber, WebUI/ComfyUI, Systemcheck
 ├─ ggufengine/            eigener GGUF-Motor (Leser, Tokenizer, Kernel, Modelle)
+├─ trtmotor/              TensorRT-Zusatz (Chat-Lesen, Krea, Wan)
 ├─ loramotor/             Coding-LoRA für lokale Modelle: an-/abklinken, Lernweg, Training
+├─ einrichtungshelfer/    Funke, der Einrichtungs-Helfer (/einrichten)
+├─ nemiview/              eigene Web-Engine für den Appstore (HTML, CSS, JavaScript)
+├─ appstore_vorlagen/     Beispiel-Apps des Appstores
 ├─ tools/                 Werkzeuge, Gedächtnis, Sandbox, Web, Wache (tools/wache/)
 ├─ ui/                    Textual-Vollbild, Desktop-Fenster, Terminal-Fenster, Themes
 ├─ ModelGGUF/             lokale Sprachmodelle, ein Ordner je Modell     (nicht in Git)
 ├─ VideoGen/              Dateien für den Video-Motor (Wan 2.2 TI2V GGUF + VAE je Unterordner, umT5 GGUF)
 ├─ Vision/                Bildbeschreiber, ein Ordner je Modell           (nicht in Git)
 ├─ Models/embeddings/     Embedding-Modell fürs Gedächtnis                (nicht in Git)
-├─ Agenten/               Anleitungen, die die Persönlichkeit abarbeitet
 ├─ chrome-erweiterung/    Chrome-Erweiterung (LIESMICH.md)
-├─ installer/             MSI-Bau
+├─ installer/             Setup-Programm (NemiCLI-Setup-<Build>.exe), wahlweise MSI-Bau
 ├─ tests/                 Offline-Tests (nicht im Repository)
 ├─ docs/                  Funktionen, Technik, Modelltests, Pläne, Ideen
 ├─ build_exe.py · NemiCLI.spec · zertifikat.py
@@ -390,7 +397,8 @@ NemiCli/
 └─ venv/ · .runtime/      Arbeits-Umgebung, isoliertes Python
 ```
 
-**Deine Daten** (`DATEN` – Ort wählst du mit `/start`; ohne Wahl beim Programm):
+**Deine Daten** (`DATEN` – Ort wählst du mit `/start`; ohne Wahl beim Programm). Die Ordner legt NemiCLI beim
+Start selbst an, sie stehen nicht im Repository:
 
 ```
 <dein Ordner>/
@@ -398,9 +406,12 @@ NemiCli/
 ├─ learned/               Gedächtnis (memory.db), Statistik, Aktions-Protokoll
 ├─ Profile/<Name>/        je Persönlichkeit: Chats, Bilder, Videos, Musik, Skills, Erinnerungen, Charakter-Datei, LoRA
 ├─ Persoenlichkeiten/     eigene Persönlichkeiten (.md) und Kugel-Bilder
+├─ Agenten/               Anleitungen, die die Persönlichkeit abarbeitet (z. B. wache_alarm.md)
 ├─ Skills/ · Wissen/      Skills und Wissen für alle Persönlichkeiten
 ├─ Bilder/                gemalte Bilder, Screenshots
 ├─ Models/Krea2/          Dateien für Krea 2
+├─ Models/Bildmodelle/    weitere Bild-Modelle (Z-Image …), je Modell ein Unterordner
+├─ Models/Videomodelle/   Video-Modelle mit Ton (LTX-2.5 …), je Modell ein Unterordner
 ├─ Wache/ · Berichte/     Systemwache · Berichte von Wache und Zeitplan
 ├─ Zeitplan/ · Befehle/   Aufträge für die Aufgabenplanung · Hilfs-Skripte
 ├─ NemiSandbox/           Sandbox: Lauf-Ordner und Pakete
@@ -504,6 +515,16 @@ Was mit **16 GB RAM + 16 GB VRAM** geht:
 - [x] Gedächtnis-Suche mit Reranker, gelernter Rangliste und sauberem Schnitt
 - [x] Coding-Assistent mit Seitenprüfung: grün nur ohne Konsolenfehler und fehlende Dateien
 - [ ] Eigener Windows-Benutzer für NemiCLI: Windows selbst sperrt den Programm-Ordner, kein Textfilter nötig
-- [ ] Lizenz festlegen (Liebesprojekt – nie zum Verkauf)
+- [x] Lizenz festgelegt: GPL-3.0 (Liebesprojekt – nie zum Verkauf)
 - [ ] Signatur mit einem anerkannten Zertifikat, wenn NemiCLI an andere geht
 - [ ] Build beim Bitdefender-Falsch-Positiv-Formular einreichen
+
+---
+
+## 📜 Lizenz
+
+**Lizenz: GPL-3.0 · © 2026 D. Hoffmann** – Volltext in `LICENSE`.
+Erstellt mit Claude Code (Claude Opus 5.5, Anthropic).
+
+Freie Software: Du darfst NemiCLI nutzen, verändern und weitergeben – auch Veränderungen müssen wieder unter
+GPL-3.0 und mit offenem Quellcode weitergegeben werden.

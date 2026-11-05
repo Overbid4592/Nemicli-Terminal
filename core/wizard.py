@@ -17,10 +17,8 @@ Geprüft/erledigt wird:
                                     Teil für Teil mit Lizenz und Größe vorab
                                     (tools/modellkatalog.py, /einrichten modelle).
 
-ISOLATION: Python + venv + Bild-Pakete kommen über `uv`
-(core/uvsetup.py). Es wird ein EIGENSTÄNDIGES Python in <NemiCLI>/.runtime/
-gelegt - kein Admin, keine PATH-Änderung, nichts am System des Nutzers. Das
-löst den alten python.org-Weg (systemweite Installation) ab.
+ISOLATION: Python + venv + Bild-Pakete kommen über `uv` (core/uvsetup.py) –
+ein eigenständiges Python in <NemiCLI>/.runtime/, ohne Admin und ohne PATH-Änderung.
 
 SICHERHEIT: Geladen wird nur von github.com (uv) und den üblichen
 Paket-Quellen (PyPI, download.pytorch.org) - HTTPS, feste Host-Prüfung.
@@ -29,12 +27,9 @@ Installiert wird immer erst nach Rückfrage.
 
 from __future__ import annotations
 
-import os
-import shutil
 import sys
 from pathlib import Path
 
-import models as M
 import setup as S
 import syscheck
 import extlibs
@@ -132,7 +127,7 @@ def check_all() -> list[dict]:
                  else "fehlt: " + ", ".join(fehlend[:6]) + (" …" if len(fehlend) > 6 else "")),
     })
 
-    # 5. Ollama (der lokale Motor; llama.cpp ist entfallen)
+    # 5. Ollama
     ollama = S.ollama_running()
     schritte.append({
         "id": "ollama", "titel": "Ollama (Motor für lokale Modelle)",

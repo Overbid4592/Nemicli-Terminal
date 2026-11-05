@@ -145,6 +145,47 @@ def lernen_planen(ctx: "Ctx", nutzertext: str, records: list[dict], web: bool,
     aufgabe.add_done_callback(_LERN_AUFGABEN.discard)
 
 
+def pflege_planen(ctx: "Ctx") -> None:
+    """Gedächtnis-Pflege im Hintergrund, nur mit einem Cloud-Modell: wenn die KI sie wünscht (Werkzeug
+    gedaechtnis_aufraeumen) oder der Takt um ist und sich genug angesammelt hat. Hält TURN_LOCK nicht –
+    die Anfrage geht ins Netz, der Chat läuft weiter."""
+    import ersatzbank
+    import gedaechtnispflege as GP
+    backend, ref = ctx.backend, ctx.model
+    if backend is None or not ersatzbank.ist_cloud(ref):
+        return
+    if not GP.nachsehen():
+        return
+    wer = PS.active().key
+
+    async def lauf() -> None:
+        import lernschleife as LS
+        try:
+            k = await asyncio.to_thread(GP.kandidaten)
+            if not GP.faellig(k, zuletzt=GP.zuletzt()):
+                GP.spaeter()
+                return
+            erg = await GP.pflegen(backend, ref, bauen=cloud_backend, k=k)
+        except Exception as e:
+            try:
+                import debugbericht
+                debugbericht.ereignis(f"Gedächtnis-Pflege fehlgeschlagen: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return
+        if erg.get("laeuft") or not erg.get("kandidaten"):
+            return
+        text = GP.bericht_text(erg)
+        ui.info("🗜 " + text)
+        LS.melden(text, wer)
+        if erg.get("zusammen") or erg.get("veraltet"):
+            await bibliothekar(ctx.current_chat)
+
+    aufgabe = asyncio.get_running_loop().create_task(lauf())
+    _LERN_AUFGABEN.add(aufgabe)
+    aufgabe.add_done_callback(_LERN_AUFGABEN.discard)
+
+
 def _kugel_stand() -> dict | None:
     """Kugel-Bild wie die Kugel es wählt (Stimmung, sonst neutral; „kugel“ = ohne Bild),
     dazu das Denk-Bild. stand ändert sich, wenn ein Bild neu gemalt wurde."""
@@ -263,7 +304,7 @@ async def start_webui(ctx: "Ctx") -> "webui.WebBridge":
             bridge.broadcast({"t": "busy", "on": True})
             try:
                 txt = emoji.expand(text or "")
-                dateien = await asyncio.to_thread(anhang.anhaengen, txt)
+                dateien = await asyncio.to_thread(anhang.anhaengen, txt, anhang.budget(ctx.model))
                 txt = dateien["text"]
                 if (h := anhang.hinweis(dateien)):
                     bridge.broadcast({"t": "info", "text": h})
@@ -293,12 +334,13 @@ async def start_webui(ctx: "Ctx") -> "webui.WebBridge":
     async def do_switch(ref: str) -> None:
         if not ref:
             return
-        ctx.backend, ctx.model = await switch_model(ref, ctx.backend, ctx.model, ctx.strength)
-        if _FORTSETZEN_NACH_MODELL[0] and ctx.backend is not None:
-            _FORTSETZEN_NACH_MODELL[0] = False
-            if not ctx.current_prompts:
-                _gespraech_fortsetzen(ctx)
-        _kontext_neu_zaehlen(ctx)
+        async with TURN_LOCK:                    # nie mitten in einem Zug wechseln
+            ctx.backend, ctx.model = await switch_model(ref, ctx.backend, ctx.model, ctx.strength)
+            if _FORTSETZEN_NACH_MODELL[0] and ctx.backend is not None:
+                _FORTSETZEN_NACH_MODELL[0] = False
+                if not ctx.current_prompts:
+                    _gespraech_fortsetzen(ctx)
+            _kontext_neu_zaehlen(ctx)
         bridge.broadcast({"t": "info", "text": f"Modell aktiv: {ctx.model}"})
         bridge.broadcast(web_state())
         ctx.sync_session()
@@ -515,13 +557,19 @@ def _stimme_zustand() -> dict:
 def _gui_bilder(anzahl: int = 300) -> list[str]:
     """Galerie: Bilder der aktiven Persönlichkeit und die gemeinsamen von früher, neueste zuerst."""
     import profilordner
+
+    def zeit(d: Path) -> float:
+        try:
+            return d.stat().st_mtime
+        except OSError:                              # inzwischen gelöscht
+            return 0.0
     dateien = []
     for ordner in profilordner.bilder_ordner_alle():
         try:
             dateien += [d for d in ordner.iterdir() if d.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp")]
         except OSError:
             continue
-    dateien.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    dateien.sort(key=zeit, reverse=True)
     return [str(d) for d in dateien[:anzahl]]
 
 
@@ -573,7 +621,7 @@ async def _fenster_zug(ctx: "Ctx", text: str, senden, fragen, *, erlaubt, quelle
             senden(ev)
         try:
             txt = emoji.expand(text or "")
-            dateien = await asyncio.to_thread(anhang.anhaengen, txt)
+            dateien = await asyncio.to_thread(anhang.anhaengen, txt, anhang.budget(ctx.model))
             txt = dateien["text"]
             if (h := anhang.hinweis(dateien)):
                 senden({"t": "info", "text": h})
@@ -599,6 +647,7 @@ async def _fenster_zug(ctx: "Ctx", text: str, senden, fragen, *, erlaubt, quelle
             memory.release_encoder()
             lernen_planen(ctx, text, fertig.get("records") or [], actions.web_tainted(),
                           pricing.weggefallen_holen(ctx.backend))
+            pflege_planen(ctx)
         except Exception as e:
             senden({"t": "error", "text": f"Fehler: {e}"})
         finally:
@@ -1017,7 +1066,7 @@ async def start_musik(ctx: "Ctx"):
 
 async def start_charaktere(ctx: "Ctx"):
     """Brücke zur Charakter-Galerie (/charaktere): Vorlagen mit Porträt, Vorschläge der KI, Porträts mit Krea,
-    ✨ Verbessern, Übernehmen (Persönlichkeit + Charakter-Datei + Profilbild) und das Bearbeiten der eigenen."""
+    ✨ Verbessern, Gespräch mit der KI, Namen der KI, Übernehmen (Persönlichkeit + Charakter-Datei + Profilbild) und das Bearbeiten."""
     import shutil
     import charaktergalerie as CG
     import gui_bruecke
@@ -1045,6 +1094,20 @@ async def start_charaktere(ctx: "Ctx"):
         ziel.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(pfad, ziel)
         return str(ziel)
+
+    async def frag(art: str, frage: str, system: str) -> str:
+        """Ein Auftrag an die KI – mit Zeile im Debugbericht (Art, Modell, Dauer, Fehler)."""
+        import debugbericht as _DBG
+        start = time.monotonic()
+        try:
+            antwort = await ctx.backend.ask_once(frage, system)
+        except Exception as e:
+            _DBG.ereignis(f"Galerie-KI {art}: Fehler nach {time.monotonic() - start:.1f} s – "
+                          f"{type(e).__name__}: {str(e)[:200]}", speicher=False)
+            raise
+        _DBG.ereignis(f"Galerie-KI {art}: {getattr(ctx, 'model', '') or '?'} · {time.monotonic() - start:.1f} s · "
+                      f"{len(antwort or '')} Zeichen", speicher=False)
+        return antwort
 
     def ki_bereit() -> bool:
         if ctx.backend is None or not hasattr(ctx.backend, "ask_once"):
@@ -1081,17 +1144,26 @@ async def start_charaktere(ctx: "Ctx"):
     async def vorschlaege(a: dict) -> None:
         auftrag[0] += 1
         nr = auftrag[0]
+        frei = CG.steckbrief_pruefen(a.get("frei")) if a.get("frei") is not None else None
         try:
-            g, alter, eig = CG.auswahl(a.get("geschlecht"), a.get("alter"), a.get("eigenschaften"))
+            if frei is not None:                 # freier Weg: Steckbrief in eigenen Worten statt Auswahl
+                (g, alter), eig = CG.person_pruefen(a.get("geschlecht"), a.get("alter")), []
+                if not frei:
+                    raise ValueError("Erzähl erst ein bisschen von deinem Charakter – der Steckbrief ist noch leer.")
+            else:
+                g, alter, eig = CG.auswahl(a.get("geschlecht"), a.get("alter"), a.get("eigenschaften"))
         except ValueError as e:
             senden("fehler", text=str(e))
             return
         if not ki_bereit():
             return
+        aussehen = {} if frei is not None else CG.aussehen_pruefen(a.get("aussehen"), g)
         senden("status", text="✨ Die KI erfindet Charaktere …", laeuft=True)
         try:
-            antwort = await ctx.backend.ask_once(CG.vorschlag_auftrag(g, alter, eig), CG.VORSCHLAG_SYSTEM)
-            liste = CG.vorschlaege_lesen(antwort, g, alter, eig)
+            frage = (CG.frei_varianten_auftrag(g, alter, frei) if frei is not None else
+                     CG.vorschlag_auftrag(g, alter, eig, aussehen=aussehen, idee=str(a.get("idee") or "")))
+            antwort = await frag("Varianten", frage, CG.VORSCHLAG_SYSTEM)
+            liste = CG.vorschlaege_lesen(antwort, g, alter, eig, aussehen=aussehen, frei=frei)
         except Exception as e:
             senden("fehler", text=f"Vorschläge: {e}")
             return
@@ -1104,7 +1176,7 @@ async def start_charaktere(ctx: "Ctx"):
                 return
             senden("status", text=f"🎨 Krea malt {v['name']} ({i + 1}/{len(liste)}) …", laeuft=True)
             try:
-                pfad = await malen(CG.portraet_prompt(g, alter, v["kern"], v["stil"]), v["seed"],
+                pfad = await malen(CG.portraet_prompt(g, alter, v["kern"], v["stil"], v.get("outfit", "")), v["seed"],
                                    CG.ordner() / "Entwuerfe" / f"{int(time.time())}_{nr}_{i}.png")
             except Exception as e:
                 senden("fehler", text=f"Porträt {v['name']}: {e}")
@@ -1119,11 +1191,51 @@ async def start_charaktere(ctx: "Ctx"):
             return
         try:
             frage = CG.verbessern_auftrag(feld, str(entwurf.get(feld) or ""), entwurf, str(a.get("wunsch") or ""))
-            text = CG.verbessert_lesen(await ctx.backend.ask_once(frage, CG.VERBESSERN_SYSTEM), feld)
+            text = CG.verbessert_lesen(await frag(f"Verbessern {feld}", frage, CG.VERBESSERN_SYSTEM), feld)
         except Exception as e:
             senden("fehler", text=f"✨ {e}")
             return
         senden("verbessert", feld=feld, text=text)
+
+    async def namen(a: dict) -> None:
+        entwurf, bisher = a.get("entwurf") or {}, [str(n) for n in a.get("bisher") or []][-60:]
+        if not ki_bereit():
+            return
+        senden("status", text="✨ Die KI sucht Namen …", laeuft=True)
+        try:
+            text = await frag("Namen", CG.namen_auftrag(entwurf, bisher), CG.NAMEN_SYSTEM)
+            liste = CG.namen_lesen(text, bisher)
+        except Exception as e:
+            senden("fehler", text=f"Namen: {e}")
+            return
+        senden("namen", liste=liste, nr=a.get("nr"))
+        senden("status", text="✅ Such dir einen Namen aus – oder tipp einen eigenen.", laeuft=False)
+
+    async def editor(a: dict) -> None:
+        if not ki_bereit():
+            return
+        senden("status", text="💬 Die KI denkt nach …", laeuft=False)
+        try:
+            frage = CG.editor_auftrag(a.get("verlauf") or [], str(a.get("text") or ""), a.get("stand") or {})
+            antwort, aenderungen = CG.editor_lesen(await frag("Gespräch", frage, CG.EDITOR_SYSTEM))
+        except Exception as e:
+            senden("fehler", text=f"💬 {e}")
+            return
+        senden("editor", antwort=antwort, aenderungen=aenderungen, nr=a.get("nr"))
+        senden("status", text="", laeuft=False)
+
+    async def frei_gespraech(a: dict) -> None:
+        if not ki_bereit():
+            return
+        senden("status", text="💬 Die KI denkt nach …", laeuft=False)
+        try:
+            frage = CG.frei_auftrag(a.get("verlauf") or [], str(a.get("text") or ""), a.get("stand") or {})
+            antwort, aenderungen = CG.frei_lesen(await frag("Frei", frage, CG.FREI_SYSTEM))
+        except Exception as e:
+            senden("fehler", text=f"💬 {e}")
+            return
+        senden("frei", antwort=antwort, aenderungen=aenderungen, nr=a.get("nr"))
+        senden("status", text="", laeuft=False)
 
     async def neu_malen(a: dict) -> None:
         entwurf = a.get("entwurf") or {}
@@ -1141,7 +1253,8 @@ async def start_charaktere(ctx: "Ctx"):
             except ValueError as e:
                 senden("fehler", text=str(e))
                 return
-            prompt = CG.portraet_prompt(g, alter, entwurf.get("kern", ""), entwurf.get("stil", ""))
+            prompt = CG.portraet_prompt(g, alter, entwurf.get("kern", ""), entwurf.get("stil", ""),
+                                        entwurf.get("outfit", ""))
         senden("status", text="🎨 Krea malt neu …", laeuft=True)
         try:
             pfad = await malen(prompt, seed, CG.ordner() / "Entwuerfe" / f"{int(time.time())}_neu.png")
@@ -1180,7 +1293,8 @@ async def start_charaktere(ctx: "Ctx"):
         import profilordner
         name = PS.active().name
         try:
-            p = await asyncio.to_thread(CG.bearbeitung_speichern, name, a.get("kern"), a.get("stil"), a.get("seed"))
+            p = await asyncio.to_thread(CG.bearbeitung_speichern, name, a.get("kern"), a.get("stil"), a.get("seed"),
+                                        a.get("aussehen") if isinstance(a.get("aussehen"), dict) else None)
             bild = a.get("bild") or ""
             if bild and Path(bild).is_file() and not Path(bild).is_relative_to(profilordner.ordner(anlegen=False)):
                 ziel = profilordner.ordner("Bilder") / f"portraet_{time.strftime('%Y%m%d_%H%M%S')}.png"
@@ -1197,6 +1311,9 @@ async def start_charaktere(ctx: "Ctx"):
         "start": lambda a: loop.call_soon_threadsafe(start, a),
         "vorschlaege": lambda a: plane(vorschlaege(a)),
         "verbessern": lambda a: plane(verbessern(a)),
+        "namen": lambda a: plane(namen(a)),
+        "editor": lambda a: plane(editor(a)),
+        "frei": lambda a: plane(frei_gespraech(a)),
         "neu_malen": lambda a: plane(neu_malen(a)),
         "uebernehmen": lambda a: plane(uebernehmen(a)),
         "laden": lambda a: loop.call_soon_threadsafe(laden, a),
@@ -1307,8 +1424,6 @@ def _migrate_ref(old: str | None) -> str | None:
         return old
     if old.startswith("claude"):         # früher: bare Anthropic-Name
         return M.make_ref("anthropic", old)
-    # Frueher stand hier noch die Umschreibung alter GGUF-Kurznamen
-    # ("gemma-12b" -> local:...). Mit llama.cpp ist die entfallen.
     return None
 
 
@@ -1321,15 +1436,13 @@ async def make_backend(ref: str, carry: list | None, strength: str = M.DEFAULT_S
     if provider != "gguf" and "gguflokal" in sys.modules:
         sys.modules["gguflokal"].entladen()          # anderes Modell: VRAM freigeben
     if provider == "anthropic":
-        if not os.getenv("ANTHROPIC_API_KEY"):
-            raise RuntimeError("Für Claude brauchst du einen ANTHROPIC_API_KEY in der .env.")
-        from chat import Chat
-        backend = Chat(model=model_id, strength=strength)
+        backend = await cloud_backend(ref, strength)
     elif provider == "gguf":
         import gguflokal
         if model_id not in gguflokal.modelle():
             raise RuntimeError(f"Kein lokales Modell '{model_id}' in {gguflokal.ORDNER}.")
         backend = gguflokal.GgufChat(model_id)
+        backend.strength = strength                  # Denk-Budget (/staerke)
     elif provider == "funke":
         if not funke_da():
             raise RuntimeError(FUNKE_FEHLT)
@@ -1338,17 +1451,29 @@ async def make_backend(ref: str, carry: list | None, strength: str = M.DEFAULT_S
             raise RuntimeError(f"Kein lokales Modell '{model_id}' – Funke Groß ist nicht mitgeliefert.")
         backend = funkechat.FunkeChat(ref)
     else:
-        prov = P.get(provider)
-        if prov is None:
-            raise RuntimeError(f"Unbekannter Anbieter: '{provider}'.")
-        if not prov.available():
-            raise RuntimeError(f"Kein Key für {prov.label} – {prov.env} in der .env setzen.")
-        from cloud import CloudChat
-        backend = CloudChat(provider, model_id, strength=strength)
+        backend = await cloud_backend(ref, strength)
 
     if carry:
         backend.messages = carry
     return backend
+
+
+async def cloud_backend(ref: str, strength: str = M.DEFAULT_STRENGTH):
+    """Ein Cloud-Modell (Anthropic oder OpenAI-kompatibel) – ohne Modellwechsel, der lokale Motor bleibt
+    geladen. Auch für Helfer wie die Gedächtnis-Pflege."""
+    provider, model_id = M.split_ref(ref)
+    if provider == "anthropic":
+        if not os.getenv("ANTHROPIC_API_KEY"):
+            raise RuntimeError("Für Claude brauchst du einen ANTHROPIC_API_KEY in der .env.")
+        from chat import Chat
+        return Chat(model=model_id, strength=strength)
+    prov = P.get(provider)
+    if prov is None:
+        raise RuntimeError(f"Unbekannter Anbieter: '{provider}'.")
+    if not prov.available():
+        raise RuntimeError(f"Kein Key für {prov.label} – {prov.env} in der .env setzen.")
+    from cloud import CloudChat
+    return CloudChat(provider, model_id, strength=strength)
 
 
 def _fmt_bytes(n: int) -> str:
@@ -1383,15 +1508,52 @@ async def _run_with_status(title: str, work) -> str:
     return state["result"] or ""
 
 
-# Der Bibliothekar (indexdb.after_turn) läuft nach jeder Runde und zeigt seinen Fortschritt
-# als Balken. Er darf den Chat nicht blockieren (ein großer Wache-Bericht = 60 Brocken
-# ≈ 90 s auf der CPU). Deshalb zwei Wege:
-#   TUI:      Hintergrund-Task, Fortschritt als Badge mit Mini-Balken in der Statuszeile
-#             (screen_tx.set_bibliothekar); der Nutzer tippt derweil weiter. Läuft schon
-#             einer, wird nur „nochmal“ vorgemerkt – nie zwei gleichzeitig.
-#   Klassik:  wie gehabt inline mit Panel (rich.Live und Prompt vertragen sich nicht
-#             gleichzeitig), aber portionsweise (indexdb-Grenzen je Runde).
-_BIB: dict = {"task": None, "nochmal": None}
+# Bibliothekar nach jeder Runde: im TUI als Hintergrund-Task mit Badge (läuft einer, wird nur „nochmal“
+# vorgemerkt), in der Klassik-Oberfläche inline mit Panel (rich.Live verträgt sich nicht mit dem Prompt).
+# wartet: im Takt (/embeddingtimer) gesammelt, läuft beim nächsten Schlag · letzter: Start des letzten Laufs
+_BIB: dict = {"task": None, "nochmal": None, "wartet": False, "wartet_chat": None, "takt": None,
+              "letzter": time.monotonic()}
+TAKT_PRUEF_S = 30.0        # so oft schaut der Takt nach, ob er fällig ist (eine geänderte Einstellung greift)
+LOW_RUHE_S = 3.0           # Low-Modus: so kurz wird auf Ruhe gewartet, danach geht es gedrosselt los
+
+
+def _takt_rest_s() -> float:
+    """Sekunden bis zum nächsten Schlag des Takts (0 = fällig oder Takt aus)."""
+    import einbetttakt
+    m = einbetttakt.minuten()
+    return max(0.0, m * 60 - (time.monotonic() - _BIB["letzter"])) if m else 0.0
+
+
+def takt_stand() -> str:
+    """Eine Zeile für /embeddingtimer: Takt, Low-Modus, nächster Lauf."""
+    import einbetttakt
+    m = einbetttakt.minuten()
+    zeile = f"Gedächtnis-Takt: {einbetttakt.text(m)} · {einbetttakt.low_text(einbetttakt.low())}"
+    if m and _BIB["wartet"]:
+        zeile += f" · nächster Lauf in ~{max(1, round(_takt_rest_s() / 60))} min"
+    return zeile
+
+
+def _vormerken(chat_id) -> None:
+    _BIB["wartet"] = True
+    _BIB["wartet_chat"] = chat_id or _BIB["wartet_chat"]
+    if ui.TUI is not None and (_BIB["takt"] is None or _BIB["takt"].done()):
+        _BIB["takt"] = asyncio.create_task(_takt_schleife())
+
+
+async def _takt_schleife() -> None:
+    """Holt das Vorgemerkte ab, sobald der Takt fällig ist."""
+    try:
+        while _BIB["wartet"]:
+            rest = _takt_rest_s()
+            if rest > 0:
+                await asyncio.sleep(min(rest, TAKT_PRUEF_S))
+                continue
+            chat = _BIB["wartet_chat"]
+            _BIB["wartet"], _BIB["wartet_chat"] = False, None
+            await bibliothekar(chat)
+    finally:
+        _BIB["takt"] = None
 
 
 def _chat_jetzt(ctx) -> bool:
@@ -1408,21 +1570,12 @@ def _chat_jetzt(ctx) -> bool:
         return False
 
 
-def _bibliothekar_lauf(chat_id, alles: bool, on_status, erzwingen: bool = False) -> dict:
-    """Blockierend (im Thread): after_turn + Ergebnis. `n` = neu gespeicherte Brocken,
-    `mit_vektor` = wie viele Brocken in diesem Lauf einen Vektor bekommen haben."""
-    out = {"n": 0, "err": None, "mit_vektor": 0, "neu": 0}
-    try:
-        vorher = indexdb.offen()
-        out["n"] = indexdb.after_turn(chat_id, status=on_status, alles=alles, chat_erzwingen=erzwingen)
-        nachher = indexdb.offen()
-        # Direkt gezählt: Brocken insgesamt und Brocken mit Vektor des aktiven Modells.
-        out["neu"] = max(0, nachher["brocken"] - vorher["brocken"])
-        out["mit_vektor"] = max(0, (nachher["brocken"] - nachher["ohne_vektor"])
-                                - (vorher["brocken"] - vorher["ohne_vektor"]))
-    except Exception as e:
-        out["err"] = e
-    return out
+def _bibliothekar_lauf(chat_id, alles: bool, on_status, erzwingen: bool = False, langsam: bool = False) -> dict:
+    """Blockierend (im Thread): ein Lauf im eigenen Prozess (bibkind), Ergebnis wie after_turn.
+    `langsam`: im Low-Modus gleich gedrosselt beginnen (gerade läuft Chat oder Bild)."""
+    import bibkind
+    _BIB["letzter"] = time.monotonic()
+    return bibkind.laufen(chat_id, alles, on_status, erzwingen, langsam=langsam)
 
 
 def _bibliothekar_text(res: dict) -> str:
@@ -1453,9 +1606,15 @@ def _beschaeftigt(tui) -> bool:
     return memory.gpu_pause()
 
 
-async def _ruhe_abwarten(tui, erzwingen: bool) -> None:
+async def _ruhe_abwarten(tui, erzwingen: bool) -> bool:
     """Vektorisiert wird in ruhigen Phasen: BIB_RUHE_S ohne Runde, Bild oder Video und ohne
-    Eingabe (ein ausgelagerter Chat soll schneller findbar sein: dann ein Viertel davon)."""
+    Eingabe (ein ausgelagerter Chat soll schneller findbar sein: dann ein Viertel davon).
+    Im Low-Modus nur LOW_RUHE_S – dann geht es auch mitten in Chat oder Bild los, gedrosselt.
+    Liefert True, wenn gedrosselt begonnen werden soll."""
+    import einbetttakt
+    if einbetttakt.low():
+        await asyncio.sleep(LOW_RUHE_S)
+        return _beschaeftigt(tui)
     noetig = BIB_RUHE_S / 4 if erzwingen else BIB_RUHE_S
     ruhig_seit, marke = time.monotonic(), indexdb._unterbrechung
     while True:
@@ -1465,27 +1624,26 @@ async def _ruhe_abwarten(tui, erzwingen: bool) -> None:
             ruhig_seit, marke = time.monotonic(), indexdb._unterbrechung
             continue
         if time.monotonic() - max(ruhig_seit, eingabe) >= noetig:
-            return
+            return False
 
 
 async def _bibliothekar_hintergrund(chat_id, alles: bool, erzwingen: bool = False) -> None:
     tui = ui.TUI
     try:
         while True:
+            langsam = False
             if not alles:                              # /gedaechtnis indexieren will es jetzt
-                await _ruhe_abwarten(tui, erzwingen)
-            zuletzt = {"msg": ""}
-
+                langsam = await _ruhe_abwarten(tui, erzwingen)
             def on_status(m: str) -> None:
-                zuletzt["msg"] = m
                 if tui is not None:
                     try:
                         tui.app.call_from_thread(tui.set_bibliothekar, m)
                     except Exception:
                         pass
 
-            res = await asyncio.to_thread(_bibliothekar_lauf, chat_id, alles, on_status, erzwingen)
+            res = await asyncio.to_thread(_bibliothekar_lauf, chat_id, alles, on_status, erzwingen, langsam)
             memory.release_encoder()
+            indexdb.vorwaermen()                       # neue Brocken jetzt einlesen, nicht in der nächsten Suche
             if res["err"]:
                 ui.info(f"📚 Bibliothekar: {res['err']}")
             elif res["n"]:
@@ -1494,7 +1652,12 @@ async def _bibliothekar_hintergrund(chat_id, alles: bool, erzwingen: bool = Fals
                     o = indexdb.offen()
                     offen = o["berichte_offen"] + o["ohne_vektor"]
                     if offen and not alles:
-                        rest = f" – noch {o['berichte_offen']} Berichte / {o['ohne_vektor']} Brocken offen, geht nächste Runde weiter (/gedaechtnis indexieren = alles jetzt)"
+                        import einbetttakt
+                        m = einbetttakt.minuten()
+                        wann = f"in {m} min" if m else "nächste Runde"
+                        rest = f" – noch {o['berichte_offen']} Berichte / {o['ohne_vektor']} Brocken offen, geht {wann} weiter (/gedaechtnis indexieren = alles jetzt)"
+                        if m:
+                            _vormerken(None)
                 except Exception:
                     pass
                 ui.info(_bibliothekar_text(res) + rest + ".")
@@ -1511,11 +1674,20 @@ async def _bibliothekar_hintergrund(chat_id, alles: bool, erzwingen: bool = Fals
                 pass
 
 
-async def bibliothekar(chat_id: int | None = None, alles: bool = False, erzwingen: bool = False) -> int:
+async def bibliothekar(chat_id: int | None = None, alles: bool = False, erzwingen: bool = False,
+                       sofort: bool = False) -> int:
     """Nach der Runde: Notizen und Skills einbetten, den Chat je indexdb.CHAT_SCHRITT Token
     (`erzwingen`: sofort, z. B. nach dem Kontext-Aufräumen), dann Rückstände, bis die nächste
     Runde beginnt. Im TUI im Hintergrund (Badge in der Statuszeile, Rückgabe 0), in der
-    Klassik-Oberfläche inline mit Panel."""
+    Klassik-Oberfläche inline mit Panel.
+    Mit Takt (/embeddingtimer) wird vorgemerkt und erst beim nächsten Schlag gerechnet – außer `alles`,
+    `erzwingen` (ausgelagerter Kontext muss gleich findbar sein) und `sofort` (ausdrücklicher Befehl)."""
+    if not (alles or erzwingen or sofort) and _takt_rest_s() > 0:
+        _vormerken(chat_id)
+        return 0
+    if _BIB["wartet"]:                                  # Vorgemerktes läuft gleich mit
+        chat_id = chat_id or _BIB["wartet_chat"]
+        _BIB["wartet"], _BIB["wartet_chat"] = False, None
     if ui.TUI is not None:
         if _BIB["task"] is not None and not _BIB["task"].done():
             alt = _BIB["nochmal"] or (None, False, False)
@@ -1706,7 +1878,7 @@ def _grafikkarte_frei() -> bool:
 
 async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
     """/kugel · malen [beschreibung | <bereich> | alle] · motive · impuls [an|aus] · ankommen [an|aus] ·
-    leben [an|aus] · musik [an|aus] · erinnerungen · weg · ordner
+    leben [an|aus] · musik [an|aus] · zuschauen [an|aus] · erinnerungen · weg · ordner
     – siehe tools/kugelbilder.py und tools/kugelmotive.py."""
     import kugelbilder as KB
     import kugelmotive as KM
@@ -1714,6 +1886,30 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
     teile = arg.split(maxsplit=1)
     sub = teile[0].lower() if teile else ""
     rest = teile[1].strip() if len(teile) > 1 else ""
+    if sub == "auto":
+        from wache import lebendig as LB
+        if rest.lower() in ("an", "aus"):
+            LB.auto_setzen(rest.lower() == "an")
+        stand = LB.auto_stand()
+        ui.info(f"✨ AUTO: {'an' if stand is True else 'aus' if stand is False else 'gemischt'} – "
+                + (f"{name} lebt von selbst: freier Moment, Begrüßen, Desktop-Leben, Musik und Zuschauen beim "
+                   "Spielen. Nachts still, im Vollbild ruhig, Bilder nur mit genug Grafikspeicher."
+                   if stand is True else
+                   "die Kugel ist nur still da. Einschalten: /kugel auto an" if stand is False else
+                   "einiges ist an, einiges aus. /kugel auto an schaltet alles ein.")
+                + " Erinnerungen kommen immer.")
+        return
+    if sub == "vorne":
+        if rest.lower() in ("an", "aus"):
+            _c = config.load()
+            _c["kugel_vorne"] = rest.lower() == "an"
+            config.save(_c)
+        an = bool(config.load().get("kugel_vorne", True))
+        ui.info(f"📌 Immer vorne: {'an' if an else 'aus'} – "
+                + ("die Kugel bleibt über allen Fenstern; verdeckt sie etwas, holt NemiCLI sie zurück. Im "
+                   "exklusiven Vollbild eines Spiels geht das nicht."
+                   if an else "die Kugel ist ein normales Fenster und darf verdeckt werden. Einschalten: /kugel vorne an"))
+        return
     if sub == "impuls":
         if rest.lower() in ("an", "aus"):
             _c = config.load()
@@ -1754,6 +1950,21 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
                     + (f"läuft ein Stück aus Spotify, YouTube, VLC & Co. länger, sagt {name} ab und zu etwas dazu "
                        "(nur die Lautstärke wird gelesen)."
                        if an else "keine Kommentare zur Musik. Einschalten: /kugel musik an"))
+        return
+    if sub == "zuschauen":
+        if rest.lower() in ("an", "aus"):
+            _c = config.load()
+            _c["kugel_zuschauen"] = rest.lower() == "an"
+            config.save(_c)
+        an = bool(config.load().get("kugel_zuschauen", False))
+        taste = str(config.load().get("kugel_frage_taste", "strg+alt+n") or "aus")
+        ui.info(f"🎮 Beim Spielen zuschauen: {'an' if an else 'aus'} – "
+                + (f"läuft ein Spiel, schaut {name} alle paar Minuten auf den Bildschirm und sagt etwas, wenn es "
+                   "spannend ist. Das Foto sieht ein Cloud-Modell mit Bild-Eingang; lokal nur, wenn genug "
+                   "Grafikspeicher frei ist. Im exklusiven Vollbild ist die Kugel nicht zu sehen – im Spiel "
+                   "„Randloses Fenster“ wählen."
+                   if an else "sie schaut beim Spielen nicht zu. Einschalten: /kugel zuschauen an")
+                + (f" Fragen zum Spiel: {taste.upper()} öffnet ihr Fenster, auch über dem Spiel." if taste != "aus" else ""))
         return
     if sub == "erinnerungen":
         from wache import erinnerungen as ER
@@ -1806,7 +2017,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         o = KB.outfits(name)
         if o["liste"]:
             ui.info(f"   Outfits (wählt {name} selbst): "
-                    + ", ".join(k + (" ✓" if k == o["aktiv"] else "") for k in o["liste"]))
+                    + ", ".join(k + (" ✔️" if k == o["aktiv"] else "") for k in o["liste"]))
         try:
             from wache import steuerung
             z = steuerung.lesen()
@@ -1846,7 +2057,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
             except Exception as e:
                 ui.error(f"Selbstbeschreibung fehlgeschlagen: {e}")
                 return
-        beschreibung = beschreibung.strip().strip('"„“').splitlines()[0] if beschreibung else ""
+        beschreibung = (beschreibung.strip().strip('"„“').splitlines() or [""])[0]
         if not beschreibung:
             ui.warn("Keine Beschreibung bekommen – versuch /kugel malen <beschreibung>.")
             return
@@ -1937,17 +2148,8 @@ async def _kugel_motive_malen(name: str, auswahl: str) -> None:
 
 
 async def run_reich(erststart: bool = False) -> None:
-    """Wo soll der NemiCLI-Ordner liegen?  (/start – und einmalig beim ersten Start)
-
-    Trennt den Ordner des Nutzers vom Programm-Ordner. Warum das sein muss,
-    steht in core/paths.py; wie das Fenster arbeitet, in core/reich.py.
-
-    Drei Dinge sind hier Absicht:
-      * Es wird KEIN Ordner vorgeschlagen – das ist die Entscheidung des Nutzers.
-      * Vor dem Kopieren steht, was mitkommt und wie groß es ist. Bei mehreren
-        Gigabyte Modellen soll niemand blind auf "Ja" drücken.
-      * Es wird nichts gelöscht. Das Original bleibt liegen.
-    """
+    """/start (und einmalig beim ersten Start): Ort des Daten-Ordners wählen (core/reich.py). Kein Vorschlag,
+    vor dem Kopieren Inhalt und Größe zeigen, nichts löschen."""
     import reich
 
     if erststart:

@@ -1,5 +1,6 @@
 {
   "_hinweis": "Befehlsanfänge, die bei `befehl` als harmlos gelten (eine Rückfrage statt zwei). Nur der Nutzer ändert diese Datei.",
+  "fassung": 2,
   "befehle": [
     "git status",
     "git log",
@@ -47,15 +48,10 @@
     "ollama show",
     "code",
     "notepad",
-    "explorer",
-    "start-process explorer",
     "start-process notepad",
     "new-item -itemtype directory",
     "mkdir",
     "md",
-    "copy-item",
-    "copy",
-    "cp",
     "set-location",
     "cd",
     "push-location",
@@ -69,5 +65,24 @@
     "where.exe",
     "gcm",
     "get-command"
+  ],
+  "_hinweis_auto": "Zusätzliche Befehlsanfänge, die im Modus Auto ohne Rückfrage laufen. Alles andere hält auch in Auto an.",
+  "auto_freigabe": [
+    "python -m pip install -r",
+    "python -m pip install -e",
+    "pip install -r",
+    "pip install -e",
+    "py -m pip install -r",
+    "uv pip install -r",
+    "uv add",
+    "uv lock",
+    "ruff check --fix",
+    "ruff format",
+    "black",
+    "git stash",
+    "git merge",
+    "git cherry-pick",
+    "git init",
+    "git rebase --continue"
   ]
 }

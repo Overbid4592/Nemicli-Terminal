@@ -13,6 +13,9 @@ Web-Allowlist, Netz-Taint fürs Merken) hängen NICHT am Modus – die gelten im
   ⚙ normal  Der klassische Weg: Lesen sofort, Verändern mit Rückfrage (F8).
   ⚡ auto    Ohne Rückfragen – Dateiaktionen im aktuellen Ordner und Befehle
              laufen direkt; Dateiaktionen AUSSERHALB des Ordners fragen.
+             Riskantes läuft nur von der Gästeliste (sicherheit.auto_grund):
+             Befehle von Whitelist/Auto-Liste, Python-Skripte im Ordner,
+             einzelne Dateien im Ordner löschen. Alles andere hält an.
              Dazu der Zünder: nach AUTO_FUSE_S Sekunden fällt NemiCLI von
              selbst in „chat" zurück, damit Auto nie versehentlich anbleibt.
   🚀 autoan  Wie Auto, aber ohne Zünder: bleibt an, bis der Nutzer umschaltet.
@@ -51,7 +54,8 @@ _current = DEFAULT
 _auto_until: float | None = None     # monotonic-Zeit, zu der der Zünder auslöst
 
 # Werkzeuge, die auch im Chat-Modus frei bleiben (schreiben nur nach learned/).
-MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen"}
+MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen",
+                "gedaechtnis_aufraeumen"}
 
 # Reine LESE-Werkzeuge: NUR diese dürfen im Modus „lesen" laufen. Alles andere
 # blockt dort – ausdrücklich als Allowlist, damit ein neues oder unbekanntes
@@ -65,7 +69,7 @@ READ_TOOLS = {
     "api_nachschlagen", "code_pruefen", "paket_info", "seite_ansehen", "doku_suchen", "app_liste", "app_pruefen",
     "dateien_suchen", "inhalt_suchen",
     "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
-    "gedaechtnis_suchen", "gedaechtnis_lesen", "skill_laden",
+    "gedaechtnis_suchen", "gedaechtnis_lesen", "skill_laden", "bilder_suchen",
     # feste Systemabfragen (systemabfrage.py) + Zeitplan ansehen
     "abfragen", "zeitplan_anzeigen",
     # nachsehen, welche Programme ein Update haben (winget, nichts wird installiert)
@@ -295,6 +299,12 @@ def decide(action: dict, needs_confirm: bool) -> str:
             return "ask"
         if needs_confirm and tool != "befehl" and not _inside_cwd(action):
             return "ask"                                 # Datei außerhalb des Ordners
+        try:                                             # Gästeliste: Riskantes nur, wenn freigegeben
+            import sicherheit
+            if sicherheit.auto_grund(action):
+                return "ask"
+        except ImportError:
+            pass
         return "run"
     return "ask" if needs_confirm else "run"             # normal
 
@@ -368,12 +378,14 @@ _PROMPT_HINTS = {
                "vorher (F8)."),
     "auto": ("Modus ⚡ Auto: Dateiaktionen im aktuellen Ordner und Befehle laufen OHNE Rückfrage "
              "– arbeite deshalb besonders sorgfältig, in kleinen Schritten, und prüfe Ergebnisse. "
-             "Dateien außerhalb des aktuellen Ordners fragen weiterhin. Der Modus schaltet sich "
-             "nach 5 Minuten selbst ab."),
+             "Dateien außerhalb des aktuellen Ordners fragen weiterhin, ebenso Befehle, die nicht "
+             "auf der Whitelist oder Auto-Liste stehen, Ordner löschen und Zeitpläne. Der Modus "
+             "schaltet sich nach 5 Minuten selbst ab."),
     "autoan": ("Modus 🚀 Auto ON: Dateiaktionen im aktuellen Ordner und Befehle laufen OHNE "
                "Rückfrage – dauerhaft, bis der Nutzer umschaltet. Arbeite deshalb besonders "
                "sorgfältig, in kleinen Schritten, und prüfe Ergebnisse. Dateien außerhalb des "
-               "aktuellen Ordners fragen weiterhin."),
+               "aktuellen Ordners fragen weiterhin, ebenso Befehle, die nicht auf der Whitelist "
+               "oder Auto-Liste stehen, Ordner löschen und Zeitpläne."),
 }
 
 

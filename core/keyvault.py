@@ -1,22 +1,9 @@
 """
-keyvault.py - API-Keys schützen: Windows-„Umschlag" + Anzeige-Maske.
+keyvault.py - API-Keys schützen: Windows-DPAPI + Anzeige-Maske.
 
-Zwei einfache, ehrliche Schutz-Bausteine:
-
-1) VERSCHLÜSSELN (encrypt/decrypt): nutzt die in Windows eingebaute DPAPI
-   (Data Protection API) über `ctypes` – KEIN Zusatz-Paket nötig. Der Schlüssel
-   ist an dein Windows-Konto auf diesem PC gebunden. Heißt konkret:
-     • Kopiert/stiehlt jemand die .env-Datei -> sie enthält nur Buchstabensalat,
-       der auf einem anderen PC / unter einem anderen Konto NICHT zu öffnen ist.
-     • Du brauchst kein Passwort – Windows entsperrt es automatisch für DICH.
-   Ehrliche Grenze: Schadsoftware, die GERADE als du läuft, kann es trotzdem
-   entschlüsseln (sie ist ja „du"). Davor schützt nur ein Master-Passwort.
-
-2) MASKIEREN (mask): zeigt einen Key nie voll an, sondern z.B. `sk-12309912•••••`.
-   Schützt vor neugierigen Blicken / Screenshots.
-
-Auf Nicht-Windows-Systemen ist available() False – dann bleiben Keys im Klartext
-(die App funktioniert weiter, nur ohne den Umschlag).
+encrypt/decrypt: DPAPI über ctypes, an das Windows-Konto auf diesem PC gebunden. Eine kopierte
+.env ist anderswo nicht lesbar; Programme, die unter demselben Konto laufen, können entschlüsseln.
+mask: zeigt einen Key nur gekürzt an. Ohne Windows ist available() False (Keys bleiben Klartext).
 """
 
 from __future__ import annotations
