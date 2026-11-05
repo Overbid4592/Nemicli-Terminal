@@ -8,15 +8,18 @@ from .gemma4 import Gemma4Model
 from .bailing3 import BailingMoe3Model
 from .baukasten import BaukastenModel
 from .deepseek2 import DeepSeek2Model
+from .embeddinggemma import EmbeddingGemma2Model
 from .hybrid import HybridModel
 from .llama4 import Llama4Model
 from .qwen35 import Qwen35Model
 from .qwen3vl import Qwen3VLModel
 
-_MODELS = (Qwen35Model, Qwen3VLModel, Gemma4Model, BailingMoe3Model, DeepSeek2Model, HybridModel, Llama4Model, BaukastenModel)
+_MODELS = (Qwen35Model, Qwen3VLModel, Gemma4Model, BailingMoe3Model, DeepSeek2Model, HybridModel, Llama4Model,
+           EmbeddingGemma2Model, BaukastenModel)
 # Name der Steine-Datei in der Modell-Datenbank (daten/bauarten.json, Feld "klasse")
 KLASSEN = {"qwen35": Qwen35Model, "qwen3vl": Qwen3VLModel, "gemma4": Gemma4Model, "bailing3": BailingMoe3Model,
-           "deepseek2": DeepSeek2Model, "hybrid": HybridModel, "llama4": Llama4Model, "baukasten": BaukastenModel}
+           "deepseek2": DeepSeek2Model, "hybrid": HybridModel, "llama4": Llama4Model,
+           "embeddinggemma": EmbeddingGemma2Model, "baukasten": BaukastenModel}
 SUPPORTED_ARCHS = tuple(ausfuellen.bauarten())
 
 

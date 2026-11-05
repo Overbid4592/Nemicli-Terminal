@@ -265,9 +265,8 @@ def _verschmelzen_runden(word: List[str], ranks: Dict[Tuple[str, str], int]) -> 
 
 def _verschmelzen_heap(word: List[str], ranks: Dict[Tuple[str, str], int]) -> List[str]:
     """Dasselbe Ergebnis wie Runde für Runde, in O(n log n): Paare in einer Vorrangliste nach (Rang, Position),
-    Symbole als verkettete Liste. Ein Rang wird wie eine Runde ganz abgearbeitet – alle seine Vorkommen von
-    links –, bevor neu entstandene Paare drankommen, auch wenn deren Rang kleiner ist (Gemma: die Merges sind
-    nicht nach Lernreihenfolge sortiert, Leerzeichen-Folgen verschmolzen sonst anders)."""
+    Symbole als verkettete Liste. Ein Rang wird ganz abgearbeitet (alle Vorkommen von links), bevor neu
+    entstandene Paare drankommen, auch mit kleinerem Rang – Merges sind nicht immer nach Lernreihenfolge sortiert."""
     import heapq
     sym = list(word)
     n = len(sym)
@@ -296,7 +295,7 @@ def _verschmelzen_heap(word: List[str], ranks: Dict[Tuple[str, str], int]) -> Li
             if rechts[i] < n:
                 links[rechts[i]] = i
             neu.append(i)
-        for i in neu:                                 # neue Paare erst nach der Runde (wie das alte Verfahren)
+        for i in neu:                                 # neue Paare erst nach der Runde
             if not lebt[i]:
                 continue
             if links[i] >= 0:

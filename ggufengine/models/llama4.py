@@ -62,7 +62,8 @@ class _Block:
             q = q * (torch.log(stufe + 1) * TEMP_SKALA + 1).view(L, 1, 1)
         self.cache.write(k, v, pos_idx)
         block = hp["chunk"] if self.mit_rope else 0
-        o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, D ** -0.5, chunk=block)
+        o = self.cache.o_zurueck(attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, D ** -0.5,
+                                           chunk=block))
         return self.o(o.reshape(L, -1)).float()
 
     def _ffn(self, x):

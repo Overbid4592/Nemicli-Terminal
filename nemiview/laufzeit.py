@@ -82,7 +82,11 @@ class AppLaufzeit:
         if not index.is_file() or index.stat().st_size > MAX_INDEX:
             raise OSError(f"{self.einstieg} fehlt oder ist zu groß")
         js = self.js
-        self.dok = nemidom.laden(js, index.read_text(encoding="utf-8", errors="replace"), self.ordner, self.einstieg)
+        try:
+            self.dok = nemidom.laden(js, index.read_text(encoding="utf-8", errors="replace"), self.ordner,
+                                     self.einstieg)
+        except Grenze as e:                          # z. B. zu viele Elemente: wie eine nicht ladbare Datei
+            raise OSError(f"{self.einstieg}: {e}") from None
         self.dok.fenster = self.fenster
         self._globale(js)
         self.kaskade = nemicss.Kaskade(self.dok.css_texte, self.breite, self.dunkel)

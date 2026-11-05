@@ -132,7 +132,7 @@ class AppAnsicht(QWidget):
             self.lz = AppLaufzeit(self.ordner, max(320, self.width()), max(240, self.height()),
                                   speicher_ordner=self.speicher, gastgeber=self)
             self.lz.laden()
-        except OSError as e:
+        except (OSError, RecursionError) as e:
             self.lz = None
             self.fehler_text = f"Die App lässt sich nicht laden: {e}"
         self.update()

@@ -58,7 +58,7 @@ class _Block:
         q = self.rope(rms_norm(q, self.q_norm, self.eps), pos3)
         k = self.rope(rms_norm(k, self.k_norm, self.eps), pos3)
         self.cache.write(k, v, pos_idx)
-        o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, self.scale)
+        o = self.cache.o_zurueck(attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, self.scale))
         h = h + self.o(o.reshape(L, -1)).float()
         x = rms_norm(h, self.ffn_norm, self.eps)
         return h + swiglu_mlp(x, self.gate, self.up, self.down).float()

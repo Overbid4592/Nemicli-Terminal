@@ -1,22 +1,14 @@
 """
-Block-format matrices (Q4_K, Q6_K) for few tokens per step, after the MMVQ idea of llama.cpp (MIT):
-the input is quantised once per 32 values, the kernel reads each weight byte once and multiplies four
-values per dp4a.  No shared memory for the input, one warp per output row - many warps keep the memory
-busy.  The input goes in two int8 stages (the rounding rest once more with 1/254 of the scale, about
-15 bits together): one stage alone loses several percent on inputs with outliers.  The min term of
-Q4_K uses the exact sum of each 32 values.
+Block-format matrices (Q4_K, Q6_K) on their own kernels, after the MMVQ idea of llama.cpp (MIT):
 
-  Q4_K (256 values, 144 bytes): eight lanes per block, 16 quant bytes each; four blocks per warp at once
-  Q6_K (256 values, 210 bytes): one lane takes half a block = 128 values (64 ql + 32 qh bytes)
+* up to MMVQ_BIS tokens: the input quantised to two int8 stages per 32 values (about 15 bits),
+  each weight byte read once, four values per dp4a, one warp per output row
+* up to MMQ_BIS tokens: weight blocks unpacked once to fp16 in shared memory, tensor cores (MMQ)
+* more tokens: unpacked to bf16 for cuBLAS
+* one token per step: fused small steps (norm, activation, RoPE + KV cache, attention) that hand
+  their int8 input straight to the matrices
 
-Up to SPALTEN tokens share one pass over the weights, more go in groups (up to MMVQ_BIS); up to
-MMQ_BIS tokens the MMQ kernel unpacks each weight block once into shared memory as fp16 and multiplies
-all tokens on the tensor cores; beyond that the matrix is unpacked to bf16 for cuBLAS.  For one token per step there are fused small steps as well
-(norm, activation, RoPE + KV cache, attention split over the keys) that hand their result straight to
-the matrices.
-
-Compiled with NVRTC like cudakern.py and launched through the driver API on torch's current stream
-(CUDA-graph safe). Without NVRTC the callers keep their other paths.
+Compiled with NVRTC like cudakern.py, launched on torch's current stream (CUDA-graph safe).
 """
 from __future__ import annotations
 

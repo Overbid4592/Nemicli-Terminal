@@ -268,7 +268,8 @@ class _AttentionLayer:
         q = self.rope(rms_norm(q, self.q_norm, self.eps), pos3)
         k = self.rope(rms_norm(k, self.k_norm, self.eps), pos3)
         self.cache.write(k, v, pos_idx)
-        o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, self.scale).float() * torch.sigmoid(gate)
+        o = self.cache.o_zurueck(attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len,
+                                           self.scale)).float() * torch.sigmoid(gate)
         return self.o(o.reshape(L, -1))
 
 
@@ -341,8 +342,8 @@ class _MtpAttention(_AttentionLayer):
         q = self.rope(rms_norm(q, self.q_norm, self.eps), pos3)
         k = self.rope(rms_norm(k, self.k_norm, self.eps), pos3)
         self.cache.write(k, v, pos_idx)
-        o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, self.scale,
-                      key_pos=self.key_pos[:kv_len]).float() * torch.sigmoid(gate)
+        o = self.cache.o_zurueck(attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, self.scale,
+                                           key_pos=self.key_pos[:kv_len])).float() * torch.sigmoid(gate)
         return self.o(o.reshape(L, -1))
 
 
@@ -384,8 +385,7 @@ class _Mtp:
 class _MtpSchritt:
     """One MTP proposal step with static buffers (for a CUDA graph): reads `h`, writes the
     MTP output back to `h` for the next step, returns (token id, its probability) as (2,) float32.
-    The proposal comes from the full LM head: a smaller vocabulary missed a third of the
-    tokens of German answers (Qwen3.8-27B: 49 % instead of 71 % proposals right)."""
+    The proposal comes from the full LM head: a smaller vocabulary misses too many tokens."""
 
     def __init__(self, model: "Qwen35Model"):
         self.model = model

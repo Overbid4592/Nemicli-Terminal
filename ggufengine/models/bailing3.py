@@ -228,7 +228,8 @@ class _MLALayer:
         key = torch.cat([latent.unsqueeze(1), k_rot], dim=-1)                  # (L, 1, lora + rope)
         # the value is the latent: the first kv_lora features of the stored key
         self.cache.write(key, key, pos_idx)
-        o = attention(torch.cat([q_lat, q_rot], dim=-1), *self.cache.kv(kv_len), pos_idx, kv_len, self.scale)
+        o = self.cache.o_zurueck(attention(self.cache.q_drehen(torch.cat([q_lat, q_rot], dim=-1)),
+                                           *self.cache.kv(kv_len), pos_idx, kv_len, self.scale))
         o = torch.einsum("lhc,hvc->lhv", o[..., :self.lora].float(), self.v_b)   # (L, H, v)
         o = o * torch.sigmoid(self.gate(x).float()).unsqueeze(-1)
         return self.o(o.reshape(L, H * self.vd))

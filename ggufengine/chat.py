@@ -39,6 +39,7 @@ IMAGE_MARKS = {                                   # begin, placeholder, end
     "gemma4": ("<|image>", "<|image|>", "<image|>"),
     "qwen": ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"),
     "pixtral": ("[IMG_BREAK]", "[IMG]", "[IMG_END]"),   # Zeilenende, Platzhalter, Bildende
+    "lfm3": ("<|vision_start|>", "<|image|>", "<|vision_end|>"),
 }
 IMAGE_BEGIN, IMAGE_TOKEN, IMAGE_END = IMAGE_MARKS["gemma4"]
 ZEILEN_MARKEN = IMAGE_MARKS["pixtral"]            # Bild zeilenweise, braucht `grid` (Zeilen, Spalten)
@@ -109,14 +110,41 @@ class ChatFormatter:
         """Does the generation prompt open a thinking block (the reply starts inside it)?"""
         if not self.thinking:
             return False
-        return self.fmt in ("k2", "bailing", "granite4", "harmony") or             (self.fmt == "chatml" and self.chatml_denkt)
+        return self.fmt in ("k2", "bailing", "granite4", "lfm3", "harmony") or             (self.fmt == "chatml" and self.chatml_denkt)
+
+    @property
+    def denken_schaltbar(self) -> bool:
+        """Does `thinking` change what the model does (its template switches thinking on and off)?"""
+        if self.fmt == "chatml":
+            return self.chatml_denkt
+        if self.fmt == "gemma4":
+            return "<|think|>" in self.tok.special
+        return self.fmt in ("bailing", "harmony", "granite4", "lfm3", "k2", "smollm3")
+
+    @property
+    def denkt_immer(self) -> bool:
+        """Ist das Modell aufs Nachdenken trainiert, so dass Antworten ohne es unzuverlässig werden (LFM3:
+        Denken ist die Vorgabe seiner Vorlage, ohne erfindet es Werkzeug-Ergebnisse)?"""
+        return self.fmt == "lfm3"
+
+    @property
+    def hintergrund_getrennt(self) -> bool:
+        """Did the model learn context from the harness as turns of their own (LFM3: agent harnesses, tool results
+        in the "tool" role)?  Then background for a message comes as a system turn in front of it – inside
+        the user turn the model takes it for the request."""
+        return self.fmt == "lfm3"
+
+    @property
+    def denken_im_system(self) -> bool:
+        """Is the switch part of the system turn?  Then changing it re-reads the whole prompt."""
+        return self.fmt in ("bailing", "harmony", "smollm3", "gemma4")
 
     @property
     def drops_old_thinking(self) -> bool:
         """Does the model's own template leave the thinking of earlier answers out?  Then
         such answers are passed as text (Message.ids = None) and rendered without it.
         Ling keeps it (preserved_thinking)."""
-        return self.fmt in ("chatml", "granite4", "gemma4", "deepseek", "harmony")
+        return self.fmt in ("chatml", "granite4", "lfm3", "gemma4", "deepseek", "harmony")
 
     def denk_marken(self):
         """(open, close) token ids of the thinking block in the generated text, or None.
@@ -406,6 +434,35 @@ class ChatFormatter:
             ids += [s] + tok.encode("assistant\n") + oeffnen
         return ids
 
+    def _lfm3(self, messages, gen):
+        """LFM3: BOS (the tokenizer does not add it), ChatML; the generation prompt opens "<think>"
+        or closes it at once ("<think></think>", no line breaks); earlier answers carry an empty
+        think block in front of their text; tool results are turns of the "tool" role."""
+        tok = self.tok
+        s, e = tok.special_id("<|im_start|>"), tok.special_id("<|im_end|>")
+        nl = tok.encode("\n")
+        oeffnen = self._stuecke(("<think>",) if self.thinking else ("<think>", "</think>"))
+        leer = self._stuecke(("<think>", "</think>"))
+        ids: List[int] = [tok.bos_id] if tok.bos_id is not None else []
+        for m in messages:
+            if m.role not in ("system", "user", "assistant"):
+                raise ValueError(f"unsupported role {m.role!r}")
+            rolle = "tool" if m.role == "user" and m.werkzeug_antwort else m.role   # template: results as "tool"
+            ids += [s] + tok.encode(rolle + "\n")
+            if m.role == "assistant":
+                if m.ids is not None:
+                    ids += oeffnen + list(m.ids) + [e] + nl
+                    continue
+                content = m.content.split("</think>")[-1].strip() if "</think>" in m.content else m.content
+                ids += leer + self._inhalt(m, content) + [e] + nl
+                continue
+            if m.role == "user" and m.images:
+                ids += self._image_ids(m.images)
+            ids += self._inhalt(m, strip=False) + [e] + nl
+        if gen:
+            ids += [s] + tok.encode("assistant\n") + oeffnen
+        return ids
+
     def _chatml(self, messages, gen):
         tok = self.tok
         s, e = tok.special_id("<|im_start|>"), tok.special_id("<|im_end|>")
@@ -423,7 +480,7 @@ class ChatFormatter:
                 content = content.split("</think>")[-1].lstrip("\n")
             if m.role == "user" and m.images:
                 ids += self._image_ids(m.images)
-            # text after </think> keeps leading spaces (as before); pieces: only the message ends
+            # text after </think> keeps leading spaces; pieces: only the message ends
             ids += self._inhalt(m, content, strip=bool(m.teile)) + [e] + nl
         if gen:
             ids += [s] + tok.encode("assistant\n") + self._chatml_think(nl)
@@ -588,7 +645,7 @@ class ChatFormatter:
                         content = content.split("<channel|>")[-1].strip()
                     if m.teile or offen:
                         ids += kopf + self._inhalt(m, content)
-                    else:                                            # one piece, as before
+                    else:                                            # one piece
                         ids += [sot] + tok.encode("model\n" + content)
                 offen = danach_antwort
                 if not offen:

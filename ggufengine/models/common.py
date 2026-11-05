@@ -628,6 +628,22 @@ KV_GROWTH = 4096         # full KV caches start this big and grow in these steps
 
 KV_GROUP = 32            # 8-bit KV cache: one scale per 32 values of a head vector (like q8_0)
 
+# 4-bit KV storage (TurboQuant idea): a fixed random rotation spreads outlier channels over the
+# whole head vector, the rotated values are close to Gaussian and get the 16 Lloyd-Max levels
+# of N(0, 1) with one scale per KV_GROUP values (around the group's RMS, the best of KV4_SKALEN).
+KV4_STUFEN = (0.1284, 0.3880, 0.6568, 0.9423, 1.2562, 1.6180, 2.0690, 2.7326)
+KV4_SKALEN = (0.85, 1.0, 1.15)
+KV4_STUECK = 4096        # positions packed at once (bounds the temporary memory of a prefix fill)
+# bits -> storage of keys and values.  Keys carry almost all of the error at 4 bit, so 6 keeps them in int8.
+KV_ARTEN = {16: ("voll", "voll"), 8: ("int8", "int8"), 6: ("int8", "vier"), 4: ("vier", "vier")}
+
+
+def kv_drehung(dim: int, device) -> torch.Tensor:
+    """Random orthogonal (dim, dim) matrix, the same for every cache of this head size."""
+    g = torch.Generator().manual_seed(0x4B56 + dim)
+    q, r = torch.linalg.qr(torch.randn(dim, dim, generator=g, dtype=torch.float64))
+    return (q * torch.sign(torch.diagonal(r))).float().to(device)
+
 
 # Positions per full KV cache that live in VRAM (None: all).  Set by the Engine while it
 # builds the model; positions beyond it go to RAM blocks and travel to the GPU per layer.
@@ -641,9 +657,12 @@ SCHICHTEN_RAM: frozenset = frozenset()
 class KVCache:
     """Full-context KV cache: slot i holds position i.  Allocated for KV_GROWTH positions
     and grown on demand up to `max_len` (`ensure`), so a short chat does not reserve the
-    VRAM of the whole context.  With bits=8 keys and values are stored as int8 with one
-    scale per KV_GROUP values (53 % of the bf16 size); `kv(n)` hands them to the attention
-    in the compute dtype, one layer at a time.
+    VRAM of the whole context.  `bits` (KV_ARTEN): 16 in the compute dtype, 8 keys and values
+    as int8 with one scale per KV_GROUP values (53 % of the bf16 size), 6 int8 keys and 4-bit
+    values (41 %), 4 both as 4-bit levels (28 %); `kv(n)` hands them to the attention in the
+    compute dtype, one layer at a time.  4-bit tensors stay rotated: the caller rotates the query
+    (`q_drehen`) and turns the attention output back (`o_zurueck`) – q.k and the weighted sum of
+    values are unchanged by an orthogonal rotation.  `kv_echt(n)` returns them unrotated.
 
     With KV_GPU_SLOTS set (smaller than max_len) only the first `gpu_max` positions stay in
     VRAM; later ones go to RAM blocks of KV_GROWTH positions (pinned when possible) and
@@ -653,7 +672,20 @@ class KVCache:
     def __init__(self, n_kv_heads: int, head_dim: int, max_len: int, device, dtype, bits: int = 16):
         self.max_len = max_len
         self.dtype = dtype
-        self.int8 = bits == 8 and head_dim % KV_GROUP == 0
+        self.D = head_dim
+        self.arten = KV_ARTEN.get(bits, KV_ARTEN[16]) if head_dim % KV_GROUP == 0 else KV_ARTEN[16]
+        self.int8 = self.arten == KV_ARTEN[8]
+        self.dreh = None
+        if "vier" in self.arten:
+            self.dreh = kv_drehung(head_dim, device)
+            stufen = torch.tensor(KV4_STUFEN)
+            stufen = torch.cat([-stufen.flip(0), stufen])
+            self._stufen = stufen.to(device)
+            self._mitten = ((stufen[1:] + stufen[:-1]) / 2).to(device)
+            b = torch.arange(256)
+            paare = torch.stack([stufen[b & 15], stufen[b >> 4]], dim=1).to(device=device, dtype=dtype)
+            # both values of a byte as one machine word: one index_select per byte instead of two gathers
+            self._paare = paare.view({2: torch.int32, 4: torch.int64}[paare.element_size()]).reshape(-1)
         teilung = KV_GPU_SLOTS
         self.gpu_max = max_len if not teilung or teilung >= max_len else max(1, int(teilung))
         self.ram: List[tuple] = []        # RAM blocks for positions >= gpu_max
@@ -664,6 +696,23 @@ class KVCache:
     def geteilt(self) -> bool:
         return self.gpu_max < self.max_len
 
+    @property
+    def gepackt(self) -> bool:
+        """Not stored in the compute dtype."""
+        return self.arten != KV_ARTEN[16]
+
+    @property
+    def bits(self) -> int:
+        return next(b for b, a in KV_ARTEN.items() if a == self.arten)
+
+    def q_drehen(self, q: torch.Tensor) -> torch.Tensor:
+        """Query (L, H, D) into the space of the stored keys."""
+        return (q.float() @ self.dreh).to(q.dtype) if self.arten[0] == "vier" else q
+
+    def o_zurueck(self, o: torch.Tensor) -> torch.Tensor:
+        """Attention output (L, H, D) back from the space of the stored values."""
+        return (o.float() @ self.dreh.t()).to(o.dtype) if self.arten[1] == "vier" else o
+
     def _empty(self, heads: int, n: int, dim: int, device, pin: bool = False):
         def neu(shape, dt):
             if pin:
@@ -672,11 +721,16 @@ class KVCache:
                 except RuntimeError:              # pinned RAM exhausted: pageable (slower copies)
                     pass
             return torch.zeros(shape, device=device, dtype=dt)
-        if not self.int8:
-            return neu((heads, n, dim), self.dtype), neu((heads, n, dim), self.dtype), None, None
-        s = (heads, n, dim // KV_GROUP)
-        return (neu((heads, n, dim), torch.int8), neu((heads, n, dim), torch.int8),
-                neu(s, self.dtype), neu(s, self.dtype))
+        werte, skalen = [], []
+        for art in self.arten:
+            if art == "voll":
+                werte.append(neu((heads, n, dim), self.dtype))
+                skalen.append(None)
+            else:                                 # 4 bit: two values per byte
+                werte.append(neu((heads, n, dim // 2 if art == "vier" else dim),
+                                 torch.uint8 if art == "vier" else torch.int8))
+                skalen.append(neu((heads, n, dim // KV_GROUP), self.dtype))
+        return werte[0], werte[1], skalen[0], skalen[1]
 
     @property
     def heads(self) -> int:
@@ -684,7 +738,7 @@ class KVCache:
 
     @property
     def head_dim(self) -> int:
-        return self.k.shape[2]
+        return self.D
 
     def ensure(self, n: int) -> bool:
         """Room for positions [0, n); returns True if the tensors were replaced (captured
@@ -730,25 +784,52 @@ class KVCache:
             raus.append(torch.cat([t.to(device, non_blocking=True) for t in teile], dim=1))
         return raus
 
-    def _pack(self, x: torch.Tensor):
-        """(H, L, D) -> int8 values and one scale per KV_GROUP (scale rounded first, so the
-        stored pair reproduces the values as closely as the grid allows)."""
+    def _pack(self, x: torch.Tensor, art: str):
+        """(H, L, D) -> stored values and one scale per KV_GROUP (None for "voll").  int8: the
+        scale is rounded first, so the stored pair reproduces the values as closely as the grid allows."""
+        if art == "voll":
+            return x.to(self.dtype), None
+        if art == "vier":
+            teile = [self._pack4(x[:, i:i + KV4_STUECK]) for i in range(0, x.shape[1], KV4_STUECK)]
+            return torch.cat([t[0] for t in teile], dim=1), torch.cat([t[1] for t in teile], dim=1)
         g = x.float().unflatten(-1, (-1, KV_GROUP))
         s = (g.abs().amax(-1) / 127).to(self.dtype)
         q = torch.round(g / s.float().clamp_min(1e-30).unsqueeze(-1)).clamp_(-127, 127)
         return q.to(torch.int8).flatten(-2), s
 
-    def _unpack(self, q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    def _pack4(self, x: torch.Tensor):
+        """(H, L, D) unrotated -> (H, L, D/2) level indices (two per byte, the even value in the low
+        nibble) and (H, L, D/KV_GROUP) scales; per group the scale with the smallest error wins."""
+        y = (x.float() @ self.dreh).unflatten(-1, (-1, KV_GROUP))
+        rms = y.pow(2).mean(-1, keepdim=True).sqrt()
+        best_q = best_s = best_e = None
+        for f in KV4_SKALEN:
+            s = (rms * f).to(self.dtype).float().clamp_min(1e-30)    # rounded as stored
+            q = torch.bucketize(y / s, self._mitten)
+            e = (self._stufen[q] * s - y).pow(2).sum(-1, keepdim=True)
+            if best_e is None:
+                best_q, best_s, best_e = q, s, e
+            else:
+                besser = e < best_e
+                best_q, best_s = torch.where(besser, q, best_q), torch.where(besser, s, best_s)
+                best_e = torch.minimum(e, best_e)
+        q = best_q.flatten(-2).to(torch.uint8)
+        return q[..., 0::2] | (q[..., 1::2] << 4), best_s.squeeze(-1).to(self.dtype)
+
+    def _unpack(self, q: torch.Tensor, s: Optional[torch.Tensor], art: str) -> torch.Tensor:
+        if art == "voll":
+            return q
+        if art == "vier":                                               # (H, n, D) in the rotated space
+            q = torch.index_select(self._paare, 0, q.reshape(-1).int()).view(self.dtype).view(*q.shape[:-1], -1)
         return (q.unflatten(-1, (-1, KV_GROUP)).to(self.dtype) * s.unsqueeze(-1)).flatten(-2)
+
+    def _werte(self, k: torch.Tensor, v: torch.Tensor) -> tuple:
+        (kq, ks), (vq, vs) = self._pack(k, self.arten[0]), self._pack(v, self.arten[1])
+        return kq, vq, ks, vs
 
     def write(self, k: torch.Tensor, v: torch.Tensor, pos_idx: torch.Tensor):
         """k, v: (L, n_kv_heads, head_dim); pos_idx: (L,) positions to write."""
-        k, v = k.transpose(0, 1), v.transpose(0, 1)
-        if self.int8:
-            (kq, ks), (vq, vs) = self._pack(k), self._pack(v)
-            werte = (kq, vq, ks, vs)
-        else:
-            werte = (k.to(self.k.dtype), v.to(self.v.dtype), None, None)
+        werte = self._werte(k.transpose(0, 1), v.transpose(0, 1))
         if self.geteilt:
             drin = pos_idx < self.gpu_max
             if not bool(drin.all()):                   # some positions go to RAM
@@ -770,19 +851,21 @@ class KVCache:
         if n > self.gpu_max:                           # the rest comes from RAM
             ram = self._ram_lesen(n, self.k.device)
             teile = [None if t is None else torch.cat([t, r], dim=1) for t, r in zip(teile, ram)]
-        if not self.int8:
-            return teile[0], teile[1]
-        return self._unpack(teile[0], teile[2]), self._unpack(teile[1], teile[3])
+        return self._unpack(teile[0], teile[2], self.arten[0]), self._unpack(teile[1], teile[3], self.arten[1])
+
+    def kv_echt(self, n: int):
+        """Like `kv(n)`, unrotated (as the model computed them) – what `fill` takes."""
+        k, v = self.kv(n)
+        if self.arten[0] == "vier":
+            k = (k.float() @ self.dreh.t()).to(k.dtype)
+        if self.arten[1] == "vier":
+            v = (v.float() @ self.dreh.t()).to(v.dtype)
+        return k, v
 
     def fill(self, k: torch.Tensor, v: torch.Tensor):
-        """Positions [0, n) from keys/values as `kv(n)` returns them (prefix cache)."""
+        """Positions [0, n) from keys/values as `kv_echt(n)` returns them (prefix cache)."""
         n = k.shape[1]
-        k, v = k.to(self.k.device), v.to(self.k.device)
-        if self.int8:
-            (kq, ks), (vq, vs) = self._pack(k), self._pack(v)
-            werte = (kq, vq, ks, vs)
-        else:
-            werte = (k.to(self.k.dtype), v.to(self.v.dtype), None, None)
+        werte = self._werte(k.to(self.k.device), v.to(self.k.device))
         g = min(n, self.gpu_max)
         for ziel, w in zip((self.k, self.v, self.ks, self.vs), werte):
             if ziel is not None:
@@ -816,11 +899,18 @@ class RingKVCache:
         """The whole ring (`pos` tells the attention which position each slot holds)."""
         return self.k, self.v
 
+    def q_drehen(self, q: torch.Tensor) -> torch.Tensor:
+        return q
+
+    def o_zurueck(self, o: torch.Tensor) -> torch.Tensor:
+        return o
+
 
 def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Tensor,
               kv_len: int, scale: float, window: int = 0,
               key_pos: Optional[torch.Tensor] = None, spans=None,
-              sinks: Optional[torch.Tensor] = None, chunk: int = 0) -> torch.Tensor:
+              sinks: Optional[torch.Tensor] = None, chunk: int = 0,
+              segmente: Optional[torch.Tensor] = None) -> torch.Tensor:
     """
     q: (L, H, D) ; k, v: caches (Hkv, slots, D) ; q_pos: (L,) positions of the queries.
     Without `key_pos` slot i holds position i and slots [0, kv_len) are used.  With
@@ -829,11 +919,15 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Te
     "standard" semantics).  `spans`: position ranges [lo, hi) read bidirectionally
     (an image's tokens; all of them must be written in this call).  `sinks` (H,): one extra
     logit per head in the softmax denominator, without a value (gpt-oss).  `chunk` > 0: keys only
-    from the query's own block of `chunk` positions (Llama 4 chunked attention).  Returns (L, H, D).
+    from the query's own block of `chunk` positions (Llama 4 chunked attention).  `segmente` (slots,):
+    sequence number per slot – several packed sequences, each one sees only itself (embeddings).
+    Returns (L, H, D).
     """
     L, H, D = q.shape
+    if segmente is not None and key_pos is not None:
+        raise ValueError("packed sequences need a full KV cache")
     if (L > 1 and key_pos is None and window <= 0 and chunk <= 0 and not spans and sinks is None
-            and not mehrere_aufnahme()):
+            and segmente is None and not mehrere_aufnahme()):
         # Einlesen: die Token stehen auf den letzten L Plätzen des Caches – unten rechts kausal, ohne
         # ausgeschriebene Maske (der Kern überspringt verdeckte Kacheln). Nicht in einer Graph-Aufnahme
         # mehrerer Token: dort ist kv_len aufgerundet.
@@ -859,6 +953,8 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Te
         drin_q = (q_pos >= lo) & (q_pos < hi)
         drin_k = (key_pos >= lo) & (key_pos < hi)
         mask = mask | (drin_q.unsqueeze(1) & drin_k.unsqueeze(0))
+    if segmente is not None:
+        mask = mask & (segmente.index_select(0, q_pos).unsqueeze(1) == segmente[:kv_len].unsqueeze(0))
     if L == 1:
         return _attention_step(q, kh[0], vh[0], mask, scale, sinks)
     if sinks is not None:
@@ -872,10 +968,8 @@ _CUDNN_ATTENTION = {"geht": None}      # None: noch nicht versucht, False: nicht
 
 
 def cudnn_zuerst():
-    """SDPA mit cuDNN zuerst, die übrigen Kerne als Reserve. `sdpa_kernel` stellt die Kerne für den ganzen
-    Prozess um, nicht je Faden: „nur cuDNN“ ließ gleichzeitig rechnende Fäden (Musik in fp32, Köpfe über 128)
-    ohne Kern („No available kernel“), und zwei sich überkreuzende Umschaltungen hinterließen „nur cuDNN“
-    dauerhaft. Mit Reihenfolge statt Ausschluss bleibt jeder Kern erlaubt."""
+    """SDPA mit cuDNN zuerst, die übrigen Kerne als Reserve. `sdpa_kernel` gilt prozessweit: Reihenfolge
+    statt Ausschluss lässt anderen Fäden jeden Kern."""
     from torch.nn.attention import SDPBackend, sdpa_kernel
     return sdpa_kernel([SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
                         SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH], set_priority=True)
@@ -884,9 +978,9 @@ CUDNN_KOPIE_BIS = 256 * 2**20          # vervielfachte K/V höchstens so groß (
 
 
 def _kausal_rechts(q: torch.Tensor, kh: torch.Tensor, vh: torch.Tensor, scale: float) -> torch.Tensor:
-    """q (L, H, D), kh/vh (1, Hkv, S, D) mit den Abfragen auf den letzten L Plätzen. cuDNN-SDPA (auf Blackwell
-    gemessen 2–4× schneller als mit Maske; ohne GQA – KV-Köpfe werden vervielfacht), sonst der effiziente Kern
-    mit derselben Kausalität."""
+    """q (L, H, D), kh/vh (1, Hkv, S, D) mit den Abfragen auf den letzten L Plätzen. cuDNN-SDPA (deutlich
+    schneller als mit Maske; ohne GQA – KV-Köpfe werden vervielfacht), sonst der effiziente Kern mit derselben
+    Kausalität."""
     from torch.nn.attention.bias import causal_lower_right
     L, H, D = q.shape
     Hkv, S = kh.shape[1], kh.shape[2]
@@ -987,7 +1081,7 @@ _MEHRERE = threading.local()          # set while several tokens are warmed up a
 def _host_lesen_finden():
     """Dispatch mode that fails on reads from the GPU to the host (item/int, nonzero, copies to the CPU).
     Unlike torch.cuda.set_sync_debug_mode it only applies to the calling thread – the global mode made
-    synchronizing calls in other threads fail too (seen: the TensorRT build next to the image describer).
+    synchronizing calls in other threads fail too.
     It runs in the warm-up, not in the capture, so an op may finish before it is reported."""
     from torch.utils._python_dispatch import TorchDispatchMode
     from torch.utils._pytree import tree_leaves
@@ -1203,12 +1297,9 @@ class GraphDecoder:
             vorher(tokens)
         key = self._schluessel(kv_len, L)
         if key not in self.graphs:
-            # only the current bucket keeps several-token graphs, in a pool of their own that
-            # goes with them: each holds its (L, V) logits and activations (measured: 48 graphs
-            # over 12k positions in the shared pool = 1 GiB that never came back).  Single-token
-            # graphs captured while that pool lived can point into it (library workspaces of a
-            # capture land in its pool): they go too, else their replay reads freed memory
-            # (measured on Gemma 4 12B: illegal memory access after a bucket change)
+            # several-token graphs only for the current bucket, in their own pool (each holds its
+            # (L, V) logits).  Single-token graphs can point into that pool (library workspaces):
+            # they are dropped with it, else their replay reads freed memory
             if any(self._mehrfach(k) and k[-1] != kv_len for k in self.graphs):
                 torch.cuda.synchronize()
                 self.leeren()

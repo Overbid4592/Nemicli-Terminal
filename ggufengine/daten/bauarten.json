@@ -21,7 +21,8 @@
   "yarn_log_mul_all_dim": "YaRN-Lautstärke mit yarn_log_multiplier als mscale_all_dim",
   "glu_oai": "begrenzte SwiGLU-Variante von gpt-oss",
   "temperatur_skala": "Q-Temperatur je Position ab dem Original-Kontext",
-  "gross_27b_bei_schichten": "so viele Schichten = 27B: Attention-Skala 1/sqrt(n_embd/n_head)"
+  "gross_27b_bei_schichten": "so viele Schichten = 27B: Attention-Skala 1/sqrt(n_embd/n_head)",
+  "unter_4b": "Ausnahme von der 4B-Grenze für Chat-Modelle: Familie kleiner Spezialisten, die als Team arbeiten (der Downloader zeigt sie auch unter 4B)"
  },
  "bauarten": {
   "qwen35": {
@@ -40,6 +41,9 @@
   },
   "gemma4": {
    "klasse": "gemma4"
+  },
+  "gemma-embedding2": {
+   "klasse": "embeddinggemma"
   },
   "bailingmoe3": {
    "klasse": "bailing3",
@@ -72,6 +76,10 @@
   "lfm2moe": {
    "klasse": "hybrid",
    "moe": true
+  },
+  "lfm3": {
+   "klasse": "hybrid",
+   "unter_4b": true
   },
   "llama4": {
    "klasse": "llama4",

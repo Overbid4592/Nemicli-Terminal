@@ -26,7 +26,6 @@ from __future__ import annotations
 from typing import List, Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 
 from .gguf import GGML_TYPES, GGUFError
 from .quant import _blocks, _f16, _nibbles, _q5_high_bits, _scale_min_k4

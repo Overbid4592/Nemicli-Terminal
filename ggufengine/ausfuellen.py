@@ -91,7 +91,7 @@ _BAU_MERKMALE = {
     "global_ohne_rope": bool, "ohne_rope_jede": int, "fenster_rope_schlicht": bool, "parallel": bool,
     "logits_mal_skala": bool, "fenster_basis": float, "topk_normieren": bool, "softmax_nach_auswahl": bool,
     "ffn_norm_heisst_post_attn": bool, "yarn_ungerundet": bool, "yarn_log_mul_all_dim": bool, "glu_oai": bool,
-    "temperatur_skala": bool, "gross_27b_bei_schichten": int,
+    "temperatur_skala": bool, "gross_27b_bei_schichten": int, "unter_4b": bool,
 }
 _AKTIVIERUNGEN = ("silu", "gelu")
 
@@ -116,6 +116,39 @@ def bauarten() -> dict:
             if not ok or (typ is int and v < 1) or (k == "aktivierung" and v not in _AKTIVIERUNGEN):
                 raise DbFehler(f"Bauart {arch!r}: {k}={v!r} ungültig")
     return tabelle
+
+
+_SAMPLING_TEILE = ("werte", "denken", "ohne_denken")
+
+
+@lru_cache(maxsize=None)
+def sampling_tabelle() -> dict:
+    """sampling.json, geprüft: jeder Wert bekannt und im erlaubten Bereich."""
+    from .sampling import wert_gueltig
+    d = lesen("sampling")
+    if not isinstance(d.get("standard"), dict) or not isinstance(d.get("familien"), list):
+        raise DbFehler("Modell-Datenbank sampling.json: 'standard' oder 'familien' fehlt")
+    gruppen = [("standard", d["standard"])]
+    for f in d["familien"]:
+        if not isinstance(f, dict) or not isinstance(f.get("name"), str) or not isinstance(f.get("wenn"), list):
+            raise DbFehler(f"sampling.json: Familie {f!r} ohne 'name' oder 'wenn'")
+        if not any(t in f for t in _SAMPLING_TEILE):
+            raise DbFehler(f"sampling.json: Familie {f['name']!r} ohne Werte")
+        if "dry" in f and not isinstance(f["dry"], bool):
+            raise DbFehler(f"sampling.json: Familie {f['name']!r}: 'dry' muss true oder false sein")
+        gruppen += [(f["name"], f[t]) for t in _SAMPLING_TEILE if t in f]
+    for name, werte in gruppen:
+        if not isinstance(werte, dict):
+            raise DbFehler(f"sampling.json: {name!r} ist kein Objekt")
+        for k, v in werte.items():
+            if not wert_gueltig(k, v):
+                raise DbFehler(f"sampling.json: {name!r} {k}={v!r} ungültig")
+    return d
+
+
+def sampling_familie(fmt: str, arch: str, name: str = "") -> Optional[dict]:
+    """Der Familien-Eintrag für Chat-Format, Bauart und Modellnamen (None: nur 'standard')."""
+    return erkennen(sampling_tabelle()["familien"], f"fmt:{fmt} {name.lower()}", arch)
 
 
 def bauart(arch: str) -> Optional[dict]:

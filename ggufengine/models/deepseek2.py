@@ -213,7 +213,8 @@ class _MLA:
         q_lat = torch.einsum("lhn,hcn->lhc", q_nope, self.k_b)                # into the latent space
         key = torch.cat([latent.unsqueeze(1), k_rot], dim=-1)                  # (L, 1, kv_lora + rope)
         self.cache.write(key, key, pos_idx)                                    # value = latent part of the key
-        o = attention(torch.cat([q_lat, q_rot], dim=-1), *self.cache.kv(kv_len), pos_idx, kv_len, self.scale)
+        o = self.cache.o_zurueck(attention(self.cache.q_drehen(torch.cat([q_lat, q_rot], dim=-1)),
+                                           *self.cache.kv(kv_len), pos_idx, kv_len, self.scale))
         o = torch.einsum("lhc,hvc->lhv", o[..., :self.lora].float(), self.v_b)   # (L, H, v)
         return self.o(o.reshape(L, H * self.vd))
 

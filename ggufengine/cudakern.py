@@ -1,6 +1,6 @@
 """
 Own CUDA kernels: matrix-vector products directly on GGUF block data for every block format
-(legacy Q4/Q5/Q8, K-quants, the IQ family, MXFP4).  Nothing is unpacked, each weight byte is
+(legacy Q4/Q5/Q8, K-quants, the IQ family, MXFP4, ternary and 1-bit formats).  Nothing is unpacked, each weight byte is
 read once.  Used for one token per step: MoE experts (also from pinned RAM, read directly over
 PCIe) and dense layers in formats without the int4 path (IMMER_GEPACKT).
 
@@ -45,10 +45,13 @@ FORMATE = {
     "IQ3_S": (256, 110), "IQ4_NL": (32, 18), "IQ4_XS": (256, 136), "MXFP4": (32, 17),
     "Q4_0": (32, 18), "Q4_1": (32, 20), "Q5_0": (32, 22), "Q5_1": (32, 24), "Q8_0": (32, 34),
     "Q4_K": (256, 144), "Q5_K": (256, 176), "Q6_K": (256, 210),
+    "Q1_0": (128, 18), "Q2_0": (64, 18), "PQ2_0": (128, 34), "TQ2_0": (256, 66), "TQ1_0": (256, 54),
+    "PTQ1_0": (128, 28),
 }
 # formats without the int4 path (qlinear): always kept in block format
 IMMER_GEPACKT = frozenset(("Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS",
-                           "IQ3_S", "IQ4_NL", "IQ4_XS", "MXFP4"))
+                           "IQ3_S", "IQ4_NL", "IQ4_XS", "MXFP4", "Q1_0", "Q2_0", "PQ2_0", "TQ2_0", "TQ1_0",
+                           "PTQ1_0"))
 
 _GRUNDLAGEN = r'''
 typedef unsigned char u8;
@@ -411,6 +414,65 @@ template <class X> __device__ __forceinline__ RT dot_MXFP4(const u8* b, int s, X
     #pragma unroll
     for (int j = 0; j < 16; ++j) r += kv[16 + (q[j] & 15)] * x[j] + kv[16 + (q[j] >> 4)] * x[j + 16];
     return d * r;
+}
+
+// ternary and 1-bit formats: code q stands for (q - 1) * d, so the sum is d * (sum q x - sum x)
+template <class X> __device__ __forceinline__ RT dot_Q2_0(const u8* b, int s, X x, const float* kv) {
+    const u8* q = b + 2 + 8 * s;                  // value j: byte j / 4, bits 2 * (j % 4)
+    RT r = RT(), ax = RT();
+    #pragma unroll
+    for (int t = 0; t < 32; ++t) { r += (float)((q[t >> 2] >> (2 * (t & 3))) & 3) * x[t]; ax += x[t]; }
+    return h2f(ld16(b)) * (r - ax);
+}
+
+template <class X> __device__ __forceinline__ RT dot_PQ2_0(const u8* b, int s, X x, const float* kv) {
+    return dot_Q2_0(b, s, x, kv);                 // same layout, 128 values per block
+}
+
+template <class X> __device__ __forceinline__ RT dot_TQ2_0(const u8* b, int s, X x, const float* kv) {
+    const u8* q = b + 32 * (s >> 2);
+    const int sh = 2 * (s & 3);
+    RT r = RT(), ax = RT();
+    #pragma unroll
+    for (int t = 0; t < 32; ++t) { r += (float)((q[t] >> sh) & 3) * x[t]; ax += x[t]; }
+    return h2f(ld16(b + 64)) * (r - ax);
+}
+
+template <class X> __device__ __forceinline__ RT dot_Q1_0(const u8* b, int s, X x, const float* kv) {
+    const u8* q = b + 2 + 4 * s;                  // bit set: +d, clear: -d
+    RT r = RT(), ax = RT();
+    #pragma unroll
+    for (int t = 0; t < 32; ++t) { r += (float)((q[t >> 3] >> (t & 7)) & 1) * x[t]; ax += x[t]; }
+    return h2f(ld16(b)) * (2.f * r - ax);
+}
+
+// five trits per byte (3^5 = 243 < 256) as a fixed-point fraction: trit n of v = ((v 3^n) & 255) 3 >> 8
+__device__ __forceinline__ float trit(u32 v, int n) {
+    const u32 p = n == 0 ? 1u : n == 1 ? 3u : n == 2 ? 9u : n == 3 ? 27u : 81u;
+    return (float)((((v * p) & 255u) * 3u) >> 8);
+}
+// qs in two stages of A and B columns (five values per byte each), then QH bytes of four values
+template <int A, int B, int QH, class X> __device__ __forceinline__ RT dot_trits(const u8* b, int s, X x) {
+    RT r = RT(), ax = RT();
+    #pragma unroll
+    for (int t = 0; t < 32; ++t) {
+        const int e = 32 * s + t;
+        int i, n;
+        if (e < 5 * A) { i = e % A; n = e / A; }
+        else if (e < 5 * (A + B)) { const int f = e - 5 * A; i = A + f % B; n = f / B; }
+        else { const int f = e - 5 * (A + B); i = A + B + f % QH; n = f / QH; }
+        r += trit(b[i], n) * x[t];
+        ax += x[t];
+    }
+    return r - ax;
+}
+
+template <class X> __device__ __forceinline__ RT dot_TQ1_0(const u8* b, int s, X x, const float* kv) {
+    return h2f(ld16(b + 52)) * dot_trits<32, 16, 4>(b, s, x);
+}
+
+template <class X> __device__ __forceinline__ RT dot_PTQ1_0(const u8* b, int s, X x, const float* kv) {
+    return h2f(ld16(b + 26)) * dot_trits<16, 8, 2>(b, s, x);
 }
 '''
 

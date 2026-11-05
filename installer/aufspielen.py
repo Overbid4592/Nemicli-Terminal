@@ -140,6 +140,9 @@ def aufspielen(zip_pfad: Path, ziel: Path, fortschritt: Optional[Callable[[int, 
     Gibt die ersetzten Teile zurück."""
     ziel.mkdir(parents=True, exist_ok=True)
     neu, alt = ziel / NEU, ziel / ALT
+    for t in (list(alt.iterdir()) if alt.is_dir() else []):   # gescheiterter Rückweg: alte Teile zurück
+        if not (ziel / t.name).exists():
+            t.rename(ziel / t.name)
     for rest in (neu, alt):                          # Reste eines abgebrochenen Laufs (nur eigene Ordner)
         shutil.rmtree(rest, ignore_errors=True)
     with zipfile.ZipFile(zip_pfad) as z:

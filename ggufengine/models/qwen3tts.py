@@ -71,7 +71,7 @@ def _hp(gg: GGUFFile, p: str) -> dict:
     )
 
 
-@dataclass
+@dataclass(frozen=True)
 class Abtastung:
     temperatur: float = 0.9
     top_k: int = 50

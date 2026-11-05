@@ -3,6 +3,50 @@
  "beschreibung": "Werkzeug-Formate der Modelle (aus ihren Chat-Vorlagen abgeschrieben). Platzhalter %{…}; die Reihenfolge zählt: der erste Eintrag, dessen Regeln zur Vorlage passen, gilt.",
  "formate": [
   {
+   "name": "lfm3_xml",
+   "modelle": "LFM3",
+   "wenn": [
+    {
+     "alle": [
+      "<tool_call>",
+      "<function=",
+      "<parameter=",
+      "<additional_tools>"
+     ]
+    }
+   ],
+   "marken": [
+    "<tool_call>",
+    "</tool_call>",
+    "<tool_response>",
+    "</tool_response>"
+   ],
+   "anfang": "<tool_call>",
+   "ende": "</tool_call>",
+   "liste": {
+    "art": "json_zeilen",
+    "huelle": false,
+    "vorlage": "<tools>%{liste}\n</tools>",
+    "ort": "nach_text",
+    "trenner": "\n\n"
+   },
+   "aufruf": {
+    "vorlage": "<tool_call>\n<function=%{name}>\n%{felder}</function>\n</tool_call>",
+    "feld": "<parameter=%{schluessel}>\n%{wert}\n</parameter>\n",
+    "felder_trenner": "",
+    "werte": "text"
+   },
+   "lesen": {
+    "art": "xml",
+    "aufruf": "<tool_call>\\s*(?:<tool_call>\\s*)?<function=([^>\\n]+)>(.*?)(?:</function>\\s*)?</tool_call>",
+    "feld": "<parameter=([^>\\n]+)>\\n?(.*?)\\n?</parameter>"
+   },
+   "antwort": {
+    "vorlage": "<tool_response>\n%{ergebnis}\n</tool_response>",
+    "zwischen": "\n"
+   }
+  },
+  {
    "name": "qwen_xml_granite",
    "modelle": "Granite 4.x",
    "wenn": [

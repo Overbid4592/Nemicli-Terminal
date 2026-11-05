@@ -148,6 +148,17 @@
    ]
   },
   {
+   "format": "lfm3",
+   "wenn": [
+    {
+     "bauart": [
+      "lfm3"
+     ]
+    }
+   ],
+   "hinweis": "LFM3"
+  },
+  {
    "format": "granite4",
    "wenn": [
     {

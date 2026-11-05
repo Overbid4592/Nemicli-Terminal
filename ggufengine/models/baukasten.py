@@ -2,35 +2,12 @@
 Baukasten: ein Decoder-Transformer, der sich aus der GGUF-Datei selbst zusammensetzt.
 
 Wie in llama.cpp teilen sich die Bauarten dieselben Bausteine (Norm, Attention, RoPE, FFN,
-MoE); was eine Bauart ausmacht, steht in der Datei – vorhandene Tensoren und Metadaten –
-plus die Bauanleitung je Architektur aus der Modell-Datenbank (daten/bauarten.json: RoPE-Art,
-Aktivierung, Muster der Fenster-Schichten, ...).
+MoE). Was eine Bauart ausmacht, ergibt sich aus den vorhandenen Tensoren und Metadaten der Datei
+plus der Bauanleitung je Architektur (daten/bauarten.json: RoPE-Art, Aktivierung, Fenster-Muster,
+Sonderformen). Jede Zahl aus der Datei wird vor Gebrauch auf Plausibilität geprüft.
 
-Erkannt je Schicht:
-* Norm vor und/oder nach Attention und FFN (`attn_norm`, `post_attention_norm`, `ffn_norm`,
-  `post_ffw_norm`), RMSNorm oder LayerNorm (mit Bias), K2-Horizon gruppiert
-* Q/K/V getrennt oder zusammengefasst (`attn_qkv`), Biases, Q/K-Norm je Kopf oder über alle Köpfe
-* RoPE: NeoX oder Paare, teilweise, `rope_freqs` (Llama 3.x), linear, YaRN, LongRoPE (Phi-3/4)
-* Schiebefenster je Schicht (Gemma 2/3: Muster; sonst alle Schichten), eigene RoPE-Basis dort
-* Attention- und Logit-Softcap (Gemma 2), Skalen (Gemma: Einbettung; Granite: Einbettung,
-  Attention, Residual, Logits)
-* FFN: gated (SiLU/GELU), Gate+Up zusammengefasst (Phi-3), ohne Gate; Mixture-of-Experts
-  (`ffn_gate_inp` + `ffn_*_exps`, optional geteilter Experte, Router- und Experten-Bias,
-  Auswahl-Korrektur `exp_probs_b`)
-* Router Softmax oder Sigmoid (`expert_gating_func`), Experten-Gruppen, Gewichts-Skala
-* gpt-oss: Attention-Sinks (`attn_sinks`), Fenster jede zweite Schicht, Top-k vor der Softmax,
-  begrenzte SwiGLU-Variante, YaRN ohne gerundete Grenzen
-* Command-R/Cohere 2: Attention und FFN parallel, globale Schichten ohne RoPE (auch EXAONE 4)
-* SmolLM3: Llama-Aufbau, jede vierte Schicht ohne RoPE
-* GLM-4.5: Zusatzschichten für Mehr-Token-Vorhersage werden übersprungen
-* Ministral 3 (`mistral3`): Q-Temperatur je Position ab dem Original-Kontext (wie Llama 4),
-  YaRN-Lautstärke aus `yarn_log_multiplier` (= mscale_all_dim)
-
-Jede Zahl aus der Datei wird vor Gebrauch auf Plausibilität geprüft.
-
-Ein Token je Schritt (Schreiben) läuft, wo die Schicht es zulässt, über verschmolzene Kerne
-(mmvq: Norm + int8-Eingang, RoPE + KV-Cache, Attention, Aktivierung) – rund 14 statt 80 Kerne je
-Schicht; Matrizen ohne int8-Weg rechnen dort auf ihrem eigenen Weg mit.
+Ein Token je Schritt läuft, wo die Schicht es zulässt, über verschmolzene Kerne (mmvq);
+Matrizen ohne int8-Weg rechnen dort auf ihrem eigenen Weg mit.
 """
 from __future__ import annotations
 
@@ -220,7 +197,7 @@ class _Schicht:
         if (self.moe or hp["layernorm"] or hp["norm_groups"] != 1 or hp["parallel"] or hp["attn_softcap"]
                 or self.attn_post is not None or self.ffn_post is not None or self.attn_norm is None
                 or self.ffn_norm is None or self.attn_norm[1] is not None or self.ffn_norm[1] is not None
-                or self.gate_up or not isinstance(c, KVCache) or c.int8 or c.geteilt
+                or self.gate_up or not isinstance(c, KVCache) or c.gepackt or c.geteilt
                 or c.k.dtype != torch.bfloat16 or not c.k.is_cuda
                 or any(n is not None and n.numel() != D for n in (self.q_norm, self.k_norm))
                 or (self.rope is not None and self.rope.dim > D)
@@ -262,9 +239,14 @@ class _Schicht:
             a, ea = mmvq.akt_q8(_mal(self.up, e, xn), None, hp["gelu"])
         return torch.add(h, _mal(self.down, ea, a), alpha=rs).view(1, -1)
 
-    def __call__(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+    def __call__(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int,
+                 rope_pos: Optional[torch.Tensor] = None, segmente: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """pos_idx: Plätze im Cache. Gepackte Folgen (einbetten_stapel): `rope_pos` die Position je Folge ab 0,
+        `segmente` die Folge je Platz."""
         hp, L = self.hp, h.shape[0]
-        if L == 1 and h.is_cuda and h.dtype == torch.float32:
+        if rope_pos is None:
+            rope_pos = pos_idx
+        if L == 1 and h.is_cuda and h.dtype == torch.float32 and segmente is None:
             if self._plan is None:
                 self._plan = self._schritt_planen()
             if self._plan:
@@ -286,18 +268,20 @@ class _Schicht:
         if self.k_norm is not None and self.k_norm.numel() == D:
             k = rms_norm(k, self.k_norm, hp["eps"])
         if self.rope is not None:
-            q, k = self.rope(q, pos_idx), self.rope(k, pos_idx)
+            q, k = self.rope(q, rope_pos), self.rope(k, rope_pos)
         if hp["q_temp"] is not None:                                 # Ministral 3: 1 + β·ln(1 + ⌊pos/n⌋)
             beta, n = hp["q_temp"]
-            q = q * (1 + beta * torch.log1p(torch.div(pos_idx, n, rounding_mode="floor").float())).view(L, 1, 1)
+            q = q * (1 + beta * torch.log1p(torch.div(rope_pos, n, rounding_mode="floor").float())).view(L, 1, 1)
         self.cache.write(k, v, pos_idx)
         if hp["attn_softcap"]:
-            o = attention_softcap(q, *self.cache.kv(kv_len), pos_idx, kv_len, hp["attn_scale"],
+            if segmente is not None:
+                raise ValueError("packed sequences: no softcap attention")
+            o = attention_softcap(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, hp["attn_scale"],
                                   hp["attn_softcap"], self.fenster)
         else:
-            o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, hp["attn_scale"], self.fenster,
-                          sinks=self.sinks)
-        o = self.o(o.reshape(L, -1)).float()
+            o = attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, hp["attn_scale"], self.fenster,
+                          sinks=self.sinks, segmente=segmente)
+        o = self.o(self.cache.o_zurueck(o).reshape(L, -1)).float()
         if hp["parallel"]:
             return h + o + self._ffn(x)
         if self.attn_post is not None:
@@ -562,6 +546,50 @@ class BaukastenModel:
         if pooling == "mean":
             return summe / len(tokens)
         return erstes if pooling == "cls" else x[-1]
+
+    def stapel_platz(self) -> int:
+        """So viele Token passen zusammen in einen Durchgang von `einbetten_stapel` – 0: nur einzeln."""
+        art = type(self)
+        if (self.hp["attn_softcap"] or art._verborgen is not BaukastenModel._verborgen
+                or art.einbettung is not BaukastenModel.einbettung
+                or not all(type(s) is _Schicht and type(s.cache) is KVCache for s in self.layers)):
+            return 0
+        return min(self.n_ctx, self.prefill_chunk)
+
+    @torch.inference_mode()
+    def einbetten_stapel(self, folgen: List[List[int]], pooling: str = "last") -> List[torch.Tensor]:
+        """Mehrere Folgen in einem Durchgang: hintereinander im Cache, RoPE-Positionen je Folge ab 0, und
+        jede Folge sieht nur sich selbst – dieselben Vektoren wie `einbetten` einzeln, aber die Gewichte
+        werden einmal für alle gelesen."""
+        laengen = [len(f) for f in folgen]
+        if not folgen or min(laengen) < 1:
+            raise ValueError("empty sequence")
+        if pooling not in ("last", "mean", "cls"):
+            raise ValueError(f"unknown pooling {pooling!r}")
+        platz = self.stapel_platz()
+        if len(folgen) == 1 or not platz:
+            return [self.einbetten(f, pooling) for f in folgen]
+        gesamt = sum(laengen)
+        if gesamt > platz:
+            raise RuntimeError(f"packed sequences must have at most {platz} tokens")
+        if any(not 0 <= t < self.n_vocab for f in folgen for t in f):
+            raise ValueError("token id out of range")
+        dev = self.device
+        tok = torch.tensor([t for f in folgen for t in f], device=dev, dtype=torch.long)
+        plaetze = torch.arange(gesamt, device=dev, dtype=torch.long)
+        rope_pos = torch.cat([torch.arange(n, device=dev, dtype=torch.long) for n in laengen])
+        segmente = torch.repeat_interleave(torch.arange(len(folgen), device=dev),
+                                           torch.tensor(laengen, device=dev))
+        h = self.einbettung(tok)
+        for schicht in self.layers:
+            h = schicht(h, plaetze, gesamt, rope_pos=rope_pos, segmente=segmente)
+        x = self.schluss_norm(h).float()
+        raus, start = [], 0
+        for n in laengen:
+            teil = x[start:start + n]
+            raus.append(teil.mean(0) if pooling == "mean" else teil[0] if pooling == "cls" else teil[-1])
+            start += n
+        return raus
 
     def _in_stuecken(self, tokens: List[int], pos: int, inject, grenze: int) -> torch.Tensor:
         logits = None

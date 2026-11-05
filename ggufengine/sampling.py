@@ -1,5 +1,6 @@
 """Token sampling: temperature, top-k, top-p, min-p, repetition / presence penalty,
-DRY ("don't repeat yourself") against phrases the model copies from its own earlier answers."""
+DRY ("don't repeat yourself") against phrases the model copies from its own earlier answers;
+the recommended values per model (`empfohlen`)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -25,6 +26,69 @@ class SamplerConfig:
     dry_allowed_length: int = 2
     dry_last_n: int = 8192
     seed: Optional[int] = None
+    quelle: str = ""              # woher die Werte stammen (nur fürs Debug-Log)
+
+
+# Werte, die Datei, Datenbank und Einstellung setzen dürfen: (Typ, kleinster, größter Wert)
+_BEREICHE = {
+    "temperature": (float, 0.0, 5.0), "top_p": (float, 0.0, 1.0), "top_k": (int, 0, 1 << 20),
+    "min_p": (float, 0.0, 1.0), "repeat_penalty": (float, 0.5, 2.0), "presence_penalty": (float, -2.0, 2.0),
+    "repeat_last_n": (int, 0, 1 << 16),
+}
+# general.sampling.* (llama.cpp, aus generation_config.json) -> SamplerConfig
+_DATEI_SCHLUESSEL = {"temp": "temperature", "top_p": "top_p", "top_k": "top_k", "min_p": "min_p",
+                     "penalty_repeat": "repeat_penalty", "penalty_last_n": "repeat_last_n"}
+
+
+def wert_gueltig(name: str, wert) -> bool:
+    if name not in _BEREICHE or isinstance(wert, bool) or not isinstance(wert, (int, float)):
+        return False
+    typ, lo, hi = _BEREICHE[name]
+    if typ is int and wert != int(wert):
+        return False
+    return lo <= wert <= hi
+
+
+def _nur_gueltige(werte) -> dict:
+    if not isinstance(werte, dict):
+        return {}
+    return {k: (int(v) if _BEREICHE[k][0] is int else round(float(v), 4))
+            for k, v in werte.items() if wert_gueltig(k, v)}
+
+
+def datei_werte(metadata: dict) -> dict:
+    """Sampling-Werte aus der Modelldatei (general.sampling.*); f32 auf 4 Stellen gerundet
+    (0.95 kommt sonst als 0.949999988 an).  Ungültige Werte fallen weg."""
+    return _nur_gueltige({ziel: metadata[f"general.sampling.{k}"] for k, ziel in _DATEI_SCHLUESSEL.items()
+                          if f"general.sampling.{k}" in metadata})
+
+
+def empfohlen(metadata: dict, fmt: str, arch: str, denken: bool, eigene=None, **extra) -> SamplerConfig:
+    """Sampling-Werte für ein Modell.  Rangfolge: eigene Einstellung > Modelldatei > Familie aus
+    sampling.json > 'standard'.  Ausnahme: ohne Denken gehen die 'ohne_denken'-Werte der Familie
+    der Datei vor – generation_config.json trägt meist die Werte fürs Denken.
+    `extra` setzt weitere Felder (DRY), die keine Quelle überschreibt."""
+    from . import ausfuellen
+    tabelle = ausfuellen.sampling_tabelle()
+    name = str(metadata.get("general.basename") or metadata.get("general.name") or "")
+    familie = ausfuellen.sampling_familie(fmt, arch, name) or {}
+    teil = familie.get("denken" if denken else "ohne_denken", familie.get("werte", {}))
+    datei = datei_werte(metadata)
+    eigen = _nur_gueltige(eigene)
+    werte = dict(tabelle["standard"]) | dict(familie.get("werte", {})) | dict(teil)
+    quellen = [familie["name"]] if familie else ["standard"]
+    if familie.get("dry") is False:                  # Hersteller sieht nur seine eigene Wiederholungsstrafe vor
+        extra = {**extra, "dry_multiplier": 0.0}
+    if datei:
+        if not denken and "ohne_denken" in familie:
+            werte = werte | {k: v for k, v in datei.items() if k not in familie["ohne_denken"]}
+        else:
+            werte |= datei
+        quellen.append("Datei")
+    if eigen:
+        werte |= eigen
+        quellen.append("Einstellung")
+    return SamplerConfig(**werte, **extra, quelle=" + ".join(quellen))
 
 
 def dry_penalties(history, own, breaker, cfg: SamplerConfig, max_match: int = 64, word_start=None) -> dict:
@@ -95,9 +159,11 @@ class Sampler:
         if cfg.dry_multiplier > 0 and own is not None and breaker is not None:
             strafe = dry_penalties(history, own, breaker, cfg, word_start=word_start)
             if strafe:
+                # vor der Temperatur abgezogen: bei T < 1 wöge die Strafe 1/T-fach – sie gilt wie bei T = 1
+                faktor = min(1.0, cfg.temperature) if cfg.temperature > 0 else 1.0
                 logits = logits.clone()
                 idx = torch.tensor(list(strafe), device=logits.device)
-                logits[idx] -= torch.tensor(list(strafe.values()), device=logits.device, dtype=logits.dtype)
+                logits[idx] -= torch.tensor(list(strafe.values()), device=logits.device, dtype=logits.dtype) * faktor
         if history and cfg.repeat_last_n > 0 and (cfg.repeat_penalty != 1.0 or cfg.presence_penalty != 0.0):   # 0 = aus (wie llama.cpp)
             logits = logits.clone()
             recent = torch.unique(torch.tensor(history[-cfg.repeat_last_n:], device=logits.device))

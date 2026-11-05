@@ -1,6 +1,6 @@
 """
 Hybrids of Mamba-2 state-space layers and attention ("granitehybrid", "nemotron_h",
-"nemotron_h_moe", "falcon-h1") and of short convolutions and attention ("lfm2", "lfm2moe").
+"nemotron_h_moe", "falcon-h1") and of short convolutions and attention ("lfm2", "lfm2moe", "lfm3").
 
 Mamba-2 layer (llama.cpp layout, conversion/mamba.py):
 * ssm_in = [z (d_inner) | xBC (d_inner + 2*G*N) | dt (H)]; ssm_conv1d (C, K) depthwise causal,
@@ -17,6 +17,10 @@ Layer forms per architecture:
   folded into the weights by the converter).
 * lfm2: norm -> (short conv | attention with q/k norm) -> norm -> FFN (SwiGLU or MoE with
   sigmoid router and selection bias); the final norm is stored as token_embd_norm.
+* lfm3: like lfm2 plus sandwich norms (post_attention_norm on the mixer output, post_ffw_norm on
+  the FFN output), a sigmoid gate per head on the attention output (attn_gate), sliding-window
+  layers (attention.sliding_window_pattern, rope.freq_base_swa, ring cache) and partial RoPE on
+  the full layers (rope_freqs: factor 1e30 leaves the tail unrotated).
 
 Short convolution (LFM2): shortconv.in_proj = [b | c | x], y = c * conv(b * x) with a causal
 depthwise kernel of shortconv.l_cache taps, then shortconv.out_proj.
@@ -31,8 +35,9 @@ import torch
 import torch.nn.functional as F
 
 from ..gguf import GGUFError, GGUFFile
-from .common import (GraphDecoder, KVCache, RoPE, WeightLoader, attention, letzte_zeilen, logit_zeilen,
-                     rms_norm, swiglu_mlp, fenster_nachholen, mischer_nachholen, zeilen_merken)
+from .common import (PREFILL_CHUNK, GraphDecoder, KVCache, RingKVCache, RoPE, WeightLoader, attention,
+                     letzte_zeilen, logit_zeilen, rms_norm, swiglu_mlp, fenster_nachholen, mischer_nachholen,
+                     zeilen_merken)
 from .moe import Experten
 
 BLOCK_AB = 32           # from this many tokens on the scan runs in blocks
@@ -216,16 +221,32 @@ class _Attention:
         self.k_norm = ld.norm(p + "attn_k_norm.weight") if ld.has(p + "attn_k_norm.weight") else None
         self.eps = hp["eps"]
         self.scale = hp["attn_scale"] or self.D ** -0.5
-        self.cache = KVCache(self.Hkv, self.D, n_ctx, ld.device, ld.dtype, ld.kv_bits)
+        self.gate = ld.linear(p + "attn_gate.weight") if ld.has(p + "attn_gate.weight") else None
+        if self.gate is not None and self.gate.n_out != self.H:
+            raise GGUFError(f"layer {i}: attn_gate does not match the head count")
+        # sliding-window layers only need the last `window` positions: fixed ring
+        self.window = hp["window"] if hp["swa"][i] else 0
+        self.cache = (RingKVCache(self.Hkv, self.D, self.window, ld.device, ld.dtype) if self.window
+                      else KVCache(self.Hkv, self.D, n_ctx, ld.device, ld.dtype, ld.kv_bits))
 
     def reset(self):
-        pass
+        if self.window:
+            with torch.inference_mode():
+                self.cache.pos.fill_(-1)
 
-    def snapshot(self):
-        return None
+    def snapshot(self, ring: bool = True):
+        """The ring belongs to a checkpoint: later tokens overwrite its slots.  A speculative check
+        needs no copy – rejected positions are rewritten before any query can see them, and the
+        accepted rows must stay."""
+        if not (self.window and ring):
+            return None
+        c = self.cache
+        return c.k.clone(), c.v.clone(), c.pos.clone()
 
     def restore(self, snap):
-        pass
+        if snap is not None:
+            for ziel, quelle in zip((self.cache.k, self.cache.v, self.cache.pos), snap):
+                ziel.copy_(quelle)
 
     def __call__(self, x: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
         L, H, Hkv, D = x.shape[0], self.H, self.Hkv, self.D
@@ -239,7 +260,13 @@ class _Attention:
         if self.rope is not None:
             q, k = self.rope(q, pos_idx), self.rope(k, pos_idx)
         self.cache.write(k, v, pos_idx)
-        o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, self.scale)
+        if self.window:
+            o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, self.scale, self.window, key_pos=self.cache.pos)
+        else:
+            o = self.cache.o_zurueck(attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len,
+                                               self.scale))
+        if self.gate is not None:                               # LFM3: Sigmoid-Tor je Kopf
+            o = o.float() * torch.sigmoid(self.gate(x).float()).unsqueeze(-1)
         return self.o(o.reshape(L, -1))
 
 
@@ -323,17 +350,25 @@ class _Block:
         self.ffn = _FFN(ld, i, hp) if hat_ffn else None
         if self.ssm is None and self.attn is None and self.ffn is None:
             raise GGUFError(f"layer {i}: no mixer tensors found")
+        # LFM3: Sandwich-Norm auf den Ausgaben von Mischer und FFN
+        self.post_norm = ld.norm(p + "post_attention_norm.weight") if ld.has(p + "post_attention_norm.weight") else None
+        self.post_ffn_norm = ld.norm(p + "post_ffw_norm.weight") if ld.has(p + "post_ffw_norm.weight") else None
 
     def reset(self):
         if self.ssm is not None:
             self.ssm.reset()
+        if self.attn is not None:
+            self.attn.reset()
 
-    def snapshot(self):
-        return self.ssm.snapshot() if self.ssm is not None else None
+    def snapshot(self, ring: bool = False):
+        return (self.ssm.snapshot() if self.ssm is not None else None,
+                self.attn.snapshot(ring) if self.attn is not None else None)
 
     def restore(self, snap):
         if self.ssm is not None:
-            self.ssm.restore(snap)
+            self.ssm.restore(snap[0])
+        if self.attn is not None:
+            self.attn.restore(snap[1])
 
     def __call__(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
         r = self.hp["residual_scale"]
@@ -344,16 +379,21 @@ class _Block:
                 out = out + self.attn(x, pos_idx, kv_len).float()
             if self.ssm is not None:
                 out = out + self.ssm(x).float()
+            if self.post_norm is not None:
+                out = rms_norm(out, self.post_norm, self.eps)
             h = h + out * r
             if self.ffn is None:
                 return h
             x = rms_norm(h, self.ffn_norm, self.eps) if self.ffn_norm is not None else x
-        return h + self.ffn(x) * r                               # Nemotron-H: MLP-/MoE-Schicht allein
+        f = self.ffn(x)
+        if self.post_ffn_norm is not None:
+            f = rms_norm(f, self.post_ffn_norm, self.eps)
+        return h + f * r                                         # Nemotron-H: MLP-/MoE-Schicht allein
 
 
 class HybridModel:
     alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
-    arch_names = ("granitehybrid", "nemotron_h", "nemotron_h_moe", "falcon-h1", "lfm2", "lfm2moe")
+    arch_names = ("granitehybrid", "nemotron_h", "nemotron_h_moe", "falcon-h1", "lfm2", "lfm2moe", "lfm3")
     prefill_chunk = 2048
 
     def __init__(self, gg: GGUFFile, device: torch.device, dtype: torch.dtype, n_ctx: int = 8192, progress=None,
@@ -394,8 +434,14 @@ class HybridModel:
             topk_norm=bool(gg.get(k("expert_weights_norm"), True)),
             weights_scale=float(gg.get(k("expert_weights_scale"), 1.0) or 1.0),
         )
-        mamba = not a.startswith("lfm2")
-        if not (0 < n_layer <= 512 and 0 < n_embd <= 65536 and (not mamba or (
+        fenster = int(gg.get(k("attention.sliding_window"), 0) or 0)
+        muster = gg.get(k("attention.sliding_window_pattern")) if fenster > 0 else None
+        if muster is not None and (not isinstance(muster, list) or len(muster) < n_layer):
+            raise GGUFError("invalid attention.sliding_window_pattern")
+        hp["swa"] = [bool(x) for x in muster[:n_layer]] if muster is not None else [False] * n_layer
+        hp["window"] = fenster if any(hp["swa"]) else 0
+        mamba = not a.startswith("lfm")
+        if not (0 < n_layer <= 512 and 0 < n_embd <= 65536 and 0 <= fenster <= 1 << 20 and (not mamba or (
                 1 <= hp["ssm_conv"] <= 16 and 0 < hp["ssm_heads"] <= 4096 and 0 < hp["ssm_state"] <= 4096))):
             raise GGUFError("implausible hyper-parameters")
         self.hp, self.n_ctx, self.device = hp, n_ctx, device
@@ -404,13 +450,24 @@ class HybridModel:
         self.embed, head = ld.embedding("token_embd.weight", tied_head=tied)
         self.out_norm = ld.norm("output_norm.weight" if ld.has("output_norm.weight") else "token_embd_norm.weight")
         self.lm_head = head if tied else ld.linear("output.weight")
-        rope = None
+        rope = rope_swa = None
         # Granite: rope.scaling.finetuned schaltet RoPE (fehlt er: an), q/k umsortiert -> normaler Stil;
         # Falcon-H1: NeoX-Stil ohne Umsortieren; Nemotron-H: ohne Positionen
-        if a in ("falcon-h1", "lfm2", "lfm2moe") or (a == "granitehybrid" and gg.get(k("rope.scaling.finetuned"), True)):
+        if a in ("falcon-h1", "lfm2", "lfm2moe", "lfm3") or \
+                (a == "granitehybrid" and gg.get(k("rope.scaling.finetuned"), True)):
             dim = int(gg.get(k("rope.dimension_count"), hp["head_dim"]))
-            rope = RoPE(dim, float(gg.get(k("rope.freq_base"), 10000.0)), device, n_ctx, neox=a != "granitehybrid")
-        self.blocks: List[_Block] = [_Block(ld, i, hp, rope, n_ctx) for i in range(n_layer)]
+            faktoren = ld.norm("rope_freqs.weight") if ld.has("rope_freqs.weight") else None
+            rope = RoPE(dim, float(gg.get(k("rope.freq_base"), 10000.0)), device, n_ctx, neox=a != "granitehybrid",
+                        freq_factors=faktoren)
+            if hp["window"]:                                     # Fenster-Schichten: eigene Basis, volle Drehung
+                rope_swa = RoPE(dim, float(gg.get(k("rope.freq_base_swa"), 10000.0)), device, n_ctx,
+                                neox=a != "granitehybrid")
+        self.blocks: List[_Block] = [_Block(ld, i, hp, rope_swa if hp["swa"][i] else rope, n_ctx)
+                                     for i in range(n_layer)]
+        # Ringe: höchstens PREFILL_CHUNK Token je Aufruf, sonst überschriebe er noch gebrauchte Plätze
+        self.ringe = bool(hp["window"])
+        if self.ringe:
+            self.prefill_chunk = PREFILL_CHUNK
         self.n_vocab = self.embed.n_vocab
         self.n_quant = ld.n_quant
         self.graph = GraphDecoder(self, n_ctx) if device.type == "cuda" and self._graph_ok() else None
@@ -439,16 +496,19 @@ class HybridModel:
         return common if common == old_len else None
 
     def checkpoint_state(self):
-        return self.snapshot_state()
+        return [b.snapshot(ring=True) for b in self.blocks]
 
     def restore_checkpoint(self, snap):
         self.restore_state(snap)
 
     # -- compute -------------------------------------------------------------
-    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, inject=None) -> torch.Tensor:
         h = self.embed(tok).float()
         if self.hp["embedding_scale"] != 1.0:
             h = h * self.hp["embedding_scale"]
+        if inject is not None:                                   # Bild-Einbettungen ersetzen die Platzhalter
+            rows, emb = inject
+            h = h.index_copy(0, rows, emb.to(h.device, h.dtype))
         for blk in self.blocks:
             h = blk(h, pos_idx, kv_len)
         h = rms_norm(letzte_zeilen(self, h), self.out_norm, self.hp["eps"])
@@ -460,12 +520,19 @@ class HybridModel:
             raise RuntimeError(f"context window of {self.n_ctx} tokens exceeded")
         if any(not 0 <= t < self.n_vocab for t in tokens):
             raise ValueError("token id out of range")
+        if self.ringe and len(tokens) > PREFILL_CHUNK:
+            raise ValueError(f"at most {PREFILL_CHUNK} tokens per call (sliding-window ring cache)")
+
+    @property
+    def supports_images(self) -> bool:
+        """Bild-Einbettungen über `inject` (LFM3-VL/-Omni: dieselbe Bauart wie das Textmodell)."""
+        return self.hp["arch"] == "lfm3"
 
     @torch.inference_mode()
-    def forward(self, tokens: List[int], pos: int) -> torch.Tensor:
+    def forward(self, tokens: List[int], pos: int, inject=None) -> torch.Tensor:
         self._check(tokens, pos)
-        if len(tokens) == 1 and self.graph is not None:
+        if len(tokens) == 1 and self.graph is not None and inject is None:
             return self.graph(tokens[0], pos)
         tok = torch.tensor(tokens, device=self.device, dtype=torch.long)
         pos_idx = torch.arange(pos, pos + len(tokens), device=self.device, dtype=torch.long)
-        return self._run(tok, pos_idx, pos + len(tokens))
+        return self._run(tok, pos_idx, pos + len(tokens), inject)

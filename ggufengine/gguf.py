@@ -71,8 +71,11 @@ GGML_TYPES: Dict[int, Tuple[str, int, int]] = {
     22: ("IQ2_S", 256, 82), 23: ("IQ4_XS", 256, 136), 24: ("I8", 1, 1),
     25: ("I16", 1, 2), 26: ("I32", 1, 4), 27: ("I64", 1, 8), 28: ("F64", 1, 8),
     29: ("IQ1_M", 256, 56), 30: ("BF16", 1, 2), 34: ("TQ1_0", 256, 54),
-    35: ("TQ2_0", 256, 66), 39: ("MXFP4", 32, 17),
+    35: ("TQ2_0", 256, 66), 39: ("MXFP4", 32, 17), 41: ("Q1_0", 128, 18), 42: ("Q2_0", 64, 18),
+    # PrismML fork: Q2_0 and TQ1_0 with one scale per 128 values
+    142: ("PQ2_0", 128, 34), 143: ("PTQ1_0", 128, 28),
 }
+Q2_0, PQ2_0 = 42, 142
 
 
 @dataclass(frozen=True)
@@ -242,6 +245,7 @@ class GGUFFile:
         if self.data_offset > self.file_size:
             raise GGUFError("data section starts beyond end of file")
         data_size = self.file_size - self.data_offset
+        infos = self._q2_0_gruppe(infos, data_size)
 
         for ti in infos:
             if ti.name in self.tensors:
@@ -260,6 +264,25 @@ class GGUFFile:
             if ti.offset < ende:
                 raise GGUFError(f"tensor {ti.name!r} overlaps the previous tensor")
             ende = ti.offset + ti.n_bytes
+
+    @classmethod
+    def _q2_0_gruppe(cls, infos: List[TensorInfo], data_size: int) -> List[TensorInfo]:
+        """Q2_0 has 64 values per block; older PrismML files use the same type id with 128 values
+        (today PQ2_0).  A tensor whose 64-block size does not fit up to the next tensor, while the
+        128-block size does, is read as PQ2_0 (the size difference, n/64 bytes, exceeds the padding)."""
+        if not any(ti.ggml_type == Q2_0 for ti in infos):
+            return infos
+        folge = sorted(infos, key=lambda t: t.offset)
+        platz = {id(a): (b.offset if b is not None else data_size) - a.offset
+                 for a, b in zip(folge, folge[1:] + [None])}
+        aus = []
+        for ti in infos:
+            if ti.ggml_type == Q2_0 and ti.n_bytes > platz[id(ti)]:
+                alt = cls._make_tensor_info(ti.name, ti.dims, PQ2_0, ti.offset)
+                if alt.n_bytes <= platz[id(ti)]:
+                    ti = alt
+            aus.append(ti)
+        return aus
 
     @staticmethod
     def _make_tensor_info(name: str, dims: Tuple[int, ...], ggml_type: int, offset: int) -> TensorInfo:

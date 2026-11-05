@@ -142,8 +142,8 @@ class _Layer:
             k = self.rope(rms_norm(k, self.k_norm, self.eps), pos_idx)
             v = rms_norm(v, 1.0, self.eps)
             self.cache.write(k, v, pos_idx)
-        o = attention(q, *self.cache.kv(kv_len), pos_idx, kv_len, 1.0, self.window, key_pos=self.cache.pos,
-                      spans=spans)
+        o = self.cache.o_zurueck(attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, 1.0,
+                                           self.window, key_pos=self.cache.pos, spans=spans))
         o = rms_norm(self.o(o.reshape(L, -1)), self.post_attn_norm, self.eps)
         h = h + o
         f = rms_norm(h, self.ffn_norm, self.eps)
@@ -254,7 +254,6 @@ class Gemma4Model:
         self.n_vocab = self.embed.n_vocab
         self.n_quant = ld.n_quant
         self.moe = any(l.moe for l in self.layers)
-        # expert choice depends on the data -> not recordable as a CUDA graph
         # single steps as CUDA graph: possible when every MoE layer picks its experts on the GPU
         ohne_sync = all(l.experten.graphfaehig for l in self.layers if l.moe)
         self.graph = GraphDecoder(self, n_ctx) if device.type == "cuda" and ohne_sync else None

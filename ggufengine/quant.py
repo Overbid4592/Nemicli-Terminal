@@ -403,6 +403,65 @@ def deq_mxfp4(raw, dtype=torch.float32):
     return (pairs.transpose(1, 2) * d.unsqueeze(-1)).reshape(-1)
 
 
+# --- ternary and 1-bit formats ------------------------------------------------
+# Code q stands for (q - 1) * d (Q2_0 also allows q = 3, i.e. 2d); Q1_0: bit set +d, clear -d.
+# TQ1_0/PTQ1_0 store five trits per byte as a fixed-point fraction (3^5 = 243 < 256):
+# trit n of byte v = ((v * 3^n) mod 256) * 3 >> 8.
+
+def deq_q2_0(raw, dtype=torch.float32, groesse=18):
+    b = _blocks(raw, groesse)
+    nb = b.shape[0]
+    q = (b[:, 2:].view(nb, -1, 1) >> _u8(b, 0, 2, 4, 6).view(1, 1, 4)) & 3      # value j: byte j/4
+    return (_f16(b[:, :2]).to(dtype) * (q.reshape(nb, -1).to(dtype) - 1)).reshape(-1)
+
+
+def deq_tq2_0(raw, dtype=torch.float32):
+    b = _blocks(raw, 66)
+    nb = b.shape[0]
+    q = (b[:, :64].view(nb, 2, 1, 32) >> _u8(b, 0, 2, 4, 6).view(1, 1, 4, 1)) & 3
+    return (_f16(b[:, 64:66]).to(dtype) * (q.reshape(nb, 256).to(dtype) - 1)).reshape(-1)
+
+
+def deq_q1_0(raw, dtype=torch.float32):
+    b = _blocks(raw, 18)
+    nb = b.shape[0]
+    bit = (b[:, 2:].view(nb, 16, 1) >> _u8(b, *range(8)).view(1, 1, 8)) & 1     # value j: byte j/8, bit j%8
+    return (_f16(b[:, :2]).to(dtype) * (2 * bit.reshape(nb, 128).to(dtype) - 1)).reshape(-1)
+
+
+def trit_plan(n_qs: int, n_qh: int) -> tuple:
+    """Byte index and power of 3 of every value of a TQ1_0-like block: qs in stages of 32, 16, 8
+    columns (five values each), then four values per qh byte (as ggml-quants.c)."""
+    byte, pot = [], []
+    j = 0
+    for c in (32, 16, 8):
+        while j + c <= n_qs:
+            for n in range(5):
+                byte += range(j, j + c)
+                pot += [3 ** n] * c
+            j += c
+    for n in range(4):
+        byte += range(n_qs, n_qs + n_qh)
+        pot += [3 ** n] * n_qh
+    return byte, pot
+
+
+_TRITS = {"TQ1_0": (48, 4, 54), "PTQ1_0": (24, 2, 28)}        # qs bytes, qh bytes, block bytes
+_PLAENE: dict = {}
+
+
+def _deq_trits(name: str, raw, dtype=torch.float32):
+    n_qs, n_qh, groesse = _TRITS[name]
+    b = _blocks(raw, groesse)
+    schluessel = (name, b.device)
+    if (plan := _PLAENE.get(schluessel)) is None:                 # once per device (as _u8)
+        byte, pot = trit_plan(n_qs, n_qh)
+        plan = _PLAENE[schluessel] = (torch.tensor(byte, device=b.device),
+                                      torch.tensor(pot, dtype=torch.int16, device=b.device))
+    q = (b[:, plan[0]].to(torch.int16) * plan[1]) & 255
+    return (_f16(b[:, -2:]).to(dtype) * (((q * 3) >> 8).to(dtype) - 1)).reshape(-1)
+
+
 DEQUANT: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "F32": deq_f32, "F16": deq_f16, "BF16": deq_bf16,
     "Q8_0": deq_q8_0, "Q4_0": deq_q4_0, "Q4_1": deq_q4_1,
@@ -412,10 +471,12 @@ DEQUANT: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "IQ1_S": deq_iq1_s, "IQ1_M": deq_iq1_m, "IQ2_XXS": deq_iq2_xxs, "IQ2_XS": deq_iq2_xs,
     "IQ2_S": deq_iq2_s, "IQ3_XXS": deq_iq3_xxs, "IQ3_S": deq_iq3_s, "IQ4_NL": deq_iq4_nl,
     "IQ4_XS": deq_iq4_xs, "MXFP4": deq_mxfp4,
+    "Q1_0": deq_q1_0, "Q2_0": deq_q2_0, "PQ2_0": partial(deq_q2_0, groesse=34), "TQ2_0": deq_tq2_0,
+    "TQ1_0": partial(_deq_trits, "TQ1_0"), "PTQ1_0": partial(_deq_trits, "PTQ1_0"),
 }
 # formats that can produce the target dtype themselves (no float32 intermediate)
 _EIGENER_DTYPE = {"Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S",
-                  "IQ4_NL", "IQ4_XS", "MXFP4"}
+                  "IQ4_NL", "IQ4_XS", "MXFP4", "Q1_0", "Q2_0", "PQ2_0", "TQ2_0", "TQ1_0", "PTQ1_0"}
 
 # how many elements to dequantise per chunk (bounds temporary memory on the GPU)
 CHUNK_ELEMENTS = 32 * 1024 * 1024

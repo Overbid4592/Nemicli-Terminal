@@ -14,7 +14,7 @@ import torch
 
 from .gguf import GGUFError, GGUFFile
 from .models import build_model
-from .models.common import KV_GROWTH
+from .models.common import GPU_SPERRE, KV_GROWTH
 from .qlinear import kernel_available
 from .quant import dequantize
 from .tokenizer import Tokenizer
@@ -52,8 +52,9 @@ class Nachsortierer:
                 raise GGUFError("rerank template without {query}/{document}")
             self.tok = Tokenizer(self.gg)
             dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
-            self.model = build_model(self.gg, self.device, dtype, self.max_tokens + 2,
-                                     quant=kernel_available(self.device))
+            with GPU_SPERRE:                        # nicht neben dem Bau einer Engine (KV_GPU_SLOTS, SCHICHTEN_RAM)
+                self.model = build_model(self.gg, self.device, dtype, self.max_tokens + 2,
+                                         quant=kernel_available(self.device))
             if not hasattr(self.model, "einbetten"):
                 raise GGUFError(f"architecture {a!r} cannot be used as a reranker")
             self.model.graph = None
