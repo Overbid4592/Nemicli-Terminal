@@ -1,7 +1,7 @@
 """
 videobildcloud.py - Bilder und Videos über Cloud-Anbieter, ohne eigene Grafikkarte.
 
-Gedacht für Rechner ohne passende Grafikkarte und für eine spätere App fürs Handy: Krea 2 und Wan 2.2
+Gedacht für Rechner ohne passende Grafikkarte: Krea 2 und Wan 2.2
 laufen lokal, diese Anbieter in der Cloud. Ein Anbieter zählt, wenn sein Schlüssel eingetragen ist –
 derselbe wie für die Chat-Modelle (/model).
 
