@@ -70,3 +70,16 @@ Backup/
 
 # Zwischenstände des LoRA-Trainings
 *_stand.safetensors
+
+# Weitere Laufzeitdaten im Daten-Ordner (ohne eigenen Daten-Ordner ist das der Programm-Ordner)
+/Agenten/
+/Apps/
+/Cache/
+/Charaktergalerie/
+/Debugbericht/
+/Papierkorb/
+/Profile/
+/Skills/
+/VideoGen/
+/Wache/
+/Wissen/
