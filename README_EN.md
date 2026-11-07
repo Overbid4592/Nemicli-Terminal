@@ -264,13 +264,26 @@ Commands intentionally remain **German**, even in the English documentation. Typ
 
 ## 🔒 Security
 
-- **Explicit approval:** Changes to files are displayed in a before/after review. **F8 approves; Enter does not.**
-- **Risk-aware controls:** Deletion, unfamiliar commands and scheduled actions receive stricter confirmation.
-- **System protection:** Protected system paths are read-only in the action layer; rollback, trash and backup features help recover from changes.
-- **Skill and prompt-injection defenses:** External content is treated as untrusted, and tools/skills are subject to additional checks.
-- **System and network watchdogs:** Detection rules, event monitoring, anomaly detection and shadow-mode safeguards. These **do not replace an antivirus product**.
-- **API credentials:** Windows DPAPI is used to protect supported API keys. Do not commit real `.env` files, tokens, private data or local runtime logs.
-- **Alpha warning:** Security features and the installer are still evolving and need independent testing. Report potential vulnerabilities according to [SECURITY.md](SECURITY.md).
+NemiCLI implements several safeguards, but these are **documented protections, not a guarantee that alpha software is secure**.
+
+- **Explicit review and work modes:** A before/after view can show file modifications. **F8 approves; Enter does not.** Higher-risk actions have stricter checks. Auto modes can perform specifically permitted operations without a new prompt; this is not the same as unconditional approval for every action.
+- **Protected system paths:** Windows system folders (such as `C:\Windows`, `Program Files` and `ProgramData`) and sensitive registry entries are intended to be read-only for the agent. Checks normalize path traversal, environment variables and device paths.
+- **Custom write protection:** `schreibsperre.json` can forbid access to user-selected locations. The program folder is protected against unauthorized agent edits.
+- **No agent privilege escalation:** Command guards reject elevation and restrict risky Windows utilities. System inspection can use direct APIs rather than unrestricted PowerShell.
+- **Antivirus remains separate:** The System Watchdog complements security software; it must not disable or interfere with antivirus protection.
+- **Trash, undo and deletion limit:** Deleted files may move to an application trash folder and overwritten files can be backed up. `/undo` can recover retained versions. The documented per-session deletion limit is 20 files.
+- **Web retrieval:** Direct fetches use HTTPS and an allowlist with SSRF checks across redirects. Other sites can be fetched through a configured external service with additional controls.
+- **External data is not an instruction:** Web text, downloaded files, images and memory content are treated as untrusted. Suspicious instructions, hidden text and framing tricks receive additional checks. Reading external material can cause subsequent file, command or memory actions to require review, even in Auto mode.
+- **Command and path filters:** Safeguards examine resolved paths and common PowerShell indirection. **A textual filter is not a complete security boundary.** A dedicated restricted Windows account is still planned.
+- **Sensitive control files:** Changes to personality instructions, scheduled tasks, watchdog state and learned files receive additional review.
+- **Browser extension:** Right-click explanations run without tool access. Browser content is treated as untrusted and the local bridge checks the host to reduce DNS-rebinding risk.
+- **Watchdog alarm handling:** Alarms are framed as measurement data rather than executable commands. Some important rules can only be disabled by the user.
+- **Local services:** Interfaces designed for local access bind to `127.0.0.1` and use authentication tokens or keys.
+- **Scheduled background jobs:** Run in Read Only mode.
+- **API credentials:** Supported keys stored in `.env` are protected by Windows DPAPI. Executables may be signed with an in-house `CN=NemiCLI` certificate and distributed with SHA-256 checksums. A self-signed publisher certificate is not equivalent to a publicly trusted signature.
+- **Model files and personas:** Model data undergoes defensive parsing and validation. Persona definitions are prompt text; safety enforcement is implemented in application code rather than trusted to the persona.
+
+Report potential vulnerabilities privately using [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -317,6 +330,7 @@ The four `main*.py` files form **one application**: `main.py` loads `main_dienst
 ```text
 NemiCli/ or your configured data directory/
 ├─ ModelGGUF/             Downloaded local language models
+├─ VideoGen/              GGUF video model components
 ├─ Vision/                Downloaded image describer models
 ├─ Models/embeddings/     Embedding models
 ├─ Agenten/               Agent/personality instructions (created at runtime if used)
@@ -333,16 +347,20 @@ NemiCli/ or your configured data directory/
 <your folder>/
 ├─ chats/ · Gespraeche/   Conversations and saved transcripts
 ├─ learned/               Memory, statistics, action logs
-├─ Profile/<Name>/        Per-personality chats, images, skills and memory
+├─ Profile/<Name>/        Per-personality chats, images, video, music, LoRA, skills and memory
 ├─ Persoenlichkeiten/     Custom personality definitions and orb images
+├─ Agenten/               Agent/personality instructions
 ├─ Skills/ · Wissen/      Shared skills and knowledge
 ├─ Bilder/                Generated images and screenshots
 ├─ Models/Krea2/          Krea 2 model files
+├─ Models/Bildmodelle/    Additional image models
+├─ Models/Videomodelle/   Video and audio models
 ├─ Wache/ · Berichte/     Watchdog data and reports
 ├─ Zeitplan/ · Befehle/   Scheduled tasks and helper scripts
 ├─ NemiSandbox/           Sandbox files and packages
 ├─ Doku/ · Cache/         Offline docs and engine caches
-├─ Papierkorb/            Deleted/overwritten files (undo)
+├─ Backup/                ZIP/SHA-256 backups
+├─ Papierkorb/            Retained deleted/overwritten files (undo)
 └─ Vorschläge/            Proactive personality suggestions
 ```
 
@@ -377,7 +395,7 @@ These data paths describe the intended runtime layout; individual directories ma
 | Minimum | 32 GB | Most features possible; Krea 2 can be tight |
 | Recommended | 64 GB | Image series, video and larger MoE models |
 
-**16 GB RAM is not recommended for the complete NemiCLI environment.** The German README documents approximately 6–10 GB for Windows/background apps, 2–5 GB for NemiCLI with its memory model, and 20–27 GB for Krea 2 during generation (potentially more in series).
+**16 GB RAM is not recommended for the complete NemiCLI environment.** The German README reports approximately 6–10 GB for Windows/background applications, 2–5 GB for NemiCLI with the memory model, 20–27 GB for Krea 2 and up to about 40 GB in an image series. These observations vary with workload.
 
 ---
 
