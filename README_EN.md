@@ -96,88 +96,110 @@ An optional performance path for supported NVIDIA RTX GPUs is documented in the 
 
 ## ⌨ Commands
 
-Type `/` — a menu with all commands appears (typing also searches the description). `/help`
-shows all of them. Commands with subitems open **a selection without an argument** (↑/↓ or 1–9, Enter, Esc).
-Or simply ask the AI — it knows all commands and opens suitable menus itself.
+Commands intentionally remain **German**, even in the English documentation. Type `/` to search commands, or `/help` for full descriptions. Submenus can open when a command has no arguments.
 
 **Chat & models**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/model [name\|huggingface]` | choose model, enter cloud key, fetch local model from Hugging Face |
-| `/kontext [8k…128k\|max\|8bit\|16bit]` | context of the local model, with VRAM display |
-| `/staerke [stufe]` | reasoning level/budget: `schnell` · `normal` · `stark` · `max` |
-| `/auto [an\|aus]` | Auto Strong (Ollama): Use a larger model for difficult questions |
-| `/persönlichkeiten [name\|neu]` | who speaks? Select or create new (also `/persona`) |
-| `/name [zeigen\|loeschen]` | 👤 About you: name, preferred form of address, what the AI should know |
-| `/resume [#]` · `/reset` · `/clear` | resume chat · new chat · clear screen |
-| `/subagenten [an\|auto\|off]` | helper agents: ask · as needed · blocked |
+| `/help` | Show all available commands. |
+| `/model [name\|huggingface\|ersatz]` | Select providers and models, download GGUF models, or set cloud fallbacks. |
+| `/staerke [stufe]` | Choose reasoning strength or budget. |
+| `/denken [auto\|an\|aus]` | Configure how each personality reasons. |
+| `/auto [an\|aus]` | Switch to a larger Ollama model for difficult questions. |
+| `/kontext [anzeigen\|8k…128k\|max]` | Inspect context usage or choose a GGUF context length. The old 8bit and 16bit arguments are not valid. |
+| `/compact [jetzt\|zeigen]` | Compact a conversation or inspect its saved summary where supported. |
+| `/persönlichkeiten [name\|neu]` | Choose, create or export personalities. |
+| `/name [zeigen\|loeschen]` | Manage personal name and preferred address. |
+| `/reset` | Start a new conversation. |
+| `/clear` | Clear the display. |
+| `/subagenten [an\|auto\|off]` | Configure helper agents. |
 
-**Work**
+**Work & development**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/modus [chat\|lesen\|normal\|auto\|autoan]` | work mode (also Shift+Tab) |
-| `/code [aufgabe\|status]` · `/codeend` | 🟦 start coding assistant · end it |
-| `/doku [laden python\|mdn]` | 📚 offline docs for the coding assistant |
-| `/sandbox [freigeben <Ordner> [schreiben]\|entziehen <Ordner>]` | 🧪 sandbox: status, authorize/revoke project folder |
-| `/uebung [an\|aus\|jetzt]` | practice mode: small programs while idle |
-| `/skills [selbst an\|aus \| alte]` | 🧩 Skills: list · allow self-creation · old notes |
-| `/ml` · `/ordner [pfad]` | folder sense: report · estimate folder type |
+| `/modus [chat\|lesen\|normal\|auto\|autoan]` | Choose work mode; Shift+Tab cycles modes. |
+| `/code [aufgabe\|status]` | Start or inspect the coding assistant. |
+| `/codeend` | End the coding workflow. |
+| `/doku [laden python\|mdn]` | Load offline programming documentation. |
+| `/sandbox [freigeben <Ordner> [schreiben]\|entziehen <Ordner>]` | Grant or revoke a sandbox project folder. |
+| `/uebung [an\|aus\|jetzt]` | Configure sandboxed coding practice. |
+| `/skills [selbst an\|aus\|alte]` | Inspect and manage skills. |
+| `/ml` | Show folder-sense information. |
+| `/ordner [pfad]` | Inspect a folder and its type. |
+| `/anzeige [kompakt\|rahmen]` | Choose compact or framed tool output. |
 
-**Images & orb**
+**Images, video, music & voice**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/bild [prompt\|schritte]` | generate image (Krea 2, WebUI, or ComfyUI) · Krea steps 8–16 |
-| `/bildmodel [name]` | choose image engine (`webui-adresse` changes the host) |
-| `/charakter [oeffnen]` | 🧬 character file: fixed figure of the personality |
-| `/kugel [malen …\|motive\|impuls an\|aus\|weg\|ordner]` | 🔮 floating orb: paint face and motifs, free moment |
+| `/bild [prompt\|schritte]` | Create an image or set Krea 2 steps. |
+| `/bildmodel [name]` | Choose Krea 2, Z-Image, FLUX.2, Qwen-Image, FLUX.1, Chroma, external or cloud engines. |
+| `/video <beschreibung> [options]` | Create a video with a local motor, optional LTX-2.5 audio or a configured cloud provider. |
+| `/charaktere` | Open the character gallery to create or improve adult characters. |
+| `/charakter [oeffnen]` | Open the active character definition. |
+| `/musik` | Open song planning, composing and cover creation. |
+| `/kugel [options]` | Configure the floating orb, appearance, activity and memories. |
+| `/voice [an\|knopf\|aus\|jetzt\|text]` | Control local speech and read-aloud. |
 
 **Memory**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/gedaechtnis [indexieren]` | view/delete memories · catch up vector backlog |
-| `/embeddings [<Ordner>\|huggingface]` | 🧬 embedding model for memory |
-| `/wissen` | learned code snippets and notes |
-| `/reflektieren [auto an\|aus]` | 🪞 draw lessons · automatically after corrections |
-| `/aufraeumen` | compact memory |
+| `/gedaechtnis [indexieren\|archiv\|zurueck]` | Inspect and index memories, view the archive and restore entries. |
+| `/embeddings [Ordner\|huggingface]` | Choose an embedding model or download it. |
+| `/embeddingtimer` | Inspect embedding scheduler activity. |
+| `/wissen` | Show learned knowledge and snippets. |
+| `/reflektieren [auto an\|aus]` | Extract lessons or enable automatic reflection. |
+| `/aufraeumen` | Consolidate memories. |
 
-**Security & system**
+**Security & maintenance**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/wache [status\|alarme\|fullscan\|…]` | 🛡 system watch: situation, alerts, rules, full scan, self-test |
-| `/undo` · `/limit [zahl]` · `/whitelist [befehl]` | 🗑 recycle bin · 🛑 delete limit · ✅ command allowlist |
-| `/schluessel <min> [aufgabe]` · `aus` | 🔑 open program folder to the AI for a limited time |
-| `/protokoll [n]` | 📜 action log |
-| `/web [wort\|key]` | web allowlist · configure Ollama search |
-| `/start` | 📁 where your data folder is |
-| `/einrichten` · `/update` | 🧰 install missing parts · ⬇ check venv (vulnerabilities via OSV.dev, updates) |
-| `/systemcheck` · `/selbsttest` · `/version` | PC profile · check modules · version |
+| `/wache [status\|alarme\|fullscan\|dl\|netz\|…]` | Inspect watchdog events, network checks and scans. |
+| `/backup [teil\|voll\|auto\|pruefen\|auspacken]` | Create, inspect and restore backups. |
+| `/undo` | Restore deleted or overwritten files where possible. |
+| `/limit [zahl]` | Set the deletion limit. |
+| `/whitelist [befehl]` | Inspect the command allowlist. |
+| `/schluessel <min> [aufgabe]` | Temporarily authorize program-folder access. |
+| `/protokoll [n]` | Inspect action logs. |
+| `/vision [ordner\|restart\|debug\|protokoll]` | Configure and troubleshoot the image describer. |
+| `/web [wort\|key\|fremdseiten frei\|fragen\|aus]` | Manage web allowlist and unknown-site permissions. |
+| `/start` | Choose the data folder. |
+| `/einrichten [modelle]` | Run setup and download optional model components. |
+| `/update` | Inspect dependency vulnerabilities and updates. |
+| `/venv` | Open the venv and torch instructions. |
+| `/systemcheck` | Inspect system specifications. |
+| `/selbsttest` | Run internal checks. |
+| `/version` | Display version, build and runtime information. |
+| `/debug [aus\|an\|motor an\|aus]` | Inspect diagnostics, crashes and resource reports. |
+| `/restart` | Restart the program and watchdog using direct user input. |
 
 **Interfaces & extras**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/gui` | desktop window (Chat · Work, Gallery, Skills, Personalities) |
-| `/webui` | browser interface with reading aids |
-| `/chrome [neu]` | Chrome extension: port and key |
-| `/kontextmenue [an\|aus]` | NemiCLI in the Windows right-click menu |
-| `/spiel` | chess · Nine Men's Morris · checkers · TicTacToe against the personality |
-| `/theme` · `/emoji` · `/nemi` · `/statistik [reset]` | colors · emoji shortcuts · mascot · usage |
-| `/help` · `/exit` | help · exit |
+| `/gui` | Open the desktop GUI. |
+| `/webui` | Open browser interface with reading aids. |
+| `/chrome [neu]` | Configure Chrome extension. |
+| `/kontextmenue [an\|aus]` | Toggle the Windows context-menu entry. |
+| `/spiel` | Play built-in games. |
+| `/appstore [app\|debug\|liste]` | Use and debug NemiView apps. |
+| `/theme` | Change theme. |
+| `/emoji` | Configure emoji shortcuts and level. |
+| `/nemi` | Interact with mascot. |
+| `/statistik [reset]` | Inspect or reset statistics. |
+| `/exit` | Exit NemiCLI. |
 
-**Keys:** `Enter` send · `Ctrl+J` new line · `Esc` cancel · `F2` reasoning text ·
-`F8` approve change · `F12` save entire conversation · `Shift+Tab` mode ·
-`PgUp/PgDn`, mouse wheel scroll · `Ctrl+C` copy selected text.
+**Keys:** `Enter` send · `Ctrl+J` newline · `Esc` cancel · `F2` reasoning text · **`F8` approve** · `F12` save conversation · `Shift+Tab` work mode · `Ctrl+K` search · `F3` cockpit · `PgUp/PgDn` scroll · `Ctrl+C` copy.
 
-**Without interface:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"` ·
-`--auftrag <name>` (scheduled task without a window, answer becomes a report).
+**In the tabbed terminal:** `Ctrl+Shift+T` opens a tab · `Ctrl+Shift+W` closes it · `Ctrl+PgUp/PgDn` switches tabs · `Ctrl+Shift+K` opens the AI-action tab.
+
+**Without GUI:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"` · `--auftrag <name>` (read-only scheduled task with report).
 
 ---
-
 
 ## 🔒 Security
 
