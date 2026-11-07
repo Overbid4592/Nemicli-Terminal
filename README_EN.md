@@ -24,15 +24,15 @@
 
 NemiCLI is a self-built **AI agent for the Windows terminal**, written in Python. It supports **37 cloud chat providers**, local models through its **own GGUF engine**, and external local servers such as Ollama, LM Studio, Jan, llama.cpp and vLLM.
 
-It can read and write files, execute commands, research the web, assist with programming, understand and generate images, and monitor the PC. **Changes require user approval.** It includes configurable personalities, themes, a desktop window (`/gui`), and accessibility features for people with dyslexia.
+It can read and write files, execute commands, research the web, assist with programming, understand and generate images, and monitor the PC. **Actions follow the selected work mode and its safety checks; permitted Auto-mode actions may run without individual prompts.** It includes configurable personalities, themes, a desktop window (`/gui`), and accessibility features for people with dyslexia.
 
-The core is **pure Python — no Node.js, npm, llama.cpp, or transformers dependency for its own model engine**. Local language models, image understanding and memory use its GGUF engine; image generation uses a dedicated Krea 2 pipeline.
+The core is **pure Python — no Node.js, npm, llama.cpp, or transformers dependency for its own model engine**. Local language models, image understanding and memory use its GGUF engine; image generation uses Krea 2 and other dedicated image engines.
 
 > 💜 Started from one question: "How does a coding agent actually work?" NemiCLI's birthday is June 19, 2026. Its predecessor, Nemi V1/V2, dates back to March 2026.
 
 ### 🔢 Version history
 
-After 8.9, versions continued as 8.10–8.23; the project was renamed **9.23 Alpha** on October 26, 2026. Historical changelog entries keep their original version numbers. The [current public GitHub release](https://github.com/Overbid4592/Nemicli-Terminal/releases) is named **NemiCLI 9.24 Alpha**.
+After 8.9, versions continued as 8.10–8.23; the project was renamed **9.23 Alpha** on October 26, 2026. Historical changelog entries retain their original numbers. **Current development source (`main`): NemiCLI 9.47 Alpha** as of November 7, 2026. The **latest published release is still NemiCLI 9.24 Alpha**. The source branch and the downloadable release are not the same version.
 
 ---
 
@@ -44,7 +44,7 @@ For the complete, continually maintained German specification, see [docs/Funktio
 |---|---|
 | 🧠 **Custom GGUF engine** | Local inference inside the Python process with torch; supports Gemma 4, Qwen3.5/3.6 and MoE variants, Qwen3-Next/VL, Llama 3/4, Mistral, Phi, Granite 4, Nemotron-H, Falcon-H1, LFM2, DeepSeek and others. Quantization down to IQ1; RAM-offloaded MoE experts, speculative decoding, prefix caching and context management up to 128k depending on resources. |
 | 👁 **Vision** | Cloud, Ollama and the custom engine; an image describer can assist models that lack vision capabilities. |
-| 🧭 **Reasoning and verification** | Task difficulty estimation, multi-step reasoning, alternative solutions and a separate reviewer for difficult answers; checks model claims against actual tool results. |
+| 🧭 **Reasoning and verification** | Per-personality `/denken` settings, task difficulty estimation, alternative solutions and a separate reviewer for complex answers; compares claimed results with actual tool output. |
 | 🔊 **Voice** | Local Qwen3-TTS, personality-specific voices and read-aloud for text, Markdown and PDF. |
 | ☁ **Cloud models** | **37 chat providers**, including Anthropic, OpenAI, Google, Mistral, DeepSeek, xAI, Groq, Kimi, GLM, Qwen, MiniMax, OpenRouter and Ollama Cloud. Live model lists, search and DPAPI-protected keys on Windows. |
 | ⚙ **Agent tools** | File operations, PowerShell, web research, specialist sources, PDF, system information, schedules, helper agents and task lists. |
@@ -52,13 +52,13 @@ For the complete, continually maintained German specification, see [docs/Funktio
 | 🧪 **Sandbox** | Experimental code executes within a Windows AppContainer, isolated from personal files. |
 | 🛡 **System Watchdog** | Background security monitoring with detection rules, Sigma rule support, event logs, MITRE ATT&CK mappings, ML anomaly detection and shadow-mode learning. Designed to **complement, not replace, antivirus software**. |
 | 🌐 **Network Watchdog** | Investigates connection information and firewall alerts, with ML-based connection and sequence analysis; initially in shadow mode. |
-| 💾 **Memory** | Conversations, facts, skills and knowledge files; hybrid keyword/vector retrieval, optional GGUF reranker and conversation summarization. |
-| 🎨 **Images** | Krea 2 generation pipeline, character consistency, image series and comics, character LoRA, optional Forge/ComfyUI, plus **12 cloud image providers**. |
-| 🎬 **Video** | Local Wan 2.2 video pipeline with GGUF components, clips and character continuity; **6 cloud video provider integrations** and asynchronous cloud generation. |
+| 💾 **Memory** | Conversations, facts, lessons, skills, knowledge, hybrid keyword/vector retrieval, GGUF reranking, conversation compaction and memory archives. |
+| 🎨 **Images** | Own Krea 2 pipeline, **Z-Image, FLUX.2 (4B/9B), Qwen-Image, FLUX.1 and Chroma**, plus Forge/ComfyUI and cloud providers. Supports character files, consistent identities, series, comics and LoRA. |
+| 🎬 **Video** | Local Wan 2.2 GGUF pipeline **and LTX-2.5 with stereo audio**, plus configurable settings and cloud video integrations. |
 | 🗣 **Animated portraits** | LivePortrait-based animated talking portraits with voice. |
 | 🎭 **Personalities** | Gallery of nine predefined characters, editable traits, portraits and a stable character identity. |
 | 🎵 **Music** | Local ACE-Step 1.5 GGUF-based music creation, songwriting and covers, with a dedicated `/musik` interface. |
-| 🛍 **Appstore + NemiView** | HTML/CSS/JS apps rendered with NemiCLI's own interface engine. |
+| 🛍 **Appstore + NemiView** | HTML/CSS/JS apps rendered by NemiCLI's own engine, with templates and AI-assisted app debugging. |
 | 🎭 **Interface** | Terminal tabs, Textual interface, `/gui` desktop app, web UI, floating desktop companion, Chrome extension and Windows right-click integration. |
 | 🔒 **Approvals and recovery** | Before/after review with **F8 to approve**, risk levels, trash/undo, limits on deletion, protected system paths, skill checking, action logs, SHA-256 backups and daily automatic backups. |
 
@@ -72,118 +72,218 @@ Features listed here reflect the project's documentation and may be experimental
 
 **Option 2 — Windows setup EXE:** Download `NemicliPublish.exe` from the [releases](https://github.com/Overbid4592/Nemicli-Terminal/releases), along with `NemicliPublish.sha256.txt` to verify the download. The currently published alpha asset is an `.exe`, not an `.msi` file. Models are not bundled; configure a cloud API key, an external local server or GGUF models using `/einrichten`.
 
-**Option 3 — source code:** Use the repository's Python entry point `main.py`, dependencies in `requirements.txt`, and follow the setup instructions in the [German README](README.md). Command names in NemiCLI intentionally remain German.
+**Option 3 — source code:** Create a virtual environment, install dependencies from `requirements.txt`, then run `main.py`. The tested Python target is 3.14; an appropriate torch build is installed separately for GPU support. The command names intentionally remain German.
+
+**Option 4 — build your own installer:** `python build_exe.py` creates `dist/NemiCLI/` with `NemiCLI.exe`, `NemiCLIc.exe` and `NemiCLIT2/`, plus `NemiCLI-Setup-<Build>.exe` and a SHA-256 checksum. `python build_exe.py --msi` additionally creates an MSI. The optional in-house `CN=NemiCLI` signature is not commercially trusted.
+
+**Data folder:** Use `/start` to select where chat history, generated images and learned information are stored. A folder change copies data instead of deleting it. If the selected folder becomes inaccessible, NemiCLI reports it rather than silently starting with empty memory.
 
 ---
 
 ## 🧠 Models
 
-Use `/model` to choose a provider or local model. The built-in GGUF engine can run supported models directly; Ollama, LM Studio, Jan, llama.cpp and vLLM are supported as external backends. Model size, quantization, context length and concurrent image/voice/video components determine resource requirements.
+`/model` opens the model selector automatically if no model has been configured.
 
-### 🎬 Local video models
+| Component | Location | Setup and notes |
+|---|---|---|
+| Local GGUF language model | `ModelGGUF/<Name>/` in the program folder | `/model huggingface` offers compatible models of 4B or more with resumable, SHA-256-checked downloads. A matching `mmproj-*.gguf` may add vision support. |
+| Image describer | `Vision/<Name>/` in the program folder | Vision GGUF + mmproj; choose with `/vision`. |
+| Local voice | `Vision/<Name>/` in the program folder | Qwen3-TTS Talker/VoiceDesign and 12 Hz GGUF tokenizer. |
+| Memory embeddings | `Models/embeddings/<Name>/` | Choose with `/embeddings`; uses RAM and GPU as resources permit. |
+| Krea 2 | `Models/Krea2/` in the data folder | Model, `text_encoders/`, `vae/`, `tokenizer/`; select via `/bildmodel`. |
+| Z-Image, FLUX.2, Qwen-Image, FLUX.1, Chroma | `Models/Bildmodelle/` (data or program folder) | Model-specific safetensors or GGUF and shared text encoders, tokenizers and VAEs as required. |
+| TensorRT-RTX | `Models/TensorRT-RTX/` in the program folder | Optional separately downloaded NVIDIA SDK (see below). |
+| LTX-2.5 video and audio | `Models/Videomodelle/` (data or program folder) | Each model needs its transformer, projected Gemma 4 text encoder and video/audio VAE components. Select using `/video modell`. |
+| Wan 2.2 GGUF video | `VideoGen/` in the program folder | GGUF model and VAE in each model folder, plus shared umT5 encoder/tokenizer; manifest below. |
+| ACE-Step 1.5 music | `Models/Musik/` or `Models/Music/` | GGUF audio engine, Qwen3 embedding reader, VAE and optional song planner. |
+| LivePortrait | `Models/LivePortrait/` | Five network weight files plus `landmark.onnx`; documented SHA-256 validation. |
+| Cloud models | Provider keys | Add through `/model`, with DPAPI protection on supported Windows installations. |
+| Ollama | Separate local server | Detected when running. |
+| LM Studio, Jan, llama.cpp/LocalAI, vLLM | Separate servers | Typical ports 1234, 1337, 8080 and 8000. |
 
-The documented video engine uses Wan 2.2 TI2V 5B and umT5 GGUF components. Video generation can be requested using `/video` or an appropriate model tool.
+NemiCLI writes a `LIES-MICH.txt` note in model folders with instructions about required files.
 
-### ⚡ TensorRT-RTX
+**🪑 Fallback bench (`/model ersatz`):** Up to two cloud models can take over after repeated blocked actions. If an active model hits a protected-action block five times in 30 minutes, the current turn is stopped and the first fallback is activated in the terminal, orb or watchdog. Read-only mode, orb restrictions and deletion limits do not contribute to this count.
 
-An optional performance path for supported NVIDIA RTX GPUs is documented in the [German README](README.md). Its compatibility and benefit depend on the GPU, model and installed runtime.
+### 🎬 Local GGUF video model file manifest
+
+Download the files separately and compare their sizes and SHA-256 hashes. The following paths, filenames and hashes are taken from the German README. The encoder, tokenizer and optional mini-VAE can live in shared folders or model-specific folders.
+
+```
+VideoGen/
+├─ WAN-Turbo/                        fast: four steps
+│  ├─ Wan2_2-TI2V-5B-Turbo-Q4_K_M.gguf
+│  └─ Wan2.2_VAE.safetensors
+├─ WAN-GGUF/                         standard: 30 steps
+│  ├─ Wan2.2-TI2V-5B-Q4_K_M.gguf
+│  └─ Wan2.2_VAE.safetensors
+├─ WAN-FunInP/                       start/end keyframes
+│  ├─ Wan2.2-Fun-5B-InP-Q8_0.gguf
+│  └─ Wan2.2_VAE.safetensors
+├─ text_encoders/umt5-xxl-encoder-Q8_0.gguf
+├─ tokenizer/                        tokenizer.json, spiece.model, special_tokens_map.json, tokenizer_config.json
+└─ tae/                              optional mini-VAE (faster decoding)
+   ├─ taew2_2_super.safetensors
+   └─ taew2_2.safetensors
+```
+
+| File | Source | Bytes | SHA-256 |
+|---|---|---|---|
+| `Wan2_2-TI2V-5B-Turbo-Q4_K_M.gguf` | [hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF) | 3.437.927.136 | `13b3bee8fcafd9f9a3778ed1a0ca973f4a7d152094ea305f8384b0abd7e1ad51` |
+| `Wan2.2-TI2V-5B-Q4_K_M.gguf` | [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF) | 3.433.116.000 | `95b19697b7f98e65b0a543640e9ca7b4dfec32e2a6e3731e8e10708be52655e2` |
+| `Wan2.2-Fun-5B-InP-Q8_0.gguf` | [QuantStack/Wan2.2-Fun-5B-InP-GGUF](https://huggingface.co/QuantStack/Wan2.2-Fun-5B-InP-GGUF) | 5.407.546.080 | `c88969a140da94176d8af263d031d03b83a7b4783108c73e828a69b9a8873d7f` |
+| `Wan2.2_VAE.safetensors` | [QuantStack/Wan2.2-Fun-5B-InP-GGUF](https://huggingface.co/QuantStack/Wan2.2-Fun-5B-InP-GGUF) (`vae/`) | 1.409.400.960 | `e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156` |
+| `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) | 6.043.068.256 | `2521d4de0bf9e1cc6549866463ceae85e4ec3239bc6063f7488810be39033bbc` |
+| `tokenizer.json` | [alibaba-pai/Wan2.2-Fun-5B-InP](https://huggingface.co/alibaba-pai/Wan2.2-Fun-5B-InP) (`google/umt5-xxl/`) | 16.837.417 | `6e197b4d3dbd71da14b4eb255f4fa91c9c1f2068b20a2de2472967ca3d22602b` |
+| `spiece.model` | same source | 4.548.313 | `e3909a67b780650b35cf529ac782ad2b6b26e6d1f849d3fbb6a872905f452458` |
+| `special_tokens_map.json`, `tokenizer_config.json` | same source | small | – |
+| `taew2_2_super.safetensors` | [madebyollin/taehv](https://github.com/madebyollin/taehv/tree/main/safetensors) (MIT) | 40.986.488 | `cf6d8bdadb77d9f9741ae28b5b4659bb74cf9b0be6d08fc4afed3cb50c39364c` |
+| `taew2_2.safetensors` | same source | 22.848.048 | `b84609b2a133d48434bd9636bfcb44bf05168dc436e2d3cecf26256faa1f5325` |
+The video models listed in this manifest are documented as Apache-2.0 licensed; the optional mini-VAEs are MIT-licensed. Without `tae/`, the larger VAE handles decoding more slowly. **These checksums are copied from the German source, not independently rechecked against downloaded model files.**
+
+### ⚡ Optional TensorRT-RTX acceleration
+
+NVIDIA TensorRT for RTX is **not bundled with NemiCLI**. Download the NVIDIA-licensed SDK separately from [NVIDIA](https://developer.nvidia.com/tensorrt-rtx) and place the extracted folder under `Models/TensorRT-RTX/`. NemiCLI installs the corresponding local package into its own venv if needed. `/systemcheck` reports the status.
+
+| Area | Optional role | Setting |
+|---|---|---|
+| Local chat | FP4 prompt prefill on compatible Blackwell hardware and non-MoE model architectures. The built-in engine still performs decoding. | `trt_chat` |
+| Krea 2 | NVFP4 image-transformer layers. | `bild_trt` |
+| Wan 2.2 | DiT transformer layers; video with character LoRA stays on torch. | `video_trt` |
+
+Compiled engines are cached under `Models/TensorRT-RTX/engines/` by model and GPU. Actual compatibility and performance depend on the selected hardware and software.
 
 ---
 
 ## ⌨ Commands
 
-Type `/` — a menu with all commands appears (typing also searches the description). `/help`
-shows all of them. Commands with subitems open **a selection without an argument** (↑/↓ or 1–9, Enter, Esc).
-Or simply ask the AI — it knows all commands and opens suitable menus itself.
+Commands intentionally remain **German**, even in the English documentation. Type `/` to search commands, or `/help` for full descriptions. Submenus can open when a command has no arguments.
 
 **Chat & models**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/model [name\|huggingface]` | choose model, enter cloud key, fetch local model from Hugging Face |
-| `/kontext [8k…128k\|max\|8bit\|16bit]` | context of the local model, with VRAM display |
-| `/staerke [stufe]` | reasoning level/budget: `schnell` · `normal` · `stark` · `max` |
-| `/auto [an\|aus]` | Auto Strong (Ollama): Use a larger model for difficult questions |
-| `/persönlichkeiten [name\|neu]` | who speaks? Select or create new (also `/persona`) |
-| `/name [zeigen\|loeschen]` | 👤 About you: name, preferred form of address, what the AI should know |
-| `/resume [#]` · `/reset` · `/clear` | resume chat · new chat · clear screen |
-| `/subagenten [an\|auto\|off]` | helper agents: ask · as needed · blocked |
+| `/help` | Show all available commands. |
+| `/model [name\|huggingface\|ersatz]` | Select providers and models, download GGUF models, or set cloud fallbacks. |
+| `/staerke [stufe]` | Choose reasoning strength or budget. |
+| `/denken [auto\|an\|aus]` | Configure how each personality reasons. |
+| `/auto [an\|aus]` | Switch to a larger Ollama model for difficult questions. |
+| `/kontext [anzeigen\|8k…128k\|max]` | Inspect context usage or choose a GGUF context length. The old 8bit and 16bit arguments are not valid. |
+| `/compact [jetzt\|zeigen]` | Compact a conversation or inspect its saved summary where supported. |
+| `/persönlichkeiten [name\|neu]` | Choose, create or export personalities. |
+| `/name [zeigen\|loeschen]` | Manage personal name and preferred address. |
+| `/reset` | Start a new conversation. |
+| `/clear` | Clear the display. |
+| `/subagenten [an\|auto\|off]` | Configure helper agents. |
 
-**Work**
+**Work & development**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/modus [chat\|lesen\|normal\|auto\|autoan]` | work mode (also Shift+Tab) |
-| `/code [aufgabe\|status]` · `/codeend` | 🟦 start coding assistant · end it |
-| `/doku [laden python\|mdn]` | 📚 offline docs for the coding assistant |
-| `/sandbox [freigeben <Ordner> [schreiben]\|entziehen <Ordner>]` | 🧪 sandbox: status, authorize/revoke project folder |
-| `/uebung [an\|aus\|jetzt]` | practice mode: small programs while idle |
-| `/skills [selbst an\|aus \| alte]` | 🧩 Skills: list · allow self-creation · old notes |
-| `/ml` · `/ordner [pfad]` | folder sense: report · estimate folder type |
+| `/modus [chat\|lesen\|normal\|auto\|autoan]` | Choose work mode; Shift+Tab cycles modes. |
+| `/code [aufgabe\|status]` | Start or inspect the coding assistant. |
+| `/codeend` | End the coding workflow. |
+| `/doku [laden python\|mdn]` | Load offline programming documentation. |
+| `/sandbox [freigeben <Ordner> [schreiben]\|entziehen <Ordner>]` | Grant or revoke a sandbox project folder. |
+| `/uebung [an\|aus\|jetzt]` | Configure sandboxed coding practice. |
+| `/skills [selbst an\|aus\|alte]` | Inspect and manage skills. |
+| `/ml` | Show folder-sense information. |
+| `/ordner [pfad]` | Inspect a folder and its type. |
+| `/anzeige [kompakt\|rahmen]` | Choose compact or framed tool output. |
 
-**Images & orb**
+**Images, video, music & voice**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/bild [prompt\|schritte]` | generate image (Krea 2, WebUI, or ComfyUI) · Krea steps 8–16 |
-| `/bildmodel [name]` | choose image engine (`webui-adresse` changes the host) |
-| `/charakter [oeffnen]` | 🧬 character file: fixed figure of the personality |
-| `/kugel [malen …\|motive\|impuls an\|aus\|weg\|ordner]` | 🔮 floating orb: paint face and motifs, free moment |
+| `/bild [prompt\|schritte]` | Create an image or set Krea 2 steps. |
+| `/bildmodel [name]` | Choose Krea 2, Z-Image, FLUX.2, Qwen-Image, FLUX.1, Chroma, external or cloud engines. |
+| `/video <beschreibung> [options]` | Create a video with a local motor, optional LTX-2.5 audio or a configured cloud provider. |
+| `/charaktere` | Open the character gallery to create or improve adult characters. |
+| `/charakter [oeffnen]` | Open the active character definition. |
+| `/musik` | Open song planning, composing and cover creation. |
+| `/kugel [options]` | Configure the floating orb, appearance, activity and memories. |
+| `/voice [an\|knopf\|aus\|jetzt\|text]` | Control local speech and read-aloud. |
 
 **Memory**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/gedaechtnis [indexieren]` | view/delete memories · catch up vector backlog |
-| `/embeddings [<Ordner>\|huggingface]` | 🧬 embedding model for memory |
-| `/wissen` | learned code snippets and notes |
-| `/reflektieren [auto an\|aus]` | 🪞 draw lessons · automatically after corrections |
-| `/aufraeumen` | compact memory |
+| `/gedaechtnis [indexieren\|archiv\|zurueck]` | Inspect and index memories, view the archive and restore entries. |
+| `/embeddings [Ordner\|huggingface]` | Choose an embedding model or download it. |
+| `/embeddingtimer` | Inspect embedding scheduler activity. |
+| `/wissen` | Show learned knowledge and snippets. |
+| `/reflektieren [auto an\|aus]` | Extract lessons or enable automatic reflection. |
+| `/aufraeumen` | Consolidate memories. |
 
-**Security & system**
+**Security & maintenance**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/wache [status\|alarme\|fullscan\|…]` | 🛡 system watch: situation, alerts, rules, full scan, self-test |
-| `/undo` · `/limit [zahl]` · `/whitelist [befehl]` | 🗑 recycle bin · 🛑 delete limit · ✅ command allowlist |
-| `/schluessel <min> [aufgabe]` · `aus` | 🔑 open program folder to the AI for a limited time |
-| `/protokoll [n]` | 📜 action log |
-| `/web [wort\|key]` | web allowlist · configure Ollama search |
-| `/start` | 📁 where your data folder is |
-| `/einrichten` · `/update` | 🧰 install missing parts · ⬇ check venv (vulnerabilities via OSV.dev, updates) |
-| `/systemcheck` · `/selbsttest` · `/version` | PC profile · check modules · version |
+| `/wache [status\|alarme\|fullscan\|dl\|netz\|…]` | Inspect watchdog events, network checks and scans. |
+| `/backup [teil\|voll\|auto\|pruefen\|auspacken]` | Create, inspect and restore backups. |
+| `/undo` | Restore deleted or overwritten files where possible. |
+| `/limit [zahl]` | Set the deletion limit. |
+| `/whitelist [befehl]` | Inspect the command allowlist. |
+| `/schluessel <min> [aufgabe]` | Temporarily authorize program-folder access. |
+| `/protokoll [n]` | Inspect action logs. |
+| `/vision [ordner\|restart\|debug\|protokoll]` | Configure and troubleshoot the image describer. |
+| `/web [wort\|key\|fremdseiten frei\|fragen\|aus]` | Manage web allowlist and unknown-site permissions. |
+| `/start` | Choose the data folder. |
+| `/einrichten [modelle]` | Run setup and download optional model components. |
+| `/update` | Inspect dependency vulnerabilities and updates. |
+| `/venv` | Open the venv and torch instructions. |
+| `/systemcheck` | Inspect system specifications. |
+| `/selbsttest` | Run internal checks. |
+| `/version` | Display version, build and runtime information. |
+| `/debug [aus\|an\|motor an\|aus]` | Inspect diagnostics, crashes and resource reports. |
+| `/restart` | Restart the program and watchdog using direct user input. |
 
 **Interfaces & extras**
 
-| Command | What it does |
+| Command | Description |
 |---|---|
-| `/gui` | desktop window (Chat · Work, Gallery, Skills, Personalities) |
-| `/webui` | browser interface with reading aids |
-| `/chrome [neu]` | Chrome extension: port and key |
-| `/kontextmenue [an\|aus]` | NemiCLI in the Windows right-click menu |
-| `/spiel` | chess · Nine Men's Morris · checkers · TicTacToe against the personality |
-| `/theme` · `/emoji` · `/nemi` · `/statistik [reset]` | colors · emoji shortcuts · mascot · usage |
-| `/help` · `/exit` | help · exit |
+| `/gui` | Open the desktop GUI. |
+| `/webui` | Open browser interface with reading aids. |
+| `/chrome [neu]` | Configure Chrome extension. |
+| `/kontextmenue [an\|aus]` | Toggle the Windows context-menu entry. |
+| `/spiel` | Play built-in games. |
+| `/appstore [app\|debug\|liste]` | Use and debug NemiView apps. |
+| `/theme` | Change theme. |
+| `/emoji` | Configure emoji shortcuts and level. |
+| `/nemi` | Interact with mascot. |
+| `/statistik [reset]` | Inspect or reset statistics. |
+| `/exit` | Exit NemiCLI. |
 
-**Keys:** `Enter` send · `Ctrl+J` new line · `Esc` cancel · `F2` reasoning text ·
-`F8` approve change · `F12` save entire conversation · `Shift+Tab` mode ·
-`PgUp/PgDn`, mouse wheel scroll · `Ctrl+C` copy selected text.
+**Keys:** `Enter` send · `Ctrl+J` newline · `Esc` cancel · `F2` reasoning text · **`F8` approve** · `F12` save conversation · `Shift+Tab` work mode · `Ctrl+K` search · `F3` cockpit · `PgUp/PgDn` scroll · `Ctrl+C` copy.
 
-**Without interface:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"` ·
-`--auftrag <name>` (scheduled task without a window, answer becomes a report).
+**In the tabbed terminal:** `Ctrl+Shift+T` opens a tab · `Ctrl+Shift+W` closes it · `Ctrl+PgUp/PgDn` switches tabs · `Ctrl+Shift+K` opens the AI-action tab.
+
+**Without GUI:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"` · `--auftrag <name>` (read-only scheduled task with report).
 
 ---
 
-
 ## 🔒 Security
 
-- **Explicit approval:** Changes to files are displayed in a before/after review. **F8 approves; Enter does not.**
-- **Risk-aware controls:** Deletion, unfamiliar commands and scheduled actions receive stricter confirmation.
-- **System protection:** Protected system paths are read-only in the action layer; rollback, trash and backup features help recover from changes.
-- **Skill and prompt-injection defenses:** External content is treated as untrusted, and tools/skills are subject to additional checks.
-- **System and network watchdogs:** Detection rules, event monitoring, anomaly detection and shadow-mode safeguards. These **do not replace an antivirus product**.
-- **API credentials:** Windows DPAPI is used to protect supported API keys. Do not commit real `.env` files, tokens, private data or local runtime logs.
-- **Alpha warning:** Security features and the installer are still evolving and need independent testing. Report potential vulnerabilities according to [SECURITY.md](SECURITY.md).
+NemiCLI implements several safeguards, but these are **documented protections, not a guarantee that alpha software is secure**.
+
+- **Explicit review and work modes:** A before/after view can show file modifications. **F8 approves; Enter does not.** Higher-risk actions have stricter checks. Auto modes can perform specifically permitted operations without a new prompt; this is not the same as unconditional approval for every action.
+- **Protected system paths:** Windows system folders (such as `C:\Windows`, `Program Files` and `ProgramData`) and sensitive registry entries are intended to be read-only for the agent. Checks normalize path traversal, environment variables and device paths.
+- **Custom write protection:** `schreibsperre.json` can forbid access to user-selected locations. The program folder is protected against unauthorized agent edits.
+- **No agent privilege escalation:** Command guards reject elevation and restrict risky Windows utilities. System inspection can use direct APIs rather than unrestricted PowerShell.
+- **Antivirus remains separate:** The System Watchdog complements security software; it must not disable or interfere with antivirus protection.
+- **Trash, undo and deletion limit:** Deleted files may move to an application trash folder and overwritten files can be backed up. `/undo` can recover retained versions. The documented per-session deletion limit is 20 files.
+- **Web retrieval:** Direct fetches use HTTPS and an allowlist with SSRF checks across redirects. Other sites can be fetched through a configured external service with additional controls.
+- **External data is not an instruction:** Web text, downloaded files, images and memory content are treated as untrusted. Suspicious instructions, hidden text and framing tricks receive additional checks. Reading external material can cause subsequent file, command or memory actions to require review, even in Auto mode.
+- **Command and path filters:** Safeguards examine resolved paths and common PowerShell indirection. **A textual filter is not a complete security boundary.** A dedicated restricted Windows account is still planned.
+- **Sensitive control files:** Changes to personality instructions, scheduled tasks, watchdog state and learned files receive additional review.
+- **Browser extension:** Right-click explanations run without tool access. Browser content is treated as untrusted and the local bridge checks the host to reduce DNS-rebinding risk.
+- **Watchdog alarm handling:** Alarms are framed as measurement data rather than executable commands. Some important rules can only be disabled by the user.
+- **Local services:** Interfaces designed for local access bind to `127.0.0.1` and use authentication tokens or keys.
+- **Scheduled background jobs:** Run in Read Only mode.
+- **API credentials:** Supported keys stored in `.env` are protected by Windows DPAPI. Executables may be signed with an in-house `CN=NemiCLI` certificate and distributed with SHA-256 checksums. A self-signed publisher certificate is not equivalent to a publicly trusted signature.
+- **Model files and personas:** Model data undergoes defensive parsing and validation. Persona definitions are prompt text; safety enforcement is implemented in application code rather than trusted to the persona.
+
+Report potential vulnerabilities privately using [SECURITY.md](SECURITY.md).
 
 ---
 
@@ -230,6 +330,7 @@ The four `main*.py` files form **one application**: `main.py` loads `main_dienst
 ```text
 NemiCli/ or your configured data directory/
 ├─ ModelGGUF/             Downloaded local language models
+├─ VideoGen/              GGUF video model components
 ├─ Vision/                Downloaded image describer models
 ├─ Models/embeddings/     Embedding models
 ├─ Agenten/               Agent/personality instructions (created at runtime if used)
@@ -246,16 +347,20 @@ NemiCli/ or your configured data directory/
 <your folder>/
 ├─ chats/ · Gespraeche/   Conversations and saved transcripts
 ├─ learned/               Memory, statistics, action logs
-├─ Profile/<Name>/        Per-personality chats, images, skills and memory
+├─ Profile/<Name>/        Per-personality chats, images, video, music, LoRA, skills and memory
 ├─ Persoenlichkeiten/     Custom personality definitions and orb images
+├─ Agenten/               Agent/personality instructions
 ├─ Skills/ · Wissen/      Shared skills and knowledge
 ├─ Bilder/                Generated images and screenshots
 ├─ Models/Krea2/          Krea 2 model files
+├─ Models/Bildmodelle/    Additional image models
+├─ Models/Videomodelle/   Video and audio models
 ├─ Wache/ · Berichte/     Watchdog data and reports
 ├─ Zeitplan/ · Befehle/   Scheduled tasks and helper scripts
 ├─ NemiSandbox/           Sandbox files and packages
 ├─ Doku/ · Cache/         Offline docs and engine caches
-├─ Papierkorb/            Deleted/overwritten files (undo)
+├─ Backup/                ZIP/SHA-256 backups
+├─ Papierkorb/            Retained deleted/overwritten files (undo)
 └─ Vorschläge/            Proactive personality suggestions
 ```
 
@@ -290,7 +395,7 @@ These data paths describe the intended runtime layout; individual directories ma
 | Minimum | 32 GB | Most features possible; Krea 2 can be tight |
 | Recommended | 64 GB | Image series, video and larger MoE models |
 
-**16 GB RAM is not recommended for the complete NemiCLI environment.** The German README documents approximately 6–10 GB for Windows/background apps, 2–5 GB for NemiCLI with its memory model, and 20–27 GB for Krea 2 during generation (potentially more in series).
+**16 GB RAM is not recommended for the complete NemiCLI environment.** The German README reports approximately 6–10 GB for Windows/background applications, 2–5 GB for NemiCLI with the memory model, 20–27 GB for Krea 2 and up to about 40 GB in an image series. These observations vary with workload.
 
 ---
 
