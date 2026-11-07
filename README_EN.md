@@ -82,15 +82,76 @@ Features listed here reflect the project's documentation and may be experimental
 
 ## 🧠 Models
 
-Use `/model` to choose a provider or local model. The built-in GGUF engine can run supported models directly; Ollama, LM Studio, Jan, llama.cpp and vLLM are supported as external backends. Model size, quantization, context length and concurrent image/voice/video components determine resource requirements.
+`/model` opens the model selector automatically if no model has been configured.
 
-### 🎬 Local video models
+| Component | Location | Setup and notes |
+|---|---|---|
+| Local GGUF language model | `ModelGGUF/<Name>/` in the program folder | `/model huggingface` offers compatible models of 4B or more with resumable, SHA-256-checked downloads. A matching `mmproj-*.gguf` may add vision support. |
+| Image describer | `Vision/<Name>/` in the program folder | Vision GGUF + mmproj; choose with `/vision`. |
+| Local voice | `Vision/<Name>/` in the program folder | Qwen3-TTS Talker/VoiceDesign and 12 Hz GGUF tokenizer. |
+| Memory embeddings | `Models/embeddings/<Name>/` | Choose with `/embeddings`; uses RAM and GPU as resources permit. |
+| Krea 2 | `Models/Krea2/` in the data folder | Model, `text_encoders/`, `vae/`, `tokenizer/`; select via `/bildmodel`. |
+| Z-Image, FLUX.2, Qwen-Image, FLUX.1, Chroma | `Models/Bildmodelle/` (data or program folder) | Model-specific safetensors or GGUF and shared text encoders, tokenizers and VAEs as required. |
+| TensorRT-RTX | `Models/TensorRT-RTX/` in the program folder | Optional separately downloaded NVIDIA SDK (see below). |
+| LTX-2.5 video and audio | `Models/Videomodelle/` (data or program folder) | Each model needs its transformer, projected Gemma 4 text encoder and video/audio VAE components. Select using `/video modell`. |
+| Wan 2.2 GGUF video | `VideoGen/` in the program folder | GGUF model and VAE in each model folder, plus shared umT5 encoder/tokenizer; manifest below. |
+| ACE-Step 1.5 music | `Models/Musik/` or `Models/Music/` | GGUF audio engine, Qwen3 embedding reader, VAE and optional song planner. |
+| LivePortrait | `Models/LivePortrait/` | Five network weight files plus `landmark.onnx`; documented SHA-256 validation. |
+| Cloud models | Provider keys | Add through `/model`, with DPAPI protection on supported Windows installations. |
+| Ollama | Separate local server | Detected when running. |
+| LM Studio, Jan, llama.cpp/LocalAI, vLLM | Separate servers | Typical ports 1234, 1337, 8080 and 8000. |
 
-The documented video engine uses Wan 2.2 TI2V 5B and umT5 GGUF components. Video generation can be requested using `/video` or an appropriate model tool.
+NemiCLI writes a `LIES-MICH.txt` note in model folders with instructions about required files.
 
-### ⚡ TensorRT-RTX
+**🪑 Fallback bench (`/model ersatz`):** Up to two cloud models can take over after repeated blocked actions. If an active model hits a protected-action block five times in 30 minutes, the current turn is stopped and the first fallback is activated in the terminal, orb or watchdog. Read-only mode, orb restrictions and deletion limits do not contribute to this count.
 
-An optional performance path for supported NVIDIA RTX GPUs is documented in the [German README](README.md). Its compatibility and benefit depend on the GPU, model and installed runtime.
+### 🎬 Local GGUF video model file manifest
+
+Download the files separately and compare their sizes and SHA-256 hashes. The following paths, filenames and hashes are taken from the German README. The encoder, tokenizer and optional mini-VAE can live in shared folders or model-specific folders.
+
+```
+VideoGen/
+├─ WAN-Turbo/                        fast: four steps
+│  ├─ Wan2_2-TI2V-5B-Turbo-Q4_K_M.gguf
+│  └─ Wan2.2_VAE.safetensors
+├─ WAN-GGUF/                         standard: 30 steps
+│  ├─ Wan2.2-TI2V-5B-Q4_K_M.gguf
+│  └─ Wan2.2_VAE.safetensors
+├─ WAN-FunInP/                       start/end keyframes
+│  ├─ Wan2.2-Fun-5B-InP-Q8_0.gguf
+│  └─ Wan2.2_VAE.safetensors
+├─ text_encoders/umt5-xxl-encoder-Q8_0.gguf
+├─ tokenizer/                        tokenizer.json, spiece.model, special_tokens_map.json, tokenizer_config.json
+└─ tae/                              optional mini-VAE (faster decoding)
+   ├─ taew2_2_super.safetensors
+   └─ taew2_2.safetensors
+```
+
+| File | Source | Bytes | SHA-256 |
+|---|---|---|---|
+| `Wan2_2-TI2V-5B-Turbo-Q4_K_M.gguf` | [hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF](https://huggingface.co/hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF) | 3.437.927.136 | `13b3bee8fcafd9f9a3778ed1a0ca973f4a7d152094ea305f8384b0abd7e1ad51` |
+| `Wan2.2-TI2V-5B-Q4_K_M.gguf` | [QuantStack/Wan2.2-TI2V-5B-GGUF](https://huggingface.co/QuantStack/Wan2.2-TI2V-5B-GGUF) | 3.433.116.000 | `95b19697b7f98e65b0a543640e9ca7b4dfec32e2a6e3731e8e10708be52655e2` |
+| `Wan2.2-Fun-5B-InP-Q8_0.gguf` | [QuantStack/Wan2.2-Fun-5B-InP-GGUF](https://huggingface.co/QuantStack/Wan2.2-Fun-5B-InP-GGUF) | 5.407.546.080 | `c88969a140da94176d8af263d031d03b83a7b4783108c73e828a69b9a8873d7f` |
+| `Wan2.2_VAE.safetensors` | [QuantStack/Wan2.2-Fun-5B-InP-GGUF](https://huggingface.co/QuantStack/Wan2.2-Fun-5B-InP-GGUF) (`vae/`) | 1.409.400.960 | `e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156` |
+| `umt5-xxl-encoder-Q8_0.gguf` | [city96/umt5-xxl-encoder-gguf](https://huggingface.co/city96/umt5-xxl-encoder-gguf) | 6.043.068.256 | `2521d4de0bf9e1cc6549866463ceae85e4ec3239bc6063f7488810be39033bbc` |
+| `tokenizer.json` | [alibaba-pai/Wan2.2-Fun-5B-InP](https://huggingface.co/alibaba-pai/Wan2.2-Fun-5B-InP) (`google/umt5-xxl/`) | 16.837.417 | `6e197b4d3dbd71da14b4eb255f4fa91c9c1f2068b20a2de2472967ca3d22602b` |
+| `spiece.model` | same source | 4.548.313 | `e3909a67b780650b35cf529ac782ad2b6b26e6d1f849d3fbb6a872905f452458` |
+| `special_tokens_map.json`, `tokenizer_config.json` | same source | small | – |
+| `taew2_2_super.safetensors` | [madebyollin/taehv](https://github.com/madebyollin/taehv/tree/main/safetensors) (MIT) | 40.986.488 | `cf6d8bdadb77d9f9741ae28b5b4659bb74cf9b0be6d08fc4afed3cb50c39364c` |
+| `taew2_2.safetensors` | same source | 22.848.048 | `b84609b2a133d48434bd9636bfcb44bf05168dc436e2d3cecf26256faa1f5325` |
+The video models listed in this manifest are documented as Apache-2.0 licensed; the optional mini-VAEs are MIT-licensed. Without `tae/`, the larger VAE handles decoding more slowly. **These checksums are copied from the German source, not independently rechecked against downloaded model files.**
+
+### ⚡ Optional TensorRT-RTX acceleration
+
+NVIDIA TensorRT for RTX is **not bundled with NemiCLI**. Download the NVIDIA-licensed SDK separately from [NVIDIA](https://developer.nvidia.com/tensorrt-rtx) and place the extracted folder under `Models/TensorRT-RTX/`. NemiCLI installs the corresponding local package into its own venv if needed. `/systemcheck` reports the status.
+
+| Area | Optional role | Setting |
+|---|---|---|
+| Local chat | FP4 prompt prefill on compatible Blackwell hardware and non-MoE model architectures. The built-in engine still performs decoding. | `trt_chat` |
+| Krea 2 | NVFP4 image-transformer layers. | `bild_trt` |
+| Wan 2.2 | DiT transformer layers; video with character LoRA stays on torch. | `video_trt` |
+
+Compiled engines are cached under `Models/TensorRT-RTX/engines/` by model and GPU. Actual compatibility and performance depend on the selected hardware and software.
 
 ---
 
