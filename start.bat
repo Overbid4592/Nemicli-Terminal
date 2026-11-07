@@ -37,7 +37,7 @@ if defined BOOT_PY goto :boot_ok
 echo.
 echo   [X] Auf diesem PC ist kein Python zu finden.
 echo.
-echo       NemiCLI braucht Python 3.11 oder neuer:
+echo       NemiCLI braucht Python 3.14:
 echo         https://www.python.org/downloads/
 echo       Beim Installieren "Add python.exe to PATH" ankreuzen.
 echo.

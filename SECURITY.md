@@ -5,12 +5,13 @@
 ## Unterstützte Versionen
 
 NemiCLI ist in der Alpha-Phase. Sicherheitskorrekturen gibt es nur für die
-jeweils neueste Version.
+jeweils neueste veröffentlichte Version. Welche das ist, steht in `core/version.py`
+und ganz oben im `CHANGELOG.md`.
 
-| Version         | Unterstützt |
-|-----------------|-------------|
-| 6.7 Alpha (neu) | ✅          |
-| ältere          | ❌          |
+| Version                          | Unterstützt |
+|----------------------------------|-------------|
+| neueste veröffentlichte Version  | ✅          |
+| ältere                           | ❌          |
 
 ## Sicherheitslücke melden
 
@@ -59,7 +60,8 @@ NemiCLI ist ein Ein-Personen-Projekt. Feste Antwortzeiten gibt es deshalb nicht.
 
 ## English
 
-**Supported versions:** Only the latest release (currently 6.7 Alpha) receives security fixes.
+**Supported versions:** Only the latest published release receives security fixes. The current
+version is listed in `core/version.py` and at the top of `CHANGELOG.md`.
 
 **Reporting:** Please do **not** open a public issue. Use GitHub's private reporting instead:
 **Security tab → "Report a vulnerability".**

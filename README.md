@@ -225,6 +225,7 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | `/model [name\|huggingface\|ersatz]` | Modell wählen, Cloud-Key eintragen, lokales Modell von Hugging Face holen, Ersatzbank (bis 2 Cloud-Modelle) |
 | `/kontext [anzeigen\|8k…128k\|max]` | 📊 Womit der Kontext gefüllt ist (wie `/context` bei Claude Code); lokal: Größe, Vorgabe max |
 | `/staerke [stufe]` | Denkstufe/Budget: `schnell` · `normal` · `stark` · `max` |
+| `/denken [auto\|an\|aus]` | 🧭 Ob die KI nachdenkt, je Persönlichkeit: `auto` bei kniffligen Fragen und Bitten, etwas zu tun · `an` vor jeder Antwort · `aus` nie |
 | `/auto [an\|aus]` | Auto-Stark (Ollama): bei schweren Fragen aufs große Gemma |
 | `/persönlichkeiten [name\|neu]` | Wer spricht? Wählen oder neu anlegen (auch `/persona`) |
 | `/name [zeigen\|loeschen]` | 👤 Über dich: Name, Wunsch-Anrede, was die KI wissen soll |
@@ -236,6 +237,7 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | Befehl | Was es tut |
 |---|---|
 | `/modus [chat\|lesen\|normal\|auto\|autoan]` | Arbeitsmodus (auch Shift+Tab) |
+| `/anzeige [kompakt\|rahmen]` | Werkzeug-Anzeige: `kompakt` eine Zeile mit eingerücktem Ergebnis und Diff · `rahmen` die Kästen |
 | `/code [aufgabe\|status]` · `/codeend` | 🟦 Coding-Assistent starten · beenden |
 | `/doku [laden python\|mdn]` | 📚 Offline-Doku für den Coding-Assistenten |
 | `/sandbox [freigeben <Ordner> [schreiben]\|entziehen <Ordner>]` | 🧪 Sandbox: Status, Projektordner freigeben/entziehen |
@@ -262,6 +264,7 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 |---|---|
 | `/gedaechtnis [indexieren]` | Erinnerungen ansehen/löschen · Vektor-Rückstand aufholen |
 | `/embeddings [<Ordner>\|huggingface]` | 🧬 Embedding-Modell fürs Gedächtnis |
+| `/embeddingtimer [aus\|15…90\|low an\|aus]` | ⏱ Wie oft das Gedächtnis eingebettet wird (Vorgabe 30 Minuten) · 🐢 Low-Modus |
 | `/wissen` | Gelernte Code-Schnipsel und Notizen |
 | `/reflektieren [auto an\|aus]` | 🪞 Lehren ziehen · automatisch nach Korrekturen |
 | `/aufraeumen` | Gedächtnis verdichten |

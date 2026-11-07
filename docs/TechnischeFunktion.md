@@ -53,7 +53,7 @@ Bootstrap, Chat-Schleife, Aktions-Steuerung, alle Slash-Befehle.
 | `--vollscan` / `_vollscan_befehl()` | **Vollscan** als eigener Prozess ohne Fenster (`NemiCLI.exe --vollscan`), gestartet von `/wache fullscan` nach Rückfrage. Das Terminal zeigt den Stand als Mini-Balken in der Statuszeile (alle 2 s aus `Wache/vollscan.json`) und meldet im Chat, wenn eine Stufe fertig ist; beim Start von NemiCLI wird ein laufender Vollscan wieder angezeigt. `/wache fullscan status · stop`. |
 | `_freigabe()` / `_buendel_freigabe()` | **Eine Freigabe für alle drei Abläufe** (Terminal, WebUI, Helfer): Modus → Lösch-Limit → Bündel → Vorschau/Frage nach Risikostufe → zweite Frage bei fremdem `befehl` → Protokoll. |
 
-**Slash-Befehle:** alle 55 stehen in `core/commands.py` (`COMMAND_LIST`, einzige Quelle für Menü und
+**Slash-Befehle:** alle stehen in `core/commands.py` (`COMMAND_LIST`, einzige Quelle für Menü und
 `/help`); `handle_line` verteilt sie. Übersicht in der README.
 
 ---
