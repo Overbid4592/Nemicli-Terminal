@@ -24,15 +24,15 @@
 
 NemiCLI is a self-built **AI agent for the Windows terminal**, written in Python. It supports **37 cloud chat providers**, local models through its **own GGUF engine**, and external local servers such as Ollama, LM Studio, Jan, llama.cpp and vLLM.
 
-It can read and write files, execute commands, research the web, assist with programming, understand and generate images, and monitor the PC. **Changes require user approval.** It includes configurable personalities, themes, a desktop window (`/gui`), and accessibility features for people with dyslexia.
+It can read and write files, execute commands, research the web, assist with programming, understand and generate images, and monitor the PC. **Actions follow the selected work mode and its safety checks; permitted Auto-mode actions may run without individual prompts.** It includes configurable personalities, themes, a desktop window (`/gui`), and accessibility features for people with dyslexia.
 
-The core is **pure Python — no Node.js, npm, llama.cpp, or transformers dependency for its own model engine**. Local language models, image understanding and memory use its GGUF engine; image generation uses a dedicated Krea 2 pipeline.
+The core is **pure Python — no Node.js, npm, llama.cpp, or transformers dependency for its own model engine**. Local language models, image understanding and memory use its GGUF engine; image generation uses Krea 2 and other dedicated image engines.
 
 > 💜 Started from one question: "How does a coding agent actually work?" NemiCLI's birthday is June 19, 2026. Its predecessor, Nemi V1/V2, dates back to March 2026.
 
 ### 🔢 Version history
 
-After 8.9, versions continued as 8.10–8.23; the project was renamed **9.23 Alpha** on October 26, 2026. Historical changelog entries keep their original version numbers. The [current public GitHub release](https://github.com/Overbid4592/Nemicli-Terminal/releases) is named **NemiCLI 9.24 Alpha**.
+After 8.9, versions continued as 8.10–8.23; the project was renamed **9.23 Alpha** on October 26, 2026. Historical changelog entries retain their original numbers. **Current development source (`main`): NemiCLI 9.47 Alpha** as of November 7, 2026. The **latest published release is still NemiCLI 9.24 Alpha**. The source branch and the downloadable release are not the same version.
 
 ---
 
@@ -44,7 +44,7 @@ For the complete, continually maintained German specification, see [docs/Funktio
 |---|---|
 | 🧠 **Custom GGUF engine** | Local inference inside the Python process with torch; supports Gemma 4, Qwen3.5/3.6 and MoE variants, Qwen3-Next/VL, Llama 3/4, Mistral, Phi, Granite 4, Nemotron-H, Falcon-H1, LFM2, DeepSeek and others. Quantization down to IQ1; RAM-offloaded MoE experts, speculative decoding, prefix caching and context management up to 128k depending on resources. |
 | 👁 **Vision** | Cloud, Ollama and the custom engine; an image describer can assist models that lack vision capabilities. |
-| 🧭 **Reasoning and verification** | Task difficulty estimation, multi-step reasoning, alternative solutions and a separate reviewer for difficult answers; checks model claims against actual tool results. |
+| 🧭 **Reasoning and verification** | Per-personality `/denken` settings, task difficulty estimation, alternative solutions and a separate reviewer for complex answers; compares claimed results with actual tool output. |
 | 🔊 **Voice** | Local Qwen3-TTS, personality-specific voices and read-aloud for text, Markdown and PDF. |
 | ☁ **Cloud models** | **37 chat providers**, including Anthropic, OpenAI, Google, Mistral, DeepSeek, xAI, Groq, Kimi, GLM, Qwen, MiniMax, OpenRouter and Ollama Cloud. Live model lists, search and DPAPI-protected keys on Windows. |
 | ⚙ **Agent tools** | File operations, PowerShell, web research, specialist sources, PDF, system information, schedules, helper agents and task lists. |
@@ -52,13 +52,13 @@ For the complete, continually maintained German specification, see [docs/Funktio
 | 🧪 **Sandbox** | Experimental code executes within a Windows AppContainer, isolated from personal files. |
 | 🛡 **System Watchdog** | Background security monitoring with detection rules, Sigma rule support, event logs, MITRE ATT&CK mappings, ML anomaly detection and shadow-mode learning. Designed to **complement, not replace, antivirus software**. |
 | 🌐 **Network Watchdog** | Investigates connection information and firewall alerts, with ML-based connection and sequence analysis; initially in shadow mode. |
-| 💾 **Memory** | Conversations, facts, skills and knowledge files; hybrid keyword/vector retrieval, optional GGUF reranker and conversation summarization. |
-| 🎨 **Images** | Krea 2 generation pipeline, character consistency, image series and comics, character LoRA, optional Forge/ComfyUI, plus **12 cloud image providers**. |
-| 🎬 **Video** | Local Wan 2.2 video pipeline with GGUF components, clips and character continuity; **6 cloud video provider integrations** and asynchronous cloud generation. |
+| 💾 **Memory** | Conversations, facts, lessons, skills, knowledge, hybrid keyword/vector retrieval, GGUF reranking, conversation compaction and memory archives. |
+| 🎨 **Images** | Own Krea 2 pipeline, **Z-Image, FLUX.2 (4B/9B), Qwen-Image, FLUX.1 and Chroma**, plus Forge/ComfyUI and cloud providers. Supports character files, consistent identities, series, comics and LoRA. |
+| 🎬 **Video** | Local Wan 2.2 GGUF pipeline **and LTX-2.5 with stereo audio**, plus configurable settings and cloud video integrations. |
 | 🗣 **Animated portraits** | LivePortrait-based animated talking portraits with voice. |
 | 🎭 **Personalities** | Gallery of nine predefined characters, editable traits, portraits and a stable character identity. |
 | 🎵 **Music** | Local ACE-Step 1.5 GGUF-based music creation, songwriting and covers, with a dedicated `/musik` interface. |
-| 🛍 **Appstore + NemiView** | HTML/CSS/JS apps rendered with NemiCLI's own interface engine. |
+| 🛍 **Appstore + NemiView** | HTML/CSS/JS apps rendered by NemiCLI's own engine, with templates and AI-assisted app debugging. |
 | 🎭 **Interface** | Terminal tabs, Textual interface, `/gui` desktop app, web UI, floating desktop companion, Chrome extension and Windows right-click integration. |
 | 🔒 **Approvals and recovery** | Before/after review with **F8 to approve**, risk levels, trash/undo, limits on deletion, protected system paths, skill checking, action logs, SHA-256 backups and daily automatic backups. |
 
@@ -72,7 +72,11 @@ Features listed here reflect the project's documentation and may be experimental
 
 **Option 2 — Windows setup EXE:** Download `NemicliPublish.exe` from the [releases](https://github.com/Overbid4592/Nemicli-Terminal/releases), along with `NemicliPublish.sha256.txt` to verify the download. The currently published alpha asset is an `.exe`, not an `.msi` file. Models are not bundled; configure a cloud API key, an external local server or GGUF models using `/einrichten`.
 
-**Option 3 — source code:** Use the repository's Python entry point `main.py`, dependencies in `requirements.txt`, and follow the setup instructions in the [German README](README.md). Command names in NemiCLI intentionally remain German.
+**Option 3 — source code:** Create a virtual environment, install dependencies from `requirements.txt`, then run `main.py`. The tested Python target is 3.14; an appropriate torch build is installed separately for GPU support. The command names intentionally remain German.
+
+**Option 4 — build your own installer:** `python build_exe.py` creates `dist/NemiCLI/` with `NemiCLI.exe`, `NemiCLIc.exe` and `NemiCLIT2/`, plus `NemiCLI-Setup-<Build>.exe` and a SHA-256 checksum. `python build_exe.py --msi` additionally creates an MSI. The optional in-house `CN=NemiCLI` signature is not commercially trusted.
+
+**Data folder:** Use `/start` to select where chat history, generated images and learned information are stored. A folder change copies data instead of deleting it. If the selected folder becomes inaccessible, NemiCLI reports it rather than silently starting with empty memory.
 
 ---
 
