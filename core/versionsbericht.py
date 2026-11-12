@@ -13,6 +13,16 @@ ANZAHL = 6                       # so viele Versionen zeigt der Bericht
 
 # (Version, Titel, Text) – neueste zuerst
 EINTRAEGE: list[tuple[str, str, str]] = [
+    ("9.66", "Sicherer: neue Pakete und strengere Prüfung",
+     "Pillow, pypdf und weitere Pakete hatten bekannte Sicherheitslücken; jetzt sind die behobenen Fassungen "
+     "drin. NemiView rechnet CSS ohne eval, XML mit DTD wird abgelehnt, und Ollama, ComfyUI oder SD-WebUI auf "
+     "einem anderen Rechner sprichst du nur noch verschlüsselt (https) an. Eine eigene Sicherheitsprüfung "
+     "läuft ab jetzt bei jeder Testreihe mit."),
+    ("9.65", "Die Kugel bleibt weg, solange das Terminal offen ist",
+     "Hing das Terminal kurz (langsame Platte, knapper Arbeitsspeicher), hielt die Kugel es für geschlossen und "
+     "kam herein. Jetzt zählt, ob der NemiCLI-Prozess noch lebt; erst wenn er wirklich zu ist, erscheint sie. "
+     "Die Chrome-Erweiterung hat eine feste ID, und NemiCLI antwortet nur noch ihr: Wer eine ältere Fassung "
+     "geladen hat, entfernt sie einmal unter chrome://extensions, lädt sie neu und trägt Port und Schlüssel ein."),
     ("9.64", "Ein Wecker für dich selbst",
      "erinnern kann jetzt mehr. Mit fuer: \"selbst\" stellst du dir einen eigenen Wecker: Zur Zeit bekommst du den "
      "text als Nachricht und arbeitest ihn ab (z. B. ein Bild malen, auf einer Seite nachsehen und berichten) – "

@@ -107,12 +107,52 @@ def _calc(ausdruck, bezug, fs, ctx):
         elif t in "+-*/()":
             text.append(t)
     try:
-        code = "".join(text)
-        if not re.fullmatch(r"[\d.e+\-*/() ]*", code):
-            return None
-        return float(eval(code, {"__builtins__": {}}, {}))          # nur Zahlen und + - * / ( )
-    except Exception:
+        return _rechnen(text)
+    except (ValueError, ZeroDivisionError, OverflowError, IndexError):
         return None
+
+
+def _rechnen(teile: list[str]) -> float:
+    """Rechnet + - * / und Klammern über fertige Zahlen aus (ohne eval). Fehler -> ValueError."""
+    pos = 0
+
+    def nimm() -> str:
+        nonlocal pos
+        pos += 1
+        return teile[pos - 1]
+
+    def faktor(tiefe: int) -> float:
+        if tiefe > 32:
+            raise ValueError("zu tief verschachtelt")
+        t = nimm()
+        if t in "+-" and t:
+            v = faktor(tiefe + 1)
+            return -v if t == "-" else v
+        if t == "(":
+            v = summe(tiefe + 1)
+            if nimm() != ")":
+                raise ValueError("Klammer fehlt")
+            return v
+        return float(t)
+
+    def produkt(tiefe: int) -> float:
+        v = faktor(tiefe)
+        while pos < len(teile) and teile[pos] in ("*", "/"):
+            v = v * faktor(tiefe) if nimm() == "*" else v / faktor(tiefe)
+        return v
+
+    def summe(tiefe: int) -> float:
+        v = produkt(tiefe)
+        while pos < len(teile) and teile[pos] in ("+", "-"):
+            v = v + produkt(tiefe) if nimm() == "+" else v - produkt(tiefe)
+        return v
+
+    if not teile:
+        raise ValueError("leer")
+    v = summe(0)
+    if pos != len(teile):
+        raise ValueError("Rest übrig")
+    return v
 
 
 def schrift_von(s: dict, eltern_fs: float, ctx: Ctx) -> dict:

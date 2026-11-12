@@ -34,7 +34,7 @@ _PUNKTE = sorted("""
 """.split(), key=len, reverse=True)
 _ESCAPE = {"n": "\n", "t": "\t", "r": "\r", "b": "\b", "f": "\f", "v": "\v", "0": "\0"}
 _ZAHL = re.compile(r"0[xX][0-9a-fA-F_]+|0[bB][01_]+|0[oO][0-7_]+|(?:\d[\d_]*\.?[\d_]*|\.\d[\d_]*)(?:[eE][+-]?\d+)?")
-_NAME = re.compile(r"[A-Za-z_$À-￿][\w$À-￿]*")
+_NAME = re.compile(r"[A-Za-z_$\u00c0-\uffff][\w$\u00c0-\uffff]*")
 
 
 class Tok:
