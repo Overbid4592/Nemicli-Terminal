@@ -12,7 +12,7 @@
 
 **Your own AI agent in the terminal — cloud and local, with tools, memory, and heart.** ✦
 
-**Developed by D. Hoffmann (Vibecoder) · built with Claude Opus 5.5 (Anthropic)**
+**Developed by D. Hoffmann (Vibecoder) · built with Claude Opus 5.5 (Anthropic) · Ideas & planning: Roxie – ChatGPT (OpenAI)**
 
 [Deutsch](README.md) · [Releases](https://github.com/Overbid4592/Nemicli-Terminal/releases)
 
@@ -463,6 +463,16 @@ With **16 GB RAM and 16 GB VRAM**, basic chat can work if the model fits on the 
 | [SECURITY.md](SECURITY.md) | How to report security vulnerabilities |
 | [chrome-erweiterung/LIESMICH.md](chrome-erweiterung/LIESMICH.md) | Chrome extension setup (German) |
 | `docs/Plan_*.md` and `docs/idee*.md` | Plans and ideas (German) |
+
+---
+
+## 🤝 Contributors
+
+| Who | Role |
+|---|---|
+| D. Hoffmann | Development, idea, vibecoding |
+| Claude Opus 5.5 (Anthropic) | Code (Claude Code) |
+| Roxie – ChatGPT (OpenAI) | Ideas & planning |
 
 ---
 
