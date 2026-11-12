@@ -107,7 +107,7 @@ _DANKE_ANTWORT = ["Gern geschehen! 💜", "Sehr gerne! 😊", "Immer doch! ✨"]
 # ---------------------------------------------------------------------------------------------------------------
 # Vorgaben
 # ---------------------------------------------------------------------------------------------------------------
-_EMOJI = re.compile("[\U0001F300-\U0001FAFF☀-➿⭐⬆⏳⌚⌨️‍\U0001F1E6-\U0001F1FF]+")
+_EMOJI = re.compile(r"[\U0001F300-\U0001FAFF\u2600-\u27bf\u2b50\u2b06\u23f3\u231a\u2328\ufe0f\u200d\U0001F1E6-\U0001F1FF]+")
 
 # du → Sie: ganze Wendungen zuerst, dann Wortformen. Sätze, die danach noch ein Du enthalten, fallen weg.
 _SATZANFANG = r"(?:^|(?<=[.!?:–]\s))"
