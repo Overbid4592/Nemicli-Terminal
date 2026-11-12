@@ -28,14 +28,14 @@ programmieren, Bilder ansehen und malen, den PC bewachen. Verändernde Schritte 
 Dazu eine Oberfläche mit Persönlichkeit (Nemi oder deine eigene), Themes, ein ruhiges Desktop-Fenster
 (`/gui`).
 
-**Reines Python – kein Node.js, kein npm, kein llama.cpp, kein transformers.** Lokale Sprachmodelle,
+**Reines Python – kein Node.js, kein npm, kein transformers; llama.cpp nur optional als festgenagelte Reserve.** Lokale Sprachmodelle,
 Bildbeschreiber und Gedächtnis laufen im eigenen GGUF-Motor, Bilder malt die eigene Krea-2-Pipeline.
 
 > Entstanden aus Neugier: „Wie funktioniert eigentlich so ein Coding-Agent?" 💜
 >
 > 🎂 **Geburtstag: 19. Juni 2026.** An diesem Morgen kam die Frage, woraus Claude Code besteht – zwei Stunden später lief der erste Chat. Vorläufer war Nemi (V1/V2, Desktop- und Android-Apps) ab März 2026. `/version` zeigt das Alter.
 
-### 🔢 Aktuelle Version: 9.64 Alpha – und ein kleiner Zählfehler
+### 🔢 Aktuelle Version: 9.65 Alpha – und ein kleiner Zählfehler
 
 Ehrlich gesagt: Wir haben uns verzählt. 😅 Nach **8.9** haben wir einfach mit **8.10, 8.11 … 8.23**
 weitergemacht – und dabei vergessen, dass vorne irgendwann die **9** dran ist. Eine Version 9 gab es
@@ -544,7 +544,7 @@ Was mit **16 GB RAM + 16 GB VRAM** geht:
 
 ## 🗺 Roadmap
 
-- [x] Eigener GGUF-Motor statt llama.cpp – mit Sehen, MoE, allen gängigen Formaten
+- [x] Eigener GGUF-Motor als Hauptmotor (llama.cpp nur optionale Reserve) – mit Sehen, MoE, allen gängigen Formaten
 - [x] Windows Installer `NemiCLI-<Build>.msi`: ohne Admin, Startmenü, Deinstallieren unter Apps
 - [x] Echte Sandbox für Code der KI (Windows-AppContainer)
 - [x] Desktop-Fenster `/gui`, Skills mit Wächter und geschlossener Lern-Schleife, Coding-Assistent mit Todo-Liste
