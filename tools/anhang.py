@@ -284,6 +284,8 @@ def _xml(z, name: str):
         roh = f.read(MAX_XML_BYTES + 1)            # nicht der Größenangabe im Paket trauen
     if len(roh) > MAX_XML_BYTES:
         raise RuntimeError(f"{name} ist entpackt größer als {_mb(MAX_XML_BYTES)}")
+    if b"<!DOCTYPE" in roh or b"<!ENTITY" in roh:  # Office-XML hat keine DTD; schließt Entitäts-Angriffe aus
+        raise RuntimeError(f"{name} enthält eine DTD und wird nicht gelesen")
     return ET.fromstring(roh)
 
 

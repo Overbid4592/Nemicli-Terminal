@@ -66,7 +66,7 @@ def dienstname(name: str) -> str:
 
 
 def eintrag_id(art: str, identitaet: str) -> str:
-    return hashlib.sha1(f"{art}::{identitaet.lower()}".encode("utf-8", "replace")).hexdigest()[:16]
+    return hashlib.sha1(f"{art}::{identitaet.lower()}".encode("utf-8", "replace"), usedforsecurity=False).hexdigest()[:16]
 
 
 class Eintrag:

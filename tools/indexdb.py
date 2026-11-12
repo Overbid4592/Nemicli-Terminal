@@ -272,7 +272,7 @@ def _datum_nachtragen(con: sqlite3.Connection) -> None:
 
 
 def _hash(kind: str, ref: str, text: str) -> str:
-    return hashlib.sha1(f"{kind}\n{ref}\n{text}".encode("utf-8")).hexdigest()[:20]
+    return hashlib.sha1(f"{kind}\n{ref}\n{text}".encode("utf-8"), usedforsecurity=False).hexdigest()[:20]
 
 
 _SATZENDE = re.compile(r"(?<=[.!?…])\s+")

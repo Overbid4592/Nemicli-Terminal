@@ -26,6 +26,7 @@ Ein-/Ausschalten in NemiCLI: /kontextmenue an · aus
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 import time
@@ -193,11 +194,28 @@ INBOX_DATEI = INSTALL / ".nemicli.inbox"       # Nachricht fürs laufende NemiCL
 ALIVE_MAX_S = 6.0                           # älter -> NemiCLI läuft nicht (mehr)
 
 
+def lebenszeichen_schreiben() -> None:
+    """Lebenszeichen des laufenden Fensters: Zeit und Prozessnummer."""
+    ALIVE_DATEI.write_text(f"{time.time()} {os.getpid()}", encoding="utf-8")
+
+
 def nemicli_laeuft() -> bool:
-    """Läuft gerade ein NemiCLI-Fenster? (Lebenszeichen jünger als ALIVE_MAX_S)"""
+    """Läuft gerade ein NemiCLI-Fenster?
+
+    Frisches Lebenszeichen (jünger als ALIVE_MAX_S) genügt. Ist es älter, hängt das Fenster vielleicht nur
+    (Laden, langsame Platte): Dann zählt, ob der Prozess aus dem Lebenszeichen noch lebt. Seine Startzeit
+    muss vor dem Lebenszeichen liegen, sonst gehört die Nummer inzwischen einem anderen Prozess."""
     try:
-        return time.time() - ALIVE_DATEI.stat().st_mtime < ALIVE_MAX_S
+        stand = ALIVE_DATEI.stat()
     except OSError:
+        return False
+    if time.time() - stand.st_mtime < ALIVE_MAX_S:
+        return True
+    try:
+        import psutil
+        teile = ALIVE_DATEI.read_text(encoding="utf-8").split()
+        return psutil.Process(int(teile[1])).create_time() <= stand.st_mtime
+    except Exception:
         return False
 
 

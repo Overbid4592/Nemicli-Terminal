@@ -50,6 +50,8 @@ def _arxiv(q: str, n: int) -> list[dict]:
     r = _get("https://export.arxiv.org/api/query",
              {"search_query": f"all:{q}", "start": 0, "max_results": n, "sortBy": "relevance"})
     raus = []
+    if b"<!DOCTYPE" in r.content or b"<!ENTITY" in r.content:   # Atom hat keine DTD; schließt Entitäts-Angriffe aus
+        return raus
     for e in ET.fromstring(r.content).findall("a:entry", _ATOM):
         def feld(name: str) -> str:
             return (e.findtext(f"a:{name}", "", _ATOM) or "").strip()

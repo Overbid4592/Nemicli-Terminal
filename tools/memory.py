@@ -70,7 +70,7 @@ KERN_ARTEN = ("vorliebe", "lektion")
 KERN_MAX_ZEICHEN = 2000
 MAX_NOTIZ = 800           # länger ist keine Notiz mehr, sondern ein Dokument
 MAX_ARCHIV = 500          # ersetzte/vergessene Einträge, die aufgehoben werden
-_UNSICHTBAR = re.compile("[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
+_UNSICHTBAR = re.compile(r"[\u200b-\u200f\u202a-\u202e\u2060-\u2064\ufeff]")
 letzter_grund = ""        # warum die letzte Notiz abgelehnt wurde (für das Werkzeug)
 
 

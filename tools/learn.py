@@ -68,7 +68,7 @@ def save_snippet(title: str, code: str, chat_id: int | None = None) -> Path:
     _ensure()
     code = code.strip()
     # kurzer Inhalts-Hash sorgt für Dedup: identischer Code überschreibt sich selbst
-    digest = hashlib.sha1(code.encode("utf-8")).hexdigest()[:6]
+    digest = hashlib.sha1(code.encode("utf-8"), usedforsecurity=False).hexdigest()[:6]
     path = SNIPPETS_DIR / f"{_slug(title)}-{digest}.py"
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     quelle = f" · Chat #{chat_id}" if chat_id else ""
