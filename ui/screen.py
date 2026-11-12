@@ -111,7 +111,7 @@ _MAX_LINES = 6000          # Verlauf im Speicher kappen
 # verschieden breit; das verschiebt Zeilen und hinterlässt Geister-Zeichen. Darum geht
 # alles in der nackten Form auf den Bildschirm (Flaggen fängt _mark_dirty ab).
 _VS_KEYCAP = re.compile("[︎️⃣]")
-_SKIN = re.compile("[\U0001F3FB-\U0001F3FF]")
+_SKIN = re.compile(r"[\U0001f3fb-\U0001f3ff]")
 _ZWJ_TAIL = re.compile("‍.")
 
 

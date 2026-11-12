@@ -1492,7 +1492,7 @@ def musik_karte(pfad, titel: str | None = None, info: str = ""):
             sek = w.getnframes() / max(1, w.getframerate())
     except Exception:
         sek = 0.0
-    kennung = hashlib.sha1(str(pfad).encode("utf-8")).hexdigest()[:10]
+    kennung = hashlib.sha1(str(pfad).encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
     MUSIK_KARTEN[kennung] = str(pfad)
     farbe = persona_farbe()
     knoepfe = Text(no_wrap=True, overflow="crop")

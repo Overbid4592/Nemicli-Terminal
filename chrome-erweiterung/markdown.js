@@ -1,5 +1,5 @@
 // Kleiner Markdown-Leser für die Seitenleiste. Alles wird erst maskiert, dann gezielt
-// formatiert – so landet nie fremdes HTML im Fenster. Links nur http(s).
+// formatiert – so landet nie fremdes HTML im Fenster. Klickbar sind nur https-Links.
 
 const NemiMarkdown = (() => {
   const esc = (s) => s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;").replace(/"/g, "&quot;");
@@ -8,7 +8,7 @@ const NemiMarkdown = (() => {
     return s.split(/(`[^`\n]+`)/).map((teil, i) => {
       if (i % 2 === 1) return "<code>" + esc(teil.slice(1, -1)) + "</code>";
       return esc(teil)
-        .replace(/\[([^\]]+)\]\((https?:\/\/[^\s)"]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
+        .replace(/\[([^\]]+)\]\((https:\/\/[^\s)"]+)\)/g, '<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>')
         .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
         .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<em>$2</em>")
         .replace(/~~([^~]+)~~/g, "<del>$1</del>");

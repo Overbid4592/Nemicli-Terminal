@@ -12,7 +12,7 @@
 
 **Dein eigener KI-Agent im Terminal – Cloud & lokal, mit Werkzeugen, Gedächtnis und Herz.** ✦
 
-**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5.5 (Anthropic) · Ideen & Planung: Roxie – ChatGPT (OpenAI)**
+**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5.5 (Anthropic)**
 
 </div>
 
@@ -28,14 +28,15 @@ programmieren, Bilder ansehen und malen, den PC bewachen. Verändernde Schritte 
 Dazu eine Oberfläche mit Persönlichkeit (Nemi oder deine eigene), Themes, ein ruhiges Desktop-Fenster
 (`/gui`).
 
-**Reines Python – kein Node.js, kein npm, kein transformers; llama.cpp nur optional als festgenagelte Reserve.** Lokale Sprachmodelle,
-Bildbeschreiber und Gedächtnis laufen im eigenen GGUF-Motor, Bilder malt die eigene Krea-2-Pipeline.
+**Reines Python – kein Node.js, kein npm, kein transformers.** Lokale Sprachmodelle,
+Bildbeschreiber und Gedächtnis laufen im eigenen GGUF-Motor (llama.cpp nur auf Wunsch als festgenagelte
+Reserve), Bilder malt die eigene Krea-2-Pipeline.
 
 > Entstanden aus Neugier: „Wie funktioniert eigentlich so ein Coding-Agent?" 💜
 >
 > 🎂 **Geburtstag: 19. Juni 2026.** An diesem Morgen kam die Frage, woraus Claude Code besteht – zwei Stunden später lief der erste Chat. Vorläufer war Nemi (V1/V2, Desktop- und Android-Apps) ab März 2026. `/version` zeigt das Alter.
 
-### 🔢 Aktuelle Version: 9.65 Alpha – und ein kleiner Zählfehler
+### 🔢 Aktuelle Version: 9.66 Alpha – und ein kleiner Zählfehler
 
 Ehrlich gesagt: Wir haben uns verzählt. 😅 Nach **8.9** haben wir einfach mit **8.10, 8.11 … 8.23**
 weitergemacht – und dabei vergessen, dass vorne irgendwann die **9** dran ist. Eine Version 9 gab es
@@ -43,7 +44,7 @@ deshalb nie, obwohl seit 8.9 vierzehn große Pakete dazukamen (Appstore mit eige
 37 Cloud-Anbieter, Desktop-Kugel, die von sich aus schreibt, und vieles mehr).
 
 Am 26. Oktober 2026 ist es uns aufgefallen – ausgerechnet beim Blick auf den GitHub-Stand, auf dem
-noch 8.9 steht. Seitdem heißt NemiCLI **9.23 Alpha**: vorne die nachgeholte 9, hinten zählen die Pakete
+noch 8.9 steht. Damals wurde daraus **9.23 Alpha**: vorne die nachgeholte 9, hinten zählen die Pakete
 weiter wie bisher. Die Build-Nummer (Anzahl der Commits) lief die ganze Zeit sauber weiter, und das
 Setup erkennt 9.23 richtig als neuer als 8.23 – passiert ist also nichts, nur die Zahl vorne war
 eingeschlafen. Im [CHANGELOG](CHANGELOG.md) behalten ältere Einträge ihre damalige Nummer.
@@ -160,7 +161,7 @@ Text-Encoder, Tokenizer und Mini-VAE dürfen einmal geteilt oben in `VideoGen/` 
 
 ```
 VideoGen/
-├─ WAN-Turbo/                        schnell: 4 Schritte (empfohlen zum Start)
+├─ WAN-Turbo/                        schnell: 4 Schritte
 │  ├─ Wan2_2-TI2V-5B-Turbo-Q4_K_M.gguf
 │  └─ Wan2.2_VAE.safetensors
 ├─ WAN-GGUF/                         normal: 30 Schritte
@@ -190,7 +191,7 @@ VideoGen/
 | `taew2_2.safetensors` | ebenda | 22.848.048 | `b84609b2a133d48434bd9636bfcb44bf05168dc436e2d3cecf26256faa1f5325` |
 
 Alle Video-Modelle stehen unter Apache 2.0, die Mini-VAE unter MIT. Ohne `tae/` packt die große VAE aus
-(langsamer, gleiches Bild). Wer nur ein Modell will, nimmt `WAN-Turbo` + Text-Encoder + Tokenizer.
+(langsamer, gleiches Bild). Für ein einzelnes Modell reichen sein Ordner, Text-Encoder und Tokenizer.
 
 ### 🎬 SD-Video: Bewegungs-Module selbst laden
 
@@ -278,8 +279,8 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | Befehl | Was es tut |
 |---|---|
 | `/bild [prompt\|schritte]` | Bild malen (Krea 2, WebUI oder ComfyUI) · Krea-Schritte 8–16 |
-| `/video <beschreibung> [--sekunden 10] [--start bild.png] [--figur]` | 🎬 Video mit dem eigenen Motor: 704×1024 hochkant (Seitenverhältnis wie Krea 2), 24 Bilder/s, Clips à 5 s bis 20 s · 🎞 mit LTX-2.5 auch mit Ton |
-| `/video modell [name]` · `/video einstellungen [name wert]` | 🎞 Video-Modell wählen (Wan 2.2 oder LTX-2.5) · Einstellungen der Video-Motoren mit AUTO |
+| `/video <beschreibung> [--sekunden 10] [--start bild.png] [--figur]` | 🎬 Video mit dem eigenen Motor, Clips bis 20 s: Wan 2.2 (704×1024 hochkant, 24 Bilder/s) · 🎞 LTX-2.5 auch mit Ton · SD-Video (Stable Diffusion 1.5/SDXL, 8 Bilder/s, `--figur` mit der Figur der Persönlichkeit) |
+| `/video modell [name]` · `/video einstellungen [name wert]` | 🎞 Video-Modell wählen (Wan 2.2, LTX-2.5 oder SD-Video) · Einstellungen der Video-Motoren mit AUTO |
 | `/charaktere` | 🎭 Charakter-Galerie: Vorlagen ansehen und übernehmen, eigene erschaffen (Geschlecht, Alter ab 18, bis zu 8 Eigenschaften), ✨ von der KI verbessern lassen, „Meinen Charakter verbessern“ für die aktive Persönlichkeit |
 | `/lora` | 🧬 LoRA-Werkstatt: Bilder hineinziehen, prüfen (doppelt, unscharf, Gesichter), auswählen, eine Bild-LoRA für Krea 2 trainieren (Prozent, Schritt, Restzeit, ⏸ Pause), Probebilder bei Stärke 0,6 · 0,8 · 1,0; an einen Charakter gebunden (SHA-256) kommt sie bei jedem Selbstbild zu seinem Kern dazu, im Prompt `[name] was passiert` |
 | `/musik` | 🎵 Musik-Fenster: Wunsch eintippen, ✨ Ausarbeiten (Stil, Liedtext, Tempo), 🎵 Komponieren, 🎙 Als Cover – oder einfach der KI sagen, welchen Song sie machen soll |
@@ -402,6 +403,13 @@ schließen · `Strg+Bild ↑/↓` wechseln · `Strg+Umschalt+K` Reiter „🤖 K
 - **API-Keys** verschlüsselt in `.env` (Windows-DPAPI). **exe signiert** (`CN=NemiCLI`) mit SHA-256-Prüfsummen.
 - **Modelldateien** werden gehärtet gelesen: jede Zahl geprüft, das Chat-Template der Datei nie ausgeführt.
 - **Persönlichkeiten sind nur Prompt-Text** – der Schutz sitzt im Code und gilt für jede.
+- **Geprüft vor jeder Veröffentlichung:** die ganze Testreihe (über 3.300 Tests, auf Windows 11 Pro) mit
+  eigener Sicherheitsprüfung (`tests/test_sicherheit_statisch.py`: kein `eval`, kein `shell=True`, kein
+  `pickle`, TLS-Prüfung an, SQL nur mit Platzhaltern, `http` nur zum eigenen Rechner, klickbar nur `https`,
+  keine eingecheckten Schlüssel …), dazu bandit und pip-audit (Pakete ohne bekannte Lücken). Der letzte
+  Bericht: [docs/Sicherheitspruefung_2026-11-12.md](docs/Sicherheitspruefung_2026-11-12.md).
+
+Testen selbst: `python -m unittest discover -s tests -p "test_*.py"` (mit `PYTHONIOENCODING=utf-8`).
 
 Sicherheitslücken bitte privat melden: [SECURITY.md](SECURITY.md).
 
@@ -432,7 +440,7 @@ NemiCli/
 ├─ Models/embeddings/     Embedding-Modell fürs Gedächtnis                (nicht in Git)
 ├─ chrome-erweiterung/    Chrome-Erweiterung (LIESMICH.md)
 ├─ installer/             Setup-Programm (NemiCLI-Setup-<Build>.exe), wahlweise MSI-Bau
-├─ tests/                 Offline-Tests (nicht im Repository)
+├─ tests/                 Offline-Tests und Sicherheitsprüfung
 ├─ docs/                  Funktionen, Technik, Modelltests, Pläne, Ideen
 ├─ build_exe.py · NemiCLI.spec · zertifikat.py
 ├─ nemicli.config.json · .env            Einstellungen · Schlüssel (verschlüsselt)
@@ -454,7 +462,7 @@ Start selbst an, sie stehen nicht im Repository:
 ├─ Bilder/                gemalte Bilder, Screenshots
 ├─ Models/Krea2/          Dateien für Krea 2
 ├─ Models/Bildmodelle/    weitere Bild-Modelle (Z-Image …), je Modell ein Unterordner
-├─ Models/Videomodelle/   Video-Modelle mit Ton (LTX-2.5 …), je Modell ein Unterordner
+├─ Models/Videomodelle/   Video-Modelle (LTX-2.5, SD-Video), je Modell ein Unterordner
 ├─ Wache/ · Berichte/     Systemwache · Berichte von Wache und Zeitplan
 ├─ Zeitplan/ · Befehle/   Aufträge für die Aufgabenplanung · Hilfs-Skripte
 ├─ NemiSandbox/           Sandbox: Lauf-Ordner und Pakete
@@ -537,6 +545,7 @@ Was mit **16 GB RAM + 16 GB VRAM** geht:
 | [docs/Modelltests.md](docs/Modelltests.md) | welche lokalen Modelle taugen |
 | [CHANGELOG.md](CHANGELOG.md) | Tagebuch aller Änderungen |
 | [SECURITY.md](SECURITY.md) | Sicherheitslücken melden |
+| [docs/Sicherheitspruefung_2026-11-12.md](docs/Sicherheitspruefung_2026-11-12.md) | Test- und Sicherheitsprüfung: wie getestet wurde, Ergebnisse, Funde |
 | [chrome-erweiterung/LIESMICH.md](chrome-erweiterung/LIESMICH.md) | Chrome-Erweiterung einrichten |
 | `docs/Plan_*.md` · `docs/idee*.md` | Pläne und Ideen |
 
@@ -544,7 +553,7 @@ Was mit **16 GB RAM + 16 GB VRAM** geht:
 
 ## 🗺 Roadmap
 
-- [x] Eigener GGUF-Motor als Hauptmotor (llama.cpp nur optionale Reserve) – mit Sehen, MoE, allen gängigen Formaten
+- [x] Eigener GGUF-Motor statt llama.cpp – mit Sehen, MoE, allen gängigen Formaten
 - [x] Windows Installer `NemiCLI-<Build>.msi`: ohne Admin, Startmenü, Deinstallieren unter Apps
 - [x] Echte Sandbox für Code der KI (Windows-AppContainer)
 - [x] Desktop-Fenster `/gui`, Skills mit Wächter und geschlossener Lern-Schleife, Coding-Assistent mit Todo-Liste
@@ -561,16 +570,6 @@ Was mit **16 GB RAM + 16 GB VRAM** geht:
 - [x] Lizenz festgelegt: GPL-3.0 (Liebesprojekt – nie zum Verkauf)
 - [ ] Signatur mit einem anerkannten Zertifikat, wenn NemiCLI an andere geht
 - [ ] Build beim Bitdefender-Falsch-Positiv-Formular einreichen
-
----
-
-## 🤝 Mitgewirkt
-
-| Wer | Rolle |
-|---|---|
-| D. Hoffmann | Entwicklung, Idee, Vibecoding |
-| Claude Opus 5.5 (Anthropic) | Code (Claude Code) |
-| Roxie – ChatGPT (OpenAI) | Ideen & Planung |
 
 ---
 

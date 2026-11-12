@@ -12,7 +12,7 @@
 
 **Your own AI agent in the terminal — cloud and local, with tools, memory, and heart.** ✦
 
-**Developed by D. Hoffmann (Vibecoder) · built with Claude Opus 5.5 (Anthropic) · Ideas & planning: Roxie – ChatGPT (OpenAI)**
+**Developed by D. Hoffmann (Vibecoder) · built with Claude Opus 5.5 (Anthropic)**
 
 [Deutsch](README.md) · [Releases](https://github.com/Overbid4592/Nemicli-Terminal/releases)
 
@@ -30,11 +30,11 @@ The core is **pure Python — no Node.js, npm, llama.cpp, or transformers depend
 
 > 💜 Started from one question: "How does a coding agent actually work?" NemiCLI's birthday is June 19, 2026. Its predecessor, Nemi V1/V2, dates back to March 2026.
 
-### 🔢 Current version: 9.64 Alpha — and a numbering slip
+### 🔢 Current version: 9.66 Alpha — and a numbering slip
 
 After 8.9, development continued as 8.10 through 8.23. The major version digit was not incremented, even though fourteen substantial feature packages had been added. This was corrected on October 26, 2026, when that development line became **9.23 Alpha**. Build counts and installer version comparisons were unaffected; historical versions remain as originally recorded in [CHANGELOG.md](CHANGELOG.md).
 
-**Current development source (`main`): NemiCLI 9.64 Alpha (November 12, 2026).** Published installers may have a different version; check [GitHub Releases](https://github.com/Overbid4592/Nemicli-Terminal/releases) for actual downloads and checksums.
+**Current development source (`main`): NemiCLI 9.66 Alpha (November 12, 2026).** Published installers may have a different version; check [GitHub Releases](https://github.com/Overbid4592/Nemicli-Terminal/releases) for actual downloads and checksums.
 
 ---
 
@@ -463,16 +463,6 @@ With **16 GB RAM and 16 GB VRAM**, basic chat can work if the model fits on the 
 | [SECURITY.md](SECURITY.md) | How to report security vulnerabilities |
 | [chrome-erweiterung/LIESMICH.md](chrome-erweiterung/LIESMICH.md) | Chrome extension setup (German) |
 | `docs/Plan_*.md` and `docs/idee*.md` | Plans and ideas (German) |
-
----
-
-## 🤝 Contributors
-
-| Who | Role |
-|---|---|
-| D. Hoffmann | Development, idea, vibecoding |
-| Claude Opus 5.5 (Anthropic) | Code (Claude Code) |
-| Roxie – ChatGPT (OpenAI) | Ideas & planning |
 
 ---
 

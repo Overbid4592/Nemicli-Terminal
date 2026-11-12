@@ -64,6 +64,7 @@ eingabe_win.einschalten()           # Emojis über Alt+Ziffernblock nicht verlie
 
 SCROLL_ZEILEN = 4             # Zeilen je Mausrad-Raste (Textual-Vorgabe: 2)
 SPEICHER_BLITZ_S = 1.5        # so lange leuchtet der 100k-Balken nach einer Änderung auf
+_ALIVE_SPERRE = threading.Lock()   # Lebenszeichen schreiben und beim Ende löschen nicht gleichzeitig
 
 
 def _scroll_zeilen() -> int:
@@ -158,7 +159,7 @@ _UEBERHANG = _ueberhang_muster()
 _UEBERHANG_LUECKE = re.compile("(" + _UEBERHANG.pattern + ") ")     # beim Kopieren wieder heraus
 
 
-_PLATZHALTER = re.compile("[\ue000-\ue1ff]")              # Bildstellen der Startseite (terminal_fenster)
+_PLATZHALTER = re.compile(r"[\ue000-\ue1ff]")              # Bildstellen der Startseite (terminal_fenster)
 
 
 def ueberhang(text: str) -> str:
@@ -2396,6 +2397,8 @@ class Screen:
     # -- Lebenszeichen & Briefkasten (Rechtsklick-Menü -> offenes Fenster) ------
     _alive_stamp = 0.0
     _inbox_stamp = 0.0
+    _alive_laeuft = False
+    _alive_ende = False
 
     def _lebenszeichen(self) -> None:
         """Alle 2 s .nemicli.alive anfassen; jede Sekunde .nemicli.inbox prüfen."""
@@ -2404,12 +2407,12 @@ class Screen:
             import kontextmenue as K
         except Exception:
             return
-        if now - self._alive_stamp >= 2.0:
+        if now - self._alive_stamp >= 2.0 and not self._alive_laeuft:
+            # Eigener Faden: eine langsame Platte hält so die Oberfläche nicht an.
             self._alive_stamp = now
-            try:
-                K.ALIVE_DATEI.write_text(str(time.time()), encoding="utf-8")
-            except OSError:
-                pass
+            self._alive_laeuft = True
+            threading.Thread(target=self._lebenszeichen_schreiben, args=(K,), daemon=True,
+                             name="lebenszeichen").start()
         if now - self._wecker_stamp >= 5.0:
             self._wecker_stamp = now
             self._erinnerungen_pruefen()
@@ -2435,12 +2438,27 @@ class Screen:
             self._input.load_text(text)
             self._submit()
 
+    def _lebenszeichen_schreiben(self, K) -> None:
+        try:
+            with _ALIVE_SPERRE:
+                if not self._alive_ende:            # nach dem Ende nicht wieder anlegen
+                    K.lebenszeichen_schreiben()
+        except OSError:
+            pass
+        finally:
+            self._alive_laeuft = False
+
     def _lebenszeichen_ende(self) -> None:
+        gesperrt = _ALIVE_SPERRE.acquire(timeout=3.0)
+        self._alive_ende = True
         try:
             import kontextmenue as K
             K.ALIVE_DATEI.unlink()
         except Exception:
             pass
+        finally:
+            if gesperrt:
+                _ALIVE_SPERRE.release()
 
     def _submit_start_text(self) -> None:
         """--sag: Text ins Eingabefeld und abschicken, sobald die Oberfläche steht."""

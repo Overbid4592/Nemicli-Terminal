@@ -56,7 +56,7 @@ class InstallerDatenschutz(unittest.TestCase):
                 z.writestr("NemiCLI.exe", b"dummy")
                 z.writestr("NemiCLIT2/build.txt", "test")
                 z.writestr("chats/verlauf.db", b"ersetzt")
-            with self.assertRaisesRegex(ValueError, "Unzulaessige Paketbestandteile"):
+            with self.assertRaisesRegex(ValueError, "mehr als Programmteile: chats"):
                 aufspielen(paket, ziel)
             self.assertEqual((privat / "verlauf.db").read_bytes(), b"bleibt privat")
 
