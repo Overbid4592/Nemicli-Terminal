@@ -472,6 +472,9 @@ def laeuft() -> dict | None:
         import psutil
         p = psutil.Process(pid)
         name = p.name().lower()
+        # Jünger als der Scan-Start: Windows hat die PID inzwischen neu vergeben.
+        if z.get("start") and p.create_time() > float(z["start"]) + 2.0:
+            return None
         if p.is_running() and ("python" in name or "nemicli" in name):
             return z
     except Exception:
@@ -1174,12 +1177,14 @@ def _bericht(c: sqlite3.Connection, lid: int, erster: bool, fehler: list[str] | 
     gesperrt = json.loads(unzugaenglich_json or "[]")
     stand = json.loads(windows or "{}")
     status = dict(c.execute("SELECT status, COUNT(*) FROM code GROUP BY status").fetchall())
-    pe = tuple(_PE)
-    platz = ",".join("?" * len(pe))
+    je_laenge: dict[int, list[str]] = {}               # Endungen sind unterschiedlich lang (.ax)
+    for e in sorted(_PE):
+        je_laenge.setdefault(len(e), []).append(e)
+    endung = " OR ".join(f"lower(substr(pfad, -{n})) IN ({','.join('?' * len(es))})" for n, es in je_laenge.items())
     unsigniert = c.execute(
         f"SELECT gruppe, COUNT(*) n FROM code WHERE status IN ('NotSigned', 'NotSupportedFileFormat') "
-        f"AND lower(substr(pfad, -4)) IN ({platz}) GROUP BY gruppe ORDER BY n DESC LIMIT 40",
-        tuple(e[-4:] for e in pe)).fetchall()
+        f"AND ({endung}) GROUP BY gruppe ORDER BY n DESC LIMIT 40",
+        tuple(e for es in je_laenge.values() for e in es)).fetchall()
     auffaellig = c.execute(
         "SELECT pfad, status FROM code WHERE status IN ('HashMismatch', 'NotTrusted') "
         "ORDER BY pfad LIMIT 50").fetchall()

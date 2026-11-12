@@ -141,7 +141,7 @@ def prozess(pid: int | None, filt: str = "") -> str:
         pid = treffer[0].pid
     try:
         p = psutil.Process(pid)
-    except psutil.NoSuchProcess:
+    except (psutil.NoSuchProcess, ValueError):          # ValueError: negative PID
         return f"Kein Prozess mit PID {pid}."
 
     def feld(fn, vorgabe="(kein Zugriff)"):

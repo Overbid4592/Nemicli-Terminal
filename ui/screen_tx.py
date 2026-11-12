@@ -42,7 +42,7 @@ from textual.app import App, ComposeResult
 from textual.strip import Strip
 from textual.visual import RichVisual
 from textual.binding import Binding
-from textual.containers import Vertical, VerticalScroll
+from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.screen import ModalScreen, Screen as _TxScreen
 from textual.selection import SELECT_ALL, SelectEnd, Selection
 from textual.geometry import Offset
@@ -63,6 +63,7 @@ eingabe_win.einschalten()           # Emojis über Alt+Ziffernblock nicht verlie
 
 
 SCROLL_ZEILEN = 4             # Zeilen je Mausrad-Raste (Textual-Vorgabe: 2)
+SPEICHER_BLITZ_S = 1.5        # so lange leuchtet der 100k-Balken nach einer Änderung auf
 
 
 def _scroll_zeilen() -> int:
@@ -84,11 +85,15 @@ def _uebung_gewuenscht() -> bool:
         return True
 from screen import terminal_safe, maus_tracking_aus, _checkpoint_menu, _persona_menu
 
+_SCHIRM_BG = "#0c0d14"       # Grundfarbe; das eigene Fenster lässt Zellen in dieser Farbe frei
 _COMPOSER_BG = "#11131d"
 _TOOLBAR_BG = "#15151f"
+_ROLL_SCHRITTE = (0.45, 0.8, 1.0)    # weiches Blättern: Anteile des Wegs, je Schritt ein Bild
+_ROLL_PAUSE_S = 0.03
 _MIN_INPUT_ROWS = 3
 _MAX_INPUT_ROWS = 8
 _MAX_BLOCKS = 600            # Verlauf im Speicher kappen (Widgets)
+_SUCH_STUECK = 30            # so viele Blöcke durchsucht die Suche am Stück
 _MAX_COMPLETIONS = 10         # sichtbare Zeilen im /-Menü, der Rest wird geblättert
 
 
@@ -338,6 +343,7 @@ class _Block(Static):
         super().__init__(renderable, **kw)
         self.nemi_renderable = renderable
         self._sel_visual = None
+        self._klartext = None                    # (Breite, Renderable, Text) für die Suche
 
     def render(self):
         if self._sel_visual is None:
@@ -353,6 +359,23 @@ class _Block(Static):
                       soft_wrap=False, highlight=False)
         con.print(self.nemi_renderable)
         return sio.getvalue()
+
+    def klartext(self) -> str:
+        """Wie _plain_lines, gemerkt je Breite – die Suche liest jeden Block bei jedem Tastendruck."""
+        stand = (max(1, self.content_size.width), self.nemi_renderable)
+        if self._klartext is None or self._klartext[0] != stand[0] or self._klartext[1] is not stand[1]:
+            self._klartext = (*stand, self._plain_lines())
+        return self._klartext[2]
+
+    def ganz_kopieren(self) -> str:
+        """Der ganze Block als Text, so bereinigt wie beim Markieren."""
+        gewaehlt = self.get_selection(Selection(None, None))
+        return gewaehlt[0] if gewaehlt else ""
+
+    def on_click(self, event: events.Click) -> None:
+        if event.button == 3:                    # Rechtsklick: ganzen Block kopieren
+            event.stop()
+            self.app.block_kopieren(self)
 
     def get_selection(self, selection):
         try:
@@ -393,12 +416,80 @@ class _KlappBlock(_Block):
         self.refresh(layout=True)
 
     def on_click(self, event: events.Click) -> None:
+        if event.button != 1:                    # Rechtsklick behandelt _Block (Textual ruft beide)
+            return
         try:                                     # beim Markieren nicht aufklappen
             if self.screen.get_selected_text():
                 return
         except Exception:
             pass
         self.umschalten()
+
+
+class _AntwortBlock(_Block):
+    """Eine Antwort im Verlauf: Ein Klick auf ihre Titelzeile klappt sie auf eine Zeile ein und wieder auf."""
+
+    def __init__(self, renderable, **kw):
+        super().__init__(renderable, **kw)
+        self.voll = renderable
+        self.eingeklappt = False
+
+    def _titelzeile(self) -> int:
+        """Zeile des Blocks, in der der Titel der Antwort steht (davor können Notiz und Denktext stehen)."""
+        panel = _antwort_panel(self.voll)
+        titel = panel.title if panel is not None else None
+        titel = titel.plain if isinstance(titel, Text) else Text.from_markup(str(titel or "")).plain
+        titel = titel.strip()
+        if titel:
+            for y, zeile in enumerate(self.klartext().split("\n")):
+                if titel in zeile:
+                    return y
+        return 0
+
+    def _kurz(self):
+        panel = _antwort_panel(self.voll)
+        quelle = getattr(panel.renderable, "markup", None) or ""
+        erste = next((z.strip() for z in str(quelle).splitlines() if z.strip()), "")
+        zeile = Text(no_wrap=True, overflow="ellipsis")
+        zeile.append(f"▸ {max(1, self.size.height)} Zeilen  ", style="muted")
+        zeile.append(erste, style="assistant")
+        return Panel(zeile, title=panel.title, title_align="left", box=panel.box,
+                     border_style=panel.border_style, padding=panel.padding)
+
+    def umschalten(self) -> None:
+        self.eingeklappt = not self.eingeklappt
+        self.nemi_renderable = self._kurz() if self.eingeklappt else self.voll
+        self._sel_visual = None
+        self.refresh(layout=True)
+
+    def on_click(self, event: events.Click) -> None:
+        if event.button != 1:                    # Rechtsklick behandelt _Block (Textual ruft beide)
+            return
+        try:                                     # beim Markieren nicht einklappen
+            if self.screen.get_selected_text():
+                return
+        except Exception:
+            pass
+        if self.eingeklappt or event.y == self._titelzeile():
+            self.umschalten()
+
+
+class _SuchFeld(Input):
+    """Eingabezeile der Suche im Verlauf: Enter und ↑ zum älteren Treffer, ↓ zum neueren, Esc schließt."""
+
+    async def _on_key(self, event: events.Key) -> None:
+        nemi = self.app.nemi
+        if event.key in ("escape", "ctrl+f"):
+            event.stop()
+            event.prevent_default()
+            nemi.suche_schliessen()
+            return
+        if event.key in ("up", "down", "enter"):
+            event.stop()
+            event.prevent_default()
+            nemi.such_sprung(1 if event.key == "down" else -1)
+            return
+        await super()._on_key(event)
 
 
 def _windows_clipboard(text: str) -> None:
@@ -469,6 +560,45 @@ def _cockpit_gewuenscht() -> bool:
         return bool(config.load().get("cockpit", False))
     except Exception:
         return False
+
+
+def _weich_gewuenscht() -> bool:
+    """Weiches Blättern im Verlauf? (Config „terminal_weich“, Vorgabe an)."""
+    try:
+        import config
+        return bool(config.load().get("terminal_weich", True))
+    except Exception:
+        return True
+
+
+def _fenster_melden(befehl: str) -> None:
+    """Steuerbefehl ans eigene Terminal-Fenster (Grundfarbe, Puls). In anderen Terminals passiert nichts."""
+    try:
+        import startseite
+        if startseite.echtes_fenster():
+            startseite.STEUERN(befehl)
+    except Exception:
+        pass
+
+
+def _antwort_panel(renderable):
+    """Das Antwort-Panel in einem gedruckten Block (ui.assistant_panel) – oder None."""
+    if isinstance(renderable, Panel):
+        return renderable if renderable.box is ui.LEISTE else None
+    if isinstance(renderable, Group):
+        for teil in reversed(renderable.renderables):
+            if isinstance(teil, Panel) and teil.box is ui.LEISTE:
+                return teil
+    return None
+
+
+def _treffer_in(text: str, begriff: str) -> list[tuple[int, int, int]]:
+    """Fundstellen ohne Groß/Klein als (Zeile, erstes Zeichen, Zeichen dahinter)."""
+    begriff = begriff.strip()
+    if not begriff:
+        return []
+    muster = re.compile(re.escape(begriff), re.IGNORECASE)
+    return [(y, m.start(), m.end()) for y, zeile in enumerate(text.split("\n")) for m in muster.finditer(zeile)]
 
 
 def _mischen(a: str, b: str, t: float) -> str:
@@ -924,7 +1054,8 @@ class _InlineText(Vertical):
 # ---------------------------------------------------------------------------
 class _Composer(TextArea):
     _SCROLL = {"pageup": ("page", -1), "pagedown": ("page", 1), "ctrl+up": ("line", -1),
-               "ctrl+down": ("line", 1), "ctrl+end": ("bottom", None)}
+               "ctrl+down": ("line", 1), "ctrl+end": ("bottom", None),
+               "alt+up": ("antwort", -1), "alt+down": ("antwort", 1)}
 
     async def _on_key(self, event: events.Key) -> None:
         nemi = self.app.nemi
@@ -1102,19 +1233,24 @@ class _NemiApp(App):
     SELECT_AUTO_SCROLL_SPEED = 90.0             # Zeilen je Sekunde ganz am Rand (Textual: 60)
 
     CSS = f"""
-    Screen {{ background: #0c0d14; }}
+    Screen {{ background: {_SCHIRM_BG}; }}
     Screen.nemi-modal {{ background: rgba(0, 0, 0, 0.35); align: center bottom; }}
     _ReaderScreen.nemi-modal {{ align: center middle; }}
     _PaletteScreen.nemi-modal {{ align: center top; }}
     #cockpit {{ dock: right; width: {_COCKPIT_SPALTEN}; display: none; background: #0f1019;
                border-left: vkey #2a2a36; padding: 1 1; }}
     #log {{ height: 1fr; align-vertical: bottom; scrollbar-size-vertical: 1; scrollbar-color: #2a2a36;
-           scrollbar-color-hover: #3a3a4a; scrollbar-background: #0c0d14; }}
+           scrollbar-color-hover: #3a3a4a; scrollbar-background: {_SCHIRM_BG}; }}
     #log.start {{ align-vertical: top; }}
     #leiste {{ height: auto; display: none; }}
     #log > Static {{ width: 1fr; }}
     #verlauf {{ width: 1fr; height: auto; }}
     #verlauf > _Block {{ width: 1fr; }}
+    #verlauf > _Block.kopiert {{ background: #1c2540; }}
+    #suchzeile {{ height: 1; display: none; background: {_COMPOSER_BG}; }}
+    #verlaufsuche {{ width: 1fr; height: 1; border: none; padding: 0 1; background: #1c1f30; }}
+    #verlaufsuche:focus {{ border: none; }}
+    #suchzahl {{ width: auto; min-width: 14; height: 1; padding: 0 1; color: #7d8590; background: {_COMPOSER_BG}; }}
     #live {{ width: 1fr; }}
     #header {{ height: 1; background: {_COMPOSER_BG}; }}
     #frame {{ height: auto; background: {_COMPOSER_BG}; border-left: round #5b54a8;
@@ -1146,6 +1282,9 @@ class _NemiApp(App):
         Binding("ctrl+up", "line(-1)", show=False),
         Binding("ctrl+down", "line(1)", show=False),
         Binding("ctrl+end", "bottom", show=False),
+        Binding("ctrl+f", "suche", show=False, priority=True),
+        Binding("alt+up", "antwort(-1)", show=False),
+        Binding("alt+down", "antwort(1)", show=False),
     ]
 
     def __init__(self, screen: "Screen"):
@@ -1164,6 +1303,9 @@ class _NemiApp(App):
             # seine Anordnung zwischengespeichert – sonst ordnet Textual je Bild alle Blöcke neu an.
             yield Vertical(id="verlauf")
             yield Static("", id="live")
+        with Horizontal(id="suchzeile"):
+            yield _SuchFeld(placeholder="Im Verlauf suchen …  Enter/↑ älter · ↓ neuer · Esc schließt", id="verlaufsuche")
+            yield Static("", id="suchzahl")
         yield Static("", id="header")
         with Vertical(id="frame"):
             yield Static("", id="complete")
@@ -1253,6 +1395,13 @@ class _NemiApp(App):
     def action_palette(self) -> None:
         self.nemi.palette_oeffnen()
 
+    def action_kachel(self, befehl: str) -> None:
+        """Kachel der Startseite (startseite.KACHELN): den Befehl abschicken wie getippt – nur diese festen."""
+        import startseite
+        if befehl in startseite.KACHEL_BEFEHLE and not self.nemi.busy and self.nemi._modal is None:
+            self.nemi._input.load_text(befehl)
+            self.nemi._submit()
+
     def action_musik(self, kennung: str, was: str) -> None:
         """Knöpfe der Musik-Karte (ui.musik_karte): abspielen, als Cover vorbereiten, Ordner öffnen."""
         import os
@@ -1308,6 +1457,27 @@ class _NemiApp(App):
     def action_bottom(self) -> None:
         self.nemi._scroll("bottom", None)
 
+    def action_antwort(self, d: int) -> None:
+        self.nemi._scroll("antwort", d)
+
+    def action_suche(self) -> None:
+        self.nemi.suche_oeffnen()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "verlaufsuche":
+            self.nemi.suche_aendern(event.value)
+
+    def block_kopieren(self, block: _Block) -> None:
+        """Rechtsklick auf einen Block: sein ganzer Text in die Zwischenablage, der Block blitzt kurz auf."""
+        text = block.ganz_kopieren()
+        if not text.strip():
+            return
+        self.copy_to_clipboard(text)
+        _windows_clipboard(text)
+        block.add_class("kopiert")
+        self.set_timer(0.4, lambda: block.remove_class("kopiert"))
+        self.nemi._kopie_melden(len(text))
+
 
 # ---------------------------------------------------------------------------
 # Der Screen: Zustand + Schnittstelle für main/confirm/ui
@@ -1338,6 +1508,7 @@ class Screen:
         # --- Helfer-Agenten ---
         self.helfer_aktiv = 0
         self.bibliothekar_text = ""
+        self.speicher_token: int | None = None       # Füllstand des Einlese-Speichers (None = kein Balken)
         self.vollscan_text = ""
         self._pulse_on = True
         # --- intern ---
@@ -1352,6 +1523,14 @@ class Screen:
         self._pending: list = []              # Blöcke, die vor dem Start gedruckt wurden
         self._tx_theme_pushed = False
         self._follow = True                   # Verlauf hängt am unteren Ende?
+        self._weich = _weich_gewuenscht()     # Blättern in kleinen Schritten statt in einem Sprung
+        self._roll_kennung = 0                # ein neues Blättern löst das laufende ab
+        self._suchzeile = self._suchfeld = self._suchzahl = None
+        self._such_treffer: list = []         # (Block, Zeile, erstes Zeichen, Zeichen dahinter), alt nach neu
+        self._such_nr = -1
+        self._such_kennung = 0                # eine neue Suche löst die laufende ab
+        self._puls_gemeldet = None            # dem eigenen Fenster zuletzt gemeldet: arbeitet / ruht
+        self._wecker: list = []               # fällige Erinnerungen der KI an sich selbst, noch nicht abgearbeitet
         self._kopie_zeichen = 0               # kurze Meldung „📋 n kopiert“ im Rahmen …
         self._kopie_bis = 0.0                 # … bis zu diesem Zeitpunkt
         self.start_text: str | None = None    # --sag: erste Nachricht gleich abschicken
@@ -1405,6 +1584,10 @@ class Screen:
         self._complete = app.query_one("#complete", Static)
         self._frame = app.query_one("#frame", Vertical)
         self._inline = app.query_one("#inline", Vertical)
+        self._suchzeile = app.query_one("#suchzeile", Horizontal)
+        self._suchfeld = app.query_one("#verlaufsuche", _SuchFeld)
+        self._suchzahl = app.query_one("#suchzahl", Static)
+        _fenster_melden("grund=" + _SCHIRM_BG.lstrip("#"))
         self._log.set_class(not ui.BANNER_KOMPAKT, "start")   # Startseite oben, der Chat danach unten
         self.apply_theme()
         pending, self._pending = self._pending, []
@@ -1512,6 +1695,8 @@ class Screen:
         follow = self._follow and not self._auswahl_offen()
         if isinstance(renderable, ui.Klapp):
             w = _KlappBlock(renderable, classes="block")
+        elif _antwort_panel(renderable) is not None:
+            w = _AntwortBlock(renderable, classes="block")
         else:
             w = _Block(renderable, classes="block reflow" if isinstance(renderable, _ReflowRenderable) else "block")
         self._verlauf.mount(w)
@@ -1534,7 +1719,12 @@ class Screen:
         if self._log is None:
             return
         if what == "page":
-            (self._log.scroll_page_down if arg > 0 else self._log.scroll_page_up)(animate=False)
+            self._rollen_nach(self._log.scroll_y + arg * max(1, self._log.scrollable_content_region.height))
+        elif what == "antwort":
+            ziel = self._antwort_ziel(arg)
+            if ziel is None:
+                return
+            self._rollen_nach(ziel)
         elif what == "line":
             self._log.scroll_relative(y=arg, animate=False)
         else:
@@ -1545,6 +1735,116 @@ class Screen:
             self._follow = False
         else:
             self.app.call_after_refresh(self._check_follow)
+
+    def _rollen_nach(self, ziel: float) -> None:
+        """Verlauf auf eine Zeile rollen – weich in wenigen Schritten (Config terminal_weich) oder sofort."""
+        log = self._log
+        ziel = max(0.0, min(float(ziel), float(log.max_scroll_y)))
+        self._roll_kennung += 1
+        kennung, start = self._roll_kennung, float(log.scroll_y)
+        am_ende = ziel >= log.max_scroll_y       # dort hängt sich der Verlauf wieder ans Ende
+        if not self._weich or abs(ziel - start) < 2:
+            log.scroll_to(y=ziel, animate=False)
+            self._follow = self._follow or am_ende
+            return
+
+        def schritt(i: int) -> None:
+            if kennung != self._roll_kennung:
+                return
+            log.scroll_to(y=round(start + (ziel - start) * _ROLL_SCHRITTE[i]), animate=False)
+            if i + 1 < len(_ROLL_SCHRITTE):
+                self.app.set_timer(_ROLL_PAUSE_S, lambda: schritt(i + 1))
+            else:
+                self._follow = self._follow or am_ende
+        schritt(0)
+
+    def _antwort_ziel(self, richtung: int) -> float | None:
+        """Rollstand, bei dem die vorige (−1) oder nächste (+1) Antwort oben steht; None: keine weitere."""
+        try:
+            basis = self._verlauf.virtual_region.y
+            lagen = [basis + b.virtual_region.y + (0 if b.eingeklappt else b._titelzeile())
+                     for b in self._verlauf.children if isinstance(b, _AntwortBlock)]
+            y = self._log.scroll_y
+        except Exception:
+            return None
+        if richtung < 0:
+            davor = [lage for lage in lagen if lage < y - 0.5]
+            return max(davor) if davor else None
+        danach = [lage for lage in lagen if lage > y + 0.5]
+        return min(danach) if danach else float(self._log.max_scroll_y)
+
+    # -- Suche im Verlauf (Strg+F) -----------------------------------------------
+    def suche_oeffnen(self) -> None:
+        if self.app is None or self._suchzeile is None or self._modal is not None:
+            return
+        self._suchzeile.display = True
+        self._suchfeld.focus()
+        self.suche_aendern(self._suchfeld.value)
+
+    def suche_schliessen(self) -> None:
+        if self._suchzeile is None:
+            return
+        self._such_kennung += 1
+        self._such_treffer, self._such_nr = [], -1
+        self._suchzeile.display = False
+        try:
+            self.app.screen.clear_selection()
+        except Exception:
+            pass
+        if self._input is not None:
+            self._input.focus()
+
+    def suche_aendern(self, begriff: str) -> None:
+        """Neu suchen: von der neuesten Nachricht rückwärts, in Stücken – die Oberfläche bleibt bedienbar."""
+        self._such_kennung += 1
+        self._such_treffer, self._such_nr = [], -1
+        bloecke = [b for b in self._verlauf.children if isinstance(b, _Block)] if begriff.strip() else []
+        self._such_stueck(self._such_kennung, begriff, bloecke, len(bloecke))
+
+    def _such_stueck(self, kennung: int, begriff: str, bloecke: list, ende: int) -> None:
+        if kennung != self._such_kennung:
+            return
+        start = max(0, ende - _SUCH_STUECK)
+        neu = [(block, y, a, b) for block in bloecke[start:ende]
+               for y, a, b in _treffer_in(block.klartext(), begriff)]
+        erster_fund = self._such_nr < 0 and bool(neu)
+        self._such_treffer = neu + self._such_treffer
+        if erster_fund:
+            self._such_nr = len(self._such_treffer) - 1          # beim neuesten Treffer beginnen
+        elif self._such_nr >= 0:
+            self._such_nr += len(neu)                            # ältere kommen davor, der Platz bleibt
+        self._treffer_zeigen(springen=erster_fund or start == 0)
+        if start > 0:
+            self.app.set_timer(0.01, lambda: self._such_stueck(kennung, begriff, bloecke, start))
+
+    def such_sprung(self, schritt: int) -> None:
+        if self._such_treffer:
+            self._such_nr = (self._such_nr + schritt) % len(self._such_treffer)
+        self._treffer_zeigen(springen=True)
+
+    def _treffer_zeigen(self, springen: bool) -> None:
+        """Zahl neben dem Suchfeld; der aktuelle Treffer wird markiert und in die Mitte gerollt."""
+        anzahl = len(self._such_treffer)
+        if anzahl:
+            self._suchzahl.update(f"{self._such_nr + 1} / {anzahl}")
+        else:
+            self._suchzahl.update("kein Treffer" if self._suchfeld.value.strip() else "")
+        if not springen:
+            return
+        try:
+            if not anzahl:
+                self.app.screen.clear_selection()
+                return
+            block, y, a, b = self._such_treffer[self._such_nr]
+            if block.parent is None:                  # inzwischen aus dem Verlauf gekappt
+                return
+            self.app.screen.selections = {block: Selection(Offset(a, y), Offset(b, y))}
+            self._follow = False
+            lage = self._verlauf.virtual_region.y + block.virtual_region.y + y
+            self._roll_kennung += 1
+            self._log.scroll_to(y=max(0, lage - self._log.size.height // 2), animate=False)
+        except Exception:
+            pass
 
     def print_reflow(self, make) -> None:
         """Renderable, das bei jeder Breite frisch gebaut wird (Banner)."""
@@ -1606,6 +1906,19 @@ class Screen:
     def set_bibliothekar(self, text: str) -> None:
         """„Chat #152 · Brocken 12/40“ → Badge mit Mini-Balken in der Statuszeile; "" = weg."""
         self.bibliothekar_text = text or ""
+        self._refresh_chrome()
+
+    def set_speicher(self, token: int | None) -> None:
+        """Füllstand des Einlese-Speichers → Balken „4k │ 100k“ in der Statuszeile; ändert er sich, leuchtet der
+        Balken kurz auf."""
+        alt = getattr(self, "speicher_token", None)
+        self.speicher_token = token
+        if alt is not None and token is not None and token != alt:
+            self._speicher_blitz_bis = time.monotonic() + SPEICHER_BLITZ_S
+            try:
+                self.app.set_timer(SPEICHER_BLITZ_S + 0.1, self._refresh_chrome)
+            except Exception:
+                pass
         self._refresh_chrome()
 
     def set_vollscan(self, text: str) -> None:
@@ -1729,6 +2042,9 @@ class Screen:
                 for edge in ("border_left", "border_right", "border_bottom"):
                     setattr(self._frame.styles, edge, ("round", neu["rahmen"]))
             self._chrome_stand = neu
+            if self.busy != self._puls_gemeldet:        # eigenes Fenster: Hintergrund atmet beim Arbeiten
+                self._puls_gemeldet = self.busy
+                _fenster_melden("puls=1" if self.busy else "puls=0")
         except Exception as e:                   # sonst stünden Kopf und Leiste still, ohne jede Spur
             art = type(e).__name__
             gemeldet = getattr(self, "_chrome_fehler", set())
@@ -1793,6 +2109,18 @@ class Screen:
             else:
                 ziel.append(" ", muted)
 
+        if self.speicher_token is not None and width >= 60:
+            import einlesen
+            t = self.speicher_token
+            halbe = einlesen.halbe(t)
+            farbe, halb = einlesen.farbe(t), einlesen.halb(t)
+            blitz = getattr(self, "_speicher_blitz_bis", 0.0)
+            if isinstance(blitz, float) and time.monotonic() < blitz:
+                farbe, halb = einlesen.hell(farbe), einlesen.hell(halb)
+            for i, zeichen in enumerate(einlesen.zeichen(t)):
+                grund = farbe if 2 * i + 2 <= halbe else halb if 2 * i + 1 <= halbe else einlesen.LEER
+                left.append(zeichen, Style(color="#ffffff", bold=True, bgcolor=grund))
+            left.append(" ", muted)
         plaketten: list[tuple[str, str]] = []
         try:                                     # Hintergrund-Aufgabe zuerst: sie darf nie wegfallen
             import hintergrund
@@ -1997,6 +2325,10 @@ class Screen:
         self._follow = True                   # beim Absenden ans untere Ende springen
         self._banner_verkleinern()
         self._echo_user(text)
+        self._zug_starten(text)
+
+    def _zug_starten(self, text: str) -> None:
+        """Eine Nachricht an die KI geben und ihren Zug laufen lassen (getippt oder vom Wecker)."""
         self.busy = True
         self._refresh_chrome()
         self.app.call_after_refresh(self._scroll_bottom)
@@ -2032,6 +2364,35 @@ class Screen:
         asyncio.get_running_loop().create_task(neustart.ausfuehren())
         return True
 
+    # -- Wecker: fällige Erinnerungen im Chat zeigen, die der KI an sich selbst abarbeiten ------
+    _wecker_stamp = 0.0
+
+    def _erinnerungen_pruefen(self) -> None:
+        """Fällige Erinnerungen abholen (alle 5 s). An den Nutzer: eine Zeile im Chat. Von der KI an sich
+        selbst: Sie bekommt den Text als Nachricht – sofort, oder sobald sie frei ist."""
+        try:
+            from wache import erinnerungen as ER
+            import persoenlichkeiten as PS
+            faellig = ER.abholen(terminal=True, wer=PS.active().name)
+        except Exception:
+            return
+        for d in faellig:
+            if d.get("fuer") == ER.FUER_KI:
+                self._wecker.append(d)
+            else:
+                ui.info(ER.meldung(d))
+        self._wecker_abarbeiten()
+
+    def _wecker_abarbeiten(self) -> None:
+        if not self._wecker or self.busy or self._modal is not None or self.handler is None:
+            return
+        from wache import erinnerungen as ER
+        d = self._wecker.pop(0)
+        self._follow = True
+        self._banner_verkleinern()
+        ui.info(f"⏰ {d.get('wer') or ui.persona_name()} wird erinnert: {d['text']}")
+        self._zug_starten(ER.auftrag(d))
+
     # -- Lebenszeichen & Briefkasten (Rechtsklick-Menü -> offenes Fenster) ------
     _alive_stamp = 0.0
     _inbox_stamp = 0.0
@@ -2049,6 +2410,9 @@ class Screen:
                 K.ALIVE_DATEI.write_text(str(time.time()), encoding="utf-8")
             except OSError:
                 pass
+        if now - self._wecker_stamp >= 5.0:
+            self._wecker_stamp = now
+            self._erinnerungen_pruefen()
         if now - self._inbox_stamp >= 1.0:
             self._inbox_stamp = now
             if self.busy or self._modal is not None:

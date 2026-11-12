@@ -389,6 +389,8 @@ class NetzKette:
         if self._puffer is None or self._puffer.numel() < groesse:
             if self.reserve is not None:
                 self._platz(groesse)
+                # Neues Budget = neue Kontexte: Bedarf für die Formen neu bestimmen
+                groesse = max(n._formen(formen) for n in self.netze)
             self._puffer = None
             self._puffer = torch.empty(max(groesse, 256), dtype=torch.uint8, device="cuda")
         for n, adressen in zip(self.netze, adressen_je_netz):
@@ -439,6 +441,8 @@ def holen(art: str, teile: dict, bauen, fortschritt=None, budget: int | None = N
         teil.replace(datei)
         blob = bytes(ser)
         engine = runtime.deserialize_cuda_engine(blob)
+        if engine is None:
+            raise RuntimeError("TensorRT: frisch gebautes Netz nicht ladbar")
         _DBG.ereignis(f"TensorRT: {datei.name} gebaut ({datei.stat().st_size / 2**20:.0f} MiB)")
     netz = Netz(engine, cache, budget)
     # Beim Weight-Streaming liest TensorRT die Gewichte direkt aus dem Plan im RAM: Runtime und Plan

@@ -70,6 +70,17 @@ FARBEN = {
 }
 
 
+def _rollen_schrift(rolle: str) -> QFont:
+    """Schrift der Sprechblasen: „ki“ oder „du“ in der Größe von /schriftgröße."""
+    f = QFont(QApplication.font())
+    try:
+        import design
+        f.setPixelSize(design.px(rolle))
+    except Exception:
+        pass
+    return f
+
+
 def _hex(rgb) -> str:
     return "#%02x%02x%02x" % tuple(max(0, min(255, int(v))) for v in rgb)
 
@@ -297,6 +308,7 @@ ANKOMMEN_TEXT = (
     "er war etwa {weg} weg. Niemand hat dich angesprochen; du darfst ihn von dir aus begrüßen "
     "(deine Antwort erscheint als Sprechblase an der Kugel, höchstens zwei kurze Sätze), ein Bild "
     "malen, dein Kugel-Bild wechseln – oder still bleiben. Was zuletzt war, steht in deinem Tagebuch.\n"
+    "Die Tageszeit ist nur eine Angabe: Schließ daraus nicht, dass er müde ist, und wünsch keine gute Nacht.\n"
     "Sag nur, was dir wirklich einfällt – keine Floskel. Willst du nichts tun, antworte genau: (still)"
 )
 
@@ -314,6 +326,7 @@ IMPULS_TEXT = (
     "Möglich: dem Nutzer etwas sagen (deine Antwort erscheint als Sprechblase an der Kugel, höchstens "
     "zwei kurze Sätze) · ein Bild malen (bild_malen) · dein Kugel-Bild wechseln (kugel mit stimmung) · "
     "den Bildschirm ansehen (bildschirm_ansehen), wenn du wissen willst, was gerade los ist.\n"
+    "Die Tageszeit ist nur eine Angabe: Schließ daraus nicht, dass der Nutzer müde ist, und wünsch keine gute Nacht.\n"
     "Sag nur, was dir wirklich einfällt – keine Floskel, nichts, was du heute schon gesagt hast. "
     "Willst du nichts tun, antworte genau: (still)"
 )
@@ -467,6 +480,7 @@ class _Kugelfenster(QWidget):
         self.schwebt = False                        # Maus drüber
         self._hebung = 0.0                          # 0 … 1, weich
         self._druck: QPoint | None = None
+        self._druck_punkt = QPoint()                # Mausposition beim Drücken
         self._bewegt = False
         self.bild: QPixmap | None = None            # statt der Kugel: das Bild der Persönlichkeit
         self._bewegung = ""                         # huepfen · wackeln · nicken
@@ -504,8 +518,11 @@ class _Kugelfenster(QWidget):
         """Bewegtes Porträt in der Kugel – rund, oder freigestellt (…_frei_kugel.webp) als ganze Figur ohne
         Kreis; mit `ton` (WAV) spricht sie dazu. Danach ruft es `fertig` (das Bild kommt zurück)."""
         self.film_stoppen(melden=False)
-        film = QMovie(str(pfad))
+        film = QMovie(str(pfad), parent=self)        # Qt besitzt den Film: Freigabe nur über deleteLater
         if not film.isValid():
+            film.deleteLater()
+            if fertig:                               # sonst bliebe das letzte Bild eines vorigen Films stehen
+                fertig()
             return
         self._film, self._film_fertig = film, fertig
         self._film_rund = not Path(pfad).name.endswith("_frei_kugel.webp")
@@ -533,6 +550,7 @@ class _Kugelfenster(QWidget):
         if self._film is None:
             return
         self._film.stop()
+        self._film.deleteLater()                     # kann aus frameChanged des Films selbst kommen
         if getattr(self, "_film_ton", False):
             self._film_ton = False
             try:
@@ -777,7 +795,8 @@ class _Kugelfenster(QWidget):
             self.gestupst.emit()
             return
         if e.button() == Qt.MouseButton.LeftButton:
-            self._druck = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+            self._druck_punkt = e.globalPosition().toPoint()
+            self._druck = self._druck_punkt - self.frameGeometry().topLeft()
             self._bewegt = False
 
     def mouseMoveEvent(self, e) -> None:
@@ -787,10 +806,13 @@ class _Kugelfenster(QWidget):
             if (art := self._beruehrung.fuettern(punkt.x(), punkt.y(), time.time())):
                 self.beruehrt.emit(art)
             return
-        neu = e.globalPosition().toPoint() - self._druck
-        if (neu - self.pos()).manhattanLength() > 2:
+        punkt = e.globalPosition().toPoint()
+        if not self._bewegt:
+            # Zittern beim Klicken ist kein Ziehen: erst ab der System-Zieh-Distanz zum Druckpunkt.
+            if (punkt - self._druck_punkt).manhattanLength() < QApplication.startDragDistance():
+                return
             self._bewegt = True
-        self.move(neu)
+        self.move(punkt - self._druck)
         self.gezogen.emit()
 
     def mouseReleaseEvent(self, e) -> None:
@@ -997,10 +1019,10 @@ class _Panel(QWidget):
         bar.setValue(bar.maximum())
 
     @staticmethod
-    def _textbreite(text: str, markdown: bool, maximal: int) -> int:
+    def _textbreite(text: str, markdown: bool, maximal: int, schrift: QFont | None = None) -> int:
         """So breit wie der Text, höchstens `maximal` – QLabel mit Umbruch rät sonst zu schmal."""
         doc = QTextDocument()
-        doc.setDefaultFont(QApplication.font())
+        doc.setDefaultFont(schrift or QApplication.font())
         if markdown:
             doc.setMarkdown(text)
         else:
@@ -1012,7 +1034,9 @@ class _Panel(QWidget):
         blase = QFrame(); blase.setObjectName("blase_du" if du else "blase_sie")
         b = QVBoxLayout(blase); b.setContentsMargins(12, 7, 12, 8); b.setSpacing(2)
         kopf = QLabel("Du" if du else name); kopf.setObjectName("wer_du" if du else "wer_sie")
-        lbl = QLabel()
+        lbl = QLabel(); lbl.setObjectName("text")      # Größe nach /schriftgröße (oberflaeche.QSS)
+        schrift = _rollen_schrift("du" if du else "ki")
+        lbl.setFont(schrift)
         lbl.setTextFormat(Qt.TextFormat.PlainText if du else Qt.TextFormat.MarkdownText)
         if not du:
             try:
@@ -1022,7 +1046,7 @@ class _Panel(QWidget):
                 pass
         lbl.setText(text)
         lbl.setWordWrap(True)
-        lbl.setFixedWidth(self._textbreite(text, not du, int(PANEL_BREITE * 0.78) - 26))
+        lbl.setFixedWidth(self._textbreite(text, not du, int(PANEL_BREITE * 0.78) - 26, schrift))
         lbl.setOpenExternalLinks(False)                  # nur http(s) öffnen – file:// könnte Programme starten
         lbl.linkActivated.connect(_link_oeffnen)
         lbl.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse
@@ -1386,7 +1410,8 @@ class Kugel:
         self._panel_platzieren()
         if self._blase is not None:
             self._blase_platzieren()
-        self._lage_speichern()
+        if self.fenster._druck is None:             # beim Ziehen erst nach dem Loslassen speichern
+            self._lage_speichern()
 
     def _lage_laden(self) -> tuple[int, int]:
         g = _schirm(QCursor.pos())
@@ -1502,7 +1527,12 @@ class Kugel:
         self._beschaeftigt = True
         self.fenster.beschaeftigt = True
         _spontan(True)                                   # Grafikspeicher-Regel für diese Runde
-        fut = asyncio.run_coroutine_threadsafe(self._chat(text, []), self._loop)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._chat(text, []), self._loop)
+        except Exception:                                # z. B. Schleife beendet: nicht dauerhaft beschäftigt bleiben
+            _spontan(False)
+            self._beschaeftigt = self.fenster.beschaeftigt = False
+            return
 
         def fertig(f):
             _spontan(False)
@@ -1702,8 +1732,12 @@ class Kugel:
         self.fenster.beschaeftigt = True
         self._panel.denkt(True)
         self._zustand_anwenden(steuerung.lesen())          # Denk-Bild, falls vorhanden
-        fut = asyncio.run_coroutine_threadsafe(self._chat(L.spiel_kontext(self._spiel) + text, anhaenge),
-                                               self._loop)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._chat(L.spiel_kontext(self._spiel) + text, anhaenge),
+                                                   self._loop)
+        except Exception as exc:
+            self._antwort(f"(Fehler: {exc})", [], "")
+            return
 
         def fertig(f):
             try:
@@ -1768,8 +1802,11 @@ class Kugel:
         if not self._erinnerungen:
             return
         from . import erinnerungen
-        for d in erinnerungen.abholen():
-            self.erinnern(erinnerungen.meldung(d))
+        if erinnerungen.terminal_offen():            # ein offenes NemiCLI-Fenster holt sie selbst ab
+            return
+        texte = [erinnerungen.meldung(d) for d in erinnerungen.abholen()]
+        if texte:                                    # mehrere fällige: eine Blase, sonst verdeckt die letzte alle
+            self.erinnern("\n".join(texte))
 
     def erinnern(self, text: str) -> None:
         """Fällige Erinnerung zeigen: an der Kugel (Regenbogen, dann Blase) oder neben der Uhr."""
@@ -1985,19 +2022,39 @@ class Kugel:
         try:
             self.verstecken(True)
             time.sleep(0.3)
-            O.bildschirmfoto(pfad)
+            bild = O.foto_aufnehmen()
         except Exception:
             return
         finally:
             self.verstecken(False)
-        if L.dunkel(pfad):                               # exklusives Vollbild: nur Schwarz
-            pfad.unlink(missing_ok=True)
-            return
-        self._ins_chat = False
         self._beschaeftigt = True
         self.fenster.beschaeftigt = True
+
+        def vorbereiten():                               # Packen und Prüfen dauern: nicht im GUI-Thread
+            try:
+                O.foto_speichern(bild, pfad)
+                brauchbar = not L.dunkel(pfad)           # exklusives Vollbild: nur Schwarz
+            except Exception:
+                brauchbar = False
+            O.im_gui(lambda: self._spiel_blick(pfad, brauchbar))
+
+        threading.Thread(target=vorbereiten, name="nemi-spielfoto", daemon=True).start()
+
+    def _spiel_blick(self, pfad: Path, brauchbar: bool) -> None:
+        if not brauchbar:
+            pfad.unlink(missing_ok=True)
+            self._beschaeftigt = False
+            self.fenster.beschaeftigt = False
+            return
+        self._ins_chat = False
         _spontan(True)                                   # Grafikspeicher-Regel: das Spiel braucht ihn
-        fut = asyncio.run_coroutine_threadsafe(self._zuschauen(L.spiel_text(self._spiel), str(pfad)), self._loop)
+        try:
+            fut = asyncio.run_coroutine_threadsafe(self._zuschauen(L.spiel_text(self._spiel), str(pfad)), self._loop)
+        except Exception:
+            _spontan(False)
+            pfad.unlink(missing_ok=True)
+            self._beschaeftigt = self.fenster.beschaeftigt = False
+            return
 
         def fertig(f):
             _spontan(False)

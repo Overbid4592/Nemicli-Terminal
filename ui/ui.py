@@ -71,6 +71,25 @@ THEMES: dict[str, dict] = {
         "accent": "#2de2e6", "accent_dim": "#1a8f92",
         "gradient": ["#2de2e6", "#6fd0ee", "#b07bf0", "#e25fe0", "#ff45c8", "#ff2bd6"],
     },
+    # Diese drei färben auch alle Fenster (ui/design.py PALETTEN, gleicher Name).
+    "nachtglas": {
+        "label": "🌌 Nachtglas – Terminal und alle Fenster",
+        "brand": "#9d7bff", "brand_dim": "#5f4fa8",
+        "accent": "#5ee7ff", "accent_dim": "#2f8ea3",
+        "gradient": ["#5ee7ff", "#6dd2ff", "#7dbcff", "#8ca5ff", "#958fff", "#9d7bff"],
+    },
+    "pastell": {
+        "label": "🌸 Pastell-Nacht – Terminal und alle Fenster",
+        "brand": "#f5a6d0", "brand_dim": "#9c6487",
+        "accent": "#8be3c9", "accent_dim": "#4f8f7e",
+        "gradient": ["#8be3c9", "#a3d9cc", "#bccfcf", "#d4c4d0", "#e5b6d0", "#f5a6d0"],
+    },
+    "neon": {
+        "label": "⚡ Neon-Klar – Terminal und alle Fenster",
+        "brand": "#ff2fd0", "brand_dim": "#9c1a80",
+        "accent": "#00f0ff", "accent_dim": "#00909a",
+        "gradient": ["#00f0ff", "#33c8f6", "#669fec", "#9977e3", "#cc4fd9", "#ff2fd0"],
+    },
 }
 
 EINGEBAUT = frozenset(THEMES)
@@ -105,6 +124,7 @@ def _build_theme(name: str) -> Theme:
             "muted":      "#7d8590",
             "user":       f"bold {p['accent']}",
             "assistant":  "#c8c4ff",
+            "assistant.fett": "bold #c8c4ff",
             "tool":       "bold #fbbf24",
             "diff.add":   "#c3f5cd on #17351f",
             "diff.del":   "#ffc2c6 on #3e1b1f",
@@ -336,22 +356,39 @@ def _hint(cmd: str, desc: str) -> Text:
     return t
 
 
+def verlauf_text(text: str, fett: bool = True) -> Text:
+    """Text im Farbverlauf des aktiven Themes – für Überschriften und Rahmen-Titel."""
+    t = Text(no_wrap=True, overflow="ellipsis")
+    n = max(len(text) - 1, 1)
+    for i, ch in enumerate(text):
+        farbe = _gradient[int(i / n * (len(_gradient) - 1))]
+        t.append(ch, style=f"bold {farbe}" if fett else farbe)
+    return t
+
+
 def help_panel() -> None:
     # Befehle kommen nur aus commands.py.
     import commands
 
-    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
+    table = Table(show_header=False, box=None, padding=(0, 2))
     table.add_column("Befehl", style="accent", no_wrap=True)
     table.add_column("Was es tut", style="muted")
-    for usage, beschreibung in commands.help_rows():
-        # escape: sonst hält Rich "[name]" für eine Style-Angabe und schluckt es
-        table.add_row(escape(usage), escape(beschreibung))
+    for i, (ueberschrift, zeilen) in enumerate(commands.help_gruppen()):
+        if i:
+            table.add_row("", "")
+        table.add_row(verlauf_text(ueberschrift), "")
+        for usage, beschreibung in zeilen:
+            # escape: sonst hält Rich "[name]" für eine Style-Angabe und schluckt es
+            table.add_row(escape(usage), escape(beschreibung))
     console.print(
-        Panel(table, title="[brand]Hilfe[/brand]", title_align="left",
+        Panel(table, title=verlauf_text("❓ Hilfe"), title_align="left",
               box=ROUNDED, border_style="brand.dim", padding=(1, 1))
     )
     # Start-Tipps (früher beim Start angezeigt – jetzt hier, damit der Start sauber bleibt)
-    console.print('  💡 Tippe "/" für Befehle, oder schreib einfach los.', style="muted")
+    console.print('  💡 Am einfachsten: sag der KI, was du möchtest („mal mir einen Fuchs“, „was kann ich hier machen?“).',
+                  style="muted")
+    console.print('  ⚙ /einstellungen zeigt die wichtigsten Schalter · Tippe "/" für alle Befehle nach Thema.',
+                  style="muted")
     console.print("  📒 Das Gespräch geht beim Start weiter, wo ihr aufgehört habt – /reset fängt neu an.",
                   style="muted")
     try:
@@ -459,13 +496,13 @@ def kv_panel(title: str, rows: list[tuple[str, str]]) -> None:
     table.add_column(style="muted")
     for k, v in rows:
         table.add_row(escape(str(k)), escape(str(v)))
-    console.print(Panel(table, title=f"[brand]{escape(title)}[/brand]", title_align="left",
+    console.print(Panel(table, title=verlauf_text(str(title)), title_align="left",
                         box=ROUNDED, border_style="brand.dim", padding=(1, 1)))
 
 
 def text_panel(title: str, text: str) -> None:
     """Mehrzeiliger Rohtext (Berichte, Befehlsausgaben) im Rahmen – ohne Markup-Deutung."""
-    console.print(Panel(escape(text.rstrip()) or "(leer)", title=f"[brand]{escape(title)}[/brand]",
+    console.print(Panel(escape(text.rstrip()) or "(leer)", title=verlauf_text(str(title)),
                         title_align="left", box=ROUNDED, border_style="brand.dim",
                         padding=(0, 1)))
 
@@ -526,9 +563,9 @@ def knowledge_menu(skills: list, snippets: list) -> None:
     table.add_column("Inhalt", style="assistant")
     table.add_column("Datei", style="muted", no_wrap=True)
     for path, desc in skills:
-        table.add_row("📘 Skill", desc, path.name)
+        table.add_row("📘 Skill", escape(str(desc)), escape(path.name))
     for path, title in snippets:
-        table.add_row("🐍 Code", title, path.name)
+        table.add_row("🐍 Code", escape(str(title)), escape(path.name))
     console.print(
         Panel(table, title="[brand]🧠 Wissensspeicher[/brand]  ·  gelernt aus früheren Chats",
               title_align="left", box=ROUNDED, border_style="brand.dim", padding=(1, 1))
@@ -1280,6 +1317,142 @@ def action_result(result: str, ok: bool | None = None, sekunden: float | None = 
     symbol, stil = ("◇", "muted") if ok is None else ("✓", "ok") if ok else ("✗", "err")
     return Klapp(_chip(symbol, stil, erste, rest, fmt_elapsed(sekunden) if sekunden is not None else ""),
                  panel, offen=ok is False)
+
+
+# ---------------------------------------------------------------------------
+# Web: laufende Suche, Treffer-Karten, gelesene Seite, Recherche-Leiste.
+# Die Daten kommen aus tools/webanzeige.py und sind schon bereinigt; gezeigt wird nur reiner Text (kein Markup).
+# ---------------------------------------------------------------------------
+_AMPEL_STIL = {"gruen": "ok", "gelb": "warn", "grau": "muted", "warn": "err"}
+
+
+def _sek(s: float | None) -> str:
+    if s is None:
+        return ""
+    return f"{s:.1f} s".replace(".", ",") if s < 10 else fmt_elapsed(s)
+
+
+def web_laeuft(info: dict, sekunden: float) -> Text:
+    """„🌐 sucht im Netz  ◜  „…“  ·  2,1 s“ – der Radar dreht sich mit der Zeit."""
+    import webanzeige as WA
+    t = Text("  ", no_wrap=True, overflow="ellipsis")
+    t.append(f"{info.get('symbol') or '🌐'} ", style="brand")
+    t.append(str(info.get("verb") or ""), style="brand")
+    t.append(f"  {WA.radar(sekunden)}  ", style="user")
+    t.append(str(info.get("ziel") or ""), style="assistant")
+    if info.get("zusatz"):
+        t.append(f"  ·  {info['zusatz']}", style="muted")
+    t.append(f"  ·  {_sek(sekunden)}", style="brand.dim")
+    return t
+
+
+def _treffer_zeilen(daten: dict) -> Table:
+    import webanzeige as WA
+    tab = Table.grid(padding=(0, 1))
+    tab.add_column(width=2, justify="right", no_wrap=True)
+    tab.add_column(width=2, no_wrap=True)
+    tab.add_column(ratio=1)
+    for z in daten.get("treffer", []):
+        zeichen = WA.AMPEL.get(z["ampel"], WA.AMPEL["grau"])[0]
+        titel = Text(z["titel"], style="assistant.fett", no_wrap=True, overflow="ellipsis")
+        unten = Text(no_wrap=True, overflow="ellipsis")
+        unten.append(z["host"], style="accent")
+        if z["ampel"] == "warn":
+            unten.append("  ·  wollte schon einmal steuern", style="err")
+        elif z["ampel"] == "gelb":
+            unten.append("  ·  unbekannte Seite", style="warn")
+        if z["auszug"]:
+            unten.append(f"  ·  „{z['auszug']}“", style="muted")
+        tab.add_row(Text(str(z["nr"]), style="brand.dim"), Text(zeichen, style=_AMPEL_STIL.get(z["ampel"], "muted")),
+                    Group(titel, unten))
+    return tab
+
+
+def web_karte(daten: dict, sekunden: float | None = None):
+    """Treffer einer Suche als Karte: Ampel, Titel, Domain, kurzer Auszug."""
+    import webanzeige as WA
+    titel = Text("🔎 ", style="brand")
+    titel.append(WA.kopf(daten), style="brand")
+    unter = Text(f"„{daten.get('suche', '')}“", style="muted")
+    if sekunden is not None:
+        unter.append(f"  ·  {_sek(sekunden)}", style="brand.dim")
+    if not daten.get("treffer"):
+        leer = Text("  🔎 ", style="brand")
+        leer.append(f"keine Treffer zu „{daten.get('suche', '')}“", style="muted")
+        return leer
+    teile = [_treffer_zeilen(daten)]
+    if (leg := WA.legende(daten)):
+        teile.append(Text(leg, style="brand.dim", no_wrap=True, overflow="ellipsis"))
+    panel = Panel(Group(*teile), title=titel, title_align="left", subtitle=unter, subtitle_align="right",
+                  box=ROUNDED, border_style="accent.dim", padding=(0, 1))
+    if TUI is None:
+        return panel
+    kurz = Text("  🔎 ", style="brand", no_wrap=True, overflow="ellipsis")
+    kurz.append(WA.kopf(daten), style="assistant")
+    kurz.append(f"  ·  „{daten.get('suche', '')}“  ▸", style="accent.dim")
+    return Klapp(kurz, panel, offen=True)
+
+
+def lese_karte(daten: dict, sekunden: float | None = None) -> Group:
+    """Eine gelesene Seite: „📖 gelesen 🟢 domain · Teil 1 von 3 · ≈ 4.200 Wörter · 0,8 s“ und ihr Anfang."""
+    import webanzeige as WA
+    kopf = Text("  📖 ", style="brand", no_wrap=True, overflow="ellipsis")
+    kopf.append("gelesen  ", style="brand")
+    kopf.append(WA.AMPEL.get(daten.get("ampel"), WA.AMPEL["grau"])[0] + " ",
+                style=_AMPEL_STIL.get(daten.get("ampel"), "muted"))
+    kopf.append(WA.lese_zeile(daten), style="accent")
+    if daten.get("ampel") in ("gelb", "warn"):
+        kopf.append(f"  ·  {WA.AMPEL[daten['ampel']][1]}", style=_AMPEL_STIL[daten["ampel"]])
+    if sekunden is not None:
+        kopf.append(f"  ·  {_sek(sekunden)}", style="brand.dim")
+    if not daten.get("titel"):
+        return Group(kopf)
+    return Group(kopf, Text(f"     „{daten['titel']}“", style="muted", no_wrap=True, overflow="ellipsis"))
+
+
+def web_ergebnis(daten: dict, sekunden: float | None = None):
+    return lese_karte(daten, sekunden) if daten.get("art") == "lesen" else web_karte(daten, sekunden)
+
+
+_SCHRITT_ZEICHEN = {"fertig": ("●", "ok"), "laeuft": ("◐", "user"), "offen": ("○", "brand.dim")}
+
+
+def recherche_leiste(stand: dict, sekunden: float = 0.0) -> Text:
+    """„🧭 Recherche  ●━━━●━━━◐━━━○   Plan · Suchen 3/5 · Lesen 2/4 · Bericht  ·  1m 02s“."""
+    import webanzeige as WA
+    schritte = WA.schritt_zustand(stand)
+    t = Text("  🧭 ", style="brand", no_wrap=True, overflow="ellipsis")
+    t.append("Recherche  ", style="brand")
+    for i, (_name, zustand, _z) in enumerate(schritte):
+        zeichen, stil = _SCHRITT_ZEICHEN[zustand]
+        if zustand == "laeuft":
+            zeichen = WA.radar(sekunden)
+        if i:
+            t.append("━━━", style="ok" if zustand == "fertig" else "brand.dim")
+        t.append(zeichen, style=stil)
+    t.append("   ")
+    for i, (name, zustand, zaehler) in enumerate(schritte):
+        if i:
+            t.append(" · ", style="brand.dim")
+        t.append(name + (f" {zaehler}" if zaehler else ""),
+                 style={"fertig": "ok", "laeuft": "assistant.fett", "offen": "muted"}[zustand])
+    if stand.get("phase") == "fertig":
+        t.append(f"  ·  {stand.get('quellen', 0)} Quellen", style="muted")
+    t.append(f"  ·  {fmt_elapsed(sekunden)}", style="brand.dim")
+    return t
+
+
+@contextmanager
+def recherche_live():
+    """Schritt-Leiste, die während der Recherche mitläuft; danach bleibt der letzte Stand im Verlauf stehen."""
+    letzter: dict = {}
+    with live_view(Text("  🧭 Recherche …", style="brand")) as live:
+        def zeigen(stand: dict, sekunden: float) -> None:
+            letzter["stand"], letzter["s"] = stand, sekunden
+            live.update(recherche_leiste(stand, sekunden))
+        yield zeigen
+    if letzter:
+        console.print(recherche_leiste(letzter["stand"], letzter["s"]))
 
 
 # Mini-Player für fertige Songs: Klicks im Vollbild laufen über App-Aktionen (screen_tx._NemiApp.action_musik)

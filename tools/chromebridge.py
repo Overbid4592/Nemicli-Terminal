@@ -40,6 +40,9 @@ from pathlib import Path
 import fremddaten
 
 HOST = "127.0.0.1"            # fest. Kein Parameter dafür – absichtlich.
+# Feste ID der eigenen Erweiterung, abgeleitet aus "key" in chrome-erweiterung/manifest.json.
+ERWEITUNG_ID = "hcohibkliiknikhanecidedfnehdoico"
+ERWEITUNG_ORIGIN = f"chrome-extension://{ERWEITUNG_ID}"
 PORT_STANDARD = 9000
 MAX_TEXT = 40_000             # Zeichen aus der Seite, mehr wird abgeschnitten
 MAX_KOERPER = 12 * 1024 * 1024    # Anfrage inkl. Bildschirmfoto als Data-URI
@@ -220,10 +223,10 @@ class Bridge:
                 return self.headers.get("Host", "") in (f"{HOST}:{bridge.port}", HOST)
 
             def _cors(self) -> None:
-                # Nur Chrome-Erweiterungen dürfen die Antwort lesen – Webseiten nicht.
-                origin = self.headers.get("Origin", "")
-                if origin.startswith("chrome-extension://"):
-                    self.send_header("Access-Control-Allow-Origin", origin)
+                # Nur die eigene Erweiterung darf die Antwort lesen – Webseiten und fremde
+                # Erweiterungen nicht. Gesendet wird der feste Wert, nie der Kopf der Anfrage.
+                if self.headers.get("Origin", "") == ERWEITUNG_ORIGIN:
+                    self.send_header("Access-Control-Allow-Origin", ERWEITUNG_ORIGIN)
                     self.send_header("Access-Control-Allow-Methods", "POST, GET, OPTIONS")
                     self.send_header("Access-Control-Allow-Headers", "Content-Type, X-Nemi-Key")
                     self.send_header("Access-Control-Allow-Private-Network", "true")
@@ -286,7 +289,12 @@ class Bridge:
                     return None
 
             def _auf_loop(self, coro, timeout: float):
-                return asyncio.run_coroutine_threadsafe(coro, bridge.loop).result(timeout=timeout)
+                zukunft = asyncio.run_coroutine_threadsafe(coro, bridge.loop)
+                try:
+                    return zukunft.result(timeout=timeout)
+                except TimeoutError:
+                    zukunft.cancel()                    # sonst läuft die Anfrage auf dem Loop weiter
+                    raise
 
             def do_POST(self):
                 if not self._host_ok():

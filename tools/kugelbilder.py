@@ -172,6 +172,40 @@ def freistellen(quelle: Path, ziel: Path, groesse: int = GROESSE) -> Path:
     return ziel
 
 
+def _lora(name: str) -> tuple[str | None, dict]:
+    """Gebundene Bild-LoRA der Persönlichkeit (lorabild): (Auslösesatz statt Beschreibung, {"lora": Pfad}) –
+    nur, wenn ihre SHA-256 stimmt und Krea 2 malt; sonst (None, {}) und es gilt die Beschreibung."""
+    try:
+        import imagegen
+        import lorabild
+        bindung, pfad, _grund = lorabild.fuer_charakter(name)
+        if pfad is not None and imagegen.lora_moeglich():
+            return lorabild.ausloeser(bindung["name"]), {"lora": str(pfad)}
+    except Exception:
+        pass
+    return None, {}
+
+
+def _basis(name: str, beschreibung: str) -> str:
+    """Das Aussehen, das die Kugel malt: Ist der Kern der Persönlichkeit gesperrt, immer der Kern aus ihrer
+    Charakter-Datei (Zwang) – sonst die übergebene Beschreibung."""
+    try:
+        import charakter
+        if charakter.kern_gesperrt(name) and (c := charakter_aussehen(name)):
+            return c[0]
+    except Exception:
+        pass
+    return beschreibung
+
+
+def _mit_lora(name: str, basis: str) -> tuple[str, dict]:
+    """Kern bzw. Beschreibung · Auslösewort der gebundenen Bild-LoRA (wenn es eine gültige gibt)."""
+    satz, extra = _lora(name)
+    if not satz:
+        return basis, {}
+    return (f"{basis.strip().rstrip(',.')}. {satz}" if basis.strip() else satz), extra
+
+
 def _maler():
     """Die Malfunktion – im Test austauschbar."""
     import imagegen
@@ -187,26 +221,28 @@ def malen(name: str, beschreibung: str, *, seed: int | None = None, on_status=No
     stimmungen = list(stimmungen or STIMMUNGEN)
     seed = random.randint(0, 2 ** 31 - 1) if seed is None else int(seed)
     paint = _maler()
+    beschreibung = _basis(name, beschreibung)
+    figur_text, mit_lora = _mit_lora(name, beschreibung)
     fertig: list[Path] = []
-    alte = vorhandene(name)
     for i, (stimmung, ausdruck) in enumerate(stimmungen, 1):
         was = stimmung or "neutral"
         if on_status:
             on_status(f"Bild {i}/{len(stimmungen)} · {was} · male …")
-        roh = paint(prompt_bauen(beschreibung, ausdruck, stimmung, kleidung),
-                    size=(1024, 1024), seed=seed, steps=SCHRITTE,
+        roh = paint(prompt_bauen(figur_text, ausdruck, stimmung, kleidung),
+                    size=(1024, 1024), seed=seed, steps=SCHRITTE, **mit_lora,
                     on_status=(lambda m, i=i, was=was: on_status(f"Bild {i}/{len(stimmungen)} · {was} · {m}"))
                     if on_status else None)
         if on_status:
             on_status(f"Bild {i}/{len(stimmungen)} · {was} · stelle frei …")
         ziel = dateiname(name, stimmung)
+        neu = freistellen(Path(roh), ziel.with_suffix(".neu"))   # altes Bild erst weg, wenn das neue steht
         if ziel.exists():
             try:
                 import snapshot
                 snapshot.sichern(ziel, "kugel_malen", verschieben=True)
             except Exception:
                 pass
-        freistellen(Path(roh), ziel)
+        neu.replace(ziel)
         fertig.append(ziel)
     alt = figur(name)
     if alt and (alt.get("beschreibung"), alt.get("seed"), alt.get("kleidung") or "") != (beschreibung, seed, kleidung):
@@ -252,6 +288,7 @@ def motive_malen(name: str, schluessel: list[str], *, on_status=None, abbruch=No
                            "(neue Grundbilder), dann passen auch die Motive.")
     offen = motive_fehlend(name, schluessel)
     paint = _maler()
+    figur_text, mit_lora = _mit_lora(name, f["beschreibung"])
     ordner = motiv_ordner(name)
     fertig: list[Path] = []
     for i, k in enumerate(offen, 1):
@@ -259,11 +296,11 @@ def motive_malen(name: str, schluessel: list[str], *, on_status=None, abbruch=No
             break
         deutsch, englisch = kugelmotive.MOTIVE[k]
         kopf = f"Bild {i}/{len(offen)} · {deutsch}"
-        prompt = (f"{f['beschreibung'].strip().rstrip(',.')}.{_kleid_satz(str(f.get('kleidung') or ''))} "
+        prompt = (f"{figur_text.strip().rstrip(',.')}.{_kleid_satz(str(f.get('kleidung') or ''))} "
                   f"The character is {englisch}. {RAHMEN_MOTIV_SATZ}")
         if on_status:
             on_status(f"{kopf} · male …")
-        roh = paint(prompt, size=(1024, 1024), seed=int(f["seed"]), steps=SCHRITTE,
+        roh = paint(prompt, size=(1024, 1024), seed=int(f["seed"]), steps=SCHRITTE, **mit_lora,
                     on_status=(lambda m, kopf=kopf: on_status(f"{kopf} · {m}")) if on_status else None)
         if on_status:
             on_status(f"{kopf} · stelle frei …")
@@ -365,6 +402,7 @@ def outfit_malen(name: str, key: str, kleidung: str, motive: list[str], *, on_st
     d["liste"][key] = kleidung
     _outfits_schreiben(name, d)
     paint = _maler() if offen else None
+    figur_text, mit_lora = _mit_lora(name, f["beschreibung"]) if offen else ("", {})
     fertig: list[Path] = []
     for i, m in enumerate(offen, 1):
         if abbruch and abbruch():
@@ -372,8 +410,8 @@ def outfit_malen(name: str, key: str, kleidung: str, motive: list[str], *, on_st
         kopf = f"Bild {i}/{len(offen)} · {key} · {m}"
         if on_status:
             on_status(f"{kopf} · male …")
-        roh = paint(outfit_prompt(f["beschreibung"], m, kleidung), size=(1024, 1024), seed=int(f["seed"]),
-                    steps=SCHRITTE, on_status=(lambda t, kopf=kopf: on_status(f"{kopf} · {t}")) if on_status else None)
+        roh = paint(outfit_prompt(figur_text, m, kleidung), size=(1024, 1024),
+                    seed=int(f["seed"]), steps=SCHRITTE, **mit_lora, on_status=(lambda t, kopf=kopf: on_status(f"{kopf} · {t}")) if on_status else None)
         if on_status:
             on_status(f"{kopf} · stelle frei …")
         fertig.append(freistellen(Path(roh), ordner / f"{m}.png"))

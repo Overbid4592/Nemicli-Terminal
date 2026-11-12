@@ -8,8 +8,8 @@ memory.db läuft im WAL-Modus; der Such-Index des Chats erkennt neue Einträge a
 
 Austausch über Dateien in einem Ordner je Elternprozess (die Fenster-exe hat keine Standardausgabe):
 auftrag.json → das Kind schreibt status.txt (eine Zeile je Meldung) und zuletzt ergebnis.json.
-Unterbrechen (neue Runde, Bildermalen): indexdb.unterbrechen() legt die Datei `unterbrechen` an. Im Low-Modus
-(einbetttakt.low) rechnet das Kind dann gedrosselt weiter, nur auf der CPU.
+Unterbrechen (neue Runde, Bildermalen): indexdb.unterbrechen() legt die Datei `unterbrechen` an.
+Das Kind rechnet nur auf der GPU (memory.NUR_GPU); ohne Grafikkarte auf der CPU.
 Der Merkzettel, wann welcher Chat zuletzt eingebettet wurde, geht hin und zurück.
 """
 from __future__ import annotations
@@ -54,14 +54,15 @@ def befehl(o: Path) -> list[str]:
     return [str(pythonw if pythonw.exists() else python), str(main), "--bibliothekar", str(o), str(os.getpid())]
 
 
-def lauf_hier(chat_id, alles: bool, on_status, erzwingen: bool = False) -> dict:
+def lauf_hier(chat_id, alles: bool, on_status, erzwingen: bool = False, nur_kurz: bool = False) -> dict:
     """after_turn in diesem Prozess + Ergebnis. `neu` = neu gespeicherte Brocken, `mit_vektor` = wie viele
-    Brocken in diesem Lauf einen Vektor bekommen haben."""
+    Brocken in diesem Lauf einen Vektor bekommen haben. Das bloße Sammeln läuft so: Es braucht kein Modell."""
     import indexdb
     out = {"n": 0, "err": None, "mit_vektor": 0, "neu": 0}
     try:
         vorher = indexdb.offen()
-        out["n"] = indexdb.after_turn(chat_id, status=on_status, alles=alles, chat_erzwingen=erzwingen)
+        out["n"] = indexdb.after_turn(chat_id, status=on_status, alles=alles, chat_erzwingen=erzwingen,
+                                      nur_kurz=nur_kurz)
         nachher = indexdb.offen()
         out["neu"] = max(0, nachher["brocken"] - vorher["brocken"])
         out["mit_vektor"] = max(0, (nachher["brocken"] - nachher["ohne_vektor"])
@@ -90,9 +91,8 @@ def _status_lesen(p: Path, schon: int, on_status) -> int:
     return len(zeilen)
 
 
-def laufen(chat_id, alles: bool, on_status, erzwingen: bool = False, langsam: bool = False) -> dict:
-    """Ein Bibliothekar-Lauf (blockierend, für einen Thread): im Kindprozess, sonst hier.
-    `langsam`: im Low-Modus von Anfang an gedrosselt (gerade läuft Chat oder Bild)."""
+def laufen(chat_id, alles: bool, on_status, erzwingen: bool = False) -> dict:
+    """Ein Bibliothekar-Lauf mit Modell (blockierend, für einen Thread): im Kindprozess, sonst hier."""
     if not aktiv():
         return lauf_hier(chat_id, alles, on_status, erzwingen)
     import indexdb
@@ -100,8 +100,7 @@ def laufen(chat_id, alles: bool, on_status, erzwingen: bool = False, langsam: bo
         o = ordner()
         shutil.rmtree(o, ignore_errors=True)
         o.mkdir(parents=True, exist_ok=True)
-        auftrag = {"chat_id": chat_id, "alles": bool(alles), "erzwingen": bool(erzwingen), "low": _low(alles),
-                   "langsam": bool(langsam) and _low(alles),
+        auftrag = {"chat_id": chat_id, "alles": bool(alles), "erzwingen": bool(erzwingen),
                    "chat_stand": dict(indexdb._chat_stand), "nachgeholt": dict(indexdb._nachgeholt)}
         (o / "auftrag.json").write_text(json.dumps(auftrag, ensure_ascii=False), encoding="utf-8")
         try:
@@ -139,16 +138,6 @@ def laufen(chat_id, alles: bool, on_status, erzwingen: bool = False, langsam: bo
     indexdb._invalidate()
     return {"n": int(d.get("n") or 0), "err": d.get("err"), "mit_vektor": int(d.get("mit_vektor") or 0),
             "neu": int(d.get("neu") or 0)}
-
-
-def _low(alles: bool) -> bool:
-    if alles:                                    # /gedaechtnis indexieren: voll und gern auf der GPU
-        return False
-    try:
-        import einbetttakt
-        return einbetttakt.low()
-    except Exception:
-        return False
 
 
 # --- Kind ------------------------------------------------------------------------------------------
@@ -189,11 +178,8 @@ def hauptprogramm(argv: list[str]) -> int:
     threading.Thread(target=_eltern_beobachten, args=(eltern,), daemon=True).start()
     import indexdb
     indexdb.SIGNAL_DATEI = o / "unterbrechen"
-    if d.get("low"):
-        import memory
-        indexdb.LOW = memory.NUR_CPU = True
-        if d.get("langsam"):
-            indexdb._drosseln()
+    import memory
+    memory.NUR_GPU = memory.hat_gpu()
     indexdb._chat_stand.update(d.get("chat_stand") or {})
     indexdb._nachgeholt.update(d.get("nachgeholt") or {})
     status = o / "status.txt"

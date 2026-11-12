@@ -6,29 +6,40 @@ schickt Tasten, Maus, Einfügen, Zeichen aus der Eingabemethode (Emoji-Feld
 Win + .) und abgelegte Dateien als Terminal-Folgen zurück. Kein Windows
 Terminal, keine fremde Terminal-Software, keine Fremd-DLL.
 
-Einstellungen (nemicli.config.json): `terminal_thema` (breeze | mint),
+Einstellungen (nemicli.config.json): `terminal_thema` (auto | breeze | mint; auto = Farben von /theme),
 `terminal_schrift`, `terminal_groesse`, `terminal_hintergrund` (0.3–1.0, Durchsicht
 nur des Hintergrunds, verschwommen), `terminal_unschaerfe` (true/false), `terminal_deckkraft`
-(0.5–1.0, ganzes Fenster), `terminal_ki_reiter` (true/false).
+(0.5–1.0, ganzes Fenster), `terminal_ki_reiter` (true/false), `terminal_leuchten` (true/false, Leuchten im
+Hintergrund), `terminal_weich` (true/false, weiches Rollen und gleitender Cursor), `terminal_geteilt`
+(true/false, Reiter „KI“ rechts neben dem Chat).
 
 Reiter wie bei GNOME-Terminal: die Leiste erscheint ab dem zweiten. Strg+Umschalt+T öffnet eine
 Kommandozeile, Strg+Umschalt+W schließt, Strg+Bild↑/↓ wechselt. „🤖 KI“ (Strg+Umschalt+K) zeigt die
-Befehle der KI live – NemiCLI meldet sie über eine Named Pipe (core/ki_terminal.py).
+Befehle der KI live – NemiCLI meldet sie über eine Named Pipe (core/ki_terminal.py). Strg+Umschalt+G
+stellt ihn rechts neben den Chat. Strg+F sucht (Reiter „KI“ und Kommandozeile; im Chat sucht NemiCLI selbst),
+Strg+Klick öffnet Web-Adressen und Pfade.
+
+Gezeichnet wird je Zeile in ein Bild, das mit dem Zeileninhalt gemerkt bleibt: Neu gezeichnet werden nur
+Zeilen, deren Inhalt es noch nicht gab – auch beim Rollen bleiben die Bilder gültig.
 """
 
 from __future__ import annotations
 
 import base64
+import math
 import os
 import re
 import secrets
 import functools
 import sys
 import threading
+import time
 from pathlib import Path
 
 import pyte
 import pyte.screens
+
+import terminal_text
 
 
 @functools.lru_cache(maxsize=4096)
@@ -118,6 +129,36 @@ THEMEN = {
              "normal": ["#2e3436", "#cc0000", "#4e9a06", "#c4a000", "#3465a4", "#75507b", "#06989a", "#d3d7cf"],
              "hell": ["#555753", "#ef2929", "#8ae234", "#fce94f", "#729fcf", "#ad7fa8", "#34e2e2", "#eeeeec"]},
 }
+
+
+def thema_aus_palette(palette: dict) -> dict:
+    """Farben des Fensters aus dem Farbschema von /theme (design.PALETTEN). Die 16 Terminal-Farben
+    bleiben die von Breeze – Programme in der Kommandozeile rechnen mit ihnen."""
+    breeze = THEMEN["breeze"]
+    return {"hintergrund": palette["grund"], "vordergrund": palette["text"], "cursor": palette["cyan"],
+            "normal": [palette["grund"], *breeze["normal"][1:]], "hell": list(breeze["hell"]),
+            "akzent": palette["cyan"], "akzent2": palette["lila"]}
+
+
+def akzente(thema: dict) -> tuple[str, str]:
+    """Die beiden Akzentfarben eines Themas (Reiter, Leuchten, Treffer)."""
+    return thema.get("akzent") or thema["hell"][4], thema.get("akzent2") or thema["hell"][5]
+
+
+def steuer_wert(befehl: str) -> tuple[str, str] | None:
+    """Steuerbefehle mit Wert: „grund=rrggbb“ (Grundfarbe des Programms), „puls=0|1“ (es arbeitet) und die
+    Schalter von /terminal: „leuchten=0|1“, „weich=0|1“, „geteilt=0|1“."""
+    m = re.fullmatch(r"grund=([0-9a-fA-F]{6})", befehl or "")
+    if m:
+        return "grund", "#" + m.group(1).lower()
+    m = re.fullmatch(r"(puls|leuchten|weich|geteilt)=([01])", befehl or "")
+    return (m.group(1), m.group(2)) if m else None
+
+
+PULS_S = 2.4                          # Dauer eines Atemzugs des Hintergrunds, solange das Programm arbeitet
+ZEILEN_SPEICHER = 48 * 1024 * 1024    # so viele Bytes dürfen gemerkte Zeilenbilder belegen
+ROLL_ZEILEN = 3                       # Zeilen je Raste des Mausrads (Reiter „KI“)
+TREFFER_MARKEN = 400                  # so viele Marken am Rand höchstens
 
 
 def farbe(wert: str, thema: dict, vordergrund: bool) -> str:
@@ -210,7 +251,6 @@ def einfuege_ordner() -> Path:
 
 
 def einfuegungen_aufraeumen(ordner: Path, tage: float = EINFUEGEN_TAGE) -> None:
-    import time
     grenze = time.time() - tage * 86400
     for p in ordner.glob("bild_*.png"):
         try:
@@ -368,21 +408,41 @@ class Schirm(_NullbreiteAnhaengen, pyte.Screen):
 # Das Fenster
 # ---------------------------------------------------------------------------
 
+def _terminal_punkt(c: dict) -> int:
+    """Schrift des Terminal-Fensters in Punkt aus /schriftgröße terminal (px); ohne Wahl 11 pt."""
+    try:
+        wert = int((c.get("schriftgroesse") or {}).get("terminal", 0))
+    except (AttributeError, TypeError, ValueError):
+        wert = 0
+    return max(8, min(27, round(wert * 0.75))) if wert else 11
+
+
 def _einstellungen() -> dict:
     try:
         import config
         c = config.load()
     except Exception:
         c = {}
-    thema = str(c.get("terminal_thema") or "breeze").lower()
+    name = str(c.get("terminal_thema") or "auto").lower()
+    thema = THEMEN.get(name)
+    if thema is None:                                  # auto: wie die anderen Fenster nach /theme
+        try:
+            import design
+            thema = thema_aus_palette(design.PALETTEN[design.palette_name()])
+        except Exception:
+            thema = THEMEN["breeze"]
     def zahl(schluessel, standard, unten, oben):
         try:
             return min(oben, max(unten, float(c.get(schluessel, standard))))
         except (TypeError, ValueError):
             return standard
-    return {"thema": THEMEN.get(thema, THEMEN["breeze"]),
+    return {"thema": thema,
+            "leuchten": bool(c.get("terminal_leuchten", True)),
+            "weich": bool(c.get("terminal_weich", True)),
+            "geteilt": bool(c.get("terminal_geteilt", False)),
             "schrift": str(c.get("terminal_schrift") or ""),
-            "groesse": int(c.get("terminal_groesse") or 11),
+            # /schriftgröße terminal (px) → Punkt; terminal_groesse (Punkt) hat Vorrang
+            "groesse": int(c.get("terminal_groesse") or _terminal_punkt(c)),
             # ganzes Fenster (auch Schrift) – 1.0 = aus
             "deckkraft": zahl("terminal_deckkraft", 1.0, 0.5, 1.0),
             # nur der Hintergrund, verschwommen (Windows 11 Acrylic) – 1.0 = deckend
@@ -435,6 +495,13 @@ class KiSchirm(_NullbreiteAnhaengen, pyte.HistoryScreen):
 
     def __init__(self, spalten: int, zeilen: int):
         super().__init__(spalten, zeilen, history=self.VERLAUF, ratio=0.5)
+        self.geschoben = 0             # Zeilen, die je oben hinausgerollt sind (bleibende Zeilennummern)
+
+    def index(self) -> None:
+        unten = (self.margins.bottom if self.margins else self.lines - 1)
+        if self.cursor.y == unten:
+            self.geschoben += 1
+        super().index()
 
     def write_process_input(self, data: str) -> None:
         pass
@@ -541,13 +608,14 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
     _app_kennung()
     from PySide6.QtCore import QPointF, QRect, QRectF, Qt, QTimer
     from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QGuiApplication, QIcon, QImage,
-                               QKeySequence, QPainter, QPixmap, QShortcut)
-    from PySide6.QtWidgets import (QApplication, QHBoxLayout, QMenu, QStackedWidget, QSystemTrayIcon, QTabBar,
-                                   QToolButton, QVBoxLayout, QWidget)
+                               QKeySequence, QPainter, QPixmap, QRadialGradient, QShortcut)
+    from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QSplitter, QStackedWidget,
+                                   QSystemTrayIcon, QTabBar, QToolButton, QToolTip, QVBoxLayout, QWidget)
     import terminal_pty
 
     e = _einstellungen()
     thema = e["thema"]
+    akzent, akzent2 = akzente(thema)
     app = QApplication.instance() or QApplication(sys.argv[:1])
     try:
         ki_leitung = KiLeitung() if e["ki_reiter"] else None
@@ -590,7 +658,24 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             # (nur Sichtbares); ein Klick ohne Ziehen geht ans Programm.
             self.druck = None             # (zelle, shift, alt, strg) beim Drücken links
             self.zieht = False
-            self.auswahl = None           # (start, ende) in Zellen
+            self.auswahl = None           # (start, ende) in Zellen (Spalte, bleibende Zeilennummer)
+            self.zeilen_bild = {}         # Zeileninhalt -> QPixmap (None = leere Zeile), älteste zuerst
+            self.zeilen_schluessel = {}   # Bildschirmzeile -> Inhalt beim letzten Zeichnen
+            self.bild_stand = None        # (Spalten, Bildpunkt-Verhältnis), für die die Bilder gelten
+            self.grund_programm = ""      # „#rrggbb“: Grundfarbe des Programms – solche Zellen bleiben frei
+            self.puls = False             # das Programm arbeitet: der Hintergrund atmet
+            self.puls_seit = 0.0
+            self.puls_takt = 0
+            self.leuchten_bild = None     # (Größe, Bild) des Leuchtens
+            self.roll = self.roll_ziel = 0.0          # nur Lesen: Bildpunkte über dem Ende des Verlaufs
+            self.geschoben_alt = 0
+            self.cursor_xy = None         # gleitender Cursor (Spalte, Zeile als Kommazahl)
+            self.such_begriff = ""
+            self.treffer = []             # (bleibende Zeilennummer, erste Zelle, letzte Zelle)
+            self.treffer_nr = -1
+            self.link = None              # (Zeilennummer, erste Zelle, letzte Zelle, Art, Ziel) unter der Maus
+            self.link_merk = (None, [])   # zuletzt untersuchte Zeile und ihre Links
+            self.link_klick = False
             self.takt = QTimer(self)
             self.takt.timeout.connect(self._takt)
             self.takt.start(16)
@@ -640,6 +725,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                     # /restart: NemiCLI hat sich zum Neustart beendet – im selben Fenster neu starten, erst
                     # jetzt, wo der alte Prozess wirklich weg ist (Grafikkarte und Dateien sind frei).
                     self.ende = False
+                    self.puls = False
                     with self.lock:
                         self.schirm.reset()
                         self.neu = True
@@ -652,14 +738,109 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             for befehl in befehle:
                 if befehl in ("tray", "zeigen"):
                     self.fenster.in_tray(befehl == "tray")
+                elif (wert := steuer_wert(befehl)) is not None:
+                    self._steuer_wert(*wert)
                 elif (bild := bild_befehl(befehl)) is not None:
                     self._bild_setzen(*bild)
             if not self.haupt and not self.nur_lesen and self.schirm.title != self.titel_alt:
                 self.titel_alt = self.schirm.title
                 self.fenster.reiter_benennen(self, self.titel_alt)
+            if self.nur_lesen:
+                self._rollen_takt()
+            if self._cursor_takt():
+                self.neu = True
+            if self.puls and self.fenster.leuchten:
+                self.puls_takt += 1
+                if self.puls_takt % 3 == 0:              # rund 20 Bilder je Sekunde reichen dem Atmen
+                    self.neu = True
             if self.neu:
                 self.neu = False
                 self.update()
+
+        def _steuer_wert(self, name, wert):
+            if name == "grund" and wert != self.grund_programm:
+                # Das Programm füllt jede Zelle mit seiner Grundfarbe. Diese Zellen bleiben frei, sonst
+                # deckten sie Durchsicht und Leuchten des Fensters zu.
+                self.grund_programm = wert
+                self.grund = QColor(wert)
+                if self.fenster.durchsichtig:
+                    self.grund.setAlphaF(e["hintergrund"])
+                self.zeilen_bild.clear()
+                self.neu = True
+            elif name == "puls":
+                an = wert == "1"
+                if an and not self.puls:
+                    self.puls_seit = time.monotonic()
+                self.puls, self.neu = an, True
+            elif name == "leuchten":
+                self.fenster.leuchten_setzen(wert == "1")
+            elif name == "weich":
+                self.fenster.weich = wert == "1"
+            elif name == "geteilt":
+                self.fenster.teilen(wert == "1")
+
+        def _rollen_takt(self):
+            """Reiter „KI“: Kommt Neues, während zurückgerollt ist, bleibt die Ansicht stehen; das Rollen
+            selbst läuft in kleinen Schritten auf sein Ziel zu."""
+            with self.lock:
+                neu = self.schirm.geschoben - self.geschoben_alt
+                self.geschoben_alt = self.schirm.geschoben
+                hoechstens = self._oben() * self.zh
+            if neu > 0 and self.roll_ziel > 0:
+                self.roll += neu * self.zh
+                self.roll_ziel += neu * self.zh
+            self.roll_ziel = max(0.0, min(self.roll_ziel, hoechstens))
+            self.roll = max(0.0, min(self.roll, hoechstens))
+            if self.roll != self.roll_ziel:
+                rest = self.roll_ziel - self.roll
+                springen = not self.fenster.weich or abs(rest) < 1.0
+                self.roll = self.roll_ziel if springen else self.roll + rest * 0.3
+                self.neu = True
+
+        def rollen(self, bildpunkte: float):
+            """Reiter „KI“ zurück- (+) oder vorrollen (−)."""
+            self.roll_ziel += bildpunkte
+
+        def _cursor_takt(self) -> bool:
+            """Der Cursor gleitet kurze Wege, weite springt er. True: neu zeichnen."""
+            c = self.schirm.cursor
+            ziel = (float(c.x), float(c.y))
+            alt = self.cursor_xy
+            if alt == ziel:
+                return False
+            if alt is None or c.hidden or self.nur_lesen:
+                self.cursor_xy = ziel
+                return False
+            if not self.fenster.weich or abs(alt[1] - ziel[1]) > 1.0 or abs(alt[0] - ziel[0]) > 24.0:
+                self.cursor_xy = ziel
+                return True
+            x, y = alt[0] + (ziel[0] - alt[0]) * 0.45, alt[1] + (ziel[1] - alt[1]) * 0.45
+            self.cursor_xy = ziel if abs(x - ziel[0]) < 0.05 and abs(y - ziel[1]) < 0.05 else (x, y)
+            return True
+
+        # -- Zeilen: Verlauf und Bildschirm als eine Folge --------------------------
+        def _oben(self) -> int:
+            """Zeilen im Verlauf über dem Bildschirm (nur der Reiter „KI“ hat einen)."""
+            return len(self.schirm.history.top) if self.nur_lesen else 0
+
+        def _versatz(self) -> int:
+            """Bleibende Nummer der ältesten Zeile – sie zählt weiter, wenn der Verlauf vorn kürzt."""
+            return self.schirm.geschoben - self._oben() if self.nur_lesen else 0
+
+        def _zeile(self, v: int):
+            oben = self._oben()
+            return self.schirm.history.top[v] if v < oben else self.schirm.buffer[v - oben]
+
+        def _zellen(self, nummer: int) -> list | None:
+            """Zellinhalte der Zeile mit dieser bleibenden Nummer (None: gibt es nicht mehr)."""
+            v = nummer - self._versatz()
+            if not 0 <= v < self._oben() + self.schirm.lines:
+                return None
+            zeile = self._zeile(v)
+            return [zeile[x].data for x in range(self.schirm.columns)]
+
+        def _zeilen_y(self, nummer: int, oben: int, versatz: int) -> float:
+            return 8 + (nummer - versatz - oben) * self.zh + self.roll
 
         def _bild_setzen(self, nr, hoehe, pfad):
             self.bilder_skaliert = {k: v for k, v in self.bilder_skaliert.items() if k[0] != nr}
@@ -701,9 +882,12 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             return max(20, int((self.width() - 16) // self.zb)), max(5, int((self.height() - 16) // self.zh))
 
         def _zelle(self, pos):
+            """Zelle unter einem Punkt: (Spalte, bleibende Zeilennummer). Ohne Verlauf ist die Nummer
+            die Bildschirmzeile."""
             sp = int((pos.x() - 8) // self.zb)
-            ze = int((pos.y() - 8) // self.zh)
-            return max(0, min(sp, self.schirm.columns - 1)), max(0, min(ze, self.schirm.lines - 1))
+            ze = int((pos.y() - 8 - self.roll) // self.zh) + self._oben()
+            ze = max(0, min(ze, self._oben() + self.schirm.lines - 1)) + self._versatz()
+            return max(0, min(sp, self.schirm.columns - 1)), ze
 
         def resizeEvent(self, ev):
             sp, ze = self._raster()
@@ -713,10 +897,16 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                         self.schirm = KiSchirm(sp, ze)
                         self.strom = pyte.Stream(self.schirm)
                         self.strom.feed("".join(self.protokoll))
+                        # neu aufgebaut: Zeilennummern, Rollstand und Treffer gelten nicht mehr
+                        self.geschoben_alt = self.schirm.geschoben
+                        self.roll = self.roll_ziel = 0.0
+                        self.auswahl, self.treffer, self.treffer_nr, self.link = None, [], -1, None
                     else:
                         self.schirm.resize(ze, sp)
+                    self.zeilen_schluessel.clear()
                 if self.pty is not None:
                     self.pty.groesse(sp, ze)
+            self.leuchten_bild = None
             super().resizeEvent(ev)
 
         # -- Zeichnen ------------------------------------------------------------
@@ -725,54 +915,165 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             p.setCompositionMode(QPainter.CompositionMode_Source)
             p.fillRect(self.rect(), self.grund)
             p.setCompositionMode(QPainter.CompositionMode_SourceOver)
+            self._leuchten_malen(p)
+            dpr = self.devicePixelRatioF()
             with self.lock:
+                # Unter der Sperre nur lesen, was sich geändert hat; gezeichnet wird danach – der
+                # Lese-Thread des Programms wartet so nicht auf das Zeichnen.
                 s = self.schirm
-                for y in range(s.lines):
-                    zeile = s.buffer[y]
-                    x = 0
-                    while x < s.columns:
-                        z = zeile[x]
-                        stil = (z.fg, z.bg, z.bold, z.italics, z.underscore, z.reverse)
-                        start, zellen = x, [z.data]
-                        x += 1
-                        while x < s.columns:
-                            n = zeile[x]
-                            if (n.fg, n.bg, n.bold, n.italics, n.underscore, n.reverse) != stil:
-                                break
-                            zellen.append(n.data)
-                            x += 1
-                        self._lauf(p, start, y, x - start, zellen, stil)
-                if self.bilder:                  # die Zellmatrix nur bauen, wenn es Bilder gibt
-                    self._bilder_malen(p, [[z.data for z in (s.buffer[y][x] for x in range(s.columns))]
-                                           for y in range(s.lines)])
-                if self.auswahl:
-                    (x1, y1), (x2, y2) = geordnet(*self.auswahl)
-                    farbe_a = QColor(thema["hell"][4])
-                    farbe_a.setAlpha(110)
-                    for y in range(y1, y2 + 1):
-                        von = x1 if y == y1 else 0
-                        bis = x2 if y == y2 else s.columns - 1
-                        p.fillRect(QRectF(8 + von * self.zb, 8 + y * self.zh,
-                                          (bis - von + 1) * self.zb, self.zh), farbe_a)
+                spalten, zeilen = s.columns, s.lines
+                oben, versatz = self._oben(), self._versatz()
+                if self.bild_stand != (spalten, dpr):
+                    self.bild_stand = (spalten, dpr)
+                    self.zeilen_bild.clear()
+                    self.zeilen_schluessel.clear()
+                    s.dirty.update(range(zeilen))
+                erste = int(math.floor(oben - self.roll / self.zh))
+                sichtbar = []
+                for v in range(max(0, erste), min(oben + zeilen, erste + zeilen + 1)):
+                    y = v - oben
+                    schluessel = self.zeilen_schluessel.get(y) if y >= 0 and y not in s.dirty else None
+                    if schluessel is None:
+                        zeile = self._zeile(v)
+                        schluessel = tuple(zeile[x] for x in range(spalten))
+                        if y >= 0:
+                            self.zeilen_schluessel[y] = schluessel
+                    sichtbar.append((v, schluessel))
+                s.dirty.clear()
                 c = s.cursor
-                if not self.nur_lesen and not c.hidden and 0 <= c.y < s.lines and 0 <= c.x < s.columns:
-                    r = QRectF(8 + c.x * self.zb, 8 + c.y * self.zh, self.zb, self.zh)
-                    farbe_c = QColor(thema["cursor"])
-                    if self.hasFocus():
-                        farbe_c.setAlpha(170)
-                        p.fillRect(r, farbe_c)
-                    else:
-                        p.setPen(farbe_c)
-                        p.drawRect(r.adjusted(0, 0, -1, -1))
+                cursor = None if (self.nur_lesen or c.hidden or not (0 <= c.y < zeilen and 0 <= c.x < spalten)) \
+                    else (self.cursor_xy or (c.x, c.y))
+
+            def y_von(v):                        # auf ganze Bildpunkte: die Zeilenbilder bleiben scharf
+                return round((8 + (v - oben) * self.zh + self.roll) * dpr) / dpr
+
+            for v, schluessel in sichtbar:
+                bild = self._zeilenbild(schluessel, dpr)
+                if bild is not None:
+                    p.drawPixmap(QPointF(8.0, y_von(v)), bild)
+            if self.bilder:                      # die Zellmatrix nur bauen, wenn es Bilder gibt
+                self._bilder_malen(p, [[z.data for z in schluessel] for _v, schluessel in sichtbar])
+            if self.treffer:
+                self._treffer_malen(p, y_von, versatz, oben + zeilen)
+            if self.auswahl:
+                (x1, n1), (x2, n2) = geordnet(*self.auswahl)
+                farbe_a = QColor(akzent)
+                farbe_a.setAlpha(110)
+                for v, _schluessel in sichtbar:
+                    if n1 <= v + versatz <= n2:
+                        von = x1 if v + versatz == n1 else 0
+                        bis = x2 if v + versatz == n2 else spalten - 1
+                        p.fillRect(QRectF(8 + von * self.zb, y_von(v), (bis - von + 1) * self.zb, self.zh), farbe_a)
+            if self.link is not None:
+                nummer, x0, x1 = self.link[:3]
+                y = y_von(nummer - versatz) + self.zh - 1
+                p.setPen(QColor(akzent))
+                p.drawLine(QPointF(8 + x0 * self.zb, y), QPointF(8 + (x1 + 1) * self.zb, y))
+            if cursor is not None:
+                r = QRectF(8 + cursor[0] * self.zb, y_von(oben) + cursor[1] * self.zh, self.zb, self.zh)
+                farbe_c = QColor(thema["cursor"])
+                if self.hasFocus():
+                    farbe_c.setAlpha(170)
+                    p.fillRect(r, farbe_c)
+                else:
+                    p.setPen(farbe_c)
+                    p.drawRect(r.adjusted(0, 0, -1, -1))
             p.end()
 
-        def _lauf(self, p, x, y, breite, zellen, stil):
+        def _leuchten_malen(self, p):
+            """Sanftes Leuchten oben im Fenster in den Akzentfarben. Arbeitet das Programm, atmet es.
+            Das Leuchten ist ein gemerktes Bild; beim Atmen ändert sich nur seine Deckkraft."""
+            if not self.fenster.leuchten:
+                return
+            groesse = (self.width(), self.height())
+            if self.leuchten_bild is None or self.leuchten_bild[0] != groesse:
+                b, h = groesse
+                bild = QPixmap(max(1, b), max(1, h))
+                bild.fill(Qt.transparent)
+                maler = QPainter(bild)
+                for mitte, ton, deckung in ((0.2, akzent, 46), (0.85, akzent2, 38)):
+                    verlauf = QRadialGradient(QPointF(b * mitte, -h * 0.2), max(b, h) * 0.8)
+                    innen, aussen = QColor(ton), QColor(ton)
+                    innen.setAlpha(deckung)
+                    aussen.setAlpha(0)
+                    verlauf.setColorAt(0.0, innen)
+                    verlauf.setColorAt(1.0, aussen)
+                    maler.fillRect(bild.rect(), verlauf)
+                maler.end()
+                self.leuchten_bild = (groesse, bild)
+            staerke = 0.55
+            if self.puls:
+                phase = (time.monotonic() - self.puls_seit) * 2 * math.pi / PULS_S
+                staerke = 0.55 + 0.45 * (0.5 - 0.5 * math.cos(phase))
+            p.setOpacity(staerke)
+            p.drawPixmap(0, 0, self.leuchten_bild[1])
+            p.setOpacity(1.0)
+
+        def _treffer_malen(self, p, y_von, versatz, gesamt):
+            """Suchtreffer hinterlegen (der aktuelle kräftiger) und als Marken am rechten Rand zeigen."""
+            blass, kraeftig = QColor(akzent2), QColor(akzent2)
+            blass.setAlpha(90)
+            kraeftig.setAlpha(190)
+            hoehe = self.height()
+            for i, (nummer, x0, x1) in enumerate(self.treffer):
+                y = y_von(nummer - versatz)
+                if -self.zh < y < hoehe:
+                    p.fillRect(QRectF(8 + x0 * self.zb, y, (x1 - x0 + 1) * self.zb, self.zh),
+                               kraeftig if i == self.treffer_nr else blass)
+            schritt = max(1, len(self.treffer) // TREFFER_MARKEN)
+            for i in range(0, len(self.treffer), schritt):
+                lage = (self.treffer[i][0] - versatz) / max(1, gesamt)
+                p.fillRect(QRectF(self.width() - 5, 8 + lage * (hoehe - 16), 4, 2), kraeftig)
+
+        def _zeilenbild(self, schluessel, dpr):
+            """Bild einer Zeile, gemerkt unter ihrem Inhalt (None: leere Zeile)."""
+            merk = self.zeilen_bild
+            if schluessel in merk:
+                bild = merk.pop(schluessel)                 # wieder ans Ende: zuletzt gebraucht
+                merk[schluessel] = bild
+                return bild
+            bild = None
+            if any(z.data.strip() or z.reverse or z.underscore or not self._grund_frei(z.bg) for z in schluessel):
+                breite = max(1, math.ceil(len(schluessel) * self.zb * dpr))
+                hoehe = max(1, math.ceil(self.zh * dpr))
+                bild = QPixmap(breite, hoehe)
+                bild.setDevicePixelRatio(dpr)
+                # Durchsichtig nur, wenn dahinter etwas zu sehen ist; deckend bleibt die Schrift
+                # mit Farbrand-Glättung (ClearType) so scharf wie beim direkten Zeichnen.
+                frei = self.fenster.durchsichtig or self.fenster.leuchten
+                bild.fill(Qt.transparent if frei else self.grund)
+                maler = QPainter(bild)
+                x, spalten = 0, len(schluessel)
+                while x < spalten:
+                    z = schluessel[x]
+                    stil = (z.fg, z.bg, z.bold, z.italics, z.underscore, z.reverse)
+                    start, zellen = x, [z.data]
+                    x += 1
+                    while x < spalten:
+                        n = schluessel[x]
+                        if (n.fg, n.bg, n.bold, n.italics, n.underscore, n.reverse) != stil:
+                            break
+                        zellen.append(n.data)
+                        x += 1
+                    self._lauf(maler, start, x - start, zellen, stil)
+                maler.end()
+                hoechstens = max(self.schirm.lines * 2, ZEILEN_SPEICHER // max(1, breite * hoehe * 4))
+                while len(merk) >= hoechstens:
+                    merk.pop(next(iter(merk)))
+            merk[schluessel] = bild
+            return bild
+
+        def _grund_frei(self, bg: str) -> bool:
+            """Hintergrund einer Zelle, der nicht gefüllt wird: die Grundfarbe des Fensters oder des Programms."""
+            return bg == "default" or farbe(bg, thema, False) in (thema["hintergrund"], self.grund_programm)
+
+        def _lauf(self, p, x, breite, zellen, stil):
             fg, bg, fett, kursiv, unter, umgekehrt = stil
             vorn, hinten = farbe(fg, thema, True), farbe(bg, thema, False)
             if umgekehrt:
                 vorn, hinten = hinten, vorn
-            r = QRectF(8 + x * self.zb, 8 + y * self.zh, breite * self.zb, self.zh)
-            if hinten != thema["hintergrund"]:
+            r = QRectF(x * self.zb, 0, breite * self.zb, self.zh)
+            if hinten != thema["hintergrund"] and hinten != self.grund_programm:
                 p.fillRect(r, QColor(hinten))
             if any(ch.strip() for ch in zellen):
                 f = self.fett if fett else self.schrift
@@ -820,12 +1121,20 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 self.auswahl = None
                 self.update()
                 return
+            if strg and not alt and not shift and ev.key() == Qt.Key_F and not self.haupt:
+                self.fenster.suche_oeffnen(self)         # im Chat sucht NemiCLI selbst (Strg+F geht durch)
+                return
             if self.auswahl:
                 self.auswahl = None
                 self.update()
             if self.nur_lesen:
+                seite = (self.schirm.lines - 2) * self.zh
                 if ev.key() in (Qt.Key_PageUp, Qt.Key_PageDown):
-                    self._blaettern(ev.key() == Qt.Key_PageUp)
+                    self.rollen(seite if ev.key() == Qt.Key_PageUp else -seite)
+                elif ev.key() in (Qt.Key_Up, Qt.Key_Down):
+                    self.rollen(self.zh if ev.key() == Qt.Key_Up else -self.zh)
+                elif ev.key() in (Qt.Key_Home, Qt.Key_End):
+                    self.roll_ziel = self._oben() * self.zh if ev.key() == Qt.Key_Home else 0.0
                 return
             name = self._QT_NAMEN.get(ev.key(), "")
             text = ev.text()
@@ -835,20 +1144,78 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                                    anwendungs_cursor=self.schirm.anwendungs_cursor())
             self._senden(folge)
 
-        def _blaettern(self, zurueck: bool):
-            with self.lock:
-                (self.schirm.prev_page if zurueck else self.schirm.next_page)()
-            self.update()
+        def keyReleaseEvent(self, ev):
+            if ev.key() == Qt.Key_Control:
+                self._link_setzen(None)
+            super().keyReleaseEvent(ev)
 
         def _kopieren(self):
             if not self.auswahl:
                 return
+            (x1, n1), (x2, n2) = geordnet(*self.auswahl)
             with self.lock:
-                s = self.schirm
-                zeilen = [[s.buffer[y][x].data for x in range(s.columns)] for y in range(s.lines)]
-            text = auswahl_text(zeilen, *self.auswahl)
+                zeilen = [self._zellen(n) or [] for n in range(n1, n2 + 1)]
+            text = auswahl_text(zeilen, (x1, 0), (x2, n2 - n1))
             if text:
                 QGuiApplication.clipboard().setText(text)
+
+        # -- Suche -----------------------------------------------------------------
+        def suchen(self, begriff: str) -> int:
+            """Sucht im Verlauf und auf dem Bildschirm, beginnt beim neuesten Treffer. Gibt die Zahl zurück."""
+            with self.lock:
+                versatz = self._versatz()
+                zeilen = [(v + versatz, self._zellen(v + versatz)) for v in range(self._oben() + self.schirm.lines)]
+            self.such_begriff = begriff
+            self.treffer = terminal_text.suche(zeilen, begriff, ist_platzhalter)
+            self.treffer_nr = len(self.treffer) - 1
+            self._treffer_zeigen()
+            return len(self.treffer)
+
+        def such_sprung(self, schritt: int) -> None:
+            self.treffer_nr = terminal_text.naechster(self.treffer, self.treffer_nr, schritt)
+            self._treffer_zeigen()
+
+        def suche_leeren(self) -> None:
+            self.such_begriff, self.treffer, self.treffer_nr = "", [], -1
+            self.update()
+
+        def _treffer_zeigen(self) -> None:
+            """Den aktuellen Treffer ins Bild rollen (Reiter „KI“), falls er außerhalb liegt."""
+            if self.nur_lesen and 0 <= self.treffer_nr < len(self.treffer):
+                with self.lock:
+                    lage = (self.treffer[self.treffer_nr][0] - self._versatz() - self._oben()) * self.zh
+                y = 8 + lage + self.roll_ziel
+                if not self.zh <= y <= self.height() - 2 * self.zh:
+                    self.roll_ziel = self.height() / 2 - lage          # der Takt begrenzt auf den Verlauf
+            self.update()
+
+        # -- Links (Strg+Klick) ------------------------------------------------------
+        def _link_bei(self, pos):
+            """Link unter einem Punkt: (Zeilennummer, erste Zelle, letzte Zelle, Art, Ziel) oder None."""
+            spalte, nummer = self._zelle(pos)
+            with self.lock:
+                zellen = self._zellen(nummer)
+            if zellen is None:
+                return None
+            if self.link_merk[0] != zellen:             # je Zeile nur einmal auf der Platte nachsehen
+                self.link_merk = (zellen, terminal_text.finde_links(zellen, platzhalter=ist_platzhalter))
+            for x0, x1, art, ziel in self.link_merk[1]:
+                if x0 <= spalte <= x1:
+                    return nummer, x0, x1, art, ziel
+            return None
+
+        def _link_setzen(self, link, ev=None) -> None:
+            if link == self.link:
+                return
+            self.link = link
+            if link is None:
+                self.unsetCursor()
+                QToolTip.hideText()
+            else:
+                self.setCursor(Qt.PointingHandCursor)
+                if ev is not None:                      # das Ziel zeigen, bevor geklickt wird
+                    QToolTip.showText(ev.globalPosition().toPoint(), link[4], self)
+            self.update()
 
         def _einfuegen(self):
             """Strg+V: kopierte Dateien als Pfade, sonst Text, sonst ein Bild (als PNG abgelegt, Pfad eingefügt)."""
@@ -861,7 +1228,6 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             self._text_einfuegen(text)
 
         def _bild_ablegen(self, bild) -> str:
-            import time
             if bild is None or not isinstance(bild, QImage):
                 bild = QImage(bild) if isinstance(bild, QPixmap) else None
             if bild is None or bild.isNull():
@@ -961,6 +1327,13 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
 
         def mousePressEvent(self, ev):
             k = self._KNOPF.get(ev.button())
+            shift, _alt, strg = self._tasten(ev)
+            if k == 0 and strg and not shift:
+                link = self._link_bei(ev.position())
+                if link is not None:                    # Strg+Klick auf einen Link: öffnen, nichts ans Programm
+                    self.link_klick = True
+                    terminal_text.oeffnen(link[3], link[4])
+                    return
             if k == 0 and self._programm_markiert(ev):
                 if self.auswahl:
                     self.auswahl = None
@@ -984,6 +1357,9 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
 
         def mouseReleaseEvent(self, ev):
             k = self._KNOPF.get(ev.button())
+            if k == 0 and self.link_klick:
+                self.link_klick = False
+                return
             if k == 0 and self.druck is not None:
                 zelle, tasten = self.druck
                 self.druck = None
@@ -999,6 +1375,11 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                 self.maus_knopf = None
 
         def mouseMoveEvent(self, ev):
+            shift, _alt, strg = self._tasten(ev)
+            if strg and not shift and not ev.buttons():
+                self._link_setzen(self._link_bei(ev.position()), ev)
+            elif self.link is not None:
+                self._link_setzen(None)
             if self.druck is not None and ev.buttons() & Qt.LeftButton:
                 zelle = self._zelle(ev.position())
                 if self.zieht or zelle != self.druck[0]:
@@ -1011,7 +1392,8 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
 
         def wheelEvent(self, ev):
             if self.nur_lesen:
-                self._blaettern(ev.angleDelta().y() > 0)
+                punkte = ev.pixelDelta().y()            # Tastfeld: Bildpunkte, Mausrad: Rasten zu je 120
+                self.rollen(punkte if punkte else ev.angleDelta().y() / 120 * ROLL_ZEILEN * self.zh)
             elif self.schirm.maus_an():
                 self._maus(ev, 64 if ev.angleDelta().y() > 0 else 65)
             else:
@@ -1041,11 +1423,17 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             self.fett = QFont(schrift)
             self.fett.setBold(True)
             m = QFontMetricsF(schrift)
-            self.zb, self.zh, self.oben = m.horizontalAdvance("M"), m.height(), m.ascent()
+            # Zeilenhöhe in ganzen Bildpunkten: die Zeilenbilder schließen so lückenlos aneinander an.
+            dpr = self.devicePixelRatioF()
+            self.zb, self.zh, self.oben = m.horizontalAdvance("M"), math.ceil(m.height() * dpr) / dpr, m.ascent()
+            self.leuchten = bool(e.get("leuchten", True))
+            self.weich = bool(e.get("weich", True))
             self.tray = None
             self.haupt = None
             self.ki = None
             self.ki_zu = False            # Reiter „KI“ geschlossen: erst Strg+Umschalt+K öffnet ihn wieder
+            self.geteilt = False          # Reiter „KI“ steht rechts neben dem Chat
+            self.such_ziel = None         # Ansicht, in der die Suchleiste gerade sucht
             self.reiter: list = []
             self.resize(int(self.zb * 110 + 16), int(self.zh * 32 + 16))
             self.setWindowOpacity(e["deckkraft"])
@@ -1083,11 +1471,19 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             self.leiste.setStyleSheet(self._leisten_stil())
             self.leiste.hide()
             self.stapel = QStackedWidget(self)
+            self.teiler = QSplitter(Qt.Horizontal, self)      # links die Reiter, rechts bei Bedarf „KI“
+            self.teiler.setChildrenCollapsible(False)
+            self.teiler.setHandleWidth(3)
+            self.teiler.setStyleSheet(
+                f"QSplitter::handle {{ background: {QColor(thema['hintergrund']).lighter(170).name()}; }}")
+            self.teiler.addWidget(self.stapel)
+            self.suchleiste = self._suchleiste_bauen()
             spalte.addWidget(self.leiste)
-            spalte.addWidget(self.stapel, 1)
+            spalte.addWidget(self.suchleiste)
+            spalte.addWidget(self.teiler, 1)
             for tasten, aktion in (("Ctrl+Shift+T", self.neue_shell), ("Ctrl+Shift+W", self._aktuellen_schliessen),
                                    ("Ctrl+PgDown", lambda: self._weiter(1)), ("Ctrl+PgUp", lambda: self._weiter(-1)),
-                                   ("Ctrl+Shift+K", self.ki_zeigen)):
+                                   ("Ctrl+Shift+K", self.ki_zeigen), ("Ctrl+Shift+G", self.teilen_umschalten)):
                 kurz = QShortcut(QKeySequence(tasten), self)
                 kurz.setContext(Qt.WindowShortcut)
                 kurz.activated.connect(aktion)
@@ -1105,11 +1501,148 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
                     f"QTabBar::tab {{ background: transparent; color: {thema['normal'][7]}; padding: 4px 12px;"
                     f" border: none; border-bottom: 2px solid transparent; margin-right: 2px; }}"
                     f"QTabBar::tab:selected {{ color: {thema['vordergrund']}; background: {gewaehlt.name()};"
-                    f" border-bottom: 2px solid {thema['hell'][4]}; border-radius: 4px; }}"
+                    f" border-bottom: 2px solid {akzent}; border-radius: 4px; }}"
                     f"QTabBar::tab:hover {{ color: {thema['vordergrund']}; }}"
                     f"QToolButton {{ color: {thema['vordergrund']}; background: transparent; border: none;"
                     f" padding: 2px 8px; font-size: 14px; }}"
-                    f"QToolButton:hover {{ background: {gewaehlt.name()}; border-radius: 4px; }}")
+                    f"QToolButton:hover {{ background: {gewaehlt.name()}; border-radius: 4px; }}"
+                    f"QLineEdit {{ color: {thema['vordergrund']}; background: {gewaehlt.name()};"
+                    f" border: 1px solid {akzent}; border-radius: 4px; padding: 2px 6px;"
+                    f" selection-background-color: {akzent2}; }}"
+                    f"QLabel {{ color: {thema['normal'][7]}; background: transparent; padding: 0 6px; }}")
+
+        # -- Suchleiste (Strg+F in „KI“ und Kommandozeile) ----------------------------
+        def _suchleiste_bauen(self):
+            fenster = self
+
+            class Suchfeld(QLineEdit):
+                def keyPressEvent(self, ev):
+                    if ev.key() == Qt.Key_Escape:
+                        fenster.suche_schliessen()
+                    elif ev.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Up, Qt.Key_Down):
+                        # Enter und ↑: älterer Treffer; Umschalt+Enter und ↓: neuerer
+                        zurueck = ev.key() == Qt.Key_Up or (
+                            ev.key() != Qt.Key_Down and not ev.modifiers() & Qt.ShiftModifier)
+                        fenster.such_sprung(-1 if zurueck else 1)
+                    else:
+                        super().keyPressEvent(ev)
+
+            leiste = QWidget(self)
+            leiste.setAttribute(Qt.WA_StyledBackground, True)
+            reihe = QHBoxLayout(leiste)
+            reihe.setContentsMargins(8, 4, 6, 4)
+            reihe.setSpacing(4)
+            self.suchfeld = Suchfeld(leiste)
+            self.suchfeld.setPlaceholderText("Suchen …  Enter/↑ älter · ↓ neuer · Esc schließt")
+            self.suchzahl = QLabel("", leiste)
+            zu = QToolButton(leiste)
+            zu.setText("✕")
+            zu.setFocusPolicy(Qt.NoFocus)
+            zu.clicked.connect(self.suche_schliessen)
+            reihe.addWidget(self.suchfeld, 1)
+            reihe.addWidget(self.suchzahl)
+            reihe.addWidget(zu)
+            leiste.setStyleSheet(self._leisten_stil())
+            leiste.hide()
+            self.such_warten = QTimer(self)            # erst suchen, wenn kurz nicht getippt wurde
+            self.such_warten.setSingleShot(True)
+            self.such_warten.setInterval(200)
+            self.such_warten.timeout.connect(self._suche_starten)
+            self.suchfeld.textChanged.connect(lambda _t: self.such_warten.start())
+            return leiste
+
+        def suche_oeffnen(self, ansicht):
+            self.such_ziel = ansicht
+            self.suchleiste.show()
+            self.suchfeld.setFocus()
+            self.suchfeld.selectAll()
+            self._suche_starten()
+
+        def suche_schliessen(self):
+            self.such_warten.stop()
+            self.suchleiste.hide()
+            ziel, self.such_ziel = self.such_ziel, None
+            if ziel is not None and (ziel in self.reiter or ziel is self.ki):
+                ziel.suche_leeren()
+                ziel.setFocus()
+
+        def _suche_starten(self):
+            ziel = self.such_ziel
+            if ziel is None:
+                return
+            if not self.suchfeld.text().strip():
+                ziel.suche_leeren()
+                self.suchzahl.setText("")
+                return
+            ziel.suchen(self.suchfeld.text())
+            self._suchzahl_zeigen()
+
+        def such_sprung(self, schritt: int):
+            if self.such_ziel is None:
+                return
+            if self.such_warten.isActive():           # noch nicht gesucht: erst suchen
+                self.such_warten.stop()
+                self._suche_starten()
+                return
+            self.such_ziel.such_sprung(schritt)
+            self._suchzahl_zeigen()
+
+        def _suchzahl_zeigen(self):
+            ziel = self.such_ziel
+            if ziel is None or not ziel.treffer:
+                self.suchzahl.setText("kein Treffer")
+            else:
+                self.suchzahl.setText(f"{ziel.treffer_nr + 1} / {len(ziel.treffer)}")
+
+        def leuchten_setzen(self, an: bool):
+            """Leuchten ein- oder ausschalten (/terminal). Die Zeilenbilder entstehen neu: mit Leuchten
+            sind sie durchsichtig, ohne deckend."""
+            self.leuchten = an
+            for ansicht in [*self.reiter, *([self.ki] if self.ki is not None and self.ki not in self.reiter else [])]:
+                ansicht.zeilen_bild.clear()
+                ansicht.update()
+
+        # -- Geteilte Ansicht: „KI“ rechts neben den Reitern (Strg+Umschalt+G) -----------
+        def teilen_umschalten(self):
+            self.teilen(not self.geteilt)
+            try:
+                import config
+                config.update(terminal_geteilt=self.geteilt)
+            except Exception:
+                pass
+
+        def teilen(self, an: bool):
+            if ki_leitung is None or an == self.geteilt:
+                return
+            self.suche_schliessen()
+            self.geteilt = an
+            self.ki_zu = False
+            ki = self.ki
+            if an:
+                if ki is not None and ki in self.reiter:      # aus den Reitern nach rechts
+                    self._aus_reitern(ki)
+                if ki is None:
+                    ki = self._ki_ansicht()
+                else:
+                    self.teiler.addWidget(ki)
+                    ki.show()
+                breite = max(2, self.teiler.width())
+                self.teiler.setSizes([breite * 62 // 100, breite * 38 // 100])
+            elif ki is not None:                              # von rechts zurück in die Reiter
+                ki.setParent(None)
+                self.hinzufuegen(ki, "🤖 KI", zeigen=False)
+            if self.haupt is not None:
+                self.haupt.setFocus()
+
+        def _aus_reitern(self, ansicht):
+            i = self.reiter.index(ansicht)
+            self.reiter.pop(i)
+            self.tabs.removeTab(i)
+            self.stapel.removeWidget(ansicht)
+            self.leiste.setVisible(len(self.reiter) > 1)
+            aktuell = self._ansicht(self.tabs.currentIndex())
+            if aktuell is not None:
+                self.stapel.setCurrentWidget(aktuell)
 
         # -- Reiter --------------------------------------------------------------
         def _ansicht(self, i: int):
@@ -1146,9 +1679,14 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
         def _ki_ansicht(self, zeigen: bool = False):
             if self.ki is None:
                 self.ki = Ansicht(self, nur_lesen=True)
-                self.hinzufuegen(self.ki, "🤖 KI", zeigen=zeigen)
+                if self.geteilt:
+                    self.teiler.addWidget(self.ki)
+                else:
+                    self.hinzufuegen(self.ki, "🤖 KI", zeigen=zeigen)
                 self.ki.einspeisen("\x1b[2mHier erscheinen die Befehle der KI live (nur lesen, "
-                                   "Mausrad/Bild↑↓ blättert zurück).\x1b[0m\r\n")
+                                   "Mausrad/Bild↑↓ rollt zurück, Strg+F sucht).\x1b[0m\r\n")
+            elif zeigen and self.geteilt:
+                self.ki.setFocus()
             elif zeigen:
                 self.tabs.setCurrentIndex(self.reiter.index(self.ki))
             return self.ki
@@ -1163,6 +1701,8 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             # schon zu: von Hand geschlossen, danach meldet das beendete Programm sich noch einmal
             if ansicht is None or ansicht.haupt or ansicht not in self.reiter:
                 return
+            if ansicht is self.such_ziel:
+                self.suche_schliessen()
             ansicht.takt.stop()
             ansicht.beenden()
             i = self.reiter.index(ansicht)
@@ -1196,6 +1736,8 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
 
         def _gewechselt(self, i: int):
             ansicht = self._ansicht(i)
+            if self.such_ziel is not None and self.such_ziel in self.reiter and self.such_ziel is not ansicht:
+                self.suche_schliessen()
             if ansicht is not None:
                 self.stapel.setCurrentWidget(ansicht)
                 ansicht.setFocus()
@@ -1242,6 +1784,8 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
         haupt_env.update(ki_leitung.umgebung())
     fenster.haupt = Ansicht(fenster, befehl, kind_env=haupt_env, haupt=True)
     fenster.hinzufuegen(fenster.haupt, titel)
+    if e.get("geteilt"):
+        fenster.teilen(True)
     fenster.show()
     fenster.haupt.programm_starten()
     fenster.haupt.setFocus()

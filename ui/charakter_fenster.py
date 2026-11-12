@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (QColorDialog, QComboBox, QFrame, QGraphicsDropSha
                                QStackedWidget, QVBoxLayout, QWidget)
 
 import charaktergalerie as CG
+import design as D
 from gui_fenster import FARBE, Knopf, _dunkler_rahmen, app_vorbereiten, farbe, label, leitung_oeffnen, rollbereich
 
 STIL = f"""
@@ -182,7 +183,7 @@ def _blase_in(layout: QVBoxLayout, rolle, breite: int, text: str, von_ki: bool, 
     lb.setTextFormat(Qt.TextFormat.PlainText)
     lb.setMaximumWidth(breite)
     lb.setStyleSheet(f"background: {FARBE['flaeche_hell'] if von_ki else FARBE['blase_a']}; "
-                     f"color: {FARBE['text']}; border-radius: 10px; padding: 8px; font-size: 10.5pt;")
+                     f"color: {FARBE['text']}; border-radius: 10px; padding: 8px; font-size: {D.px('ki' if von_ki else 'du')}px;")
     zeile = QHBoxLayout()
     if not von_ki:
         zeile.addStretch(1)
@@ -308,7 +309,7 @@ class CharakterFenster(QWidget):
         self.steckbrief = QLabel()
         self.steckbrief.setTextFormat(Qt.TextFormat.RichText)
         self.steckbrief.setWordWrap(True)
-        self.steckbrief.setStyleSheet(f"color: {FARBE['text']}; font-size: 10pt; line-height: 140%;")
+        self.steckbrief.setStyleSheet(f"color: {FARBE['text']}; font-size: {D.groesse(10):.1f}pt; line-height: 140%;")
         bv.addWidget(self.steckbrief)
         self.chat_k = Knopf("Mit der KI reden", "💬", klein=True)
         self.chat_k.setToolTip("Erzähl, wie du dir den Charakter vorstellst – die KI stellt die Felder ein")

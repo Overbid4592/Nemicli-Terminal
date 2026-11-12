@@ -66,6 +66,12 @@ def fenster_bauen(datei: Path):
     from PySide6.QtWidgets import QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget
 
     farben = {"nacht": "#0b0d16", "rand": "#2a3150", "text": "#e6e9f2", "leise": "#8b93a7", "knopf": "#262c48"}
+    try:                                       # gemeinsames Design aller Fenster (ui/design.py)
+        import design as _D
+        farben = {"nacht": _D.FARBE["grund"], "rand": _D.FARBE["rand"], "text": _D.FARBE["text"],
+                  "leise": _D.FARBE["dim"], "knopf": _D.FARBE["flaeche_hell"]}
+    except ImportError:
+        pass
 
     class Fenster(QWidget):
         def __init__(self):

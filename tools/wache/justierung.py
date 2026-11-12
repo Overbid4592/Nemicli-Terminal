@@ -30,7 +30,9 @@ STANDARD = {
     "autostart_windows": False,         # Eintrag in HKCU\…\Run
     "prozess_intervall": 3.0,
     "netz_intervall": 5.0,
-    "pfade": None,                      # None = Autostart, Temp, Downloads des Nutzers
+    "protokolle": True,                 # Windows-Ereignisprotokolle lesen (protokolle.py)
+    "protokoll_intervall": 30.0,
+    "pfade": None,                     # None = Autostart, Temp, Downloads des Nutzers
     "endungen": None,                   # None = Standard-Liste
     "aufbewahrung_tage": 14,
     "max_ereignisse": 200_000,
@@ -38,7 +40,8 @@ STANDARD = {
     "lernen": True,                     # automatisch nachtrainieren
     "min_training": 200,                # erstes Training ab so vielen Ereignissen
     "min_training_dateien": 60,
-    "training_alle": 200,               # danach alle N Ereignisse
+    "training_alle": 200,               # danach alle N Ereignisse …
+    "training_stunden": 6.0,            # … aber automatisch höchstens so oft (neuer Vollscan wartet nicht)
     "ml_karenz_h": 24,                  # so alt muss ein Ereignis sein, bevor der Isolation Forest daraus lernt
     "kontamination": 0.02,
     "schwelle": 0.97,
@@ -270,7 +273,8 @@ def anwenden(was: str, wert, *, wer: str, begruendung: str, speicher=None, motor
     `nutzer=True` nur aus /wache – dann gelten NUTZER_GRENZEN statt der Grenzen der Persönlichkeit."""
     begruendung = " ".join(str(begruendung or "").split())
     if len(begruendung) < 10:
-        raise Grenzverletzung("Jede Justierung braucht eine Begründung (mindestens ein Satz).")
+        raise Grenzverletzung('Jede Justierung braucht das Feld "begruendung" – ein ganzer Satz, warum '
+                             '(Feldname genau so: begruendung).')
     schluessel, alt, neu = pruefen(was, wert, nutzer=nutzer)
     if alt == neu:
         return f"{schluessel} steht schon auf {neu} – nichts geändert."

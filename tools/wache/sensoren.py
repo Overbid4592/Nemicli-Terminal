@@ -275,7 +275,9 @@ class NetzSensor:
 
 _SENSIBEL = ("startup", "\\temp", "/temp", "appdata\\roaming", "downloads")
 _IGNORIERT = ("__psscriptpolicytest_", "~$")     # PowerShell-Testdatei je Start, Office-Sperren
-STANDARD_ENDUNGEN = [".exe", ".dll", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".scr", ".lnk"]
+# .pif .com .hta .cpl: Tarn-Endungen für R013 (regeln._TARNUNG).
+STANDARD_ENDUNGEN = [".exe", ".dll", ".ps1", ".bat", ".cmd", ".vbs", ".js", ".scr", ".lnk",
+                     ".pif", ".com", ".hta", ".cpl"]
 
 
 def standard_pfade() -> list[str]:

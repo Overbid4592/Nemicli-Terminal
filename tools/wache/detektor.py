@@ -34,6 +34,7 @@ from .ereignisse import Ereignis
 from .wald import IsolationForest, Skalierer
 
 VERSIONEN = 3                  # so viele Vorversionen bleiben
+REFERENZ_MAX = 8192            # Stützpunkte der Rang-Tabelle (Auflösung ~0,0001 – fein genug für Schwelle 0,995)
 AUSREISSER = 0.995             # ab hier dämpft kein „harmlos“-Urteil mehr
 DAEMPFUNG = 0.35
 
@@ -146,6 +147,8 @@ class Detektor:
             Xs = sk.anwenden(X)
             wald = IsolationForest(baeume=100, stichprobe=256, zufall=42).anpassen(Xs)
             referenz = np.sort(wald.rohwert(Xs))
+            if len(referenz) > REFERENZ_MAX:          # feste Stützpunkte statt aller Werte: gleicher Rang, kleine Datei
+                referenz = np.quantile(referenz, np.linspace(0.0, 1.0, REFERENZ_MAX))
             self._wald, self._skalierer, self._referenz = wald, sk, referenz
             self.trainiert = True
             self.stichprobe = len(ereignisse)

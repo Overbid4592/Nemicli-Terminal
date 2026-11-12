@@ -172,8 +172,9 @@ def status(a: dict) -> str:
         zeilen.append(f"Modell Prozesse/Netz: {'trainiert' if ml['trainiert'] else 'KALTSTART'} – "
                       f"{ml['ereignisse']} Ereignisse, {ml['laeufe']} Läufe, Schwelle {ml['schwelle']}, "
                       + ("zurückgedreht – lernt erst nach einem Training durch den Nutzer wieder" if ml.get("pausiert") else
-                         f"nächstes Training in {m['training_alle'] - m['seit_training']} Ereignissen")
-                      + f", lernt nur aus Ereignissen älter als {e.get('ml_karenz_h', 24)} h")
+                         f"nächstes Training in {max(0, m['training_alle'] - m['seit_training'])} Ereignissen, "
+                         f"frühestens {e.get('training_stunden', 6)} h nach dem letzten")
+                      + f", lernt aus der ganzen Woche, nur aus Ereignissen älter als {e.get('ml_karenz_h', 24)} h")
         mld = m["ml_dateien"]
         zeilen.append(f"Modell Dateien: {'trainiert' if mld['trainiert'] else 'Kaltstart'} – {mld['ereignisse']} Ereignisse")
         for d in (ml, mld):
@@ -390,7 +391,7 @@ def _alarme_auswaehlen(sp, a: dict) -> tuple[list, str]:
 def bewerten(a: dict, wer: str = "Persönlichkeit") -> str:
     sp = zugang.speicher()
     urteil = str(a.get("urteil") or "").strip().lower()
-    grund = " ".join(str(a.get("begruendung") or "").split())
+    grund = " ".join(str(a.get("begruendung") or a.get("grund") or a.get("reason") or "").split())
     bezeichnung = " ".join(str(a.get("bezeichnung") or "").split())
     if urteil in ("fehlalarm", "ok", "normal", "unbedenklich"):
         urteil = "harmlos"
@@ -403,7 +404,8 @@ def bewerten(a: dict, wer: str = "Persönlichkeit") -> str:
     if urteil not in ("harmlos", "echt", "gesehen", UNPRUEFBAR, "erledigt"):
         return "Fehler: urteil muss harmlos, echt, gesehen, unpruefbar oder erledigt sein."
     if urteil != "gesehen" and len(grund) < 10:
-        return "Fehler: ein Urteil braucht eine Begründung (mindestens ein Satz)."
+        return ('Fehler: das Feld "begruendung" fehlt oder ist zu kurz – ein ganzer Satz, warum '
+                '(Feldname genau so: begruendung).')
     liste, was = _alarme_auswaehlen(sp, a)
     if not liste:
         return was
@@ -466,7 +468,7 @@ def bewerten(a: dict, wer: str = "Persönlichkeit") -> str:
 def justieren(a: dict, wer: str = "Persönlichkeit") -> str:
     was = str(a.get("was") or "").strip()
     wert = a.get("wert")
-    grund = str(a.get("begruendung") or "")
+    grund = str(a.get("begruendung") or a.get("grund") or a.get("reason") or "")
     try:
         return anwenden(was, wert, wer=wer, begruendung=grund, speicher=zugang.speicher(),
                         motor=zugang.motor)

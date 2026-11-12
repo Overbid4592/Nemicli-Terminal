@@ -29,7 +29,7 @@ def _git(*args: str, timeout: int = 120) -> tuple[int, str]:
     """(Exit-Code, Ausgabe) eines Git-Befehls im Projektordner."""
     try:
         r = subprocess.run(["git", *args], cwd=INSTALL, capture_output=True, text=True,
-                           timeout=timeout, creationflags=_NOWIN)
+                           encoding="utf-8", errors="replace", timeout=timeout, creationflags=_NOWIN)
         out = (r.stdout + r.stderr).strip()
         return r.returncode, out
     except FileNotFoundError:

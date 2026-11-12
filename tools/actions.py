@@ -78,6 +78,7 @@ class ActionResult:
     ok: bool | None = True
     returncode: int | None = None
     bilder: list | None = None      # Bildpfade, die das Modell in der nächsten Runde SIEHT
+    anzeige: dict | None = None     # nur für den Bildschirm (webanzeige); geht nie an das Modell
 
     @property
     def status(self) -> str:
@@ -241,12 +242,6 @@ def _kandidaten(path: str) -> list[Path] | None:
         if p not in raus:
             raus.append(p)
     return raus
-
-
-def _entwirre(path: str) -> str:
-    """Kurzform für Stellen, die einen Text brauchen: der wörtliche Ort, normiert."""
-    k = _kandidaten(path)
-    return str(k[0]) if k else ""
 
 
 def _unter(p: Path, base: Path) -> bool:
@@ -1452,20 +1447,24 @@ def _dateien_suchen(a: dict) -> str | ActionResult:
 
 def _web_lesen(a: dict) -> ActionResult:
     ganz = str(a.get("ganz") or "").strip().lower() in ("1", "true", "ja", "yes")
-    return ActionResult(webfetch.fetch(a["url"], a.get("teil") or 1, ganz=ganz), ok=None)
+    text, anzeige = webfetch.fetch_ergebnis(a["url"], a.get("teil") or 1, ganz=ganz)
+    return ActionResult(text, ok=None, anzeige=anzeige)
 
 
 def _web_wiki(a: dict) -> ActionResult:
-    return ActionResult(webfetch.wikipedia(a["suche"], teil=a.get("teil") or 1), ok=None)
+    text, anzeige = webfetch.wikipedia_ergebnis(a["suche"], teil=a.get("teil") or 1)
+    return ActionResult(text, ok=None, anzeige=anzeige)
 
 
 def _web_suche(a: dict) -> ActionResult:
-    return ActionResult(webfetch.search(a.get("suche") or a.get("query") or ""), ok=None)
+    text, anzeige = webfetch.search_ergebnis(a.get("suche") or a.get("query") or "")
+    return ActionResult(text, ok=None, anzeige=anzeige)
 
 
 def _fach_suche(a: dict) -> ActionResult:
     import fachquellen
-    return ActionResult(fachquellen.suchen(a.get("quelle", ""), a.get("suche", ""), a.get("anzahl") or 5), ok=None)
+    text, anzeige = fachquellen.suchen_ergebnis(a.get("quelle", ""), a.get("suche", ""), a.get("anzahl") or 5)
+    return ActionResult(text, ok=None, anzeige=anzeige)
 
 
 def _recherche(a: dict) -> ActionResult:
@@ -1541,16 +1540,31 @@ def _datei_bearbeiten(a: dict) -> str | ActionResult:
         return ActionResult(blocked, ok=False)
     suchen = a["suchen"].replace("\r\n", "\n")
     ersetzen = a.get("ersetzen", "").replace("\r\n", "\n")
+    if not suchen:
+        return ActionResult("Fehler: 'suchen' ist leer. Nichts geändert – für neuen Inhalt datei_schreiben nutzen.",
+                            ok=False)
     roh = Path(p).read_bytes()
     crlf = b"\r\n" in roh                              # Windows-Zeilenenden bleiben, wie sie sind
-    text = roh.decode("utf-8").replace("\r\n", "\n")
+    gemischt = crlf and roh.count(b"\n") != roh.count(b"\r\n")
+    original = roh.decode("utf-8")
+    text = original.replace("\r\n", "\n")
     n = text.count(suchen)
     if n == 0:
         return ActionResult(f"Fehler: Text nicht gefunden in {p}. Nichts geändert." + _aehnliche_stelle(text, suchen),
                             ok=False)
-    text = text.replace(suchen, ersetzen)
+    if gemischt:                                       # gemischte Zeilenenden: jede Stelle behält ihre eigenen
+        def _ersatz(m):
+            if "\n" in m.group():
+                ende = "\r\n" if "\r\n" in m.group() else "\n"
+            else:
+                i = original.find("\n", m.end())
+                ende = "\r\n" if i > 0 and original[i - 1] == "\r" else "\n"
+            return ersetzen.replace("\n", ende)
+        text = re.sub(r"\r?\n".join(map(re.escape, suchen.split("\n"))), _ersatz, original)
+    else:
+        text = text.replace(suchen, ersetzen)
     kopie = snapshot.sichern(p, "datei_bearbeiten")
-    Path(p).write_text(text, encoding="utf-8", newline="\r\n" if crlf else "\n")
+    Path(p).write_text(text, encoding="utf-8", newline="" if gemischt else "\r\n" if crlf else "\n")
     check = _sofortcheck(p, text)
     _sammeln(p, "bearbeiten", suchen, ersetzen, check, kopie)
     return f"Datei bearbeitet: {p} ({n}× ersetzt)" + _undo_hinweis(kopie) + check
@@ -2022,8 +2036,9 @@ driverquery nvidia-smi hostname ver query route netsh powercfg tzutil where.exe 
 _NATIV_VERBOTEN = re.compile(
     r"(?i)\b(ipconfig\s+/(release|renew|flushdns|registerdns|setclassid)|"
     r"arp\s+-[ds]\b|route\s+(add|delete|change)\b|"
-    r"netsh\b(?![^;|\n]*\bshow\b)|powercfg\s+/(?!q|l|a\b|energy|batteryreport|devicequery)|"
-    r"tzutil\s+/s|reg\s+(?!query\b)\w+)"
+    r"netsh\b(?![^;|\n]*\bshow\b)|powercfg\s+/(?!q|l|a\b|devicequery)|"
+    r"tzutil\s+/s|reg\s+(?!query\b)\w+|"
+    r"nvidia-smi\s+-(?!-query|-format|-list-gpus|-help|-version|q\b|L\b|h\b))"
 )
 
 # Konstrukte, die ein reiner Lese-Befehl nicht braucht.
@@ -2046,6 +2061,24 @@ _NICHT_LESEND = re.compile(
     r"\b(invoke-webrequest|invoke-restmethod|iwr|irm|curl|wget|certutil|bitsadmin)\b"
     r")"
 )
+# Eine reine Abfrage ruft nur Methoden auf, die etwas ausrechnen; .Reboot(), .Uninstall() oder .CloseMainWindow() handeln.
+_METHODE = re.compile(r"(?:\.|::)\s*([A-Za-z_]\w*)\s*\(")
+_METHODE_FREI = frozenset("""
+round floor ceiling abs min max sqrt pow tostring trim trimstart trimend tolower toupper substring split replace
+contains startswith endswith indexof lastindexof padleft padright getfilename getextension getdirectoryname
+getfilenamewithoutextension
+""".split())
+# Schlüssel und Passwörter sind keine Abfrage. Harmlose Ortsangaben ($env:TEMP …) bleiben möglich.
+_ENV_ORT = (r"userprofile|temp|tmp|appdata|localappdata|programfiles|programfiles\(x86\)|programdata|systemroot|windir|"
+            r"systemdrive|homedrive|homepath|public|computername|username|os|path|processor_architecture|"
+            r"number_of_processors")
+_GEHEIM = re.compile(
+    rf"(?i)\$env:(?!(?:{_ENV_ORT})\b)|\$\{{env:|(?<![\w$])env:|"
+    r"\.ssh\b|\bid_(?:rsa|ed25519|ecdsa|dsa)\b|(?<![\w-])\.env\b|\.pem\b|\.pfx\b|\.p12\b|\.netrc\b|\.pgpass\b|"
+    r"\.git-credentials\b|\bcredentials?(?:\.json)?\b|\bapi[_-]?keys?\b|\bsecrets?\b|\btokens?\.json\b|"
+    r"\bchatgpt_konto\.json\b")
+_FERN = re.compile(r"(?i)(?<![\w-])-(?:c(?:o(?:m(?:p(?:u\w*)?)?)?)?|cn|cimsession|pssession|session|credential|online|"
+                   r"showwindow)\b")
 _VERB_NOMEN = re.compile(r"(?<![\w$@.:\-])([A-Za-z]+)-([A-Za-z][\w]*)")
 _SEGMENT_START = re.compile(r"(?:^|[;|\n{(]|(?<![=!<>])=(?!=))\s*([^\s;|{}()]+)")
 _STRINGS = re.compile(r"'[^']*'|\"[^\"]*\"")
@@ -2068,6 +2101,13 @@ def _nur_lesend(cmd: str) -> str | None:
     if (m := _NICHT_LESEND.search(roh)):
         return (f"'{m.group(0).strip()}' gehört nicht in eine reine Abfrage – das schreibt, "
                 "startet, lädt Code oder geht selbst ins Netz.")
+    if (m := _GEHEIM.search(roh)):
+        return f"'{m.group(0).strip()}' kann Schlüssel oder Passwörter zeigen – das ist keine reine Abfrage."
+    if (m := _FERN.search(_STRINGS.sub("''", roh))):
+        return f"'{m.group(0).strip()}' geht auf einen anderen Rechner oder öffnet ein Fenster – das ist keine reine Abfrage."
+    for m in _METHODE.finditer(_STRINGS.sub("''", roh)):
+        if m.group(1).lower() not in _METHODE_FREI:
+            return f"Die Methode '{m.group(1)}' kann etwas tun – das ist keine reine Abfrage."
     for m in _VERB_NOMEN.finditer(roh):
         verb, ganz = m.group(1).lower(), m.group(0).lower()
         if ganz in _LESE_EXTRA:
@@ -2316,7 +2356,7 @@ def _bilder_suchen(a: dict) -> ActionResult:
             "z. B. EmbeddingGemma 2 mit mmproj – /embeddings.)\n")
     if not treffer:
         return ActionResult(kopf + "Kein passendes Bild gefunden. Noch nicht eingelesene Bilder holt der Bibliothekar "
-                            "nach und nach (sofort: /gedaechtnis indexieren).", ok=True)
+                            "nach und nach (sofort: /einlesen).", ok=True)
     zeilen = []
     for i, h in enumerate(treffer, 1):
         teile = {z.split(": ", 1)[0]: z.split(": ", 1)[1] for z in h["text"].splitlines()[1:] if ": " in z}
@@ -2347,6 +2387,56 @@ def _gedaechtnis_aufraeumen(a: dict) -> ActionResult:
     gedaechtnispflege.wuenschen(str(a.get("grund") or ""))
     return ActionResult("Vorgemerkt: Nach dieser Runde prüft eine Cloud-KI im Hintergrund ähnliche und alte "
                         "Notizen – zusammenlegen, Veraltetes ins Archiv. Das Ergebnis kommt als Hinweis.", ok=True)
+
+
+def _gedaechtnis_einlesen(a: dict) -> ActionResult:
+    """Den Einlese-Speicher früher abarbeiten (wie /einlesen)."""
+    import einlesen
+    if einlesen.stand() is None:
+        return ActionResult("Es ist kein Embedding-Modell da, einlesen geht gerade nicht.", ok=False)
+    einlesen.wuenschen()
+    return ActionResult("Vorgemerkt: Der Einlese-Speicher wird eingelesen, sobald diese Runde fertig ist und die GPU "
+                        "Platz hat; der Balken läuft dabei leer. Der Chat läuft weiter.", ok=True)
+
+
+def _gedaechtnis_status(a: dict) -> ActionResult:
+    """Zahlen zum Gedächtnis: Füllstand des Einlese-Speichers, Brocken mit und ohne Vektor, letztes Einlesen,
+    letzte Pflege."""
+    import einlesen
+    import gedaechtnispflege
+    import indexdb
+    zeilen = []
+    try:
+        token = einlesen.stand()
+    except Exception as e:
+        token, zeilen = None, [f"Füllstand nicht lesbar: {e}"]
+    if token is None and not zeilen:
+        zeilen.append("Kein Embedding-Modell gewählt: Es gibt keinen Einlese-Speicher, gesucht wird nur nach Stichworten.")
+    elif token is not None:
+        farbe = ("dunkelrot" if token >= einlesen.ROT_AB else "orange" if token >= einlesen.ORANGE_AB else "grün")
+        zeilen.append(f"Einlese-Speicher: {_tausend(token)} von {_tausend(einlesen.VOLL)} Token "
+                      f"({round(100 * token / einlesen.VOLL)} %, {farbe}). Ab {_tausend(einlesen.AUTO_AB)} startet das "
+                      "Einlesen von selbst.")
+    try:
+        o = indexdb.offen()
+        zeilen.append(f"Brocken im Gedächtnis: {_tausend(o['brocken'])}, davon ohne Vektor {_tausend(o['ohne_vektor'])} "
+                      "(per Stichwort schon findbar).")
+    except Exception:
+        pass
+    try:
+        zuletzt = indexdb._stand(EINLESEN_STAND)
+    except Exception:
+        zuletzt = ""
+    zeilen.append(f"Letztes Einlesen: {zuletzt or 'noch keins seit dieser Version'}")
+    zeilen.append(f"Letzte Gedächtnis-Pflege: {gedaechtnispflege.zuletzt() or 'noch keine'}")
+    return ActionResult("\n".join(zeilen), ok=True)
+
+
+EINLESEN_STAND = "einlesen_zuletzt"      # Schlüssel in indexdb._stand: Ergebnis des letzten Einlesens
+
+
+def _tausend(n: int) -> str:
+    return f"{int(n):,}".replace(",", ".")
 
 
 def _zeitplan_anzeigen(a: dict) -> ActionResult:
@@ -2520,14 +2610,14 @@ def _parse_size(v):
 
 
 def _mit_figur(a: dict) -> bool:
-    """Ist die Figur der Persönlichkeit im Bild (figur, outfit oder pose gesetzt)?"""
-    return bool(_wahr(a.get("figur")) or a.get("outfit") or a.get("pose"))
+    """Ist die Figur der Persönlichkeit im Bild (figur, outfit, pose oder frisur gesetzt)?"""
+    return bool(_wahr(a.get("figur")) or a.get("outfit") or a.get("pose") or a.get("frisur"))
 
 
 def _figur_auto(a: dict, szene: str) -> str:
-    """Grund, die Figur von selbst dazuzunehmen (charakter.meint_sich) – leer, wenn figur, outfit oder pose
+    """Grund, die Figur von selbst dazuzunehmen (charakter.meint_sich) – leer, wenn figur, outfit, pose oder frisur
     gesetzt ist (auch figur: false) oder die Szene sie nicht meint."""
-    if a.get("figur") not in (None, "") or a.get("outfit") or a.get("pose"):
+    if a.get("figur") not in (None, "") or a.get("outfit") or a.get("pose") or a.get("frisur"):
         return ""
     try:
         import charakter
@@ -2536,22 +2626,100 @@ def _figur_auto(a: dict, szene: str) -> str:
         return ""
 
 
+KUERZUNG_HINWEIS = ("\n✂ Der Prompt war zu lang ({teile}) – Krea 2 liest höchstens {max} Token (etwa 380 englische "
+                    "Wörter), der Rest fiel weg. Fasse die Szene beim nächsten Mal kürzer.")
+
+
+def _ueberlang(prompt: str) -> int:
+    """Wie viele Token Krea 2 vom Prompt abschneidet; 0 bei passendem Prompt oder anderem Bild-Motor."""
+    try:
+        import imagegen
+        import krea
+        return krea.ueberlang(prompt) if imagegen.backend() == "krea" else 0
+    except Exception:
+        return 0
+
+
+def _kuerzung(teile: list[str]) -> str:
+    import krea
+    return KUERZUNG_HINWEIS.format(teile=", ".join(teile), max=krea.MAX_TEXT) if teile else ""
+
+
 FIGUR_AUTO_HINWEIS = ("\n🧍 Figur automatisch dazu – {grund}. Kern, Seed und Charakter-LoRA kamen aus deiner "
                       "Charakter-Datei. Malst du dich, setz figur: true selbst; bist du es nicht, figur: false.")
 
 
-def _figur(a: dict, szene: str) -> tuple[str, int | None] | ActionResult:
-    """Mit figur/outfit/pose: Prompt aus der Charakter-Datei (Kern · Outfit · Pose · Szene · Stil)
-    und ihr Referenz-Seed (None bei neues_gesicht). Sonst bleibt der Prompt, wie er ist."""
-    if not _mit_figur(a):
-        return szene, None
+LORA_HINWEIS = "\n🧬 Mit der Bild-LoRA „{name}“ gemalt (SHA-256 geprüft), zusammen mit dem Kern."
+
+
+def _lora_prompt(name: str, szene: str, d: dict | None, a: dict) -> str:
+    """Prompt mit Bild-LoRA: Kern · Auslösewort · Frisur · Kleidung · Pose · Szene · Stil. Der Kern des Charakters
+    steht immer vorne (fehlt er, beginnt der Prompt mit dem Auslösewort)."""
     import charakter
+    import lorabild
+    d = d or {}
+    pose = a.get("pose") or ""
+    if d:
+        kleidung, frisur = charakter.kleidung_text(d, szene, a.get("outfit")), charakter.frisur_text(d, a.get("frisur"))
+    else:
+        kleidung, frisur = a.get("outfit") or "", a.get("frisur") or ""
+    return lorabild.prompt_bauen(name, szene, kleidung, (d.get("posen") or {}).get(pose, pose), d.get("stil") or "",
+                                 kern=d.get("kern") or "", frisur=frisur)
+
+
+def _figur(a: dict, szene: str) -> tuple[str, int | None, str | None, str] | ActionResult:
+    """Prompt, Seed, Bild-LoRA (Pfad oder None) und ein Hinweis für das Ergebnis.
+    „[name] Szene“ malt mit der LoRA „name“ (lorabild). Mit figur/outfit/pose: hat die Persönlichkeit eine
+    gebundene Bild-LoRA mit stimmender SHA-256 und malt Krea 2, gilt sie (A) – der Prompt nennt dann nur, was
+    passiert. Sonst kommt das Aussehen aus der Charakter-Datei (B: Kern · Outfit · Pose · Szene · Stil) mit
+    ihrem Referenz-Seed (None bei neues_gesicht). Ohne Figur bleibt der Prompt, wie er ist. {schlüssel} setzt
+    vorher die Prompt-Bausteine (ausdruecke) der Charakter-Datei ein, auch ohne Figur."""
+    import charakter
+    import imagegen
+    import lorabild
+    if "{" in szene:
+        szene, unbekannt = charakter.bausteine_einsetzen(szene, charakter.ausdruecke())
+        if unbekannt:
+            vorhanden = ", ".join("{" + k + "}" for k in charakter.ausdruecke()) or "noch keine"
+            return ActionResult(f"Fehler: Baustein {', '.join('{' + k + '}' for k in unbekannt)} gibt es nicht in deiner "
+                                f"Charakter-Datei. Vorhanden: {vorhanden}. Neue legst du mit charakter_aendern "
+                                "(ausdruecke) an.", ok=False)
+    neues_gesicht = _wahr(a.get("neues_gesicht"))
+    name, rest = lorabild.prompt_lesen(szene)
+    if name:
+        pfad = lorabild.finden(name)
+        if pfad is None:
+            vorhanden = ", ".join(f"[{e['name']}]" for e in lorabild.liste()) or "noch keine"
+            return ActionResult(f"Fehler: Eine Bild-LoRA „{name}“ gibt es nicht. Vorhanden: {vorhanden}. "
+                                "Neue entstehen in der LoRA-Werkstatt (/lora).", ok=False)
+        if not imagegen.lora_moeglich(a.get("vorlage")):
+            return ActionResult("Fehler: Bild-LoRAs malt nur Krea 2 – mit einem anderen Bild-Motor fehlte das "
+                                "Aussehen. Krea 2 wählt /bildmodel.", ok=False)
+        bindung, _p, _g = lorabild.fuer_charakter()
+        eigen = bindung is not None and bindung["name"] == name
+        d = charakter.laden() if eigen else None
+        seed = charakter.seed(d, neues_gesicht) if d else None
+        return _lora_prompt(name, rest, d, a), seed, str(pfad), LORA_HINWEIS.format(name=name)
+    if not _mit_figur(a):
+        return szene, None, None, ""
     d = charakter.laden()
+    bindung, pfad, grund = lorabild.fuer_charakter()
+    if pfad is not None and imagegen.lora_moeglich(a.get("vorlage")):
+        seed = charakter.seed(d, neues_gesicht) if d else charakter.seed(charakter._sauber(charakter.roh()),
+                                                                         neues_gesicht)
+        return (_lora_prompt(bindung["name"], szene, d, a), seed, str(pfad),
+                LORA_HINWEIS.format(name=bindung["name"]))
     if d is None:
         return ActionResult("Fehler: Es gibt noch keine Charakter-Datei für diese Persönlichkeit. "
                             "Erst mit charakter_aendern anlegen (kern, stil, outfits, posen).", ok=False)
-    return (charakter.prompt_bauen(d, szene, a.get("outfit"), a.get("pose")),
-            charakter.seed(d, _wahr(a.get("neues_gesicht"))))
+    hinweis = ""
+    if grund:
+        hinweis = f"\n⚠ Bild-LoRA nicht benutzt: {grund} – gemalt mit dem Aussehen aus der Charakter-Datei."
+    elif pfad is not None:
+        hinweis = ("\n⚠ Bild-LoRA nicht benutzt: sie wirkt nur mit Krea 2 – gemalt mit dem Aussehen aus der "
+                   "Charakter-Datei.")
+    return (charakter.prompt_bauen(d, szene, a.get("outfit"), a.get("pose"), a.get("frisur")),
+            charakter.seed(d, neues_gesicht), None, hinweis)
 
 
 def _bild_malen(a: dict) -> str | ActionResult:
@@ -2578,7 +2746,7 @@ def _bild_malen(a: dict) -> str | ActionResult:
     fig = _figur(a, prompt)
     if isinstance(fig, ActionResult):
         return fig
-    prompt, figur_seed = fig
+    prompt, figur_seed, lora, lora_hinweis = fig
     seed = _int("seed") if _int("seed") is not None else figur_seed
 
     vorlage = str(a.get("vorlage") or "").strip().strip('"') or None
@@ -2607,12 +2775,16 @@ def _bild_malen(a: dict) -> str | ActionResult:
             vorlage=vorlage,
             staerke=staerke,
             figur=_mit_figur(a),
+            lora=lora,
         )
     except Exception as e:
         _BILD_STATUS["msg"] = None               # Balken im Haupt-Loop beenden
         return ActionResult(f"Fehler beim Malen: {e}", ok=False)
 
-    text = f"Bild fertig 🎨✅ gespeichert: {path}{hinweis}" + (FIGUR_AUTO_HINWEIS.format(grund=auto) if auto else "")
+    text = (f"Bild fertig 🎨✅ gespeichert: {path}{hinweis}" + (FIGUR_AUTO_HINWEIS.format(grund=auto) if auto else "")
+            + lora_hinweis)
+    if (zuviel := _ueberlang(prompt)):
+        text += _kuerzung([f"{zuviel} Token zu viel"])
     try:
         besser = imagegen.gesicht_nachbessern(
             path, on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
@@ -2678,6 +2850,20 @@ def _video_erstellen(a: dict) -> str | ActionResult:
         if not Path(p).is_file():
             return ActionResult(f"Fehler: Schlüsselbild nicht gefunden: {p}", ok=False)
     sekunden = _zahl("sekunden", float) or 5.0
+    start_malen, start_hinweis = None, ""
+    if not startbild and video.motor_aktiv(modell) and videomotoren.nimmt_startbild(modell) \
+            and videomotoren.einstellung("startbild") == "auto":
+        # Der Bild-Motor malt das Startbild. Ist die Persönlichkeit selbst im Video, auf demselben Weg wie
+        # ihre Selbstbilder: Kern davor, ihr Seed, die gebundene Bild-LoRA.
+        if _figur_auto(a, prompt):
+            a = dict(a, figur=True)
+        fig = _figur(a, prompt)
+        if isinstance(fig, ActionResult):
+            return fig
+        bild_prompt, figur_seed, lora, start_hinweis = fig
+        seed_wahl = _zahl("seed", int)
+        start_malen = {"prompt": bild_prompt, "seed": seed_wahl if seed_wahl is not None else figur_seed,
+                       "lora": lora, "figur": _mit_figur(a)}
     scharf = None
     if a.get("schaerfe") not in (None, ""):
         scharf = schaerfe.stufe(a.get("schaerfe"))
@@ -2689,19 +2875,22 @@ def _video_erstellen(a: dict) -> str | ActionResult:
         path = imagegen._gpu_fuer_bild(video.generate)(
             prompt, sekunden=sekunden, startbild=startbild, seed=_zahl("seed", int), steps=_zahl("steps", int),
             modell=modell, schluesselbilder=schluessel or None, schaerfe=scharf,
-            on_status=lambda m: _BILD_STATUS.__setitem__("msg", m), motor_extra=motor_extra or None)
+            on_status=lambda m: _BILD_STATUS.__setitem__("msg", m), motor_extra=motor_extra or None,
+            start_malen=start_malen)
     except Exception as e:
         _BILD_STATUS["msg"] = None
         return ActionResult(f"Fehler beim Video: {e}", ok=False)
     _BILD_STATUS["msg"] = None
     if video.motor_aktiv(modell):
         text = (f"Video fertig 🎬✅ gespeichert: {path} ({min(sekunden, video.MAX_SEKUNDEN):.0f} s"
-                f"{', mit Ton' if videomotoren.plan(None, motor_extra)['ton'] else ''}).")
+                f"{', mit Ton' if videomotoren.plan(None, motor_extra, modell)['ton'] else ''}).")
     else:
         text = (f"Video fertig 🎬✅ gespeichert: {path} ({min(sekunden, video.MAX_SEKUNDEN):.0f} s). "
                 f"Das letzte Bild liegt als .png daneben – als startbild für eine Fortsetzung.")
     if video.GENUTZT:
         text += " 🧬 Eingemischt: " + " · ".join(video.GENUTZT) + "."
+    if start_hinweis.strip() and "gemaltes Startbild" in video.GENUTZT:
+        text += " " + start_hinweis.strip()
     if video.HINWEISE:
         text += " ⚠️ " + " · ".join(video.HINWEISE)
     try:
@@ -2813,13 +3002,13 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
     sagen = str(a.get("sagen") or "").strip()
     ohne_ton = ""
     if sagen:
-        s = _stimme()
-        if s.modus() == "aus":                     # Stimme bleibt aus – der Clip entsteht trotzdem, nur stumm
+        s = _stimme_falls_da()
+        if s is not None and s.modus() == "aus":   # Stimme bleibt aus – der Clip entsteht trotzdem, nur stumm
             sagen, ohne_ton = "", (" Die Stimme ist aus (/voice aus) – der Clip ist ohne Ton und ohne "
                                    "Mundbewegung entstanden; nur der Nutzer schaltet die Stimme wieder ein.")
-        elif not s.verfuegbar():
-            return ActionResult("Fehler: Für ein sprechendes Porträt fehlt das Stimm-Modell (Qwen3-TTS unter Vision/).",
-                                ok=False)
+        elif s is None or not s.verfuegbar():
+            sagen, ohne_ton = "", (" Kein Stimm-Modell (Qwen3-TTS unter Vision/) – der Clip ist ohne Ton und "
+                                   "ohne Mundbewegung entstanden.")
     import modes
     # Mit Stimme: im Terminal der Video-Player, in der Kugel spricht sie selbst (Tonspur zum WebP).
     zeigen = str(a.get("zeigen") or ("kugel" if modes._wache_dienst else "player" if sagen else "fenster")
@@ -2839,17 +3028,19 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
     melden = lambda m: _BILD_STATUS.__setitem__("msg", m)       # noqa: E731
 
     def arbeit():
-        if not sagen:
-            return LP.animieren(bild, ablauf, sekunden=sekunden, on_status=melden, frei=frei)
-        welle, rate = _sprechen_aufnehmen(sagen, melden, LP.MAX_SEKUNDEN)
-        return LP.animieren(bild, ablauf, on_status=melden, ton=(welle, rate), text=sagen, frei=frei)
+        try:                                       # entladen, bevor das Sprachmodell auf die GPU zurückkehrt
+            if not sagen:
+                return LP.animieren(bild, ablauf, sekunden=sekunden, on_status=melden, frei=frei)
+            welle, rate = _sprechen_aufnehmen(sagen, melden, LP.MAX_SEKUNDEN)
+            return LP.animieren(bild, ablauf, on_status=melden, ton=(welle, rate), text=sagen, frei=frei)
+        finally:
+            LP.entladen()
     try:
         erg = imagegen._gpu_fuer_bild(arbeit)()
     except Exception as e:
         return ActionResult(f"Fehler beim Porträt: {e}", ok=False)
     finally:
         _BILD_STATUS["msg"] = None
-        LP.entladen()
     sekunden = erg["bilder"] / LP.FPS
     text = (f"Porträt {'spricht 🗣' if sagen else 'bewegt 🎭'}✅ gespeichert: {erg['pfad']} ({sekunden:.0f} s, "
             f"{erg['bilder']} Bilder in {erg['sekunden_rechnen']:.0f} s auf "
@@ -2925,6 +3116,9 @@ def _bild_serie(a: dict) -> ActionResult:
         except (TypeError, ValueError):
             return None
 
+    kriterien = _kriterien(a.get("pruefen"))
+    if isinstance(kriterien, ActionResult):
+        return kriterien
     erg = _serie_malen(a, varianten, anzeigen=True)
     if isinstance(erg, ActionResult):
         return erg
@@ -2932,7 +3126,97 @@ def _bild_serie(a: dict) -> ActionResult:
     text = (f"Serie fertig 🎨✅ {len(fertig)}/{n} Bilder, Seed {erg['seed']}{erg['hinweis']}:\n"
             + "\n".join(f"  {p}" for p in fertig) + ("\n" + "\n".join(fehler) if fehler else "")
             + erg["gesicht_hinweis"] + erg["figur_hinweis"])
+    if kriterien and fertig:
+        text += _serie_pruefen(fertig, kriterien)
     return ActionResult(text, ok=bool(fertig) and not fehler)
+
+
+MAX_KRITERIEN = 8
+
+
+def _kriterien(roh) -> list[str] | ActionResult:
+    """Feld `pruefen` von bild_serie: Liste kurzer Kriterien (oder ein Text mit Zeilen oder ;)."""
+    if roh in (None, "", []):
+        return []
+    teile = roh if isinstance(roh, list) else re.split(r"[;\n]", str(roh))
+    liste = [" ".join(str(t).split())[:100] for t in teile if str(t).strip()]
+    if len(liste) > MAX_KRITERIEN:
+        return ActionResult(f"Fehler: höchstens {MAX_KRITERIEN} Punkte in 'pruefen' (hier {len(liste)}).", ok=False)
+    return liste
+
+
+def _serie_pruefen(bilder: list, kriterien: list[str]) -> str:
+    """Der Bildbeschreiber prüft jedes Bild der Serie gegen die Kriterien; zurück kommt nur eine Tabelle aus
+    ✅/❌/? – seine Antwort selbst bleibt draußen (Text im Bild ist keine Anweisung)."""
+    try:
+        import bildbeschreiber
+        if bildbeschreiber.finden() is None:
+            return "\n🔎 Prüfung übersprungen: kein Bildbeschreiber eingerichtet (Seh-Modell unter Vision/)."
+    except Exception as e:
+        return f"\n🔎 Prüfung übersprungen: {e}"
+    frage = ("Check this image ONLY against the numbered points. For each point answer in exactly one line: "
+             "<number>. yes|no – a few words why.\n" + "\n".join(f"{i}. {k}" for i, k in enumerate(kriterien, 1)))
+    kopf = "| Bild | " + " | ".join(f"{i}. {k[:28]}" for i, k in enumerate(kriterien, 1)) + " |"
+    zeilen = ["\n🔎 Prüfung durch den Bildbeschreiber:", kopf, "|" + "---|" * (len(kriterien) + 1)]
+    for n, p in enumerate(bilder, 1):
+        _BILD_STATUS["msg"] = f"prüfe Bild {n}/{len(bilder)} …"
+        try:
+            antwort = bildbeschreiber.beschreiben(p, frage)
+        except Exception as e:
+            zeilen.append(f"| {n} | Fehler: {str(e)[:80]} |")
+            continue
+        urteil = {int(m.group(1)): m.group(2).lower() for m in
+                  re.finditer(r"(?mi)^\W*(\d+)\W+(yes|no|ja|nein)\b", antwort or "")}
+        zeilen.append(f"| {n} | " + " | ".join(
+            "✅" if urteil.get(i) in ("yes", "ja") else "❌" if urteil.get(i) in ("no", "nein") else "?"
+            for i in range(1, len(kriterien) + 1)) + " |")
+    _BILD_STATUS["msg"] = None
+    zeilen.append("Das Urteil kommt von einem kleinen Seh-Modell – bei ? oder Zweifel selbst mit bild_ansehen nachsehen.")
+    return "\n".join(zeilen)
+
+
+GESCHMACK = "geschmack"                  # Notiz-Art: was dem Nutzer an Bildern gefällt, mit seinem Warum
+
+
+def _png_prompt(p: Path) -> str:
+    """Der Mal-Prompt aus den Bild-Metadaten (Krea 2: prompt, WebUI: parameters); leer, wenn keiner drinsteht."""
+    try:
+        from PIL import Image
+        with Image.open(p) as im:
+            info = getattr(im, "text", None) or im.info
+            return " ".join(str(info.get("prompt") or info.get("parameters") or "").split())
+    except Exception:
+        return ""
+
+
+def _bild_bewerten(a: dict) -> str | ActionResult:
+    """Was dem Nutzer an einem Bild gefällt oder nicht, mit seinem Warum – als Notiz der Art „geschmack“.
+    Felder: warum (Pflicht, in seinen Worten), urteil (gut · schlecht · gemischt), bild (Pfad, optional)."""
+    warum = " ".join(str(a.get("warum") or a.get("grund") or "").split())
+    if not warum:
+        return ActionResult("Fehler: 'warum' fehlt – was genau gefällt oder stört, in den Worten des Nutzers. "
+                            "Ein Urteil ohne Warum hilft beim nächsten Bild nicht.", ok=False)
+    urteil = str(a.get("urteil") or "").strip().lower()
+    urteil = {"👍": "gut", "ja": "gut", "top": "gut", "👎": "schlecht", "nein": "schlecht"}.get(urteil, urteil)
+    if urteil not in ("gut", "schlecht", "gemischt"):
+        urteil = "gemischt"
+    zusatz = ""
+    bild = str(a.get("bild") or a.get("pfad") or "").strip().strip('"')
+    if bild:
+        if (blocked := _read_guard(bild)):
+            return ActionResult(blocked, ok=False)
+        p = Path(bild)
+        prompt = _png_prompt(p) if p.is_file() else ""
+        zusatz = f" (Bild {p.name}" + (f", Prompt: {prompt[:200]}" if prompt else "") + ")"
+    text = f"Bildgeschmack {dict(gut='👍', schlecht='👎', gemischt='➖')[urteil]}: {warum}{zusatz}"
+    if (grund := memory.verdaechtig(text)):
+        return ActionResult(f"Nicht gemerkt: {grund}.", ok=False)
+    e = memory.remember(text[:memory.MAX_NOTIZ], GESCHMACK)
+    if e is None:
+        if memory.letzter_grund:
+            return ActionResult(f"Nicht gemerkt: {memory.letzter_grund}.", ok=False)
+        return "Schon so gemerkt."
+    return f"Gemerkt ✅ ({GESCHMACK}): {e['text']} – die letzten Bewertungen siehst du vor jedem Malen."
 
 
 def _serie_malen(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResult:
@@ -2960,7 +3244,8 @@ def _serie_bilder(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResu
 
     seed, steps = _zahl("seed"), _zahl("steps")
     modell, hinweis = imagegen.modell_aufloesen(a.get("model"))
-    n, je_variante, fehler, gesicht_hinweis, auto = len(varianten), [], [], "", []
+    n, je_variante, fehler, gesicht_hinweis, auto, lora_hinweise = len(varianten), [], [], "", [], []
+    zu_lang = []
     for i, v in enumerate(varianten, 1):
         v = v if isinstance(v, dict) else {"prompt": str(v)}
         felder = {k: a.get(k) for k in ("figur", "neues_gesicht")} | v
@@ -2972,7 +3257,11 @@ def _serie_bilder(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResu
         if isinstance(fig, ActionResult):
             _BILD_STATUS["msg"] = None
             return fig
-        prompt, figur_seed = fig
+        prompt, figur_seed, lora, lora_hinweis = fig
+        if lora_hinweis and lora_hinweis not in lora_hinweise:
+            lora_hinweise.append(lora_hinweis)
+        if (zuviel := _ueberlang(prompt)):
+            zu_lang.append(f"Bild {i}: {zuviel} Token zu viel")
         if seed is None:                          # einmal für die ganze Serie
             seed = figur_seed if figur_seed is not None else random.randint(1, 2 ** 31 - 1)
         melde = (lambda m, i=i: _BILD_STATUS.__setitem__("msg", f"Bild {i}/{n} · {m}"))
@@ -2980,7 +3269,7 @@ def _serie_bilder(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResu
         try:
             pfad = imagegen.paint(prompt, model=modell, neg=v.get("neg") or a.get("neg"), steps=steps,
                                   size=_parse_size(v.get("size") or a.get("size")), seed=seed, on_status=melde,
-                                  figur=_mit_figur(felder))
+                                  figur=_mit_figur(felder), lora=lora)
             try:
                 pfad = imagegen.gesicht_nachbessern(pfad, on_status=melde) or pfad
             except Exception as e:
@@ -2997,7 +3286,8 @@ def _serie_bilder(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResu
     _BILD_STATUS["msg"] = None
     return {"fertig": [p for p in je_variante if p], "je_variante": je_variante, "fehler": fehler, "seed": seed,
             "hinweis": hinweis, "gesicht_hinweis": gesicht_hinweis,
-            "figur_hinweis": FIGUR_AUTO_HINWEIS.format(grund="; ".join(auto)) if auto else ""}
+            "figur_hinweis": (FIGUR_AUTO_HINWEIS.format(grund="; ".join(auto)) if auto else "")
+            + "".join(lora_hinweise) + _kuerzung(zu_lang)}
 
 
 def _tag_lesen(roh):
@@ -3042,8 +3332,8 @@ def _tagesrueckblick(a: dict) -> ActionResult:
         return ActionResult(f"Kein Rückblick: Am {rueckblick.datum_text(tag)} sind keine Bilder entstanden. "
                             "Nenne Bilder mit 'bilder' oder male erst welche.", ok=False)
     text = str(a.get("text") or "").strip()
-    s = _stimme()
-    mit_stimme = bool(text) and s.modus() != "aus" and s.verfuegbar()
+    s = _stimme_falls_da()
+    mit_stimme = bool(text) and s is not None and s.modus() != "aus" and s.verfuegbar()
     titel = str(a.get("titel") or "Mein Tag").strip()
     melden = lambda m: _BILD_STATUS.__setitem__("msg", m)       # noqa: E731
 
@@ -3062,7 +3352,7 @@ def _tagesrueckblick(a: dict) -> ActionResult:
     except Exception:
         pass
     stimme_text = ("mit deiner Stimme" if mit_stimme else
-                   "ohne Stimme (sie steht auf „aus“)" if text and s.modus() == "aus" else
+                   "ohne Stimme (sie steht auf „aus“)" if text and s is not None and s.modus() == "aus" else
                    "ohne Stimme (kein Stimm-Modell)" if text else "ohne Erzähltext")
     return ActionResult(f"Rückblick fertig 🌙✅ {erg['pfad']} – {erg['sekunden']:.0f} s, {erg['bilder']} Bilder, "
                         f"{stimme_text}.", ok=True)
@@ -3311,8 +3601,9 @@ def _ordner_lernen(a: dict) -> str | ActionResult:
     typ = a.get("typ", "")
     if (blocked := _read_guard(p)):
         return ActionResult(blocked, ok=False)
-    if typ not in foldersense.labels():
-        gueltig = ", ".join(foldersense.labels())
+    erlaubt = [t for t in foldersense.labels() if t != "leer"]      # „leer" ist eine Regel, kein Lernziel
+    if typ not in erlaubt:
+        gueltig = ", ".join(erlaubt)
         return ActionResult(f"Fehler: '{typ}' ist kein gültiger Typ. Erlaubt: {gueltig}", ok=False)
     if foldersense.learn_folder(p, typ):
         return (f"Gelernt: '{p}' ist ein '{foldersense.labels()[typ]}'. "
@@ -3604,6 +3895,48 @@ def _debugbericht(a: dict) -> str | ActionResult:
     return fremddaten.rahmen(text, "datei", "Debugbericht")
 
 
+def _llamacpp_stand(a: dict) -> ActionResult:
+    """Stand der llama.cpp-Reserve und welches Paket zu diesem Rechner passt – nur für ein Cloud-Modell."""
+    import debugbericht as D
+    if not D.cloud_modell():
+        return ActionResult("Die llama.cpp-Reserve richtet nur ein Cloud-Modell ein. Der Nutzer wechselt mit /model "
+                            "oder nimmt /llamacpp.", ok=False)
+    import llamareserve as R
+    zeilen = R.status_zeilen()
+    if not R.bereit():
+        try:
+            namen, grund = R.passende_pakete()
+            mb = sum(R.GROESSE[n] for n in namen) / 2**20
+            zeilen.append(f"Passend für diesen Rechner: {', '.join(namen)} ({grund}), zusammen {mb:.0f} MB – "
+                          "laden und einrichten mit llamacpp_holen, erst nach dem OK des Nutzers.")
+        except Exception as exc:
+            zeilen.append(f"Paketwahl: {exc}")
+    return ActionResult("\n".join(zeilen), ok=True)
+
+
+def _llamacpp_holen(a: dict) -> ActionResult:
+    """llama.cpp-Reserve von GitHub laden und einrichten (fester Build, SHA-256) – nur für ein Cloud-Modell.
+    Feld (optional): paket = auto (Vorgabe) | cuda-13.5 | cuda-12.4 | vulkan | cpu."""
+    import debugbericht as D
+    if not D.cloud_modell():
+        return ActionResult("Die llama.cpp-Reserve richtet nur ein Cloud-Modell ein. Der Nutzer wechselt mit /model "
+                            "oder nimmt /llamacpp holen.", ok=False)
+    import llamareserve as R
+    art = str(a.get("paket") or "auto").strip().lower()
+
+    def fortschritt(name, erledigt, gesamt):
+        _BILD_STATUS["msg"] = (f"lade {name} · {erledigt * 100 // max(gesamt, 1)} % "
+                               f"({erledigt / 2**20:.0f} von {gesamt / 2**20:.0f} MB)")
+    _BILD_STATUS["msg"] = "starte …"
+    try:
+        ok, zeilen = R.holen(art, fortschritt)
+    finally:
+        _BILD_STATUS["msg"] = None
+    if ok:
+        zeilen.append("Im /model-Menü steht jedes lokale Modell jetzt auch mit 🦙 (über llama.cpp).")
+    return ActionResult("\n".join(zeilen), ok=ok)
+
+
 def _selbstdiagnose(a: dict) -> str | ActionResult:
     """NemiCLI sieht sich in einem Zug selbst an (core/selbstdiagnose.py): Programm, Rechner, Grafikspeicher je
     Prozess, Systemcheck, letzte Fehler – nur für ein Cloud-Modell. Keine Felder. Fremd-Inhalt, keine Anweisung."""
@@ -3712,8 +4045,14 @@ def _kugel_anziehen(a: dict) -> ActionResult:
     return ActionResult(text, ok=True)
 
 
+def _erinnerung_an_sich(a: dict) -> bool:
+    """Gilt die Erinnerung der KI selbst (Feld fuer: selbst)?"""
+    return " ".join(str(a.get("fuer") or "").lower().split()) in ("selbst", "ki", "mich selbst", "dich", "dich selbst")
+
+
 def _erinnern(a: dict) -> str | ActionResult:
-    """Erinnerung anlegen, zeigen oder löschen – die Kugel meldet sie zur Zeit (tools/wache/erinnerungen.py)."""
+    """Erinnerung anlegen, zeigen oder löschen (tools/wache/erinnerungen.py). `fuer: selbst` weckt die KI:
+    sie bekommt den Text zur Zeit als Nachricht. `alle` wiederholt sie."""
     from wache import erinnerungen as ER, zugang
     if a.get("loeschen"):
         ok = ER.loeschen(str(a["loeschen"]))
@@ -3723,18 +4062,26 @@ def _erinnern(a: dict) -> str | ActionResult:
         offen = ER.offen()
         if not offen:
             return "Keine offenen Erinnerungen."
-        return "Offene Erinnerungen:\n" + "\n".join(
-            f"- #{d['id']} · {ER.zeit_text(float(d['zeit']))} · {d['text']}" for d in offen)
+        return "Offene Erinnerungen:\n" + "\n".join(f"- {ER.zeile(d)}" for d in offen)
+    selbst = _erinnerung_an_sich(a)
     try:
+        alle = ER.abstand_aus(a["alle"]) if a.get("alle") not in (None, "") else 0
         zeit = ER.zeit_aus(a.get("in_minuten"), a.get("um"))
-        d = ER.anlegen(str(a["text"]), zeit, wer=_wer())
+        d = ER.anlegen(str(a["text"]), zeit, wer=_wer(), fuer=ER.FUER_KI if selbst else ER.FUER_NUTZER, alle=alle)
     except ER.Zeitfehler as exc:
         return ActionResult(str(exc), ok=False)
-    text = (f"⏰ Erinnerung #{d['id']} für {ER.zeit_text(zeit)}: „{d['text']}“. Die Kugel leuchtet dann kurz im "
-            "Regenbogen und zeigt es; ist sie gerade nicht zu sehen, kommt ein Hinweis neben der Uhr.")
+    wieder = f", danach {ER.abstand_text(alle)}" if alle else ""
+    if selbst:
+        return (f"⏰ Erinnerung an dich selbst #{d['id']} für {ER.zeit_text(zeit)}{wieder}: „{d['text']}“. Zur Zeit "
+                "bekommst du den Text als Nachricht und arbeitest ihn ab – solange ein NemiCLI-Fenster offen ist. "
+                "Ist keines offen, erfährt der Nutzer es an der Kugel oder neben der Uhr, und du holst es nach, "
+                "sobald er NemiCLI öffnet.")
+    text = (f"⏰ Erinnerung #{d['id']} für {ER.zeit_text(zeit)}{wieder}: „{d['text']}“. Sie erscheint dann im Chat; "
+            "ist kein NemiCLI-Fenster offen, leuchtet die Kugel kurz im Regenbogen und zeigt sie, oder es kommt ein "
+            "Hinweis neben der Uhr. Du selbst wirst dabei nicht geweckt – dafür fuer: selbst.")
     if not zugang.laeuft():
-        text += (" Achtung: Die Wache läuft gerade nicht – die Erinnerung kommt erst, wenn sie wieder läuft "
-                 "(/wache start).")
+        text += (" Achtung: Die Wache läuft gerade nicht – ohne offenes NemiCLI-Fenster kommt die Erinnerung "
+                 "erst, wenn sie wieder läuft (/wache start).")
     return text
 
 
@@ -3756,6 +4103,14 @@ def _stimme():
         raise RuntimeError("Kein Stimm-Modell gefunden – der Nutzer legt den Qwen3-TTS-Talker und den "
                            "12-Hz-Tokenizer (GGUF) in einen Ordner unter Vision/.")
     return stimme
+
+
+def _stimme_falls_da():
+    """Stimm-Modul oder None, wenn kein Stimm-Modell gefunden wird (Aufrufer nehmen dann den stummen Weg)."""
+    try:
+        return _stimme()
+    except RuntimeError:
+        return None
 
 
 _STIMME_AUS = ("Die Stimme ist aus (/voice aus) – nur der Nutzer schaltet sie wieder ein "
@@ -3942,8 +4297,8 @@ ACTIONS: dict[str, dict] = {
     "paket_info":       {"func": _paket_info,       "confirm": False, "felder": ["name"]},
     "seite_ansehen":    {"func": _seite_ansehen,    "confirm": False, "felder": []},
     "app_liste":        {"func": _app_liste,        "confirm": False, "felder": []},
-    "app_aufrufen":     {"func": _app_aufrufen,     "confirm": False, "felder": ["app", "funktion"]},
-    "app_pruefen":      {"func": _app_pruefen,      "confirm": False, "felder": ["app"]},
+    "app_aufrufen":     {"func": _app_aufrufen,     "confirm": False, "felder": ["funktion"]},
+    "app_pruefen":      {"func": _app_pruefen,      "confirm": False, "felder": []},
     "doku_suchen":      {"func": _doku_suchen,      "confirm": False, "felder": []},
     "ordner_auflisten": {"func": _ordner_auflisten, "confirm": False, "felder": []},
     "dateien_suchen":   {"func": _dateien_suchen,   "confirm": False, "felder": ["muster"]},
@@ -3953,10 +4308,12 @@ ACTIONS: dict[str, dict] = {
     "abfragen":         {"func": _abfragen,         "confirm": False, "felder": []},
     "zeitplan_anzeigen": {"func": _zeitplan_anzeigen, "confirm": False, "felder": []},
     # eigenes Gedächtnis (memory.db): hybride Suche und ganze Quelle lesen
-    "gedaechtnis_suchen": {"func": _gedaechtnis_suchen, "confirm": False, "felder": ["frage"]},
-    "bilder_suchen":    {"func": _bilder_suchen,    "confirm": False, "felder": ["frage"]},
+    "gedaechtnis_suchen": {"func": _gedaechtnis_suchen, "confirm": False, "felder": []},
+    "bilder_suchen":    {"func": _bilder_suchen,    "confirm": False, "felder": []},
     "gedaechtnis_lesen":  {"func": _gedaechtnis_lesen,  "confirm": False, "felder": ["ref"]},
     "gedaechtnis_aufraeumen": {"func": _gedaechtnis_aufraeumen, "confirm": False, "felder": []},
+    "gedaechtnis_einlesen": {"func": _gedaechtnis_einlesen, "confirm": False, "felder": []},
+    "gedaechtnis_status": {"func": _gedaechtnis_status, "confirm": False, "felder": []},
     # Internet (nur Whitelist / Wikipedia – lesend, sicher)
     "web_lesen":        {"func": _web_lesen,        "confirm": False, "felder": ["url"]},
     "web_wiki":         {"func": _web_wiki,         "confirm": False, "felder": ["suche"]},
@@ -4010,6 +4367,7 @@ ACTIONS: dict[str, dict] = {
     "chat_backup":      {"func": _chat_backup,      "confirm": True,  "felder": []},
     "aufgaben":         {"func": _aufgaben,         "confirm": False, "felder": []},
     "bild_serie":       {"func": _bild_serie,       "confirm": False, "felder": ["varianten"], "hintergrund": True},
+    "bild_bewerten":    {"func": _bild_bewerten,    "confirm": False, "felder": ["warum"]},
     "comic_malen":      {"func": _comic_malen,      "confirm": False, "felder": ["panels"], "hintergrund": True},
     "tagesrueckblick":  {"func": _tagesrueckblick,  "confirm": False, "felder": [], "hintergrund": True},
     "musik_machen":     {"func": _musik_machen,     "confirm": False, "felder": [], "hintergrund": True},
@@ -4044,6 +4402,9 @@ ACTIONS: dict[str, dict] = {
     # Entwicklung: der laufende Debugbericht (nur /debug an + Cloud-Modell, siehe debugbericht.py)
     "debugbericht":     {"func": _debugbericht,     "confirm": False, "felder": [], "entwickler": True},
     "selbstdiagnose":   {"func": _selbstdiagnose,   "confirm": False, "felder": [], "entwickler": True},
+    # llama.cpp-Reserve: nur Cloud-Modell; laden nur nach Freigabe (fester Build, SHA-256, nur GitHub)
+    "llamacpp_stand":   {"func": _llamacpp_stand,   "confirm": False, "felder": []},
+    "llamacpp_holen":   {"func": _llamacpp_holen,   "confirm": True,  "felder": []},
     # Charakter-LoRA trainieren: nur Cloud-Modell, läuft im Hintergrund (Stunden möglich)
     "lora_trainieren":  {"func": _lora_trainieren,  "confirm": True,  "felder": [], "hintergrund": True},   # Grafikkarte lange belegt: Nutzer gibt frei
     "lora":             {"func": _lora,             "confirm": False, "felder": []},
@@ -4101,19 +4462,58 @@ def _pfade_entsteuern(obj: dict) -> dict:
     return obj
 
 
+MAX_JE_BLOCK = 8
+_UMLAUTE = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "ß": "ss", "Ä": "ae", "Ö": "oe", "Ü": "ue"})
+
+
+def _felder_ascii(obj: dict) -> dict:
+    """Feldnamen werden ohne Umlaut geschrieben (begruendung); ein Modell schreibt sie oft mit (begründung).
+    Gleich beim Lesen übernommen, damit Prüfung, Freigabe und Ausführung dieselben Felder sehen. Ein Feld,
+    das es schon ohne Umlaut gibt, bleibt unverändert."""
+    raus = dict(obj)
+    for k in list(obj):
+        if isinstance(k, str) and (neu := k.translate(_UMLAUTE)) != k:
+            wert = raus.pop(k)
+            raus.setdefault(neu, wert)
+    return raus
+
+
+def _mehrere_aktionen(roh: str) -> list[dict]:
+    """Mehrere Aktionen in einem Block: JSON-Objekte hintereinander (auch mit Komma dazwischen). Nur wenn der
+    ganze Block daraus besteht und jedes Objekt ein "tool" hat – sonst keine (der Block gilt dann als unlesbar
+    und die KI erfährt den Grund). Jede Aktion wird danach einzeln geprüft und freigegeben."""
+    roh = roh.strip()
+    objekte, pos, dekoder = [], 0, json.JSONDecoder()
+    while pos < len(roh):
+        while pos < len(roh) and roh[pos] in " \t\r\n,":
+            pos += 1
+        if pos >= len(roh):
+            break
+        try:
+            obj, pos = dekoder.raw_decode(roh, pos)
+        except json.JSONDecodeError:
+            return []
+        objekte.append(obj)
+    if not 1 < len(objekte) <= MAX_JE_BLOCK or not all(isinstance(o, dict) and "tool" in o for o in objekte):
+        return []
+    return objekte
+
+
 def parse_actions(text: str) -> tuple[list[dict], str]:
     """Findet Aktions-Blöcke (JSON mit 'tool'). Gibt (Aktionen, Text ohne diese Blöcke)."""
     actions: list[dict] = []
     spans: list[tuple[int, int]] = []
     for m in _BLOCK.finditer(text):
         obj = _json_reparieren(m.group(1))
-        if obj is None:
-            continue
-        if isinstance(obj, dict):
+        objekte = [obj] if isinstance(obj, dict) else _mehrere_aktionen(m.group(1))
+        gefunden = False
+        for obj in objekte:
             # Felder mit „_“ setzt nur NemiCLI selbst (z. B. _frei für die Anzeige) – nie die KI.
-            obj = _pfade_entsteuern({k: v for k, v in obj.items() if not str(k).startswith("_")})
-        if isinstance(obj, dict) and "tool" in obj:
-            actions.append(obj)
+            obj = _pfade_entsteuern(_felder_ascii({k: v for k, v in obj.items() if not str(k).startswith("_")}))
+            if "tool" in obj:
+                actions.append(obj)
+                gefunden = True
+        if gefunden:
             spans.append(m.span())
 
     # nur die erkannten Aktions-Blöcke aus dem Anzeigetext entfernen
@@ -4211,7 +4611,8 @@ def _holt_aus_dem_netz(action: dict) -> bool:
         return bool(_NETZ_CODE.search(text + " " + str(action.get("modul") or "")))
     return False
 SKILL_AENDERN = {"skill_schreiben", "skill_ausbessern"}      # Prüffenster nur mit /skills selbst aus; sonst Skill-Wächter
-_MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "gedaechtnis_aufraeumen"}
+_MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "gedaechtnis_aufraeumen",
+                 "gedaechtnis_einlesen", "bild_bewerten"}
 # Werkzeuge, die Privates zeigen. Kam in derselben Runde Text aus dem Netz, fragt jede weitere
 # Anfrage nach draußen – über Suchworte oder Adressen könnten sonst Daten hinausgelangen.
 _PRIVAT_LESEN = {"datei_lesen", "ordner_auflisten", "dateien_suchen", "inhalt_suchen", "gedaechtnis_suchen",
@@ -4269,6 +4670,8 @@ def fremd_grund(action: dict) -> str | None:
     spec = ACTIONS.get(tool) or {}
     if tool in _MEMORY_TOOLS:
         return "eine Notiz nach Inhalt aus dem Netz"
+    if tool == "erinnern" and _erinnerung_an_sich(action) and action.get("text"):
+        return "eine Erinnerung der KI an sich selbst nach Inhalt aus dem Netz – sie käme später wie ein Auftrag an"
     if tool in _WEB_TOOLS and _privat_gelesen and not (
             tool == "web_lesen" and webfetch.aus_suchtreffer(str(action.get("url") or ""))):
         # Suchworte und selbst gebaute Adressen bestimmt die KI; eine Adresse aus einem Treffer nicht.
@@ -4349,6 +4752,9 @@ def confirmation_preview(action: dict) -> str | None:
         replacement = action.get("ersetzen", "")
         if not isinstance(search, str) or not isinstance(replacement, str):
             raise ValueError("Suchtext und Ersatz müssen Text sein.")
+        search, replacement = search.replace("\r\n", "\n"), replacement.replace("\r\n", "\n")
+        if not search:
+            raise ValueError("Suchtext ist leer; die Datei kann so nicht bearbeitet werden.")
         count = original.count(search)
         if count == 0:
             raise ValueError("Suchtext nicht gefunden; die Datei kann so nicht bearbeitet werden.")
@@ -4406,6 +4812,18 @@ def _taint_hinweis() -> str:
     return ""
 
 
+def _llamacpp_beschreibung(action: dict) -> str:
+    """Freigabe-Text für llamacpp_holen: welche Pakete, wie groß, woher."""
+    try:
+        import llamareserve as R
+        namen, grund = R.passende_pakete(art=str(action.get("paket") or "auto").strip().lower())
+        mb = sum(R.GROESSE[n] for n in namen) / 2**20
+        return (f"llama.cpp {R.BUILD} laden und einrichten 🦙: {', '.join(namen)} ({grund}), {mb:.0f} MB von GitHub"
+                "\n    Jede Datei mit fester SHA-256 geprüft; nur dieser Build läuft.")
+    except Exception as exc:
+        return f"llama.cpp laden und einrichten 🦙: {exc}"
+
+
 def describe(action: dict) -> str:
     """Kurze, lesbare Beschreibung einer Aktion für die Bestätigung."""
     text = _describe(action)
@@ -4449,8 +4867,14 @@ def _describe(action: dict) -> str:
         return (f"Gedächtnis durchsuchen:  {frage}" + ("  (mit Vermutung)" if g("vermutung") else "")
                 + (f"  ({filter_})" if filter_ else ""))
     if t == "gedaechtnis_lesen": return f"Gedächtnis lesen:  {g('ref', '?')}" + (f"  (ab {g('ab')})" if g("ab") else "")
+    if t == "gedaechtnis_einlesen":
+        return "Einlese-Speicher abarbeiten 📦"
     if t == "gedaechtnis_aufraeumen":
         return "Gedächtnis-Pflege vormerken 🗜" + (f":  {g('grund')}" if g("grund") else "")
+    if t == "gedaechtnis_status":
+        return "Gedächtnis-Stand ansehen 📦"
+    if t == "bild_bewerten":
+        return f"Bild bewerten 🖼:  {g('urteil', '?')} – {g('warum', '?')}" + _taint_hinweis()
     if t == "web_suche":        return f"Web durchsuchen:  {g('suche', '?')}"
     if t == "fach_suche":       return f"Fachquelle {g('quelle', '?')} durchsuchen:  {g('suche', '?')}"
     if t == "recherche":        return f"Recherche:  {g('frage', '?')}" + (f"  (Tiefe {g('tiefe')})" if g("tiefe") else "")
@@ -4609,7 +5033,10 @@ def _describe(action: dict) -> str:
         if not action.get("text"):
             return "Erinnerung ⏰: offene ansehen"
         wann = f"in {g('in_minuten')} min" if action.get("in_minuten") not in (None, "") else f"um {g('um')}"
-        return f"Erinnerung ⏰ {wann}: „{str(g('text'))[:60]}“"
+        if action.get("alle") not in (None, ""):
+            wann += f", alle {g('alle')}"
+        wem = " an sich selbst" if _erinnerung_an_sich(action) else ""
+        return f"Erinnerung{wem} ⏰ {wann}: „{str(g('text'))[:60]}“"
     if t == "kugel":
         teile = [f"{k} {g(k)}" for k in ("stimmung", "outfit", "bewegung", "ecke", "position", "groesse", "leben",
                                          "musik") if g(k)]
@@ -4630,6 +5057,8 @@ def _describe(action: dict) -> str:
     if t == "modell_schalter":  return "Modell ⚙: " + (f"Leerlauf-Entladen {g('leerlauf_min')} Min." if "leerlauf_min" in action else "Stand")
     if t == "stimme_schalter":  return "Stimme ⚙: " + (", ".join(f"{k} {g(k)}" for k in ("vorlesen_auto", "kugel_spricht") if k in action) or "Stand")
     if t == "selbstdiagnose":   return "Selbstdiagnose 🩺: Programm, Rechner, Grafikspeicher, Systemcheck, Fehler"
+    if t == "llamacpp_stand":   return "llama.cpp-Reserve 🦙: Stand"
+    if t == "llamacpp_holen":   return _llamacpp_beschreibung(action)
     if t == "debugbericht":     return f"Debugbericht lesen 🐞: {g('was', 'kurz')}" + (f" ab Zeile {g('ab')}" if g("ab") else "")
     if t == "video_erstellen":  return f"Video 🎬: {str(g('prompt', '?'))[:70]} ({g('sekunden', 5)} s)"
     if t == "chat_backup":

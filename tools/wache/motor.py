@@ -4,8 +4,9 @@ Läuft in eigenen Threads, kennt keine Oberfläche. Wer wissen will, was los ist
 fragt `stand()`; wer bei Alarmen gerufen werden will, hängt sich an `bei_alarm`.
 
 Lernen ohne Zutun: erstes Training, sobald
-`min_training` Ereignisse da sind, danach alle `training_alle` Ereignisse –
-auf den letzten 7 Tagen, nur aus Ereignissen älter als `ml_karenz_h` und ohne
+`min_training` Ereignisse da sind, danach nach `training_alle` neuen Ereignissen, aber höchstens
+alle `training_stunden` (ein neuer Vollscan wartet nicht) – gleichmäßig verteilt über die
+letzten 7 Tage, nur aus Ereignissen älter als `ml_karenz_h` und ohne
 Ereignisse mit offenem, unklarem oder echtem Alarm samt ihrer Prozess-Kette
 (Speicher.lern_ereignisse). Vor jedem Lauf werden die Profile in die Merkmale
 gespiegelt und das „harmlos“-Feedback übernommen. Jeder Lauf steht in
@@ -61,7 +62,7 @@ from .justierung import einstellungen
 from .merkmale import Burst, DateiMerkmale, ProzessMerkmale
 from .netzauskunft import Auskunft
 from .netzwaechter import SCHATTEN as NETZ_SCHATTEN, NetzFolgen, NetzMerkmale, SchattenLog, ZieleProMinute, domain_von
-from .regeln import MENGENREGELN, Regelwerk
+from .regeln import MENGENREGELN, Regelwerk, eigener_server
 from .sensoren import DateiSensor, NetzSensor, ProzessSensor, SensorThread
 from .speicher import Speicher
 from .vollscan import Baseline
@@ -72,6 +73,7 @@ FEHLER_FENSTER = 60.0       # … in so vielen Sekunden = gestört
 RUHIG_NACH = 120.0          # so lange ohne Fehler = wieder in Ordnung
 MAX_STAPEL = 5000           # nicht schreibbare Ereignisse höchstens so viele zurückhalten
 MAX_BELASTET = 5000         # so viele Prozess-Ketten mit Alarm merkt sich der Motor
+ML_LERN_MAX = 100_000       # Isolation Forest: höchstens so viele Ereignisse, gleichmäßig über das Lern-Fenster
 
 
 def _log(text: str) -> None:
@@ -125,6 +127,7 @@ class Motor:
         self._besitzer_offen: set[str] = set()
         self._besitzer: threading.Thread | None = None
         self.regeln = Regelwerk(stumm=set(self.e.get("stumme_regeln") or []))
+        self.regeln.bei_fehler = self._fehler
         self.absolvierung = Absolvierung(urteile=self.speicher.urteile_zu)   # Programme auf Anweisung (R015)
         self.burst = Burst()
         self.datei_burst = Burst()
@@ -170,11 +173,14 @@ class Motor:
 
         self._profile_spiegeln()
         self.daempfung_aktualisieren()
+        self._training_zuletzt = 0.0
+        self._training_sofort = False                 # neuer Vollscan: nicht auf den Zeitabstand warten
         # Was seit dem letzten Training reinkam, zählt weiter – sonst finge der
         # Trainings-Takt nach jedem Neustart bei 0 an.
         try:
             zuletzt = float(self.speicher.meta("training_zuletzt", "0") or 0)
             if zuletzt:
+                self._training_zuletzt = zuletzt
                 self._seit_training = self.speicher.anzahl_ereignisse_seit(zuletzt)
         except Exception:
             pass
@@ -332,7 +338,12 @@ class Motor:
                 self._inventar_anstossen()
             alarme.extend(self.regeln.pruefen(e))
             return
-        if self.e["ml"]:
+        # NemiCLIs eigener llama-server (geprüfter Build): die gelernten Modelle schlagen bei jedem Neustart an
+        # (neuer Prozess, Speicher beim Laden) – sie bewerten ihn nicht; die festen Regeln schon.
+        eigen = e.kategorie != DATEI and eigener_server(e)
+        if eigen:
+            self.regeln.treffer["eigen"] += 1
+        if self.e["ml"] and not eigen:
             try:
                 d = self.datei_detektor if e.kategorie == DATEI else self.detektor
                 score, gruende = d.bewerten(e)
@@ -346,7 +357,7 @@ class Motor:
                     alarme.append(self._ml_alarm(e, score, gruende))
             except Exception as exc:
                 self._fehler("ml", exc)
-        if self.e.get("dl", True):
+        if self.e.get("dl", True) and not eigen:
             try:
                 self._folgen_bewerten(e, alarme)
             except Exception as exc:
@@ -448,10 +459,12 @@ class Motor:
         jetzt = time.time()
         if jetzt - self._baseline_geprueft > 300:
             self._baseline_geprueft = jetzt
-            if self.baseline.aktualisieren():
-                # Neuer Vollscan: das Modell lernt mit dem neuen Stand neu.
+            if (self.baseline.aktualisieren()
+                    and str(self.baseline.lauf) != self.speicher.meta("training_vollscan", "")):
+                # Neuer Vollscan: das Modell lernt mit dem neuen Stand neu, ohne den Zeitabstand abzuwarten.
                 _log(f"Neuer Vollscan-Stand (Lauf {self.baseline.lauf}) – Training folgt")
                 self._seit_training = max(self._seit_training, self.e["training_alle"])
+                self._training_sofort = True
         if stapel and (len(stapel) >= 50 or jetzt - zuletzt > 1.5):
             zuletzt = jetzt
             if len(stapel) > MAX_STAPEL:
@@ -465,15 +478,23 @@ class Motor:
             for cb in self.bei_alarm:
                 try:
                     cb(list(alarme))
-                except Exception:
-                    pass
+                except Exception as exc:
+                    self._sensor_fehler("alarm-meldung", f"{type(exc).__name__}: {exc}")
             alarme.clear()
         if (self.e["ml"] and self.e["lernen"] and not self.detektor.pausiert and (
-                self._seit_training >= self.e["training_alle"]
+                (self._seit_training >= self.e["training_alle"] and self._training_abstand_um(jetzt))
                 or (not self.detektor.trainiert and self._seit_training >= self.e["min_training"]))):
             self._seit_training = 0
             self._vielleicht_trainieren()
         return zuletzt
+
+    def _training_abstand_um(self, jetzt: float) -> bool:
+        """Automatisch höchstens alle `training_stunden` – sonst lernt der Wald alle paar Minuten aus fast
+        denselben Daten, und die drei Vorversionen zum Zurückdrehen wären nur Minuten alt."""
+        if self._training_sofort:
+            return True
+        abstand = float(self.e.get("training_stunden", 6.0)) * 3600
+        return jetzt - self._training_zuletzt >= abstand
 
     def _schleife(self) -> None:
         stapel: list[Ereignis] = []
@@ -644,11 +665,13 @@ class Motor:
             self.daempfung_aktualisieren()
             jetzt = time.time()
             karenz = float(self.e.get("ml_karenz_h", 24.0)) * 3600
-            alle = self.speicher.lern_ereignisse(jetzt - 7 * 86400, jetzt - karenz, limit=20_000)
+            alle = self.speicher.lern_ereignisse(jetzt - 7 * 86400, jetzt - karenz, limit=ML_LERN_MAX)
             dateien = [x for x in alle if x.kategorie == DATEI]
             andere = [x for x in alle if x.kategorie != DATEI]
             ergebnis = self.detektor.trainieren(andere)
-            if len(dateien) >= self.e["min_training_dateien"]:
+            if self.datei_detektor.pausiert and wer != "Nutzer":
+                ergebnis["dateien"] = {"ok": False, "grund": "zurückgedreht – lernt erst nach einem Training durch den Nutzer"}
+            elif len(dateien) >= self.e["min_training_dateien"]:
                 ergebnis["dateien"] = self.datei_detektor.trainieren(dateien)
             else:
                 ergebnis["dateien"] = {"ok": False, "grund": f"nur {len(dateien)} Datei-Ereignisse, "
@@ -663,7 +686,10 @@ class Motor:
                 ergebnis["netz"] = self.netz_detektor.trainieren(netz)
             else:
                 ergebnis["netz"] = {"ok": False, "grund": f"nur {len(netz)} Verbindungen, {mindest} nötig"}
-        self.speicher.meta_setzen("training_zuletzt", str(time.time()))
+        self._training_zuletzt = time.time()
+        self._training_sofort = False
+        self.speicher.meta_setzen("training_zuletzt", str(self._training_zuletzt))
+        self.speicher.meta_setzen("training_vollscan", str(getattr(self.baseline, "lauf", 0)))
         kurz = (f"Prozesse: {ergebnis.get('ereignisse', 0)} Ereignisse in {ergebnis.get('sekunden', 0)}s "
                 f"(Lauf {ergebnis.get('laeufe', 0)}) · Dateien: "
                 + (f"{ergebnis['dateien'].get('ereignisse')} Ereignisse" if ergebnis["dateien"].get("ok")
@@ -828,8 +854,8 @@ class Motor:
                 for cb in self.bei_alarm:
                     try:
                         cb(list(neue_alarme))
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        self._sensor_fehler("alarm-meldung", f"{type(exc).__name__}: {exc}")
         _protokoll("wache_inventar", "Systeminventar gescannt",
                    ergebnis=f"{ergebnis['gesamt']} Einträge, {ergebnis['neu']} neu, "
                             f"{ergebnis['verschwunden']} verschwunden, {ergebnis['sekunden']}s")
@@ -876,8 +902,9 @@ class Motor:
                     d.neu_laden_wenn_geaendert()
                 self.netz_folgen.zeiger_pruefen()
                 stunden = float(self.e["inventar_stunden"])
-                if stunden > 0 and self.inventar.letzter_scan and \
-                        time.time() - self.inventar.letzter_scan >= stunden * 3600:
+                # Ohne Scan beim Start zählt der Takt ab dem Start der Wache.
+                zuletzt = self.inventar.letzter_scan or self.start_zeit
+                if stunden > 0 and zuletzt and time.time() - zuletzt >= stunden * 3600:
                     self.inventar_starten()
             except Exception as exc:
                 self.sensor_fehler.append(f"wartung: {exc!r}")
@@ -905,7 +932,7 @@ class Motor:
                          "zuletzt": self.inventar.letzter_scan, "dauer": round(self.inventar.dauer, 2),
                          **{k: v for k, v in self.letztes_inventar.items() if k in ("neu", "verschwunden", "profile")}},
             "seit_training": self._seit_training, "training_alle": self.e["training_alle"],
-            "fehler": list(self.sensor_fehler[-5:]),
+            "fehler": list(self.sensor_fehler[-5:]), "regel_fehler": sum(self.regeln.fehler.values()),
             "gestoert": self.gestoert, "verworfen": self.verworfen,
             "dl": {**self.folgen.stand(), "an": bool(self.e.get("dl", True)),
                    "alarm": bool(self.e.get("dl_alarm", False)), "auffaellig_seit_start": self.dl_auffaellig,

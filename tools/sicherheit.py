@@ -264,6 +264,8 @@ def auto_grund(act: dict) -> str | None:
     tool = act.get("tool", "")
     if tool == "updates_installieren":
         return "installiert Programme für den ganzen Rechner"
+    if tool == "llamacpp_holen":
+        return "lädt ein Programm aus dem Netz (llama.cpp)"
     if stufe(act) != RISKANT:
         return None
     basis = arbeitsordner()
@@ -500,8 +502,19 @@ def _waechter_text(text: str, p: Path) -> str | None:
     return None
 
 
+def _kern_grund(act: dict) -> str | None:
+    """charakter_aendern am gesperrten Kern: der Nutzer entscheidet (in jedem Modus)."""
+    try:
+        import charakter
+        return charakter.kern_aenderung(act)
+    except Exception:
+        return "der Kern ließ sich nicht prüfen"
+
+
 def steuerdatei_grund(act: dict) -> str | None:
     """Warum eine Änderung im Daten-Ordner trotz Stift fragen muss – oder None."""
+    if act.get("tool") == "charakter_aendern":
+        return _kern_grund(act)
     if act.get("tool") not in _ARBEITSBEREICH_TOOLS:
         return None
     try:
@@ -514,6 +527,8 @@ def steuerdatei_grund(act: dict) -> str | None:
                 if not p.is_relative_to(daten) or p == daten:
                     continue
                 erster = p.relative_to(daten).parts[0].lower()
+                if erster == "profile" and p.name.lower().endswith("_kern.json"):
+                    return "die Kern-Datei hält das Aussehen der Figur – ändern entscheidest du"
                 if erster in _STEUERND_IMMER:
                     return f"{p.relative_to(daten).parts[0]}/ läuft später von allein – das entscheidest du"
                 if erster in _SICHERUNGEN:

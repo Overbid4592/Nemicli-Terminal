@@ -83,7 +83,7 @@ def ereignis(art: str, d: dict) -> Ereignis | None:
     if art == "powershell_verdaechtig":
         skript = f.get("ScriptBlockText", "")
         from .regeln import EIGENER_RAHMEN
-        if EIGENER_RAHMEN in skript.lower():           # NemiCLIs eigener PowerShell-Rahmen
+        if " ".join(skript.lower().split()).startswith(EIGENER_RAHMEN):   # NemiCLIs eigener PowerShell-Rahmen
             return None
         pfad = f.get("Path", "")
         return Ereignis(SYSTEM, "evtlog_powershell_verdaechtig",
@@ -111,6 +111,8 @@ class ProtokollSensor:
             if kanal not in self._stand:                # erster Durchlauf: nur den Stand merken
                 self._stand[kanal] = hoechste
                 continue
+            if eintraege and hoechste < self._stand[kanal]:   # Protokoll geleert: Nummern beginnen neu
+                self._stand[kanal] = 0
             neu = sorted((d for d in eintraege if d["rec"] > self._stand[kanal]), key=lambda d: d["rec"])
             self._stand[kanal] = max(self._stand[kanal], hoechste)
             for d in neu:

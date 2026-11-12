@@ -49,6 +49,7 @@ MAX_WEITERLEITUNGEN = 5
 MAX_PDF_SEITEN = 60
 _CACHE_S = 600                    # so lange bleibt ein geladener Text für weitere Teile
 _CACHE: dict[str, tuple[float, str, str, int | str]] = {}   # schlüssel -> (zeit, quelle, text, tier)
+_CACHE_SPERRE = threading.Lock()  # Werkzeuge laufen parallel
 
 # Grenze je Suchtreffer, damit ein langer Treffer nicht das ganze MAX_OUT belegt und die
 # übrigen abschneidet. Ganz gelesen wird mit web_lesen.
@@ -157,15 +158,17 @@ def _zahl(wert, standard: int = 1) -> int:
 
 def _merken(schluessel: str, quelle: str, text: str, tier) -> None:
     jetzt = time.time()
-    for k in [k for k, v in _CACHE.items() if jetzt - v[0] > _CACHE_S]:
-        _CACHE.pop(k, None)
-    while len(_CACHE) >= 16:
-        _CACHE.pop(next(iter(_CACHE)))
-    _CACHE[schluessel] = (jetzt, quelle, text, tier)
+    with _CACHE_SPERRE:
+        for k in [k for k, v in _CACHE.items() if jetzt - v[0] > _CACHE_S]:
+            _CACHE.pop(k, None)
+        while len(_CACHE) >= 16:
+            _CACHE.pop(next(iter(_CACHE)))
+        _CACHE[schluessel] = (jetzt, quelle, text, tier)
 
 
 def _gemerkt(schluessel: str):
-    eintrag = _CACHE.get(schluessel)
+    with _CACHE_SPERRE:
+        eintrag = _CACHE.get(schluessel)
     if eintrag and time.time() - eintrag[0] <= _CACHE_S:
         return eintrag
     return None
@@ -779,16 +782,29 @@ GANZ_MAX = 8 * MAX_OUT            # „ganz“: so viel auf einmal, der Rest wei
 def fetch(url: str, teil: int = 1, ganz: bool = False) -> str:
     """Lädt eine erlaubte HTTPS-Seite (HTML, Text, JSON, PDF) und gibt Teil `teil` als Text zurück –
     mit `ganz` alles in einem Zug (bis GANZ_MAX Zeichen)."""
+    return fetch_ergebnis(url, teil, ganz)[0]
+
+
+def fetch_ergebnis(url: str, teil: int = 1, ganz: bool = False) -> tuple[str, dict | None]:
+    """Wie fetch, dazu die Anzeige-Daten der Seite (webanzeige.lesen) – None bei einem Fehler."""
+    import webanzeige
     url = url.strip()
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url        # ohne Schema -> immer HTTPS
     geladen = text_holen(url)
     if isinstance(geladen, str):
-        return geladen
+        return geladen, None
     quelle, text, tier = geladen
-    if not ganz:
-        return _als_teil(quelle, text, tier, _zahl(teil), f"web_lesen mit url: {url}")
     stuecke = _teile(text) or [""]
+    if not ganz:
+        nr = min(_zahl(teil), len(stuecke))
+        return (_als_teil(quelle, text, tier, nr, f"web_lesen mit url: {url}"),
+                webanzeige.lesen(url, text, tier, nr, len(stuecke), warn=verdaechtig(url)))
+    return _ganz_lesen(url, quelle, text, tier, stuecke), \
+        {**webanzeige.lesen(url, text, tier, 1, len(stuecke), warn=verdaechtig(url)), "ganz": True}
+
+
+def _ganz_lesen(url: str, quelle: str, text: str, tier, stuecke: list[str]) -> str:
     zusammen, n = "", 0
     for s in stuecke:
         if zusammen and len(zusammen) + len(s) > GANZ_MAX:
@@ -864,6 +880,24 @@ def text_holen(url: str) -> tuple[str, str, int | str] | str:
 def wikipedia(query: str, lang: str = "de", teil: int = 1) -> str:
     """Sucht in Wikipedia (offizielle API) und gibt den ganzen Artikel in Teilen,
     dazu die nächsten Treffer zur Auswahl."""
+    return wikipedia_ergebnis(query, lang, teil)[0]
+
+
+def wikipedia_ergebnis(query: str, lang: str = "de", teil: int = 1) -> tuple[str, dict | None]:
+    """Wie wikipedia, dazu die Anzeige-Daten des Artikels – None, wenn nichts gefunden wurde."""
+    import webanzeige
+    text = _wikipedia(query, lang, teil)
+    alt = _gemerkt(f"wiki:{lang}:{(query or '').strip().lower()}")
+    if not alt:
+        return text, None
+    kopf = alt[1].splitlines()[0]
+    m = re.match(r"Wikipedia: (.*?) — (https://\S+)", kopf)
+    titel, url = (m.group(1), m.group(2)) if m else ("", f"https://{lang}.wikipedia.org")
+    stuecke = _teile(alt[2]) or [""]
+    return text, webanzeige.lesen(url, alt[2], alt[3], min(_zahl(teil), len(stuecke)), len(stuecke), titel=titel)
+
+
+def _wikipedia(query: str, lang: str = "de", teil: int = 1) -> str:
     teil = _zahl(teil)
     schluessel = f"wiki:{lang}:{(query or '').strip().lower()}"
     weiter = f"web_wiki mit suche: {query}"
@@ -1033,10 +1067,20 @@ def search(query: str, count: int = 5) -> str:
     Liefert Titel/URL/Schnipsel als KONTEXT. Ergebnisse sind ungeprüfte
     Fremddaten und werden markiert/entschärft (Prompt-Injection-Schutz).
     """
+    return search_ergebnis(query, count)[0]
+
+
+def search_ergebnis(query: str, count: int = 5) -> tuple[str, dict | None]:
+    """Wie search, dazu die Trefferliste für die Anzeige (webanzeige.suche) – None bei einem Fehler."""
+    import webanzeige
     query = (query or "").strip()
     results = treffer(query, count)
     if isinstance(results, str):
-        return results
+        return results, None
+    return _suche_text(query, results), webanzeige.suche(query, results, warn=verdaechtig)
+
+
+def _suche_text(query: str, results: list[dict]) -> str:
     if not results:
         return f"Keine Web-Treffer zu „{query}“."
 

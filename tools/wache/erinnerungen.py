@@ -1,13 +1,17 @@
-"""Erinnerungen: „erinnere mich in 20 Minuten an die Wäsche“ – die Kugel meldet sich zur Zeit.
+"""Erinnerungen: „erinnere mich in 20 Minuten an die Wäsche“ – und der Wecker der KI für sich selbst.
 
-Angelegt wird über die Aktion `erinnern` (großes NemiCLI oder Kugel-Fenster), gemeldet im
-Wache-Prozess: Ist die Kugel zu sehen, hüpft sie und zeigt eine Blase; sonst kommt ein
-Hinweis neben der Uhr. Läuft die Wache gerade nicht, holt sie fällige Erinnerungen beim
-nächsten Start nach.
+Angelegt wird über die Aktion `erinnern` (großes NemiCLI oder Kugel-Fenster). Eine Erinnerung gilt dem
+Nutzer oder der KI selbst (`fuer`), einmal oder immer wieder (`alle`, Abstand in Sekunden nach der Uhr
+des Rechners).
 
-Jede Erinnerung ist eine eigene Datei `Wache/Erinnerungen/<id>.json`. Zwei Prozesse
-(NemiCLI legt an, die Wache holt ab) kommen sich so nie beim Schreiben in die Quere:
-Anlegen schreibt eine neue Datei, Abholen löscht sie.
+Wer meldet: Ist ein NemiCLI-Fenster offen, holt es alles Fällige ab – Erinnerungen an den Nutzer
+erscheinen im Chat, eine Erinnerung der KI an sich selbst bekommt sie als Nachricht und arbeitet sie ab.
+Sonst meldet die Wache: an der Kugel (Blase) oder neben der Uhr. Eine Erinnerung der KI an sich selbst
+kann die Wache nicht abarbeiten; sie sagt einmal Bescheid und lässt sie liegen, bis ein Fenster offen ist.
+Läuft nichts, wird Fälliges beim nächsten Start nachgeholt.
+
+Jede Erinnerung ist eine eigene Datei `Wache/Erinnerungen/<id>.json`. Anlegen schreibt eine neue Datei,
+Abholen löscht sie oder schreibt bei einer Wiederholung den nächsten Zeitpunkt hinein.
 """
 
 from __future__ import annotations
@@ -25,6 +29,13 @@ ORDNER = _WACHE / "Erinnerungen"
 TEXT_MAX = 200
 OFFEN_MAX = 50
 MIN_S, MAX_S = 30, 60 * 86400          # frühestens in 30 Sekunden, spätestens in 60 Tagen
+FUER_NUTZER, FUER_KI = "nutzer", "ki"
+WECKER_MAX = 10                        # so viele offene Erinnerungen der KI an sich selbst
+ALLE_MIN_S = 10 * 60                   # kürzester Abstand einer Wiederholung
+_EINHEIT = {"min": 60, "minute": 60, "minuten": 60, "std": 3600, "stunde": 3600, "stunden": 3600, "h": 3600,
+            "tag": 86400, "tage": 86400, "tagen": 86400, "woche": 604800, "wochen": 604800}
+_FEST = {"stündlich": 3600, "stuendlich": 3600, "täglich": 86400, "taeglich": 86400,
+         "wöchentlich": 604800, "woechentlich": 604800}
 
 
 class Zeitfehler(ValueError):
@@ -50,6 +61,44 @@ def zeit_aus(in_minuten=None, um=None, jetzt: datetime | None = None) -> float:
     if abstand > MAX_S:
         raise Zeitfehler("Höchstens 60 Tage im Voraus.")
     return ziel.timestamp()
+
+
+def abstand_aus(text) -> int:
+    """Abstand einer Wiederholung in Sekunden: „2 tage“, „alle 30 minuten“, „6 stunden“, „täglich“, „jede woche“."""
+    roh = " ".join(str(text or "").lower().split())
+    kurz = re.sub(r"^(alle|jeden|jede|jedes)\s+", "", roh)
+    if kurz in _FEST:
+        sekunden = _FEST[kurz]
+    elif kurz in _EINHEIT:
+        sekunden = _EINHEIT[kurz]
+    else:
+        m = re.fullmatch(r"(\d+(?:[.,]\d+)?)\s*([a-zäöü]+)\.?", kurz)
+        if not m or m.group(2) not in _EINHEIT:
+            raise Zeitfehler(f"Wiederholung „{text}“ nicht verstanden – z. B. 2 tage, 6 stunden, 30 minuten, täglich.")
+        sekunden = float(m.group(1).replace(",", ".")) * _EINHEIT[m.group(2)]
+    if sekunden < ALLE_MIN_S:
+        raise Zeitfehler(f"Eine Wiederholung braucht mindestens {ALLE_MIN_S // 60} Minuten Abstand.")
+    if sekunden > MAX_S:
+        raise Zeitfehler("Eine Wiederholung liegt höchstens 60 Tage auseinander.")
+    return int(sekunden)
+
+
+def abstand_text(sekunden: float) -> str:
+    """„alle 2 Tage“ · „alle 6 Stunden“ · „alle 30 Minuten“."""
+    for name, mehr, s in (("Woche", "Wochen", 604800), ("Tag", "Tage", 86400), ("Stunde", "Stunden", 3600)):
+        if sekunden >= s and sekunden % s == 0:
+            n = int(sekunden // s)
+            return f"jede {name}" if n == 1 and name != "Tag" else "jeden Tag" if n == 1 else f"alle {n} {mehr}"
+    return f"alle {max(1, round(sekunden / 60))} Minuten"
+
+
+def terminal_offen() -> bool:
+    """Läuft ein NemiCLI-Fenster? Dann holt es die fälligen Erinnerungen ab, nicht die Wache."""
+    try:
+        import kontextmenue
+        return kontextmenue.nemicli_laeuft()
+    except Exception:
+        return False
 
 
 def _uhrzeit(text: str) -> tuple[int, int]:
@@ -92,6 +141,7 @@ def _lesen(pfad: Path) -> dict | None:
         return None
     if not isinstance(d, dict) or "zeit" not in d:
         return None
+    d["text"] = " ".join(str(d.get("text") or "").split())[:TEXT_MAX]     # auch bei von Hand abgelegten Dateien
     d["id"] = pfad.stem
     return d
 
@@ -103,19 +153,29 @@ def offen() -> list[dict]:
     return sorted(out, key=lambda d: float(d["zeit"]))
 
 
-def anlegen(text: str, zeit: float, wer: str = "") -> dict:
+def anlegen(text: str, zeit: float, wer: str = "", fuer: str = FUER_NUTZER, alle: int = 0) -> dict:
+    """`fuer`: wem sie gilt (dem Nutzer oder der KI selbst), `alle`: Abstand der Wiederholung in Sekunden (0 = einmal)."""
     text = " ".join(str(text or "").split())
     if not text:
         raise Zeitfehler("Woran soll ich erinnern? Feld text fehlt.")
-    if len(offen()) >= OFFEN_MAX:
+    alle_offen = offen()
+    if len(alle_offen) >= OFFEN_MAX:
         raise Zeitfehler(f"Schon {OFFEN_MAX} offene Erinnerungen – erst eine löschen.")
-    d = {"zeit": float(zeit), "text": text[:TEXT_MAX], "wer": wer, "angelegt": time.time()}
-    ORDNER.mkdir(parents=True, exist_ok=True)
+    fuer = FUER_KI if fuer == FUER_KI else FUER_NUTZER
+    if fuer == FUER_KI and sum(1 for d in alle_offen if d.get("fuer") == FUER_KI) >= WECKER_MAX:
+        raise Zeitfehler(f"Schon {WECKER_MAX} offene Erinnerungen an dich selbst – erst eine löschen.")
+    d = {"zeit": float(zeit), "text": text[:TEXT_MAX], "wer": wer, "angelegt": time.time(),
+         "fuer": fuer, "alle": max(0, int(alle))}
     eid = uuid.uuid4().hex[:8]
-    tmp = ORDNER / f"{eid}.tmp"
-    tmp.write_text(json.dumps(d, ensure_ascii=False), encoding="utf-8")
-    tmp.replace(ORDNER / f"{eid}.json")
+    _schreiben(eid, d)
     return {**d, "id": eid}
+
+
+def _schreiben(eid: str, d: dict) -> None:
+    ORDNER.mkdir(parents=True, exist_ok=True)
+    tmp = ORDNER / f"{eid}.tmp"
+    tmp.write_text(json.dumps({k: v for k, v in d.items() if k != "id"}, ensure_ascii=False), encoding="utf-8")
+    tmp.replace(ORDNER / f"{eid}.json")
 
 
 def loeschen(eid: str) -> bool:
@@ -132,15 +192,36 @@ def loeschen(eid: str) -> bool:
         return False
 
 
-def abholen(jetzt: float | None = None) -> list[dict]:
-    """Fällige Erinnerungen herausgeben und ihre Dateien löschen (die Kugel meldet sie dann)."""
+def abholen(jetzt: float | None = None, *, terminal: bool = False, wer: str | None = None) -> list[dict]:
+    """Fällige Erinnerungen herausgeben. Einmalige werden gelöscht, wiederkehrende bekommen ihren nächsten
+    Zeitpunkt (verpasste Male werden nicht nachgeholt).
+
+    `terminal`: Der Aufrufer ist ein NemiCLI-Fenster und kann eine Erinnerung der KI an sich selbst abarbeiten –
+    aber nur die der Persönlichkeit `wer`. Ohne `terminal` (Wache) bleibt so eine Erinnerung liegen und kommt
+    einmal mit `wartet: True` heraus, damit der Nutzer Bescheid bekommt."""
     jetzt = time.time() if jetzt is None else jetzt
     out = []
     for d in offen():
         if float(d["zeit"]) > jetzt:
             break
+        if d.get("fuer") == FUER_KI:
+            if not terminal:
+                if not d.get("gemeldet"):
+                    try:
+                        _schreiben(d["id"], {**d, "gemeldet": True})
+                    except OSError:
+                        continue
+                    out.append({**d, "wartet": True})
+                continue
+            if wer is not None and d.get("wer") and d["wer"] != wer:
+                continue                    # gehört einer anderen Persönlichkeit: bleibt für sie liegen
         try:
-            (ORDNER / f"{d['id']}.json").unlink()
+            alle = int(d.get("alle") or 0)
+            if alle >= ALLE_MIN_S:
+                verpasst = int((jetzt - float(d["zeit"])) // alle) + 1
+                _schreiben(d["id"], {**d, "zeit": float(d["zeit"]) + verpasst * alle, "gemeldet": False})
+            else:
+                (ORDNER / f"{d['id']}.json").unlink()
         except OSError:
             continue                        # schon abgeholt oder gerade gesperrt: nächster Takt
         out.append(d)
@@ -162,7 +243,29 @@ def zeit_text(zeit: float, jetzt: float | None = None) -> str:
 def meldung(d: dict, jetzt: float | None = None) -> str:
     """Text der Blase – mit Hinweis, wenn die Erinnerung verspätet kommt (Wache lief nicht)."""
     jetzt = time.time() if jetzt is None else jetzt
+    if d.get("wartet"):                     # Erinnerung der KI an sich selbst, gerade kein Fenster offen
+        return f"⏰ Für {d.get('wer') or 'die KI'}: {d['text']} – wird erledigt, sobald ein NemiCLI-Fenster offen ist"
     text = f"⏰ {d['text']}"
     if jetzt - float(d["zeit"]) > 300:
         text += f" (war für {zeit_text(float(d['zeit']), jetzt)})"
     return text
+
+
+def zeile(d: dict, jetzt: float | None = None) -> str:
+    """Eine offene Erinnerung für Listen: Nummer, Zeit, Wiederholung, für wen, Text."""
+    teile = [f"#{d['id']}", zeit_text(float(d["zeit"]), jetzt)]
+    if int(d.get("alle") or 0):
+        teile.append("🔁 " + abstand_text(int(d["alle"])))
+    if d.get("fuer") == FUER_KI:
+        teile.append(f"🤖 für {d.get('wer') or 'die KI'} selbst")
+    return " · ".join(teile + [d["text"]])
+
+
+def auftrag(d: dict, jetzt: float | None = None) -> str:
+    """Die Nachricht, mit der eine Erinnerung der KI an sich selbst bei ihr ankommt."""
+    jetzt = time.time() if jetzt is None else jetzt
+    wann = zeit_text(float(d["zeit"]), jetzt)
+    zusatz = f", {abstand_text(int(d['alle']))}" if int(d.get("alle") or 0) else ""
+    spaet = " – verspätet, vorher war kein Fenster offen" if jetzt - float(d["zeit"]) > 300 else ""
+    return (f"⏰ Erinnerung an dich selbst (von dir gestellt für {wann}{zusatz}{spaet}): {d['text']}\n"
+            "Das ist keine neue Nachricht des Nutzers. Tu jetzt, woran du dich erinnern wolltest.")

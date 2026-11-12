@@ -123,8 +123,13 @@ def _ist_text(p: Path, probe: int = 8192) -> bool:
 
 def finde_pfade(text: str) -> list[Path]:
     """Alle EXISTIERENDEN Dateien UND Ordner, die im Text als Pfad vorkommen."""
-    gefunden: list[Path] = []
-    gesehen: set[str] = set()
+    return [p for p, _ in _finde_mit_formen(text)]
+
+
+def _finde_mit_formen(text: str) -> list[tuple[Path, list[str]]]:
+    """Wie finde_pfade, dazu je Pfad die Schreibweisen, in denen er im Text steht."""
+    gefunden: list[tuple[Path, list[str]]] = []
+    formen: dict[str, list[str]] = {}
     kandidaten = [text.strip().strip('"').strip("'")]
     for m in _PFAD_RX.finditer(text):
         kandidaten.append(m.group(1) or m.group(2) or m.group(3))
@@ -142,13 +147,15 @@ def finde_pfade(text: str) -> list[Path]:
         except (OSError, ValueError):
             continue
         key = str(p).lower()
-        if key not in gesehen:
-            gesehen.add(key)
-            gefunden.append(p)
+        if key not in formen:
+            formen[key] = []
+            gefunden.append((p, formen[key]))
+        if k not in formen[key]:
+            formen[key].append(k)
     return gefunden
 
 
-_GEHEIM_NAME = re.compile(r"(?i)^(\.env(\..*)?|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|\.git-credentials|\.netrc|"
+_GEHEIM_NAME = re.compile(r"(?i)^(\.env(\..*)?|chatgpt_konto\.json|id_(rsa|dsa|ecdsa|ed25519)(\.pub)?|\.git-credentials|\.netrc|"
                           r"_netrc|\.pgpass|credentials(\.json)?|.*\.(pem|key|pfx|p12|kdbx|ppk|keystore|jks))$")
 _GEHEIM_ORDNER = {".ssh", ".aws", ".gnupg", ".azure", ".kube", ".docker"}
 
@@ -503,7 +510,7 @@ def anhaengen(text: str, grenze: int = MAX_ZEICHEN) -> dict:
         gelesen   [(Pfad, Art, Hinweis)] – was angehängt wurde
         uebergangen [(Pfad, Grund)] – was NICHT angefasst wurde
     """
-    pfade = finde_pfade(text)
+    pfade = _finde_mit_formen(text)
     if not pfade:
         return {"text": text, "bilder": [], "gelesen": [], "uebergangen": []}
 
@@ -515,17 +522,19 @@ def anhaengen(text: str, grenze: int = MAX_ZEICHEN) -> dict:
     frei = max(0, int(grenze))
     lese_sperre, verbergen = _sperren()
 
-    for p in pfade:
+    for p, formen in pfade:
         if (grund := geheim(p)):
+            if p.suffix.lower() in BILD:             # vision holt Bilder sonst aus dem Text
+                rest = _pfad_entfernen(rest, p, formen)
             uebergangen.append((p, grund))
             continue
         if lese_sperre is not None and lese_sperre(str(p)):
-            rest = _pfad_entfernen(rest, p)          # auch Bilder: vision holt sie sonst aus dem Text
+            rest = _pfad_entfernen(rest, p, formen)  # auch Bilder: vision holt sie sonst aus dem Text
             uebergangen.append((p, "gesperrter Bereich – wird nicht angehängt"))
             continue
         if p.is_dir():
             # Ordner: Listing statt Inhalt.
-            rest = _pfad_entfernen(rest, p)
+            rest = _pfad_entfernen(rest, p, formen)
             listing, n_o, n_d = liste_ordner(p, verbergen=verbergen)
             zusatz = f"{n_o} Ordner, {n_d} Dateien"
             bloecke.append(_als_daten(p, listing, "Ordner", zusatz))
@@ -535,7 +544,7 @@ def anhaengen(text: str, grenze: int = MAX_ZEICHEN) -> dict:
         if art == "bild":
             bilder.append(p)                   # bleibt im Text, vision macht den Rest
             continue
-        rest = _pfad_entfernen(rest, p)
+        rest = _pfad_entfernen(rest, p, formen)
         if art == "binaer":
             uebergangen.append((p, f"{p.suffix or 'ohne Endung'} – kein lesbares Format"))
             continue
@@ -581,12 +590,13 @@ def anhaengen(text: str, grenze: int = MAX_ZEICHEN) -> dict:
     return {"text": text, "bilder": bilder, "gelesen": gelesen, "uebergangen": uebergangen}
 
 
-def _pfad_entfernen(text: str, p: Path) -> str:
-    """Nimmt den Pfad (in jeder Schreibweise) aus der Nachricht."""
-    for form in (f'"{p}"', f"'{p}'", str(p), str(p).replace("\\", "/")):
-        text = text.replace(form, " ")
-    # Auch die ursprünglich getippte, nicht aufgelöste Form (relativ, ~ …)
-    text = re.sub(r"\s{2,}", " ", text)
+def _pfad_entfernen(text: str, p: Path, getippt: list[str] | tuple[str, ...] = ()) -> str:
+    """Nimmt den Pfad aus der Nachricht: aufgelöst und in jeder getippten Schreibweise (relativ, ~ …).
+    Nur Leerzeichen direkt um die Stelle fallen weg; Einrückung und Zeilenumbrüche bleiben."""
+    namen = list(dict.fromkeys([str(p), str(p).replace("\\", "/"), *getippt]))
+    for form in [f'"{n}"' for n in namen] + [f"'{n}'" for n in namen] + namen:
+        if form:
+            text = re.sub(r"[ \t]*(?<![\w\\/])" + re.escape(form) + r"(?!\.?[\w\\/-])[ \t]*", " ", text)
     return text
 
 

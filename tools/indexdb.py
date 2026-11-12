@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
+import sys
 import re
 import sqlite3
 import threading
@@ -44,7 +44,7 @@ VOLLSCAN_BEHALTEN = 2            # davon getrennt: die letzten Vollscan-Berichte
 EMBED_BATCH = 16                 # so viele Brocken je Encoder-Aufruf – dazwischen wird Fortschritt gemeldet
 BERICHTE_JE_RUNDE = 2            # Berichte je Bibliothekar-Lauf (ein Wache-Bericht = bis zu 60 Brocken ≈ 90 s CPU)
 WISSEN_JE_RUNDE = 3              # geänderte Wissen-Dateien je Bibliothekar-Lauf
-CHAT_SCHRITT = 25_000            # Token: der laufende Chat steht im Kontext und wird erst je so viel Zuwachs eingebettet
+NACHRECHNEN_STUECK = 256          # /einlesen schreibt nach so vielen Brocken: der Balken läuft leer, ein Abbruch kostet wenig
 NACHZUEGLER_CHATS = 3            # so viele zuletzt benutzte andere Chats holt der Bibliothekar nach
 
 # Unterbrechen: Beginnt eine neue Runde, hört after_turn nach dem laufenden Stapel auf –
@@ -53,9 +53,8 @@ NACHZUEGLER_CHATS = 3            # so viele zuletzt benutzte andere Chats holt d
 _unterbrechung = 0
 _lauf_marke: int | None = None   # Zählerstand beim Start des laufenden after_turn (None = keiner läuft)
 SIGNAL_DATEI: Path | None = None  # Bibliothekar im eigenen Prozess (bibkind): Unterbrechen über diese Datei
-LOW = False                      # Low-Modus (bibkind): bei Chat oder Bild langsam weiter statt aufhören
-_langsam = False                 # Low-Modus: schon gedrosselt
-_chat_stand: dict[str, int] = {}  # Chat-Ref → Token beim letzten Einbetten (in dieser Sitzung)
+_chat_stand: dict[str, int] = {}  # Chat-Ref → Token beim letzten Einlesen (in dieser Sitzung)
+_lauf = threading.local()         # nur_text: dieser Lauf sammelt ohne Modell (Brocken landen ohne Vektor im Speicher)
 _nachgeholt: dict[str, str] = {}    # Chat-Ref → Stand („aktualisiert“) beim letzten Nachholen
 
 # Fortschritt nach außen (Balken in der Statuszeile). after_turn(status=fn) setzt den Melder; die Einbett-Stellen
@@ -77,37 +76,10 @@ def unterbrechen() -> None:
 
 
 def _unterbrochen() -> bool:
-    """Soll der laufende Lauf aufhören? Im Low-Modus nie – dann wird er gedrosselt und macht zwischen
-    den Häppchen eine Pause."""
+    """Soll der laufende Lauf aufhören?"""
     if _lauf_marke is None:
         return False
-    signal = _lauf_marke != _unterbrechung or (SIGNAL_DATEI is not None and SIGNAL_DATEI.exists())
-    if not LOW:
-        return signal
-    if signal:
-        import einbetttakt
-        _drosseln()
-        time.sleep(einbetttakt.LOW_PAUSE_S)
-    return False
-
-
-def _drosseln() -> None:
-    """Low-Modus: wenige Rechen-Threads und Leerlauf-Priorität, damit Chat und Bild Vorrang haben."""
-    global _langsam
-    if _langsam:
-        return
-    _langsam = True
-    import einbetttakt
-    try:
-        import torch
-        torch.set_num_threads(einbetttakt.LOW_KERNE)
-    except Exception:
-        pass
-    try:
-        import psutil
-        psutil.Process().nice(psutil.IDLE_PRIORITY_CLASS if os.name == "nt" else 19)
-    except Exception:
-        pass
+    return _lauf_marke != _unterbrechung or (SIGNAL_DATEI is not None and SIGNAL_DATEI.exists())
 
 
 def _melden(text: str) -> None:
@@ -432,8 +404,21 @@ def _upsert(kind: str, ref: str, texts: list[str], datum: str | None = None) -> 
     return _upsert_geordnet(kind, ref, pieces, datum) or 0
 
 
+def _gpu_vorrat_leeren() -> None:
+    try:
+        torch = sys.modules.get("torch")
+        if torch is not None and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
 def _einbetten(texte: list[str]) -> list[list[float]] | None:
-    """Portionsweise einbetten und dabei Fortschritt melden. None, wenn der Encoder fehlt."""
+    """Portionsweise einbetten und dabei Fortschritt melden. None, wenn der Encoder fehlt oder der Lauf
+    nur sammelt (`_lauf.nur_text`). Bei Speichermangel halbiert er den Stapel; was gar nicht passt, bleibt im
+    Einlese-Speicher."""
+    if getattr(_lauf, "nur_text", False):
+        return None
     try:
         import memory
     except Exception:
@@ -450,27 +435,35 @@ def _einbetten(texte: list[str]) -> list[list[float]] | None:
     # Großer Auftrag? Im Modus „auto“ rechnet er auf der GPU und geht danach zurück in den RAM.
     with memory.auftrag(n) as auf_gpu:
         wo = " auf der GPU" if auf_gpu else ""
-        for i in range(0, n, EMBED_BATCH):
+        i, stapel = 0, EMBED_BATCH
+        while i < n:
             if _unterbrochen():
                 return out or None                # Rest landet ohne Vektor, nachvektorisieren holt ihn
-            teil = texte[i:i + EMBED_BATCH]
+            teil = texte[i:i + stapel]
             _melden(f"{_kontext} · Brocken {i}/{n}{wo}" if _kontext else f"Brocken {i}/{n}{wo}")
             try:
                 vecs = memory._embed_texts(teil)
             except Exception:
                 vecs = None
             if not vecs:
-                return None
+                if stapel > 1 and memory.encoder_loaded():
+                    stapel //= 2
+                    _gpu_vorrat_leeren()
+                    continue
+                return out or None
             out.extend(vecs)
+            i += len(teil)
     _melden(f"{_kontext} · Brocken {n}/{n}" if _kontext else f"Brocken {n}/{n}")
     return out
 
 
 def drop_ref(ref: str) -> None:
     con = _connect()
-    con.execute("DELETE FROM chunks WHERE ref=?", (ref,))
-    con.commit()
-    con.close()
+    try:
+        con.execute("DELETE FROM chunks WHERE ref=?", (ref,))
+        con.commit()
+    finally:
+        con.close()
     _invalidate()
 
 
@@ -607,15 +600,15 @@ def chat_tokens(chat_id: int) -> int:
     return _tokens_von(_chat_laden(chat_id))
 
 
-def chat_faellig(chat_id: int, schritt: int = CHAT_SCHRITT, data: dict | None = None) -> bool:
-    """Ist der Chat seit dem letzten Einbetten um `schritt` Token gewachsen? `data`: schon geladener Chat."""
+def chat_geaendert(chat_id: int, data: dict | None = None) -> bool:
+    """Hat sich der Chat seit dem letzten Einlesen geändert? `data`: schon geladener Chat."""
     if data is None:
         data = _chat_laden(chat_id)
-    return _tokens_von(data) - _chat_stand.get(_chat_ref(chat_id), 0) >= schritt
+    return _tokens_von(data) != _chat_stand.get(_chat_ref(chat_id), 0)
 
 
 def chat_einbetten(chat_id: int, data: dict | None = None) -> int:
-    """Chat einbetten und seinen Stand merken. Geladen wird er dafür nur einmal."""
+    """Chat einlesen (Vektoren je nach Lauf) und seinen Stand merken. Geladen wird er dafür nur einmal."""
     if data is None:
         data = _chat_laden(chat_id)
     n = ingest_chat_file(int(chat_id), data) if data else 0
@@ -624,8 +617,8 @@ def chat_einbetten(chat_id: int, data: dict | None = None) -> int:
 
 
 def nachzuegler_chats(aktuell: int | None, anzahl: int = NACHZUEGLER_CHATS) -> int:
-    """Die zuletzt benutzten anderen Chats vollständig einbetten – was dort unter
-    CHAT_SCHRITT liegen blieb (Chat gewechselt, Programm beendet), kommt so nach."""
+    """Die zuletzt benutzten anderen Chats vollständig einlesen – was dort liegen blieb (Chat gewechselt,
+    Programm beendet), kommt so nach."""
     try:
         import chatstore
         neueste = [m for m in chatstore.list_chats() if m["id"] != aktuell][:anzahl]   # neueste zuerst
@@ -755,30 +748,115 @@ def _ref_vollstaendig(ref: str) -> bool:
     return bool(r and r[0] and not r[1])
 
 
-def nachvektorisieren(limit: int = BACKFILL_BATCH) -> int:
-    """Brocken ohne Vektor (Encoder war nicht da) oder mit Vektor eines anderen
-    Modells (Modell gewechselt) nachträglich einbetten."""
+def ohne_vektor_token(bild_token: int = 800) -> int | None:
+    """Füllstand des Einlese-Speichers: Token aller Brocken ohne Vektor des aktiven Modells (Text: Zeichen / 4,
+    Bild pauschal). Bilder nur die der aktiven Persönlichkeit – die anderen bettet das Einlesen erst ein, wenn
+    ihre Persönlichkeit aktiv ist, sie blieben sonst als Rest im Stand. None ohne Embedding-Modell."""
+    kennung = _kennung()
+    if not kennung:
+        return None
+    try:
+        import profilordner
+        bilder_von = f"bild:{profilordner.aktiv()}:*"
+    except Exception:
+        bilder_von = "bild:*"
+    con = _connect()
+    try:
+        bilder, zeichen = con.execute(
+            "SELECT COALESCE(SUM(kind='bild'), 0), COALESCE(SUM(CASE WHEN kind='bild' THEN 0 ELSE LENGTH(text) END), 0) "
+            "FROM chunks INDEXED BY idx_chunks_stand WHERE vec_modell != ? AND (kind != 'bild' OR ref GLOB ?)",
+            (kennung, bilder_von)).fetchone()
+    finally:
+        con.close()
+    return int(zeichen) // 4 + int(bilder) * bild_token
+
+
+def _chat_nachrechnen(ref: str) -> int:
+    """Brocken eines Chats ohne passenden Vektor jetzt einbetten (Kontext aufgeräumt: gleich nach Bedeutung findbar)."""
+    kennung = _kennung()
+    if not kennung:
+        return 0
+    con = _connect()
+    try:
+        rows = con.execute("SELECT hash, text FROM chunks WHERE ref=? AND vec_modell != ?", (ref, kennung)).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        return 0
+    _lauf.nur_text = False
+    try:
+        vecs = _einbetten([t for _h, t in rows])
+    finally:
+        _lauf.nur_text = True
+    if not vecs:
+        return 0
+    con = _connect()
+    try:
+        con.executemany("UPDATE chunks SET vec=?, vec_modell=? WHERE hash=?",
+                        [(vec_packen(v), kennung, h) for (h, _t), v in zip(rows, vecs)])
+        con.commit()
+    finally:
+        con.close()
+    _invalidate()
+    return len(vecs)
+
+
+def _block_einlesen() -> int:
+    """Den abgetrennten Block abarbeiten: alles bis zur jetzt letzten Zeile. Was der Chat-Prozess währenddessen
+    sammelt, liegt dahinter und gehört zum nächsten Block. Geschrieben wird stückweise."""
+    kennung = _kennung()
+    if not kennung:
+        return 0
+    import memory
+    ohne_bilder = " AND kind != 'bild'" if _bilder_sehen() else ""
+    con = _connect()
+    try:
+        grenze = int(con.execute("SELECT COALESCE(MAX(rowid), 0) FROM chunks").fetchone()[0])
+        gesamt = int(con.execute("SELECT COUNT(*) FROM chunks INDEXED BY idx_chunks_stand "
+                                 f"WHERE vec_modell != ? AND rowid <= ?{ohne_bilder}", (kennung, grenze)).fetchone()[0])
+    finally:
+        con.close()
+    _lauf.nur_text = False
+    n = 0
+    if gesamt:
+        with memory.auftrag(gesamt):
+            while (neu := nachvektorisieren(NACHRECHNEN_STUECK, f"Einlesen {n}/{gesamt}", grenze)):
+                n += neu
+    n += ingest_bilder(None)
+    ingest_berichte(je_runde=None)                # jetzt mit Vektoren: alte Berichte dürfen in den Papierkorb
+    return n
+
+
+def nachvektorisieren(limit: int = BACKFILL_BATCH, kontext: str = "Nachzügler ohne passenden Vektor",
+                      bis: int | None = None) -> int:
+    """Brocken ohne Vektor (noch im Einlese-Speicher, Encoder war nicht da) oder mit Vektor eines anderen
+    Modells (Modell gewechselt) nachträglich einbetten. `bis`: nur bis zu dieser Zeile (abgetrennter Block)."""
     kennung = _kennung()
     if not kennung:
         return 0
     ohne_bilder = " AND kind != 'bild'" if _bilder_sehen() else ""   # die bettet ingest_bilder als Bild ein
     con = _connect()
-    rows = con.execute("SELECT hash, text FROM chunks WHERE rowid IN (SELECT rowid FROM chunks "
-                       f"INDEXED BY idx_chunks_stand WHERE vec_modell != ?{ohne_bilder} LIMIT ?)",
-                       (kennung, limit)).fetchall()
-    con.close()
+    bis_sql = "" if bis is None else f" AND rowid <= {int(bis)}"
+    try:
+        rows = con.execute("SELECT hash, text FROM chunks WHERE rowid IN (SELECT rowid FROM chunks "
+                           f"INDEXED BY idx_chunks_stand WHERE vec_modell != ?{ohne_bilder}{bis_sql} LIMIT ?)",
+                           (kennung, limit)).fetchall()
+    finally:
+        con.close()
     if not rows:
         return 0
     global _kontext
-    _kontext = "Nachzügler ohne passenden Vektor"
+    _kontext = kontext
     vecs = _einbetten([t for _h, t in rows])
     if not vecs:
         return 0
     con = _connect()
-    con.executemany("UPDATE chunks SET vec=?, vec_modell=? WHERE hash=?",
-                    [(vec_packen(v), kennung, h) for (h, _t), v in zip(rows, vecs)])
-    con.commit()
-    con.close()
+    try:
+        con.executemany("UPDATE chunks SET vec=?, vec_modell=? WHERE hash=?",
+                        [(vec_packen(v), kennung, h) for (h, _t), v in zip(rows, vecs)])
+        con.commit()
+    finally:
+        con.close()
     _invalidate()
     return len(vecs)
 
@@ -828,8 +906,10 @@ def ingest_berichte(behalten: int | None = None, je_runde: int | None = BERICHTE
         return 0, 0
     dateien = sorted((p for p in ordner.glob("*.md") if p.is_file()), key=lambda p: p.stat().st_mtime)
     con = _connect()
-    drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='bericht'")}
-    con.close()
+    try:
+        drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='bericht'")}
+    finally:
+        con.close()
     neu = [p for p in reversed(dateien) if f"bericht:{p.name}" not in drin]     # neueste zuerst
     if je_runde is not None:
         neu = neu[:max(0, je_runde)]
@@ -1018,8 +1098,10 @@ def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
         rel = wissen.name(p, basis)
         live[f"wissen:{rel}"] = wissen.brocken(f"📚 {rel}", a, CHUNK)
     con = _connect()
-    drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='wissen'")}
-    con.close()
+    try:
+        drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='wissen'")}
+    finally:
+        con.close()
     for ref in drin - set(live):
         drop_ref(ref)
     n, geschrieben, fertig = 0, 0, True
@@ -1098,7 +1180,7 @@ def ingest_bilder(je_runde: int | None = BILDER_JE_RUNDE) -> int:
         return 0
     if not wurzel.is_dir():
         return 0
-    sehen = _bilder_sehen()
+    sehen = not getattr(_lauf, "nur_text", False) and _bilder_sehen()   # beim Sammeln kommt nur der Text
     kennung = _kennung() if sehen else ""
     con = _connect()
     try:
@@ -1173,33 +1255,36 @@ def bilder_suchen(frage: str, k: int = 5) -> list[dict]:
 
 
 def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
-               chat_erzwingen: bool = False) -> int:
-    """Bibliothekar nach der Runde: Dateien lesen → embedden → memory.db.
+               chat_erzwingen: bool = False, nur_kurz: bool = False) -> int:
+    """Bibliothekar: Quellen lesen → memory.db. Ohne `alles` sammelt er nur, ohne Modell: Die Brocken landen ohne
+    Vektor im Einlese-Speicher (einlesen.py), die Stichwortsuche findet sie sofort.
 
-    chat_id: der gerade gespeicherte Chat (None = nur Notizen/Skills). Er steht im Kontext
-             und wird nur je CHAT_SCHRITT Token Zuwachs eingebettet – oder sofort mit
-             `chat_erzwingen` (Kontext aufgeräumt: der ausgelagerte Teil muss findbar sein).
-    status:  Melder für den Fortschritt (Text mit „i/n“ → Balken in der Oberfläche).
-    alles:   ohne Portionsgrenzen und ohne Unterbrechen – für /gedaechtnis indexieren.
+    chat_id:  der gerade gespeicherte Chat (None = nur Notizen/Skills).
+    status:   Melder für den Fortschritt (Text mit „i/n“ → Balken in der Oberfläche).
+    alles:    /einlesen: erst alles sammeln, das trennt den Block ab; dann ohne Unterbrechen seine Vektoren.
+    chat_erzwingen: Kontext aufgeräumt: der laufende Chat bekommt gleich seine Vektoren.
+    nur_kurz: beim Sammeln nur Chat, Notizen und Skills; Berichte, Wissen und Bilder lesen die seltenen Läufe.
     Beginnt währenddessen eine Runde (unterbrechen), bleiben die Rückstände für später."""
     global _status, _kontext, _lauf_marke
     _status, _kontext = status, ""
     _lauf_marke = None if alles else _unterbrechung
+    _lauf.nur_text = True
     n = 0
     try:
         if chat_id:
-            daten = None if (alles or chat_erzwingen) else _chat_laden(chat_id)
-            if daten is None or chat_faellig(chat_id, data=daten):
+            daten = _chat_laden(chat_id)
+            if alles or chat_erzwingen or chat_geaendert(chat_id, daten):
                 n += chat_einbetten(int(chat_id), daten)
+            if chat_erzwingen and not alles:
+                n += _chat_nachrechnen(_chat_ref(chat_id))
         n += ingest_all_notes()
         n += ingest_learned()
-        rueckstand = [
+        rueckstand = [] if nur_kurz else [
             lambda: nachzuegler_chats(chat_id),
             lambda: backfill(10_000 if alles else BACKFILL_BATCH, ausser=None if alles else chat_id),
-            lambda: nachvektorisieren(1_000_000 if alles else BACKFILL_BATCH),
-            lambda: ingest_berichte(je_runde=None if alles else BERICHTE_JE_RUNDE)[0],
-            lambda: ingest_wissen(None if alles else WISSEN_JE_RUNDE),
-            lambda: ingest_bilder(None if alles else BILDER_JE_RUNDE),
+            lambda: ingest_berichte(je_runde=None)[0],
+            lambda: ingest_wissen(None),
+            lambda: ingest_bilder(None),
             lambda: neu_schneiden(1_000_000 if alles else NEU_SCHNEIDEN_JE_LAUF),
             lambda: vektoren_umwandeln(1_000_000 if alles else UMWANDELN_JE_LAUF) and 0,   # zählt nicht als neu
         ]
@@ -1210,8 +1295,11 @@ def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
                 n += schritt()
             except Exception:
                 pass
+        if alles:
+            n += _block_einlesen()
     finally:
         _status, _kontext, _lauf_marke = None, "", None
+        _lauf.nur_text = False
     return n
 
 
@@ -1288,11 +1376,13 @@ def neu_schneiden(limit: int = NEU_SCHNEIDEN_JE_LAUF) -> int:
 
 def backfill(limit: int = BACKFILL_BATCH, ausser: int | None = None) -> int:
     """Indexiert noch fehlende Chats/Skills/Snippets, portionsweise. `ausser`: der laufende Chat –
-    der steht im Kontext und wird im eigenen Takt eingebettet (CHAT_SCHRITT)."""
+    der steht im Kontext und wird eigens gesammelt."""
     done = 0
     con = _connect()
-    have_refs = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks")}
-    con.close()
+    try:
+        have_refs = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks")}
+    finally:
+        con.close()
     try:
         import chatstore
         for meta in chatstore.list_chats():
@@ -1476,18 +1566,20 @@ def _voll_aufbauen(stamp, kennung: str, db: str, np) -> None:
     zustand: dict = {}
     try:
         con = _connect()
-        for rowid, h, kind, ref, text, vec_s, datum, vec_modell in con.execute(
-                "SELECT rowid, hash, kind, ref, text, vec, datum, vec_modell FROM chunks"):
-            meta.append((kind, ref, text, datum or "", rowid))
-            hat = vec_s is not None and bool(kennung) and vec_modell == kennung
-            zustand[rowid] = (h, hat, datum or "")
-            if not hat:
-                continue                  # kein Vektor oder von einem anderen Modell
-            v = _vektor(vec_s, np)
-            if v is not None:
-                vecs.append(v)
-                vec_zeilen.append(rowid)
-        con.close()
+        try:
+            for rowid, h, kind, ref, text, vec_s, datum, vec_modell in con.execute(
+                    "SELECT rowid, hash, kind, ref, text, vec, datum, vec_modell FROM chunks"):
+                meta.append((kind, ref, text, datum or "", rowid))
+                hat = vec_s is not None and bool(kennung) and vec_modell == kennung
+                zustand[rowid] = (h, hat, datum or "")
+                if not hat:
+                    continue                  # kein Vektor oder von einem anderen Modell
+                v = _vektor(vec_s, np)
+                if v is not None:
+                    vecs.append(v)
+                    vec_zeilen.append(rowid)
+        finally:
+            con.close()
     except Exception as e:
         # Ein halber Index unter dem aktuellen Stand gespeichert hieße: Suche still leer, bis die DB
         # sich wieder ändert. Also nicht merken – der nächste Abruf baut neu.
@@ -1799,7 +1891,9 @@ def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "
     ix = None if nur_worte else _index(warten=laden)     # Prompt-Pfad: nie auf einen Neuaufbau warten
     uhr = _messen("Index", uhr)
     if ix is not None and not ix["meta"]:
-        return []
+        if ix.get("stamp") is not None:
+            return []
+        ix = None                            # Aufbau gescheitert: trotzdem Stichwortsuche
     meta = ix["meta"] if ix is not None else []
     punkte: dict[int, float] = {}        # rowid → Punkte
     wie: dict[int, set] = {}
@@ -1954,9 +2048,11 @@ def quelle_lesen(ref: str, max_zeichen: int = 12_000, ab: int = 1) -> dict | Non
         return None
     try:
         con = _connect()
-        zeilen = con.execute("SELECT kind, text, datum FROM chunks WHERE ref=? ORDER BY rowid",
-                             (ref,)).fetchall()
-        con.close()
+        try:
+            zeilen = con.execute("SELECT kind, text, datum FROM chunks WHERE ref=? ORDER BY rowid",
+                                 (ref,)).fetchall()
+        finally:
+            con.close()
     except sqlite3.Error:
         return None
     if not zeilen:

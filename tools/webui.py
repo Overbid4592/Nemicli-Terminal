@@ -6,7 +6,7 @@ Terminal-Prozess). `/webui` startet hier einen winzigen lokalen Server und öffn
 eine schön lesbare Seite im Browser. Alles, was du auf der Seite tust, geht über
 denselben Sitzungs-Status (`Ctx`) wie das Terminal – derselbe Chat, dasselbe Modell.
 
-Gedacht für bessere Lesbarkeit (u.a. bei LRS): umschaltbare Schrift (inkl.
+Gedacht für bessere Lesbarkeit: umschaltbare Schrift (inkl.
 OpenDyslexic), Größe & Abstände, kontrastreiche Themes und Vorlesen (Text-to-Speech).
 
 Technik bewusst schlank: nur die Standard-Library.
@@ -55,6 +55,7 @@ class WebBridge:
         self._confirms: dict[int, object] = {}  # id -> asyncio.Future
         self._cid = 0
         self._offene_frage: dict | None = None   # bekommt auch ein neu geladener Tab
+        self._ende = threading.Event()           # beendet offene SSE-Verbindungen nach stop()
 
     # --- SSE-Clients (je offener Tab eine Queue) ---------------------------
     def add_client(self) -> queue.Queue:
@@ -110,11 +111,20 @@ class WebBridge:
         """Aus dem Server-Thread: die wartende Bestätigung auflösen."""
         fut = self._confirms.get(cid)
         if fut is not None and not fut.done():
-            self.loop.call_soon_threadsafe(fut.set_result, choice)
+            self.loop.call_soon_threadsafe(_aufloesen, fut, choice)
 
     def stop(self) -> None:
+        self._ende.set()
         if self.httpd is not None:
             self.httpd.shutdown()
+            self.httpd.server_close()
+            self.httpd = None
+
+
+def _aufloesen(fut, choice: str) -> None:
+    """Auf der Schleife: zwischen Prüfung und Ausführung kann die Frage abgelaufen oder beantwortet sein."""
+    if not fut.done():
+        fut.set_result(choice)
 
 
 # --- HTTP-Server ------------------------------------------------------------
@@ -212,7 +222,7 @@ def _make_handler(bridge: WebBridge, handlers: dict):
             except OSError:
                 bridge.remove_client(q); return
             try:
-                while True:
+                while not bridge._ende.is_set():
                     try:
                         data = q.get(timeout=15)
                     except queue.Empty:
@@ -276,6 +286,7 @@ class _QuietServer(ThreadingHTTPServer):
 def start(bridge: WebBridge, handlers: dict, host: str = "127.0.0.1", port: int = 0) -> str:
     """Startet den Server in einem Hintergrund-Thread und gibt die URL (mit Token) zurück."""
     httpd = _QuietServer((host, port), _make_handler(bridge, handlers))
+    bridge._ende.clear()
     bridge.httpd = httpd
     real_port = httpd.server_address[1]
     threading.Thread(target=httpd.serve_forever, daemon=True,
@@ -527,7 +538,7 @@ body.t-hc{--bg:#000;--panel:#0a0a0a;--panel2:#111;--text:#ffe600;--muted:#cccc00
     <label>Schrift
       <select id="fFont">
         <option value="'Atkinson Hyperlegible', system-ui, sans-serif">Atkinson (gut lesbar)</option>
-        <option value="'OpenDyslexic', system-ui, sans-serif">OpenDyslexic (LRS)</option>
+        <option value="'OpenDyslexic', system-ui, sans-serif">OpenDyslexic</option>
         <option value="system-ui, -apple-system, Segoe UI, sans-serif">System serifenlos</option>
         <option value="Georgia, 'Times New Roman', serif">Serif</option>
       </select>
@@ -540,7 +551,7 @@ body.t-hc{--bg:#000;--panel:#0a0a0a;--panel2:#111;--text:#ffe600;--muted:#cccc00
       <select id="fTheme">
         <option value="">Dunkel</option>
         <option value="t-light">Hell</option>
-        <option value="t-cream">Creme (LRS)</option>
+        <option value="t-cream">Creme (augenschonend)</option>
         <option value="t-hc">Hoher Kontrast</option>
       </select>
     </label>

@@ -64,8 +64,8 @@ _MUSTER = re.compile(
 # Unsichtbare Zeichen, mit denen sich Befehle tarnen lassen (Nullbreite, Richtungssteuerung,
 # Unicode-Tags, Variantenwähler außer der Emoji-Darstellung U+FE0F, weiches Trennzeichen).
 _UNSICHTBAR = re.compile(
-    "[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\ufe00-\ufe0e"
-    "\U000e0000-\U000e007f\U000e0100-\U000e01ef]")
+    r"[\u00ad\u180e\u200b-\u200f\u202a-\u202e\u2060-\u2064\u2066-\u2069\ufeff\ufe00-\ufe0e"
+    r"\U000e0000-\U000e007f\U000e0100-\U000e01ef]")
 _BASE64 = re.compile(r"[A-Za-z0-9+/]{200,}={0,2}")
 
 # Tarnschrift -> lateinisch, nur für die Mustersuche und 1:1 je Zeichen, damit die Fundstellen im

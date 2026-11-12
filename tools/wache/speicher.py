@@ -20,6 +20,8 @@ from .ereignisse import Alarm, Ereignis
 
 ID_PRAEFIX_AB = 6                 # abgekürzte Alarm-ids (KIs kürzen gern): erst ab so vielen Zeichen, eindeutig
 DAEMPFEN_TAGE = 30                # nur so junge harmlos-Urteile dämpfen – keine Freigabe für immer
+LERN_ROH_MAX = 400_000            # so viele Ereignisse eines Lern-Fensters werden höchstens gefiltert (schmale Spalten)
+_ID_STUECK = 900                  # Ereignisse je Abfrage beim Nachladen nach id
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS ereignisse (
@@ -66,7 +68,7 @@ CREATE TABLE IF NOT EXISTS justierungen (
 
 -- Bekannte harmlose Dinge: was ist das (bezeichnung) und warum harmlos. Gefüllt
 -- aus den Urteilen der Persönlichkeit (wache_bewerten mit bezeichnung). Schlüssel
--- = "prozess:winstore.app.exe", "ziel:2.23.246.164", "datei:c:\…", "eintrag:…".
+-- = "prozess:winstore.app.exe", "ziel:11.22.33.44", "datei:c:\…", "eintrag:…".
 -- Netz-Auskunft: Besitzer öffentlicher Netze laut Adressregister (RDAP), gemerkt statt jedes Mal gefragt.
 CREATE TABLE IF NOT EXISTS netz_besitzer (
     von TEXT NOT NULL, bis TEXT NOT NULL, netz TEXT DEFAULT '', org TEXT DEFAULT '',
@@ -147,6 +149,9 @@ class Speicher:
         self._lock = threading.RLock()
         self._c = sqlite3.connect(str(pfad), check_same_thread=False)
         self._c.row_factory = sqlite3.Row
+        # SQLites LOWER kennt nur ASCII; Abgleiche hier laufen gegen Python-str.lower() (Umlaute).
+        self._c.create_function("LOWER", 1, lambda s: s.lower() if isinstance(s, str) else s,
+                                deterministic=True)
         self._c.execute("PRAGMA journal_mode=WAL")
         self._c.execute("PRAGMA synchronous=NORMAL")
         self._c.executescript(SCHEMA)
@@ -233,7 +238,8 @@ class Speicher:
 
     def lern_ereignisse(self, seit: float, bis: float, limit: int = 20_000) -> list[Ereignis]:
         """Fürs Training: Ereignisse zwischen `seit` und `bis` ohne alles, was mit einem
-        offenen, unklaren oder echten Alarm zusammenhängt.
+        offenen, unklaren oder echten Alarm zusammenhängt – höchstens `limit`, gleichmäßig über
+        das ganze Zeitfenster verteilt (nicht nur die neuesten Stunden).
 
         Herausgenommen werden: das Ereignis des Alarms, Wiederholungen, die der Motor nur am
         Alarm gezählt hat (`extra.alarm`), Schatten-Funde des Folgen-Netzes (`extra.dl_fund`) und des
@@ -241,12 +247,18 @@ class Speicher:
         die ganze Prozess-Kette dieser Ereignisse und die Prozesse, die darin gestartet wurden.
         Ketten über PID + Startzeit, bei älteren Ereignissen ohne Startzeit über PID +
         Prozessname innerhalb einer Stunde. Ein Ablauf, den noch niemand als harmlos
-        beurteilt hat, wird so nie zum gelernten Normalbild (auch kein „nicht voll prüfbares“)."""
+        beurteilt hat, wird so nie zum gelernten Normalbild (auch kein „nicht voll prüfbares“).
+
+        Gefiltert wird über alle Ereignisse des Fensters (nur die nötigen Spalten), erst danach
+        ausgedünnt – eine Stichprobe vorher könnte das markierte Ereignis einer Kette verfehlen."""
         belastete_status = "('offen', 'gesehen', 'unpruefbar', 'echt', 'erledigt')"
         with self._lock:
             rows = self._c.execute(
-                "SELECT * FROM ereignisse WHERE zeit >= ? AND zeit < ? ORDER BY zeit DESC LIMIT ?",
-                (seit, bis, limit)).fetchall()
+                "SELECT id, zeit, aktion, pid, ppid, start, eltern_start, prozess, "
+                "CASE WHEN extra LIKE '%\"alarm\"%' OR extra LIKE '%\"dl_fund\"%' "
+                "OR extra LIKE '%\"netz_fund\"%' THEN extra ELSE '' END AS extra "
+                "FROM ereignisse WHERE zeit >= ? AND zeit < ? ORDER BY zeit DESC LIMIT ?",
+                (seit, bis, LERN_ROH_MAX)).fetchall()
             belastet = self._c.execute(
                 "SELECT e.id, e.pid, e.start, LOWER(e.prozess) prozess, e.zeit FROM alarme a "
                 "JOIN ereignisse e ON a.ereignis_id = e.id "
@@ -273,7 +285,7 @@ class Speicher:
                 ids.add(r["id"])
                 if r["pid"] and r["start"]:
                     ketten.add((r["pid"], round(r["start"], 3)))
-        out = []
+        frei = []
         for r in reversed(rows):
             if r["id"] in ids or str(r["aktion"] or "").startswith("evtlog_"):   # Protokolle: nur Regeln
                 continue
@@ -284,7 +296,17 @@ class Speicher:
             zeiten = ohne_start.get((r["pid"], (r["prozess"] or "").lower())) if r["pid"] else None
             if zeiten and any(abs(r["zeit"] - z) <= 3600 for z in zeiten):
                 continue
-            out.append(Ereignis.aus_zeile(r))
+            frei.append(r["id"])
+        if len(frei) > limit > 0:                        # gleichmäßig über das Fenster, älteste bis neueste
+            schritt = len(frei) / limit
+            frei = [frei[int(i * schritt)] for i in range(limit)]
+        out: list[Ereignis] = []
+        with self._lock:
+            for i in range(0, len(frei), _ID_STUECK):
+                stueck = frei[i:i + _ID_STUECK]
+                out += [Ereignis.aus_zeile(r) for r in self._c.execute(
+                    f"SELECT * FROM ereignisse WHERE id IN ({','.join('?' * len(stueck))})", stueck)]
+        out.sort(key=lambda e: e.zeit)
         return out
 
     def anzahl_ereignisse_seit(self, seit: float) -> int:

@@ -405,10 +405,15 @@ def planen(art: str, modelle: bool = False, ganz: bool = False,
         if melde:
             melde(f"vergleiche {i}/{len(dateien)}")
         try:
-            if _datei_hash(f.pfad) == soll:
+            if _ist_sqlite(f.pfad):            # im Zip liegt die Kopie der Backup-API, nicht die Rohdatei
+                with tempfile.TemporaryDirectory(prefix="nemicli_backup_") as tmp:
+                    gleich = _datei_hash(_sqlite_kopie(f.pfad, Path(tmp))) == soll
+            else:
+                gleich = _datei_hash(f.pfad) == soll
+            if gleich:
                 unveraendert += 1
                 continue
-        except OSError:
+        except (OSError, sqlite3.Error):
             pass
         neu.append(f)
     namen = {f.name for f in dateien}

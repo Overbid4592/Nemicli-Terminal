@@ -21,6 +21,7 @@ from rich.box import ROUNDED
 from rich.console import Group
 from rich.padding import Padding
 from rich.panel import Panel
+from rich.style import Style
 from rich.table import Table
 from rich.text import Text
 
@@ -316,13 +317,45 @@ def _person() -> Group:
     return Group(kasten, *gruss)
 
 
+# Kacheln der Startseite: ein Klick schickt den Befehl ab (screen_tx action_kachel), Text daneben zum Lesen.
+KACHELN = (("⚙", "Einstellungen", "/einstellungen"), ("🎨", "Malen", "/bild"), ("🎵", "Musik", "/musik"),
+           ("🎭", "Charaktere", "/charaktere"), ("🛍", "Apps", "/appstore"), ("🖥", "Fenster", "/gui"),
+           ("❓", "Hilfe", "/help"))
+KACHEL_BEFEHLE = frozenset(b for _, _, b in KACHELN)
+
+
+def _kacheln() -> Text:
+    """Eine Zeile großer Knöpfe in den Farben des Themes – klickbar im Vollbild."""
+    try:
+        import ui
+        p = ui.THEMES[ui.current_theme()]
+        farben = (p["brand_dim"], p["accent_dim"])
+    except Exception:
+        farben = ("#5b54a8", "#2a8f86")
+    t = Text(justify="left")
+    for i, (zeichen, titel, befehl) in enumerate(KACHELN):
+        if i:
+            t.append("  ")
+        grund = farben[i % 2]
+        klick = {"@click": f"app.kachel('{befehl}')"}
+        t.append("▐", style=Style(color=grund, meta=klick))                       # runde Kanten aus Halbblöcken
+        t.append(f"{zeichen} {titel}", style=Style(color="#ffffff", bgcolor=grund, bold=True, meta=klick))
+        t.append("▌", style=Style(color=grund, meta=klick))
+    t.append("\n💬 Oder einfach schreiben, was du möchtest.", style="muted")
+    return t
+
+
 def _karte(titel: str, inhalt) -> Panel:
-    return Panel(inhalt, title=f"[brand]{titel}[/brand]", title_align="left", box=ROUNDED,
-                 border_style="brand.dim", padding=(0, 1))
+    try:
+        import ui
+        kopf = ui.verlauf_text(titel)                  # Titel im Farbverlauf des Themes
+    except Exception:
+        kopf = f"[brand]{titel}[/brand]"
+    return Panel(inhalt, title=kopf, title_align="left", box=ROUNDED, border_style="brand.dim", padding=(0, 1))
 
 
 def _karten(breite: int) -> list:
-    karten = []
+    karten = [_kacheln()]
     lz = STAND.get("letzter")
     if lz:
         t = Text()

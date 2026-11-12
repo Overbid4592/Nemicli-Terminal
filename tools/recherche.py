@@ -11,6 +11,7 @@ Umgebung (von main.py gesetzt, damit Terminal und /gui dieselbe Logik nutzen):
   melde(text)                       Fortschritt
   abbruch() -> bool                 Esc gedrückt? (wird zwischen den Schritten abgefragt)
   parallel                          Teilfragen gleichzeitig (Cloud) oder nacheinander (lokal)
+  fortschritt(stand)                Stand für die Schritt-Leiste (webanzeige.recherche_stand)
 """
 
 from __future__ import annotations
@@ -25,6 +26,7 @@ from typing import Awaitable, Callable
 
 import fachquellen
 import fremddaten
+import webanzeige
 import webfetch
 
 MAX_TEILFRAGEN = 6
@@ -84,6 +86,7 @@ class Stand:
     bericht: str = ""
     pfad: Path | None = None
     abgebrochen: str = ""
+    bearbeitet: int = 0
 
 
 @dataclass
@@ -94,6 +97,18 @@ class Umgebung:
     parallel: bool = False
     lokal: bool = False
     abbruch: Callable[[], bool] = lambda: False
+    fortschritt: Callable[[dict], None] = lambda _s: None
+
+
+def _fortschritt(stand: Stand, umg: Umgebung, phase: str) -> None:
+    """Schritt-Leiste nachführen; eine Störung der Anzeige hält die Recherche nie auf."""
+    n = len(stand.teilfragen)
+    try:
+        umg.fortschritt(webanzeige.recherche_stand(
+            phase, teilfragen=n, bearbeitet=min(stand.bearbeitet, n), gelesen=len(stand.gelesen),
+            lese_ziel=min(MAX_SEITEN, n * LESEN_JE_TEILFRAGE), quellen=len(stand.quellen)))
+    except Exception:
+        pass
 
 
 ESC_TEXT = "abgebrochen (Esc) – Zwischenstand"
@@ -158,6 +173,14 @@ async def _notiz(umg: Umgebung, teilfrage: str, quelle: str, text: str) -> str:
 
 
 async def _teilfrage_bearbeiten(stand: Stand, umg: Umgebung, idx: int, ende: float) -> None:
+    try:
+        await _teilfrage_suchen(stand, umg, idx, ende)
+    finally:
+        stand.bearbeitet += 1
+        _fortschritt(stand, umg, "suchen")
+
+
+async def _teilfrage_suchen(stand: Stand, umg: Umgebung, idx: int, ende: float) -> None:
     tf = stand.teilfragen[idx]
     if _halt(stand, umg):
         return
@@ -184,6 +207,7 @@ async def _teilfrage_bearbeiten(stand: Stand, umg: Umgebung, idx: int, ende: flo
         if t["url"] in stand.gelesen:
             continue
         stand.gelesen.add(t["url"])
+        _fortschritt(stand, umg, "suchen")
         geholt = await asyncio.to_thread(webfetch.text_holen, t["url"])
         if isinstance(geholt, str):
             if not t.get("text"):
@@ -265,10 +289,12 @@ async def lauf(frage: str, umg: Umgebung, ordner: Path, tiefe: int = 1) -> Stand
     tiefe = max(1, min(int(tiefe or 1), 3))
     ende = time.monotonic() + MAX_DAUER_S
     try:
+        _fortschritt(stand, umg, "plan")
         umg.melde("🗺 Plane Teilfragen …")
         stand.teilfragen = _teilfragen(_json_liste(await umg.ask(f"Frage: {stand.frage}", PLAN_SYSTEM)),
                                        MAX_TEILFRAGEN) or [{"frage": stand.frage, "suche": stand.frage, "fach": ""}]
         umg.plan_zeigen([t["frage"] for t in stand.teilfragen])
+        _fortschritt(stand, umg, "suchen")
         neu = list(range(len(stand.teilfragen)))
         for runde in range(tiefe):
             await _runde(stand, umg, neu, ende)
@@ -277,21 +303,25 @@ async def lauf(frage: str, umg: Umgebung, ordner: Path, tiefe: int = 1) -> Stand
             if runde + 1 >= tiefe or time.monotonic() > ende or len(stand.gelesen) >= MAX_SEITEN:
                 break
             umg.melde("⚖️ Prüfe Lücken …")
+            _fortschritt(stand, umg, "pruefen")
             luecken = _teilfragen(_json_liste(await umg.ask(
                 f"Frage: {stand.frage}\n\n{_notizen_text(stand)}", LUECKEN_SYSTEM)), MAX_NEUE_TEILFRAGEN)
             if not luecken:
                 break
             neu = list(range(len(stand.teilfragen), len(stand.teilfragen) + len(luecken)))
             stand.teilfragen += luecken
+            _fortschritt(stand, umg, "suchen")
         if time.monotonic() > ende:
             stand.abgebrochen = f"Zeitgrenze ({MAX_DAUER_S // 60} min) erreicht"
         if stand.quellen and not _halt(stand, umg):
+            _fortschritt(stand, umg, "bericht")
             umg.melde("📝 Schreibe den Bericht …")
             bericht = await umg.ask(f"Frage: {stand.frage}\n\nNotizen aus den Quellen:\n\n{_notizen_text(stand)}",
                                     BERICHT_SYSTEM)
             bericht = re.sub(r"(?s)<think>.*?</think>", "", bericht or "").strip()
             stand.bericht = _verweise_pruefen(bericht, len(stand.quellen))
         speichern(stand, ordner)
+        _fortschritt(stand, umg, "fertig")
         return stand
     except asyncio.CancelledError:
         stand.abgebrochen = ESC_TEXT

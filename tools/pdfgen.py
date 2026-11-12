@@ -95,6 +95,8 @@ def _jpeg(data: bytes) -> dict | None:
         if marker in (0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7,
                       0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF):
             h, w = struct.unpack(">HH", data[i + 5:i + 9])
+            if not w or not h:
+                return None
             comps = data[i + 9]
             cs = {1: "/DeviceGray", 3: "/DeviceRGB", 4: "/DeviceCMYK"}.get(comps, "/DeviceRGB")
             return {"w": w, "h": h, "cs": cs, "bpc": 8,
@@ -231,10 +233,13 @@ def _load_image(path: Path) -> dict | None:
         data = path.read_bytes()
     except Exception:
         return None
-    if data[:2] == b"\xff\xd8":
-        return _jpeg(data)
-    if data[:8] == b"\x89PNG\r\n\x1a\n":
-        return _png(data)
+    try:                                         # kaputter Bildkopf: nur das Bild fehlt, nicht das PDF
+        if data[:2] == b"\xff\xd8":
+            return _jpeg(data)
+        if data[:8] == b"\x89PNG\r\n\x1a\n":
+            return _png(data)
+    except (struct.error, IndexError, ValueError):
+        return None
     return None
 
 
@@ -317,6 +322,7 @@ class Document:
 
     def bullet(self, text: str, ordered: str | None = None):
         marker = ordered if ordered else "•"
+        self._need(15.5)                         # Punkt und erste Zeile auf dieselbe Seite
         self._show(MARGIN + 6, self.y + 11, marker, 11,
                    F_BOLD if ordered else F_REG, ACCENT)
         self._para(_inline(text), 11, leading=15.5, indent=MARGIN + 22, color=INK)

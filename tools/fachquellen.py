@@ -159,9 +159,20 @@ def treffer(quelle: str, suche: str, anzahl: int = 5) -> list[dict] | str:
 
 def suchen(quelle: str, suche: str, anzahl: int = 5) -> str:
     """Werkzeug `fach_suche`: Treffer als Fremddaten mit Lese-Ampel."""
+    return suchen_ergebnis(quelle, suche, anzahl)[0]
+
+
+def suchen_ergebnis(quelle: str, suche: str, anzahl: int = 5) -> tuple[str, dict | None]:
+    """Wie suchen, dazu die Trefferliste für die Anzeige (webanzeige.suche) – None bei einem Fehler."""
+    import webanzeige
     raus = treffer(quelle, suche, anzahl)
     if isinstance(raus, str):
-        return raus
+        return raus, None
+    name = QUELLEN[quelle_von(quelle)][0]
+    return _suchen_text(quelle, suche, raus), webanzeige.suche(suche, raus, quelle=name, warn=webfetch.verdaechtig)
+
+
+def _suchen_text(quelle: str, suche: str, raus: list[dict]) -> str:
     q = quelle_von(quelle)
     name, tier = QUELLEN[q]
     if not raus:

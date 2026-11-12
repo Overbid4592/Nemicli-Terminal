@@ -51,6 +51,8 @@ SYSTEM = (
     "überholter Stand. Im Zweifel behalten. Vorlieben und Lehren sind nie veraltet.\n"
     "- Was du nicht nennst, bleibt unverändert. Leere Listen sind eine gute Antwort."
 )
+NOCHMAL = ("\n\nDeine letzte Antwort war kein gültiges JSON in dieser Form. Antworte jetzt NUR mit dem JSON-Objekt, "
+           "ohne Text davor oder danach, ohne Markdown-Zaun.")
 
 
 def wuenschen(grund: str = "") -> None:
@@ -257,6 +259,8 @@ async def pflegen(backend, ref: str, bauen=None, k: dict | None = None, ersatz: 
                         break
                     b = await bauen(r)
                 plan = auswerten(await b.ask_once(prompt, SYSTEM), k)
+                if plan is None:                      # Format verfehlt: einmal mit Hinweis, erst dann das nächste Modell
+                    plan = auswerten(await b.ask_once(prompt + NOCHMAL, SYSTEM), k)
             except Exception as e:
                 erg["abgegeben"].append((r, f"Fehler: {str(e)[:120]}"))
                 continue

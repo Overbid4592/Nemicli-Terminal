@@ -8,10 +8,19 @@ Profile/<Name>/<name>.json:
     stil           Bildstil, ans Ende des Prompts
     outfits        {Schlüssel: Text}
     posen          {Schlüssel: Text}
+    frisuren       {Schlüssel: Text} – wie die Haare heute liegen (Zopf, Dutt …); im Bild-Auftrag als `frisur`
+    ausdruecke     {Schlüssel: Text} – bewährte Prompt-Bausteine, im Prompt als {schlüssel} (bausteine_einsetzen)
     regeln         [Text] – feste Vorgaben für Bilder der Figur
     voice          {beschreibung, seed, sprache} – die Stimme (engines/stimme.py)
     aussehen       {Feld: Wert} – Angaben aus der Charakter-Galerie (Haare, Augen, Körper; Farben als Hex)
     steckbrief     {aussehen, wesen, eigenheiten} – freier Weg der Galerie, in eigenen Worten (deutsch)
+    lora_bild      {name, datei, sha256} – gebundene Bild-LoRA (lorabild); stimmt sie, ersetzt sie beim Malen den kern
+
+Kern (das Aussehen, das immer an der Figur ist) liegt in einer eigenen Datei Profile/<Name>/<name>_kern.json
+{kern, sprechweise, gesperrt, vorher} – mit eigener Sicherung B. `sprechweise` (wie die Figur redet) gehört
+dazu und ist mit dem Kern gesperrt; sie geht mit jeder Nachricht als Anker an die KI (persona.rollen_anker). In der Charakter-Datei steht er nur noch als Spiegel; gilt
+immer der Kern aus seiner Datei. Gesperrt ändert ihn nur der Nutzer (/kern, Galerie) – eine KI nur nach seinem Ja
+(sicherheit.steuerdatei_grund fragt dann in jedem Modus). Jedes Selbstbild beginnt mit dem Kern.
 
 Absicherung: Jede geschriebene Charakter-Datei (A) bekommt eine Kopie (B) unter
 Backup/Charaktere/<name>.json im Daten-Ordner. Fehlt A oder ist sie kaputt, gilt B – und A wird daraus
@@ -32,6 +41,7 @@ MAX_TEXT = 800
 MAX_BAUSTEINE = 60
 MAX_REGELN = 12
 MAX_STECKBRIEF = 1200
+MAX_SPRECHWEISE = 300
 
 
 def datei(name: str | None = None) -> Path:
@@ -50,7 +60,14 @@ def sicherung(name: str | None = None) -> Path:
 
 
 def schreiben(daten: dict, name: str | None = None, grund: str = "") -> Path:
-    """Charakter-Datei (A) schreiben – der alte Stand in den Papierkorb (`grund`), danach die Kopie (B)."""
+    """Charakter-Datei (A) schreiben – der alte Stand in den Papierkorb (`grund`), danach die Kopie (B).
+    Ein `kern` darin landet in der Kern-Datei (eigenes Zuhause); die Charakter-Datei behält ihn als Spiegel."""
+    if _text(daten.get("kern")):
+        _kern_schreiben(_text(daten["kern"]), name, grund or "charakter")
+    return _json_schreiben(daten, name, grund)
+
+
+def _json_schreiben(daten: dict, name: str | None, grund: str) -> Path:
     from atomar import text_schreiben
     p = datei(name)
     p.parent.mkdir(parents=True, exist_ok=True)
@@ -164,7 +181,8 @@ def _sauber(d: dict) -> dict:
         regeln = [regeln]
     raus = {"name": _text(d.get("name"))[:60], "kern": _text(d.get("kern")), "seed_referenz": seed,
             "stil": _text(d.get("stil")), "outfits": _bausteine(d.get("outfits")),
-            "posen": _bausteine(d.get("posen")),
+            "posen": _bausteine(d.get("posen")), "ausdruecke": _bausteine(d.get("ausdruecke")),
+            "frisuren": _bausteine(d.get("frisuren")),
             "regeln": [r for r in (_text(x) for x in regeln) if r][:MAX_REGELN]}
     if (stimme := stimme_sauber(d.get("voice"))):
         raus["voice"] = stimme                          # Stimme bleibt beim Speichern erhalten
@@ -175,6 +193,12 @@ def _sauber(d: dict) -> dict:
                       for k, v in list(d["steckbrief"].items())[:6] if _text(k) and isinstance(v, str) and v.strip()}
         if steckbrief:
             raus["steckbrief"] = steckbrief
+    try:
+        import lorabild
+        if (bindung := lorabild.bindung_sauber(d.get("lora_bild"))):
+            raus["lora_bild"] = bindung                 # gesetzt nur über die LoRA-Werkstatt (lorabild.binden)
+    except ImportError:
+        pass
     return raus
 
 
@@ -222,7 +246,146 @@ def laden(name: str | None = None) -> dict | None:
         d = _sauber(roh_)
     except Exception:
         return None
+    if kern_datei(name).is_file() or kern_sicherung(name).is_file():
+        d["kern"] = kern_stand(name)["kern"]                   # der Kern aus seinem eigenen Zuhause gilt
     return d if d["kern"] else None
+
+
+# --- Kern: eigene Datei, Sperre, Verlauf -------------------------------------------------------------
+KERN_VORHER = 5
+
+
+def kern_datei(name: str | None = None) -> Path:
+    p = datei(name)
+    return p.with_name(p.stem + "_kern.json")
+
+
+def kern_sicherung(name: str | None = None) -> Path:
+    b = sicherung(name)
+    return b.with_name(b.stem + "_kern.json")
+
+
+def _kern_sauber(d: dict | None) -> dict | None:
+    if not isinstance(d, dict) or not (_text(d.get("kern")) or _text(d.get("sprechweise"))):
+        return None
+    vorher = [_text(v) for v in (d.get("vorher") or []) if isinstance(v, str) and _text(v)]
+    return {"kern": _text(d.get("kern")), "sprechweise": _text(d.get("sprechweise"))[:MAX_SPRECHWEISE],
+            "gesperrt": bool(d.get("gesperrt")), "vorher": vorher[:KERN_VORHER]}
+
+
+def kern_stand(name: str | None = None) -> dict:
+    """{kern, gesperrt, vorher} – aus der Kern-Datei (A, sonst Sicherung B, A wird wiederhergestellt);
+    gibt es beide nicht, der Kern aus der Charakter-Datei (noch nicht gesperrt)."""
+    a = kern_datei(name)
+    if (d := _kern_sauber(_json(a))) is not None:
+        return d
+    b = kern_sicherung(name)
+    if (d := _kern_sauber(_json(b))) is not None:
+        try:
+            from atomar import text_schreiben
+            if a.is_file():
+                import snapshot
+                snapshot.sichern(a, "kern_kaputt")
+            a.parent.mkdir(parents=True, exist_ok=True)
+            text_schreiben(a, b.read_text(encoding="utf-8"))
+            _melden(f"Kern-Datei fehlte oder war kaputt – aus der Sicherung wiederhergestellt: {a}")
+        except Exception as e:
+            _melden(f"Kern-Datei fehlt – Sicherung gelesen, aber nicht zurückgeschrieben ({e})")
+        return d
+    return {"kern": _text((_lesen(name) or {}).get("kern")), "sprechweise": "", "gesperrt": False, "vorher": []}
+
+
+def kern(name: str | None = None) -> str:
+    return kern_stand(name)["kern"]
+
+
+def kern_gesperrt(name: str | None = None) -> bool:
+    s = kern_stand(name)
+    return bool(s["gesperrt"]) and bool(s["kern"] or s["sprechweise"])
+
+
+def sprechweise(name: str | None = None) -> str:
+    """Wie die Figur redet (z. B. „frech, duzt, kurze Sätze“) – leer, wenn nichts festgelegt ist."""
+    return kern_stand(name)["sprechweise"]
+
+
+def _kern_schreiben(text: str, name: str | None, grund: str, gesperrt: bool | None = None,
+                    sprech: str | None = None) -> Path:
+    """Kern-Datei (A) und ihre Sicherung (B) schreiben; der vorige Kern wandert in `vorher`."""
+    from atomar import text_schreiben
+    alt = kern_stand(name)
+    stand = {"kern": text, "sprechweise": alt["sprechweise"] if sprech is None else _text(sprech)[:MAX_SPRECHWEISE],
+             "gesperrt": alt["gesperrt"] if gesperrt is None else bool(gesperrt), "vorher": list(alt["vorher"])}
+    if alt["kern"] and alt["kern"] != text:
+        stand["vorher"] = ([alt["kern"]] + [v for v in alt["vorher"] if v != alt["kern"]])[:KERN_VORHER]
+    a = kern_datei(name)
+    if a.is_file() and _json(a) == stand:
+        return a
+    a.parent.mkdir(parents=True, exist_ok=True)
+    if a.is_file() and grund:
+        import snapshot
+        snapshot.sichern(a, grund)
+    inhalt = json.dumps(stand, indent=2, ensure_ascii=False)
+    text_schreiben(a, inhalt)
+    try:
+        b = kern_sicherung(name)
+        b.parent.mkdir(parents=True, exist_ok=True)
+        text_schreiben(b, inhalt)
+    except Exception as e:
+        _melden(f"Kern-Datei: Sicherung nicht geschrieben ({e})")
+    return a
+
+
+def kern_setzen(text: str, name: str | None = None, *, gesperrt: bool | None = None, grund: str = "kern") -> Path:
+    """Den Kern setzen (Nutzer: /kern, Galerie) – Kern-Datei samt Sicherung, Spiegel in der Charakter-Datei."""
+    text = _text(text)
+    if not text:
+        raise ValueError("Der Kern ist leer.")
+    p = _kern_schreiben(text, name, grund, gesperrt)
+    d = _lesen(name)
+    if d is None:                                       # noch keine Charakter-Datei: mit festem Seed anlegen
+        _json_schreiben(_neu(None, {"name": name or "", "kern": text}), name, grund)
+    elif d.get("kern") != text:
+        d["kern"] = text
+        _json_schreiben(d, name, grund)
+    return p
+
+
+def kern_sperren(an: bool, name: str | None = None) -> bool:
+    """Sperre an/aus. Gibt es noch keine Kern-Datei, entsteht sie aus dem Kern der Charakter-Datei."""
+    stand = kern_stand(name)
+    if not stand["kern"] and not stand["sprechweise"]:
+        raise ValueError("Es gibt noch keinen Kern – erst einen eintragen.")
+    _kern_schreiben(stand["kern"], name, "kern_sperre", gesperrt=an)
+    return an
+
+
+def sprechweise_setzen(text: str, name: str | None = None, grund: str = "sprechweise") -> Path:
+    """Die Sprechweise setzen (leerer Text entfernt sie); Kern und Sperre bleiben."""
+    return _kern_schreiben(kern_stand(name)["kern"], name, grund, sprech=_text(text))
+
+
+def kern_zurueck(name: str | None = None) -> str:
+    """Den vorigen Kern wiederherstellen (der jetzige wird dafür selbst zum vorigen)."""
+    stand = kern_stand(name)
+    if not stand["vorher"]:
+        raise ValueError("Es gibt keinen früheren Kern.")
+    frueher = stand["vorher"][0]
+    kern_setzen(frueher, name, grund="kern_zurueck")
+    return frueher
+
+
+def kern_aenderung(a: dict, name: str | None = None) -> str | None:
+    """Würde dieser Werkzeug-Aufruf (charakter_aendern) den gesperrten Kern oder die Sprechweise ändern?
+    Dann der Grund, sonst None."""
+    if not kern_gesperrt(name):
+        return None
+    stand = kern_stand(name)
+    if a.get("kern") is not None and _text(a.get("kern")) != stand["kern"]:
+        return "der Kern ist gesperrt – ihn ändert nur der Nutzer (alt und neu stehen in der Vorschau)"
+    if a.get("sprechweise") is not None and _text(a.get("sprechweise"))[:MAX_SPRECHWEISE] != stand["sprechweise"]:
+        return "die Sprechweise ist gesperrt – sie ändert nur der Nutzer (alt und neu stehen in der Vorschau)"
+    return None
 
 
 def _satz(t: str) -> str:
@@ -253,15 +416,58 @@ def kern_erwachsen(kern: str) -> str:
     return k
 
 
-def prompt_bauen(d: dict, szene: str = "", outfit: str | None = None, pose: str | None = None) -> str:
-    """Kern · Outfit · Pose · Szene · Stil. Ein unbekannter Outfit-/Posen-Schlüssel gilt als freier Text."""
-    teile = [_satz(kern_erwachsen(d["kern"]))]
+def kleidung_text(d: dict, szene: str = "", outfit: str | None = None) -> str:
+    """Was die Figur trägt: das gewählte Outfit (Schlüssel oder freier Text) – und fehlt jede Kleidung (kein
+    Outfit, keine im Kern, keine in der Szene), das Standard-Outfit der Datei. Sonst wählte Krea selbst."""
+    outfits = d.get("outfits") or {}
     if outfit:
-        teile.append(_satz("Wearing " + d["outfits"].get(outfit, outfit)))
+        return outfits.get(outfit, outfit)
+    if outfits.get("standard") and not kleidung_im_kern(d.get("kern", "")) and not kleidung_im_kern(szene):
+        return outfits["standard"]
+    return ""
+
+
+def frisur_text(d: dict, frisur: str | None = None) -> str:
+    """Die Frisur (Schlüssel aus `frisuren` oder freier Text) – leer ohne Angabe."""
+    return (d.get("frisuren") or {}).get(frisur, frisur) if frisur else ""
+
+
+def prompt_bauen(d: dict, szene: str = "", outfit: str | None = None, pose: str | None = None,
+                 frisur: str | None = None) -> str:
+    """Kern · Frisur · Kleidung · Pose · Szene · Stil – der Kern steht immer vorne.
+    Ein unbekannter Outfit-/Posen-/Frisuren-Schlüssel gilt als freier Text."""
+    teile = [_satz(kern_erwachsen(d["kern"]))]
+    if (haare := frisur_text(d, frisur)):
+        teile.append(_satz("Hair: " + haare))
+    if (kleidung := kleidung_text(d, szene, outfit)):
+        teile.append(_satz("Wearing " + kleidung))
     if pose:
         teile.append(_satz(d["posen"].get(pose, pose)))
     teile += [_satz(szene), _satz(d["stil"])]
     return " ".join(t for t in teile if t)
+
+
+_PLATZHALTER = re.compile(r"\{([A-Za-z0-9_äöüÄÖÜß-]{2,60})\}")
+
+
+def ausdruecke(name: str | None = None) -> dict[str, str]:
+    """Die Prompt-Bausteine der Persönlichkeit – auch, wenn die Datei (noch) keinen Kern hat."""
+    return _bausteine(roh(name).get("ausdruecke"))
+
+
+def bausteine_einsetzen(text: str, bausteine: dict[str, str]) -> tuple[str, list[str]]:
+    """{schlüssel} im Prompt durch den Baustein ersetzen (Groß-/Kleinschreibung egal).
+    Rückgabe (Text, unbekannte Schlüssel); Unbekanntes bleibt stehen."""
+    klein = {k.lower(): v for k, v in bausteine.items()}
+    unbekannt: list[str] = []
+
+    def ersetzen(m):
+        wert = klein.get(m.group(1).lower())
+        if wert is None:
+            unbekannt.append(m.group(1))
+            return m.group(0)
+        return wert
+    return _PLATZHALTER.sub(ersetzen, text or ""), unbekannt
 
 
 def seed(d: dict, neues_gesicht: bool = False) -> int | None:
@@ -272,8 +478,9 @@ def seed(d: dict, neues_gesicht: bool = False) -> int | None:
 def _neu(alt: dict | None, a: dict) -> dict:
     """Änderungen aus den Werkzeug-Feldern auf den alten Stand legen (leerer Text entfernt Bausteine)."""
     d = dict(alt or {"name": "", "kern": "", "seed_referenz": None, "stil": "",
-                     "outfits": {}, "posen": {}, "regeln": []})
-    d["outfits"], d["posen"] = dict(d.get("outfits") or {}), dict(d.get("posen") or {})
+                     "outfits": {}, "posen": {}, "ausdruecke": {}, "regeln": []})
+    for feld in ("outfits", "posen", "ausdruecke", "frisuren"):
+        d[feld] = dict(d.get(feld) or {})
     for feld in ("name", "kern", "stil"):
         if a.get(feld) is not None:
             d[feld] = _text(a.get(feld))
@@ -283,7 +490,7 @@ def _neu(alt: dict | None, a: dict) -> dict:
         d["seed_referenz"] = a.get("seed_referenz")
     if str(a.get("neuer_seed", "")).lower() in ("1", "true", "ja", "yes") or d.get("seed_referenz") in (None, ""):
         d["seed_referenz"] = random.randint(1, 2 ** 31 - 1)
-    for feld in ("outfits", "posen"):
+    for feld in ("outfits", "posen", "ausdruecke", "frisuren"):
         for k, v in (a.get(feld) or {}).items() if isinstance(a.get(feld), dict) else ():
             if _text(v):
                 d[feld][_text(k)[:60]] = _text(v)
@@ -307,11 +514,15 @@ def _pruefen(d: dict) -> str | None:
 def zeigen(d: dict | None, name: str | None = None) -> str:
     if d is None:
         return (f"Noch keine Charakter-Datei ({datei(name)}). Anlegen mit charakter_aendern "
-                "(kern Pflicht, dazu stil, outfits, posen, regeln).")
+                "(kern Pflicht, dazu stil, outfits, posen, ausdruecke, regeln).")
     zeilen = [f"Charakter {d['name'] or '?'} · Seed {d['seed_referenz']}",
               f"kern: {d['kern']}", f"stil: {d['stil'] or '–'}"]
-    for feld in ("outfits", "posen"):
-        zeilen.append(f"{feld}: " + ("; ".join(f"{k} = {v}" for k, v in d[feld].items()) or "–"))
+    if kern_gesperrt(name):
+        zeilen[1] += "  🔒 gesperrt – ändert nur der Nutzer (/kern)"
+    if (sw := sprechweise(name)):
+        zeilen.insert(2, f"sprechweise: {sw}")
+    for feld in ("outfits", "posen", "ausdruecke", "frisuren"):
+        zeilen.append(f"{feld}: " + ("; ".join(f"{k} = {v}" for k, v in (d.get(feld) or {}).items()) or "–"))
     zeilen.append("regeln: " + (" · ".join(d["regeln"]) or "–"))
     if d.get("voice"):
         zeilen.append(f"voice: {d['voice']['beschreibung']} (Seed {d['voice']['seed']})")
@@ -324,23 +535,39 @@ def vorschau(a: dict) -> str:
     if (fehler := _pruefen(neu)):
         return f"Charakter-Datei wird NICHT geändert: {fehler}"
     kopf = "Neue Charakter-Datei" if alt is None else "Charakter-Datei ändern"
-    return f"{kopf}: {datei()}\n\n{zeigen(neu)}"
+    kern_teil = ""
+    if a.get("sprechweise") is not None and _text(a["sprechweise"]) != sprechweise():
+        kern_teil += (f"\n\n🗣 SPRECHWEISE ÄNDERN{' (gesperrt)' if kern_gesperrt() else ''}:\n  alt: "
+                      f"{sprechweise() or '–'}\n  neu: {_text(a['sprechweise']) or '–'}")
+    if alt is not None and neu["kern"] != alt["kern"]:
+        kern_teil += (f"\n\n🔒 KERN ÄNDERN{' (gesperrt)' if kern_gesperrt() else ''}:\n  alt: {alt['kern']}"
+                      f"\n  neu: {neu['kern']}")
+    return f"{kopf}: {datei()}{kern_teil}\n\n{zeigen(neu)}"
 
 
 def aendern(a: dict) -> tuple[str, bool]:
     alt = laden()
+    if kern_aenderung(a) and not a.get("_kern_ja"):
+        # Gesperrter Kern ohne das Ja des Nutzers (das setzt nur die Rückfrage, nie die KI): er bleibt.
+        a = {k: v for k, v in a.items() if k not in ("kern", "sprechweise")}
+        gesperrt_hinweis = ("\n🔒 Kern und Sprechweise sind gesperrt und blieben, wie sie waren – sie ändert nur der "
+                            "Nutzer (/kern).")
+    else:
+        gesperrt_hinweis = ""
     neu = _neu(alt, a)
     if (fehler := _pruefen(neu)):
         return fehler, False
     if "voice" not in neu and (stimme := stimme_sauber(roh().get("voice"))):
         neu["voice"] = stimme                           # Datei ohne Kern, aber mit Stimme
     p = schreiben(neu, None, "charakter_aendern")
+    if a.get("sprechweise") is not None and _text(a["sprechweise"]) != sprechweise():
+        sprechweise_setzen(a["sprechweise"], None, "charakter_aendern")
     hinweis = kleidung_im_kern(neu.get("kern", ""))
     return ("Charakter-Datei gespeichert" + (" (alter Stand im Papierkorb)" if alt else "")
             + f": {p}\n{zeigen(neu)}"
             + (f"\n⚠ Kleidung im kern erkannt ({', '.join(hinweis)}) – Kleidung gehört in outfits, nicht in den "
                "kern: Der kern steht in jedem Bild-Auftrag und wiegt schwerer als der Rest – so taucht die "
-               "Kleidung auch dort auf, wo sie nicht hingehört." if hinweis else "")), True
+               "Kleidung auch dort auf, wo sie nicht hingehört." if hinweis else "") + gesperrt_hinweis), True
 
 
 # Kleidungswörter (englisch und deutsch); der kern beschreibt nur, wer die Figur ist (Gesicht, Haare, Körper).
@@ -415,4 +642,5 @@ def kurzinfo(name: str | None = None) -> str:
     if d is None:
         return ""
     return (f"Outfits: {', '.join(d['outfits']) or '–'} · Posen: {', '.join(d['posen']) or '–'} · "
-            f"Seed fest ({d['seed_referenz']})" + (f" · Regeln: {' · '.join(d['regeln'])}" if d["regeln"] else ""))
+            f"Frisuren: {', '.join(d.get('frisuren') or {}) or '–'} · "
+            f"Ausdrücke: {', '.join('{' + k + '}' for k in d['ausdruecke']) or '–'} · Seed fest ({d['seed_referenz']})" + (f" · Regeln: {' · '.join(d['regeln'])}" if d["regeln"] else ""))

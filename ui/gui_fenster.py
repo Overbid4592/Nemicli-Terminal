@@ -21,23 +21,21 @@ from pathlib import Path
 
 from PySide6.QtCore import (QEasingCurve, QObject, QPointF, QPropertyAnimation, QRectF, QSize, Qt, QTimer,
                             QUrl, Signal)
-from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase, QIcon, QImageReader,
-                           QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap, QTextCursor,
+from PySide6.QtGui import (QColor, QDesktopServices, QFont, QIcon, QImageReader, QKeySequence, QShortcut,
+                           QLinearGradient, QPainter, QPainterPath, QPalette, QPen, QPixmap, QRadialGradient,
+                           QTextCursor,
                            QTextDocument)
-from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QFileDialog, QFrame, QGridLayout,
-                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QScrollArea, QScrollBar,
+from PySide6.QtWidgets import (QAbstractButton, QApplication, QDialog, QFileDialog, QFrame, QGraphicsDropShadowEffect,
+                               QGridLayout,
+                               QHBoxLayout, QLabel, QLineEdit, QPlainTextEdit, QProgressBar, QScrollArea, QScrollBar,
                                QSizePolicy,
                                QStackedWidget, QStyle, QStyleOptionSlider, QTextBrowser, QVBoxLayout, QWidget)
 
 MAX_NACHRICHT = 48 * 1024 * 1024
 SPALTE = 760                                  # Breite der Chat-Spalte
 
-FARBE = {
-    "grund": "#0c0c10", "leiste": "#111116", "flaeche": "#1b1b22", "flaeche_hell": "#26262f",
-    "rand": "#2c2c36", "text": "#ececf1", "dim": "#a3a3ae", "blass": "#6f6f7b",
-    "cyan": "#22d3ee", "lila": "#a855f7", "blase_a": "#4c1d95", "blase_b": "#155e75",
-    "ok": "#34d399", "warn": "#fbbf24", "fehler": "#f87171",
-}
+# Farben und Schrift kommen aus dem gemeinsamen Design (design.py) – hier für die Fenster, die sie von hier holen.
+from design import FARBE, farbe, schrift, schrift_rolle, verlauf_farbe  # noqa: E402,F401
 
 VORSCHLAEGE = {
     "chat": [("🎨", "Male mir ein Bild von einem Sonnenuntergang am Meer"),
@@ -49,34 +47,6 @@ VORSCHLAEGE = {
 }
 
 _BILDPFAD = re.compile(r"[A-Za-z]:\\[^\n\"<>|*?]+?\.(?:png|jpe?g|webp)", re.IGNORECASE)
-
-
-def farbe(name: str, alpha: int | None = None) -> QColor:
-    c = QColor(FARBE[name])
-    if alpha is not None:
-        c.setAlpha(alpha)
-    return c
-
-
-def verlauf_farbe(r: QRectF, a: str = "cyan", b: str = "lila") -> QLinearGradient:
-    g = QLinearGradient(r.topLeft(), r.bottomRight())
-    g.setColorAt(0.0, farbe(a))
-    g.setColorAt(1.0, farbe(b))
-    return g
-
-
-_FAMILIE: list[str] = []
-
-
-def schrift(groesse: float = 10.5, fett: bool = False) -> QFont:
-    if not _FAMILIE:
-        familien = set(QFontDatabase.families())
-        _FAMILIE.append(next((f for f in ("Segoe UI Variable Text", "Segoe UI") if f in familien), ""))
-    f = QFont(_FAMILIE[0]) if _FAMILIE[0] else QFont()
-    f.setPointSizeF(groesse)
-    if fett:
-        f.setWeight(QFont.Weight.DemiBold)
-    return f
 
 
 def label(text: str = "", groesse: float = 10.5, farbname: str = "text", fett: bool = False,
@@ -313,17 +283,24 @@ class Flaeche(QWidget):
         self.leuchten = False
 
     def paintEvent(self, _):
+        # Glas: oben etwas heller als unten, feiner Rand, oben ein Lichtstreif
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
-        p.setBrush(farbe(self.farbname))
+        glas = QLinearGradient(r.topLeft(), r.bottomLeft())
+        glas.setColorAt(0.0, farbe("flaeche_hell" if self.farbname == "flaeche" else self.farbname, 240))
+        glas.setColorAt(1.0, farbe(self.farbname, 248))
+        p.setBrush(glas)
         if self.leuchten:
-            p.setPen(QPen(verlauf_farbe(r), 1.2))
+            p.setPen(QPen(verlauf_farbe(r), 1.4))
         elif self.rand:
             p.setPen(QPen(farbe("rand"), 1))
         else:
             p.setPen(Qt.PenStyle.NoPen)
         p.drawRoundedRect(r, self.radius, self.radius)
+        if self.rand and r.width() > 2 * self.radius:
+            p.setPen(QPen(QColor(255, 255, 255, 18), 1))
+            p.drawLine(QPointF(r.left() + self.radius, r.top() + 1.0), QPointF(r.right() - self.radius, r.top() + 1.0))
 
 
 class Logo(QWidget):
@@ -356,10 +333,13 @@ class Avatar(QWidget):
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
         p.setPen(Qt.PenStyle.NoPen)
-        p.setBrush(verlauf_farbe(r))
+        p.setBrush(verlauf_farbe(r))                   # Verlauf-Ring, innen die Fläche
         p.drawEllipse(r)
-        p.setPen(QColor("#ffffff"))
-        p.setFont(schrift(self.width() / 2.6, fett=True))
+        ring = max(2.0, self.width() / 14)
+        p.setBrush(farbe("flaeche_hoch"))
+        p.drawEllipse(r.adjusted(ring, ring, -ring, -ring))
+        p.setPen(farbe("text"))
+        p.setFont(schrift(self.width() / 2.8, fett=True))
         p.drawText(r, int(Qt.AlignmentFlag.AlignCenter), self.buchstabe)
 
 
@@ -456,7 +436,7 @@ class Markdown(QTextBrowser):
         self.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
-        self.setFont(schrift(11))
+        self.setFont(schrift_rolle("ki"))            # /schriftgröße ki
         pal = self.palette()
         pal.setColor(QPalette.ColorRole.Base, QColor(0, 0, 0, 0))
         pal.setColor(QPalette.ColorRole.Text, farbe("text"))
@@ -502,6 +482,7 @@ class NutzerBlase(QWidget):
         innen = QVBoxLayout(self.blase)
         innen.setContentsMargins(16, 10, 16, 10)
         lb = label(text, 11, "text")
+        lb.setFont(schrift_rolle("du"))                 # /schriftgröße du
         lb.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         lb.setMaximumWidth(int(SPALTE * 0.68))
         innen.addWidget(lb)
@@ -644,7 +625,7 @@ class Karte(Flaeche):
     antwort = Signal(object, str)
 
     def __init__(self, titel: str, symbol: str = "⚙", parent=None):
-        super().__init__(parent, radius=12)
+        super().__init__(parent, radius=16)
         self.v = QVBoxLayout(self)
         self.v.setContentsMargins(14, 10, 14, 10)
         self.v.setSpacing(6)
@@ -705,7 +686,7 @@ class Karte(Flaeche):
 
 class Fortschritt(Flaeche):
     def __init__(self, titel: str, parent=None):
-        super().__init__(parent, radius=12)
+        super().__init__(parent, radius=16)
         v = QVBoxLayout(self)
         v.setContentsMargins(14, 10, 14, 12)
         self.text = label(titel, 10, "dim")
@@ -733,6 +714,171 @@ class Fortschritt(Flaeche):
             voll = QRectF(r.left(), r.top(), r.width() * self.anteil, r.height())
             p.setBrush(verlauf_farbe(r))
             p.drawRoundedRect(voll, 3, 3)
+
+
+_AMPEL_FARBE = {"gruen": "ok", "gelb": "warn", "grau": "blass", "warn": "fehler"}
+
+
+class WebKarte(Flaeche):
+    """Suche oder Lesen im Netz: erst eine lebendige Zeile (Radar, Sekunden), dann Treffer-Karten bzw. die Seite.
+    Alle Texte kommen bereinigt aus webanzeige und werden nur als reiner Text gesetzt (label: PlainText)."""
+
+    def __init__(self, info: dict, parent=None):
+        super().__init__(parent, radius=16)
+        import webanzeige
+        self.WA = webanzeige
+        self.info = info
+        self.beginn = time.monotonic()
+        self.v = QVBoxLayout(self)
+        self.v.setContentsMargins(14, 10, 14, 10)
+        self.v.setSpacing(6)
+        self.kopf = label("", 10, "cyan", fett=True, umbruch=False)
+        self.v.addWidget(self.kopf)
+        self.leuchten = True
+        self._uhr = QTimer(self)
+        self._uhr.timeout.connect(self._ticken)
+        self._uhr.start(150)
+        self._ticken()
+
+    def _ticken(self) -> None:
+        s = time.monotonic() - self.beginn
+        zusatz = f"  ·  {self.info['zusatz']}" if self.info.get("zusatz") else ""
+        self.kopf.setText(f"{self.info.get('symbol') or '🌐'}  {self.info.get('verb') or ''}   "
+                          f"{self.WA.radar(s)}   {self.info.get('ziel') or ''}{zusatz}  ·  {_sek_text(s)}")
+
+    def _stopp(self) -> None:
+        self._uhr.stop()
+        self.leuchten = False
+        self.update()
+
+    def fertig(self, daten: dict, sekunden) -> None:
+        self._stopp()
+        zeit = f"  ·  {_sek_text(sekunden)}" if isinstance(sekunden, (int, float)) else ""
+        if daten.get("art") == "lesen":
+            self.kopf.setText(f"📖  gelesen  ·  {self.WA.lese_zeile(daten)}{zeit}")
+            zeile = QHBoxLayout()
+            zeile.setSpacing(8)
+            punkt = label(self.WA.AMPEL.get(daten.get("ampel"), self.WA.AMPEL["grau"])[0], 9.5,
+                          _AMPEL_FARBE.get(daten.get("ampel"), "blass"), umbruch=False)
+            zeile.addWidget(punkt)
+            text = f"„{daten['titel']}“" if daten.get("titel") else self.WA.AMPEL.get(daten.get("ampel"),
+                                                                                     self.WA.AMPEL["grau"])[1]
+            zeile.addWidget(label(text, 9.5, "dim"), 1)
+            self.v.addLayout(zeile)
+            return
+        self.kopf.setText(f"🔎  {self.WA.kopf(daten)}   „{daten.get('suche', '')}“{zeit}")
+        if not daten.get("treffer"):
+            self.v.addWidget(label("keine Treffer", 9.5, "dim"))
+            return
+        for z in daten["treffer"]:
+            self.v.addWidget(self._treffer(z))
+        if (leg := self.WA.legende(daten)):
+            self.v.addWidget(label(leg, 8.5, "blass"))
+
+    def _treffer(self, z: dict) -> QWidget:
+        w = Flaeche(radius=12, farbname="flaeche_hell", rand=False)
+        h = QHBoxLayout(w)
+        h.setContentsMargins(10, 6, 10, 6)
+        h.setSpacing(10)
+        nr = label(str(z["nr"]), 9, "blass", umbruch=False)
+        nr.setFixedWidth(14)
+        h.addWidget(nr, 0, Qt.AlignmentFlag.AlignTop)
+        h.addWidget(label(self.WA.AMPEL.get(z["ampel"], self.WA.AMPEL["grau"])[0], 9.5,
+                          _AMPEL_FARBE.get(z["ampel"], "blass"), umbruch=False), 0, Qt.AlignmentFlag.AlignTop)
+        spalte = QVBoxLayout()
+        spalte.setSpacing(1)
+        spalte.addWidget(label(z["titel"], 10, "text", fett=True))
+        unten = z["host"]
+        if z["ampel"] in ("gelb", "warn"):
+            unten += f"  ·  {self.WA.AMPEL[z['ampel']][1]}"
+        spalte.addWidget(label(unten, 9, _AMPEL_FARBE["warn"] if z["ampel"] == "warn" else "cyan"))
+        if z["auszug"]:
+            spalte.addWidget(label(f"„{z['auszug']}“", 9, "dim"))
+        h.addLayout(spalte, 1)
+        return w
+
+    def fehler(self, text: str, ok) -> None:
+        """Ohne Anzeige-Daten (Fehler, gesperrt): die Meldung wie bei jeder anderen Aktion."""
+        self._stopp()
+        self.kopf.setText(f"{self.info.get('symbol') or '🌐'}  {self.info.get('verb') or ''}   "
+                          f"{self.info.get('ziel') or ''}")
+        kurz = (text or "").strip()
+        kurz = kurz[:900] + " …" if len(kurz) > 900 else kurz
+        self.v.addWidget(label(f"{'✗' if ok is False else '•'}  {kurz}", 9.5, "fehler" if ok is False else "dim"))
+
+
+def _sek_text(s: float) -> str:
+    s = max(0.0, float(s))
+    if s < 10:
+        return f"{s:.1f} s".replace(".", ",")
+    return f"{int(s)} s" if s < 60 else f"{int(s) // 60}m {int(s) % 60:02d}s"
+
+
+class RechercheLeiste(Flaeche):
+    """Schritt-Leiste der Recherche: Plan · Suchen · Lesen · Bericht, mit Zählern, Radar und Zeit."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent, radius=16)
+        import webanzeige
+        self.WA = webanzeige
+        self.stand: dict = {"phase": "plan"}
+        self.beginn = time.monotonic()
+        self.ende: float | None = None
+        v = QVBoxLayout(self)
+        v.setContentsMargins(14, 10, 14, 12)
+        v.setSpacing(6)
+        self.kopf = label("🧭  Recherche", 10, "cyan", fett=True, umbruch=False)
+        v.addWidget(self.kopf)
+        self.punkte = QWidget()
+        self.punkte.setFixedHeight(16)
+        self.punkte.paintEvent = self._malen
+        v.addWidget(self.punkte)
+        self.namen = label("", 9, "dim", umbruch=False)
+        v.addWidget(self.namen)
+        self.leuchten = True
+        self._uhr = QTimer(self)
+        self._uhr.timeout.connect(self._zeigen)
+        self._uhr.start(200)
+        self._zeigen()
+
+    def setzen(self, stand: dict) -> None:
+        self.stand = dict(stand or {})
+        if self.stand.get("phase") == "fertig":
+            self.ende = time.monotonic()
+            self._uhr.stop()
+            self.leuchten = False
+            self.update()
+        self._zeigen()
+
+    def _zeigen(self) -> None:
+        s = (self.ende or time.monotonic()) - self.beginn
+        rest = f"  ·  {self.stand.get('quellen', 0)} Quellen" if self.stand.get("phase") == "fertig" else ""
+        self.kopf.setText(f"🧭  Recherche{rest}  ·  {_sek_text(s)}")
+        self.namen.setText("   ·   ".join(f"{n} {z}".strip() for n, _zu, z in self.WA.schritt_zustand(self.stand)))
+        self.punkte.update()
+
+    def _malen(self, _):
+        p = QPainter(self.punkte)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        schritte = self.WA.schritt_zustand(self.stand)
+        r = QRectF(self.punkte.rect())
+        n = len(schritte)
+        abstand = (r.width() - 16) / max(1, n - 1)
+        mitte = r.center().y()
+        puls = 0.5 + 0.5 * abs(((time.monotonic() * 1.6) % 2) - 1)
+        for i, (_n, zustand, _z) in enumerate(schritte):
+            x = 8 + i * abstand
+            if i:
+                p.setPen(QPen(farbe("ok") if zustand == "fertig" else farbe("rand"), 2))
+                p.drawLine(QPointF(x - abstand + 8, mitte), QPointF(x - 8, mitte))
+            p.setPen(Qt.PenStyle.NoPen)
+            if zustand == "fertig":
+                p.setBrush(farbe("ok"))
+            elif zustand == "laeuft":
+                p.setBrush(farbe("cyan", int(120 + 135 * puls)))
+            else:
+                p.setBrush(farbe("flaeche_hoch"))
+            p.drawEllipse(QPointF(x, mitte), 6, 6)
 
 
 class BildDialog(QDialog):
@@ -803,6 +949,11 @@ class Eingabe(QWidget):
         self.chips.addStretch(1)
         v.addLayout(self.chips)
         self.pille = Flaeche(radius=24)
+        schatten = QGraphicsDropShadowEffect(self.pille)   # schwebt über dem Chat
+        schatten.setBlurRadius(36)
+        schatten.setOffset(0, 10)
+        schatten.setColor(QColor(0, 0, 0, 150))
+        self.pille.setGraphicsEffect(schatten)
         zeile = QHBoxLayout(self.pille)
         zeile.setContentsMargins(10, 7, 8, 7)
         zeile.setSpacing(8)
@@ -1450,9 +1601,24 @@ class Seitenleiste(QWidget):
         self.personas.clicked.connect(lambda: self.fenster.seite("personas"))
         self.einstellungen = Knopf("Einstellungen", "⚙")
         self.einstellungen.clicked.connect(lambda: self.fenster.seite("einstellungen"))
-        for k in (self.neu, self.galerie, self.skills, self.personas, self.einstellungen):
+        for k, kuerzel in ((self.neu, "Strg+N"), (self.galerie, "Strg+2"), (self.skills, "Strg+4"),
+                           (self.personas, "Strg+3"), (self.einstellungen, "Strg+,")):
+            k.setToolTip(kuerzel)
+            v.addWidget(k)
+        v.addSpacing(10)
+        oeffnen = label("ÖFFNEN", 8, "blass", fett=True, umbruch=False)
+        oeffnen.setContentsMargins(12, 0, 0, 2)
+        v.addWidget(oeffnen)
+        for titel, zeichen, was in (("Musik", "🎵", "musik"), ("Charaktere", "🎭", "charaktere"),
+                                    ("Apps", "🛍", "apps")):
+            k = Knopf(titel, zeichen)
+            k.setToolTip(f"{titel}-Fenster öffnen")
+            k.clicked.connect(lambda _=False, w=was: self.fenster.leitung.senden({"op": "oeffnen", "was": w}))
             v.addWidget(k)
         v.addStretch(1)                          # keine Chat-Liste: das Gespräch geht von selbst weiter
+        self.tasten = label("Strg+N neu · Strg+1–4 Seiten · Strg+, ⚙", 8, "blass", umbruch=True)
+        self.tasten.setContentsMargins(12, 0, 6, 6)
+        v.addWidget(self.tasten)
         self.unten = Klickflaeche()
         self.unten.setToolTip("Über dich – Name, Anrede und was die KI wissen soll")
         self.unten.geklickt.connect(lambda: self.fenster.profil_oeffnen())
@@ -1522,6 +1688,13 @@ class Fenster(QWidget):
         oben.addStretch(1)
         self.status = label("", 9, "blass", umbruch=False)
         oben.addWidget(self.status)
+        self.speicher = QProgressBar()              # Einlese-Speicher: Aufschrift mittig, Farbe nach Füllstand
+        self.speicher.setRange(0, 100_000)
+        self.speicher.setFormat("100k")
+        self.speicher.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.speicher.setFixedSize(104, 18)
+        self.speicher.hide()
+        oben.addWidget(self.speicher)
         rechts.addLayout(oben)
         self.stapel = QStackedWidget()
         self.chat = ChatSeite(self)
@@ -1537,8 +1710,22 @@ class Fenster(QWidget):
 
         leitung.ereignis.connect(self.ereignis)
         leitung.getrennt.connect(self.getrennt)
+        for taste, tun in (("Ctrl+N", lambda: self.seite("chat", neu=True)), ("Ctrl+1", lambda: self.seite("chat")),
+                           ("Ctrl+2", lambda: self.seite("galerie")), ("Ctrl+3", lambda: self.seite("personas")),
+                           ("Ctrl+4", lambda: self.seite("skills")), ("Ctrl+,", lambda: self.seite("einstellungen"))):
+            QShortcut(QKeySequence(taste), self, activated=tun)
         self.modus("chat")
         leitung.senden({"op": "zustand"})
+
+    def paintEvent(self, _):
+        # sanftes Leuchten oben rechts in der Akzentfarbe (Grund kommt aus der Palette)
+        p = QPainter(self)
+        w, h = self.width(), self.height()
+        licht = QRadialGradient(QPointF(w * 0.78, -h * 0.12), max(w, h) * 0.62)
+        licht.setColorAt(0.0, farbe("cyan", 30))
+        licht.setColorAt(0.5, farbe("lila", 12))
+        licht.setColorAt(1.0, farbe("grund", 0))
+        p.fillRect(self.rect(), licht)
 
     # -- Aktionen --------------------------------------------------------------
     def leiste_umschalten(self, auf: bool) -> None:
@@ -1616,11 +1803,27 @@ class Fenster(QWidget):
         for block in self.findChildren(KiBlock):
             block.vorlesen.setVisible(block.fertig and bool(block.antwort.strip()) and KiBlock.stimme_da)
 
+    def _speicher_zeigen(self, token) -> None:
+        """Balken des Einlese-Speichers; ohne Embedding-Modell (None) unsichtbar."""
+        self.speicher.setVisible(token is not None)
+        if token is None:
+            return
+        import einlesen
+        self.speicher.setValue(min(int(token), einlesen.VOLL))
+        self.speicher.setFormat(einlesen.zeichen(int(token)).strip())
+        self.speicher.setToolTip(f"Einlese-Speicher: {einlesen.kurz(int(token))}. /einlesen arbeitet ihn ab.")
+        self.speicher.setStyleSheet(
+            "QProgressBar { background: #3a3a3a; color: #ffffff; border: none; border-radius: 4px; font-weight: bold; }"
+            f"QProgressBar::chunk {{ background: {einlesen.farbe(int(token))}; border-radius: 4px; }}")
+
     # -- Ereignisse der Sitzung -------------------------------------------------
     def ereignis(self, ev: dict) -> None:
         t = ev.get("t")
         c = self.chat
-        if t == "state":
+        if t == "speicher":
+            self._speicher_zeigen(ev.get("token"))
+        elif t == "state":
+            self._speicher_zeigen(ev.get("speicher"))
             self._letzter_zustand = ev
             self._stimme_zeigen(ev.get("stimme"))
             self.leiste.zustand(ev)
@@ -1660,17 +1863,36 @@ class Fenster(QWidget):
                 if not c.aktuell.antwort.strip() and not c.aktuell.gedanken_text:
                     c.aktuell.hide()
         elif t == "action":
-            karte = Karte(str(ev.get("desc") or ""), "⚠" if ev.get("risiko") else "⚙")
+            if isinstance(ev.get("web"), dict):
+                karte = WebKarte(ev["web"])
+            else:
+                karte = Karte(str(ev.get("desc") or ""), "⚠" if ev.get("risiko") else "⚙")
             c.karten["letzte"] = karte
             c._hinzu(karte)
         elif t == "action_result":
             karte = c.karten.pop("letzte", None)
+            if isinstance(karte, WebKarte):
+                if isinstance(ev.get("web"), dict):
+                    karte.fertig(ev["web"], ev.get("sekunden"))
+                else:
+                    karte.fehler(str(ev.get("text") or ""), ev.get("ok"))
+                return
             if karte is None:
                 karte = Karte("Ergebnis")
                 c._hinzu(karte)
             bilder = karte.ergebnis(str(ev.get("text") or ""), ev.get("ok"))
             if bilder:
                 c.bilder_zeigen(bilder)
+        elif t == "recherche":
+            stand = ev.get("stand") if isinstance(ev.get("stand"), dict) else {}
+            leiste = c.karten.get("recherche")
+            if leiste is None or stand.get("phase") == "plan":
+                leiste = RechercheLeiste()
+                c.karten["recherche"] = leiste
+                c._hinzu(leiste)
+            leiste.setzen(stand)
+            if stand.get("phase") == "fertig":
+                c.karten.pop("recherche", None)
         elif t == "confirm":
             karte = Karte(str(ev.get("question") or "Freigeben?"), "❓")
             karte.frage(ev.get("id"), [tuple(o) for o in ev.get("options") or []], ev.get("preview"))

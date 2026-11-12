@@ -199,7 +199,7 @@ def describe(path: str | os.PathLike) -> str:
 
 def learn_folder(path: str | os.PathLike, label: str) -> bool:
     """NemiCLI bringt sich einen echten Ordner als Beispiel bei und trainiert neu."""
-    if label not in LABEL_DE:
+    if label not in LABEL_DE or label == "leer":      # „leer" ist eine Regel in classify(), keine Klasse
         return False
     toks = features(path)
     if not toks:

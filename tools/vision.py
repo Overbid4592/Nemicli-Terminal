@@ -109,6 +109,8 @@ def to_data_uri(path: Path) -> str:
                 img = img.convert("RGBA" if "A" in img.mode else "RGB")
             buf = io.BytesIO()
             img.save(buf, "PNG")
+            if buf.tell() > GROSS_BYTES:
+                return to_data_uri_small(path, 2048)
             return "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode("ascii")
         except Exception:
             pass

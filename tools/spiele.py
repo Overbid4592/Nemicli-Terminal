@@ -269,8 +269,10 @@ class SpieleServer:
         if self.httpd is not None:
             try:
                 self.httpd.shutdown()
+                self.httpd.server_close()
             except Exception:
                 pass
+            self.httpd = None
 
 
 # ---------------------------------------------------------------------------

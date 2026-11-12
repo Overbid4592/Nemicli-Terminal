@@ -6,10 +6,12 @@ Grenzen – von der Persönlichkeit stumm geschaltet werden (`stumm`), nie gelö
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
+from pathlib import Path
 
 from . import herkunft
 from .ereignisse import DATEI, NETZ, PROZESS, Alarm, Ereignis, Schwere
@@ -31,16 +33,45 @@ _VERDAECHTIGE_FLAGS = ["-enc", "-encodedcommand", "-e ", "-w hidden", "-windowst
 # aus und weckte die Persönlichkeit erneut. Ein gefälschter Rahmen unter fremdem Elternprozess
 # fällt weiter bei R002 und im Profil auf.
 EIGENER_RAHMEN = "$progresspreference='silentlycontinue'; $outputencoding = [console]::outputencoding"
-_EIGENE_ELTERN = {"python.exe", "pythonw.exe", "nemicli.exe"}
+_EIGENE_ELTERN = {"python.exe", "pythonw.exe", "nemicli.exe", "nemiclic.exe"}   # nemiclic = exe mit Konsole
+# Vor dem Rahmen steht nur der Programmname und diese Schalter (actions.py `_befehl_roh`).
+_EIGENE_SCHALTER = {"-noprofile", "-noninteractive", "-command"}
+_SHELL_NAMEN = {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}
 
 
 def eigener_aufruf(e: Ereignis) -> bool:
-    """Ist dieser Prozess NemiCLI selbst bei der Arbeit (abfragen/befehl/Zeitplan)?"""
+    """Ist dieser Prozess NemiCLI selbst bei der Arbeit (abfragen/befehl/Zeitplan)? Der Rahmen muss
+    den Befehl eröffnen – irgendwo in der Kommandozeile reicht nicht (etwa hinter -enc)."""
     if (e.prozess or "").lower() not in ("powershell.exe", "pwsh.exe"):
         return False
     if (e.eltern or "").lower() not in _EIGENE_ELTERN:
         return False
-    return EIGENER_RAHMEN in " ".join((e.cmdline or "").lower().split())
+    vor, rahmen, _ = " ".join((e.cmdline or "").lower().split()).partition(EIGENER_RAHMEN)
+    if not rahmen:
+        return False
+    # subprocess setzt das Skript-Argument in Anführungszeichen: `-Command "$ProgressPreference=…`
+    teile = [t for t in (t.strip('"') for t in vor.split()) if t]
+    if teile and teile[0].replace("/", "\\").rsplit("\\", 1)[-1] in _SHELL_NAMEN:
+        teile = teile[1:]
+    return all(t in _EIGENE_SCHALTER for t in teile)
+
+
+def eigener_server(e: Ereignis) -> bool:
+    """Ist das NemiCLIs llama.cpp-Reserve? Genau die geprüfte llama-server.exe (Pfad des festgenagelten
+    Builds, jede Datei laut Prüfliste unverändert), gestartet von NemiCLI. Verbindungen nach außen zählen
+    nie dazu – der Server läuft offline und nur auf 127.0.0.1."""
+    if (e.prozess or "").lower() != "llama-server.exe" or (e.eltern or "").lower() not in _EIGENE_ELTERN:
+        return False
+    if (e.extra or {}).get("extern"):
+        return False
+    try:
+        import llamareserve
+        soll = os.path.normcase(str(llamareserve.server_pfad().resolve()))
+        if not e.exe or os.path.normcase(str(Path(e.exe).resolve())) != soll:
+            return False
+        return llamareserve.pruefen() is None
+    except Exception:
+        return False
 
 
 def _flags_in(cmd: str) -> list[str]:
@@ -159,6 +190,9 @@ def subjekt_fuer(regel: str, e: Ereignis) -> str:
 
 
 BEACON_MAX = 5000                   # (Prozess, Ziel)-Paare für R007
+# R007 braucht sechs Verbindungen: im 5-Minuten-Fenster blieben Takte ab 60 s unsichtbar.
+BEACON_FENSTER = 3600
+BEACON_LAENGE = 50                  # je Paar nur die jüngsten Zeitpunkte
 
 
 def _kuerzen(dq: deque, grenze: float) -> None:
@@ -174,9 +208,11 @@ class Regelwerk:
         self._starts: dict[str, deque] = defaultdict(deque)
         self._conns: dict[str, deque] = defaultdict(deque)
         self._dateien: deque = deque()
-        self._beacon: dict[tuple[str, str], deque] = defaultdict(deque)
+        self._beacon: dict[tuple[str, str], deque] = defaultdict(lambda: deque(maxlen=BEACON_LAENGE))
         self._seit_aufraeumen = 0
         self.treffer: dict[str, int] = defaultdict(int)
+        self.fehler: dict[str, int] = defaultdict(int)       # Regel → Ausnahmen
+        self.bei_fehler = None                                # Aufruf(wo, exc) beim 1. und jedem 100. Mal
         self.regeln = [self._r001, self._r002, self._r003, self._r004, self._r005, self._r006,
                        self._r007, self._r008, self._r009, self._r010, self._r011, self._r012,
                        self._r013, self._r014, self._r016, self._r017, self._sigma]
@@ -194,7 +230,8 @@ class Regelwerk:
         for regel in self.regeln:
             try:
                 t = regel(e)
-            except Exception:
+            except Exception as exc:
+                self._ausnahme(regel.__name__.lstrip("_").upper(), exc)
                 continue
             if t is None:
                 continue
@@ -207,6 +244,16 @@ class Regelwerk:
                                  subjekt=t.subjekt or subjekt_von(e)))
         return out
 
+    def _ausnahme(self, name: str, exc: Exception) -> None:
+        """Eine Regel scheiterte: zählen und melden; die übrigen Regeln laufen weiter."""
+        self.fehler[name] += 1
+        n = self.fehler[name]
+        if self.bei_fehler is not None and (n == 1 or n % 100 == 0):
+            try:
+                self.bei_fehler(f"regel {name} ({n}×)", exc)
+            except Exception:
+                pass
+
     def _zustand(self, e: Ereignis) -> None:
         jetzt = e.zeit or time.time()
         grenze = jetzt - self.fenster
@@ -215,8 +262,8 @@ class Regelwerk:
         elif e.kategorie == NETZ and e.aktion == "conn_open":
             dq = self._conns[e.prozess or "?"]; dq.append(jetzt); _kuerzen(dq, grenze)
             if e.ziel:
-                bq = self._beacon[(e.prozess or "?", e.ziel)]; bq.append(jetzt); _kuerzen(bq, grenze)
-        elif e.kategorie == DATEI and e.aktion in ("file_created", "file_modified", "file_deleted"):
+                bq = self._beacon[(e.prozess or "?", e.ziel)]; bq.append(jetzt); _kuerzen(bq, jetzt - BEACON_FENSTER)
+        elif e.kategorie == DATEI and e.aktion in ("file_created", "file_modified", "file_deleted", "file_moved"):
             self._dateien.append(jetzt); _kuerzen(self._dateien, grenze)
         self._seit_aufraeumen += 1
         if self._seit_aufraeumen >= 1000 or len(self._beacon) > BEACON_MAX:
@@ -229,7 +276,7 @@ class Regelwerk:
         for d in (self._starts, self._conns):
             for k in [k for k, dq in d.items() if not dq or dq[-1] < grenze]:
                 del d[k]
-        for k in [k for k, dq in self._beacon.items() if not dq or dq[-1] < jetzt - 3600]:
+        for k in [k for k, dq in self._beacon.items() if not dq or dq[-1] < jetzt - BEACON_FENSTER]:
             del self._beacon[k]
         if len(self._beacon) > BEACON_MAX:                 # immer noch zu viele: die ältesten zuerst
             for k in sorted(self._beacon, key=lambda k: self._beacon[k][-1])[:len(self._beacon) - BEACON_MAX // 2]:
@@ -450,7 +497,8 @@ class Regelwerk:
             try:
                 if not trifft(r, e, herkunft.originalname):
                     continue
-            except Exception:
+            except Exception as exc:
+                self._ausnahme(f"SIGMA {r.kennung}", exc)
                 continue
             zeilen = [f"{r.titel}: {r.beschreibung}",
                       f"Sigma-Regel {r.kennung}" + (f" · ATT&CK {r.technik}" if r.technik else "")]

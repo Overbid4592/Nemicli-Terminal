@@ -63,7 +63,8 @@ PROFIL_ARTEN = ("lektion",)
 
 # gültige Notiz-Arten (nur zur Ordnung; frei wählbar)
 #   lektion = aus einer Aufgabe/Fehler gelernte Lehre (Reflexion / Feedback)
-KINDS = ("fakt", "vorliebe", "projekt", "person", "pc", "lektion", "sonstiges")
+#   geschmack = Bild-Bewertung des Nutzers mit seinem Warum (Werkzeug bild_bewerten)
+KINDS = ("fakt", "vorliebe", "projekt", "person", "pc", "lektion", "sonstiges", "geschmack")
 # Kern-Gedächtnis: diese Arten stehen in jedem Gespräch im System-Prompt (persona)
 KERN_ARTEN = ("vorliebe", "lektion")
 KERN_MAX_ZEICHEN = 2000
@@ -241,14 +242,21 @@ NEUER_VERSUCH_S = 300    # nach einem Fehlschlag frühestens so spät erneut lad
 # Der Bibliothekar bleibt nach der Runde geladen und wird erst nach dieser Ruhe entladen:
 # Neuladen kostet Sekunden vor der nächsten Antwort.
 IDLE_UNLOAD_S = 600      # 10 Minuten
-WACHE_IDLE_UNLOAD_S = 180   # die Wache: das Hauptprogramm hält oft eine eigene Kopie – nicht lange doppelt
 
 
-def _idle_s() -> float:
+def _hintergrund_runde() -> bool:
+    """Wache: Alarm, Blick aufs Spiel oder freier Moment. Solche Runden nutzen ein geladenes Modell, laden es aber
+    nicht und halten es nicht wach: Sie kommen im Minutentakt und niemand wartet auf ihre Suche."""
     modes = sys.modules.get("modes")
-    return WACHE_IDLE_UNLOAD_S if getattr(modes, "_wache_dienst", False) else IDLE_UNLOAD_S
+    if not getattr(modes, "_wache_dienst", False):
+        return False
+    if not getattr(modes, "_kugel_runde", False):
+        return True
+    vonsichaus = sys.modules.get("vonsichaus")
+    return bool(vonsichaus is not None and vonsichaus.in_runde())
 
-_encoder = None          # embedder.Embedder | False = nicht verfügbar (siehe _fehler)
+
+_encoder = None         # embedder.Embedder | False = nicht verfügbar (siehe _fehler)
 _fehler = ""             # warum der Encoder nicht lädt – für /gedaechtnis und /einrichten
 _fehlschlag_zeit = 0.0
 _enc_lock = threading.RLock()
@@ -264,7 +272,7 @@ GPU_AB_STANDARD = 32     # ab so vielen Texten in einem Auftrag rechnet „auto�
 GPU_FREI_MB = 2500       # so viel freier VRAM muss dafür da sein (Modell + Rechenpuffer)
 GPU_MIN_MB = 1500        # Bibliothekar-Prozess: kleinste VRAM-Obergrenze, mit der die GPU sich lohnt
 GPU_RESERVE_MB = 300     # Abstand zum gerade freien VRAM (CUDA-Kontext)
-NUR_CPU = False          # Low-Modus im Bibliothekar-Prozess: große Aufträge bleiben auf der CPU
+NUR_GPU = False          # Bibliothekar-Prozess: rechnet nur auf der GPU, kein Ausweichen auf die CPU
 
 
 def geraet_gewuenscht() -> str:
@@ -293,9 +301,11 @@ def _ist_gguf(ordner) -> bool:
 
 def _geraet_waehlen(ordner=None) -> str:
     """Wohin der Encoder beim Laden kommt. Nur „cuda“ lädt direkt auf die GPU; bei „auto“
-    liegt er im RAM (auch als GGUF) – große Aufträge holen sich eine GPU-Fassung (auftrag). Im Low-Modus
-    (NUR_CPU) immer die CPU: der Lauf geht neben Chat und Bild weiter."""
-    if NUR_CPU or geraet_gewuenscht() != "cuda":
+    liegt er im RAM (auch als GGUF) – große Aufträge holen sich eine GPU-Fassung (auftrag). Im Bibliothekar-Prozess
+    (NUR_GPU) immer die GPU."""
+    if NUR_GPU:
+        return "cuda"
+    if geraet_gewuenscht() != "cuda":
         return "cpu"
     try:
         import torch
@@ -349,6 +359,33 @@ def _vram_deckeln() -> None:
     _DBG.ereignis(f"Bibliothekar: VRAM höchstens {budget} MB")
 
 
+def hat_gpu() -> bool:
+    """Gibt es eine nutzbare Grafikkarte? Ohne sie bleibt dem Bibliothekar nur die CPU."""
+    try:
+        import cockpit
+        g = cockpit.gpu(0.0)
+        if g and g.get("gesamt"):
+            return True
+    except Exception:
+        pass
+    try:
+        import torch
+        return bool(torch.cuda.is_available())
+    except Exception:
+        return False
+
+
+def gpu_platz() -> tuple[bool, str]:
+    """Kann der Bibliothekar jetzt rechnen? (ja/nein, Grund). Misst über NVML, legt keinen CUDA-Kontext an.
+    Ohne Grafikkarte oder Messung: ja – scheitert der Lauf, bleibt alles im Einlese-Speicher."""
+    if gpu_pause():
+        return False, "gerade wird gemalt"
+    budget = gpu_budget_mb()
+    if budget is None or budget >= GPU_MIN_MB:
+        return True, ""
+    return False, f"nur {budget / 1024:.1f} GB Grafikspeicher frei, nötig sind {GPU_MIN_MB / 1024:.1f} GB"
+
+
 def _gpu_frei_genug() -> bool:
     """Über NVML: torch.cuda.mem_get_info legt einen CUDA-Kontext an (~0,4 GB VRAM bis zum
     Prozessende), auch wenn der Auftrag danach im RAM bleibt. Im Bibliothekar-Prozess zählt
@@ -379,7 +416,7 @@ def auftrag(anzahl: int):
     global _geraet_aktiv
     enc = None
     gewechselt = False
-    if geraet_gewuenscht() == "auto" and anzahl >= gpu_ab() and not gpu_pause() and not NUR_CPU:
+    if geraet_gewuenscht() == "auto" and anzahl >= gpu_ab() and not gpu_pause() and not NUR_GPU:
         enc = _get_encoder()
         if enc is not None and str(getattr(enc, "device", "cpu")) == "cpu" and _gpu_frei_genug():
             try:
@@ -567,13 +604,17 @@ def _get_encoder():
         try:
             import embedder
             geraet = _geraet_waehlen(ordner)
-            for versuch in (geraet, "cpu"):
+            if NUR_GPU:
+                _vram_deckeln()
+                import torch
+                torch.set_num_threads(1)        # die CPU bereitet nur vor, gerechnet wird auf der GPU
+            for versuch in ((geraet,) if NUR_GPU else (geraet, "cpu")):
                 try:
                     enc = embedder.laden(str(ordner), device=versuch, local_files_only=True)
                     break
                 except Exception:
                     # GPU voll oder CUDA-Fehler → auf der CPU weiter, nicht ohne Gedächtnis
-                    if versuch == "cpu":
+                    if NUR_GPU or versuch == "cpu":
                         raise
             global _geraet_aktiv
             _geraet_aktiv = enc.device
@@ -625,7 +666,7 @@ def warm_encoder() -> None:
     laufenden Runde. Nicht während eine Bilderserie läuft: sonst lädt jede Suche ihn zwischen zwei Bildern
     wieder auf die GPU."""
     global _warm_thread
-    if gpu_pause():
+    if gpu_pause() or _hintergrund_runde():
         return
     with _enc_lock:
         if _encoder is not None:            # geladen oder dauerhaft nicht da
@@ -638,7 +679,7 @@ def warm_encoder() -> None:
 
 
 def _start_idle_watch() -> None:
-    """Wächter: wirft den Encoder nach IDLE_UNLOAD_S (in der Wache WACHE_IDLE_UNLOAD_S) Ruhe aus dem RAM."""
+    """Wächter: wirft den Encoder nach IDLE_UNLOAD_S Ruhe aus dem RAM."""
     global _idle_thread
     if _idle_thread is not None and _idle_thread.is_alive():
         return
@@ -649,7 +690,7 @@ def _start_idle_watch() -> None:
             with _enc_lock:
                 if _encoder is None or _encoder is False:
                     return                  # nichts geladen -> Wächter aus
-                if time.time() - _last_use < _idle_s():
+                if time.time() - _last_use < IDLE_UNLOAD_S:
                     continue
                 _unload_locked()
                 return
@@ -712,7 +753,8 @@ def release_encoder() -> None:
     """Runde vorbei: der Bibliothekar bleibt warm und geht erst nach
     IDLE_UNLOAD_S Ruhe von selbst schlafen."""
     global _last_use
-    _last_use = time.time()
+    if not _hintergrund_runde():
+        _last_use = time.time()
     if encoder_loaded():
         _start_idle_watch()
 
@@ -834,9 +876,11 @@ def frage_einbetten(text: str, aufgabe: str = "gedaechtnis") -> list[list[float]
     der Bibliothekar gerade oder wird der Encoder umgezogen, None – die Runde sucht dann nur
     nach Stichworten."""
     global _last_use
+    wach_halten = not _hintergrund_runde()
     enc = _encoder if encoder_loaded() else None
     if enc is not None and (gemerkt := _aus_speicher(enc, aufgabe, [text])[0]) is not None:
-        _last_use = time.time()
+        if wach_halten:
+            _last_use = time.time()
         return [gemerkt]
     if not _enc_lock.acquire(blocking=False):
         return None
@@ -848,7 +892,7 @@ def frage_einbetten(text: str, aufgabe: str = "gedaechtnis") -> list[list[float]
         return None
     try:
         vecs = _fragen_vektoren(enc, [text], aufgabe)
-        if vecs:
+        if vecs and wach_halten:
             _last_use = time.time()
         return vecs
     finally:
@@ -1050,6 +1094,12 @@ def all_entries() -> list[dict]:
     for datei in _dateien():
         out += _load(datei)["entries"]
     return out
+
+
+def nach_art(kind: str, n: int = 6) -> list[dict]:
+    """Die neuesten `n` Einträge einer Art (gemeinsame und die der aktiven Persönlichkeit)."""
+    passend = [e for e in all_entries() if e.get("kind") == kind and (e.get("text") or "").strip()]
+    return sorted(passend, key=lambda e: (str(e.get("ts") or ""), e.get("id") or 0), reverse=True)[:n]
 
 
 def _archivieren(data: dict, eintrag: dict, grund: str) -> None:

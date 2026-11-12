@@ -133,6 +133,8 @@ class Dienst:
         if self.kugel is not None:
             return
         from . import erinnerungen
+        if erinnerungen.terminal_offen():            # ein offenes NemiCLI-Fenster holt sie selbst ab
+            return
         for d in erinnerungen.abholen():
             self._melden("Erinnerung", erinnerungen.meldung(d))
 
@@ -175,8 +177,13 @@ class Dienst:
             threading.Thread(target=self.motor.trainieren, args=("Nutzer",), daemon=True).start()
         elif name == "pause":
             if self.pausiert:
-                self.motor.start()
+                # start() wartet auf einen noch laufenden Durchlauf (z. B. Training): nicht im Menü-Thread.
+                def _fortsetzen():
+                    self.motor.start()
+                    if self.pausiert:            # währenddessen erneut pausiert
+                        self.motor.stop()
                 self.pausiert = False
+                threading.Thread(target=_fortsetzen, daemon=True, name="wache-fortsetzen").start()
             else:
                 self.motor.stop()
                 self.pausiert = True
