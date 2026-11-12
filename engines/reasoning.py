@@ -27,13 +27,20 @@ EFFORTS = {"schnell": "low", "normal": "medium", "stark": "high", "max": "high"}
 # https://developers.openai.com/api/docs/models/gpt-5.4-nano
 # https://developers.openai.com/api/docs/models/gpt-5.5
 # https://developers.openai.com/api/docs/models/gpt-5.6-sol
+# https://developers.openai.com/api/docs/models/gpt-6-astra · …/gpt-6.1-sol (o1 ist abgeschaltet)
 _OPENAI_MODELS = {
-    "o1", "o3", "o3-mini", "o4-mini",
+    "o3", "o3-mini", "o4-mini",
     "gpt-5", "gpt-5-mini", "gpt-5-nano",
-    "gpt-5.1", "gpt-5.2",
-    "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano",
-    "gpt-5.5", "gpt-5.6",
+    "gpt-5.1", "gpt-5.2", "gpt-5.2-pro",
+    "gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano", "gpt-5.4-pro",
+    "gpt-5.5", "gpt-5.5-pro", "gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna",
+    "gpt-6-astra", "gpt-6-sol", "gpt-6-luna", "gpt-6.1-sol", "gpt-6.1-terra",
 }
+# Familien mit den Stufen low … xhigh, max (Modellseiten): „max“ in NemiCLI ist dort die echte Stufe max.
+_OPENAI_BIS_MAX = ("gpt-5.6", "gpt-6", "gpt-6.1")
+# Responses API: max_output_tokens zählt das Denken mit (OpenAI rät zu mindestens 25.000). None = Modell-Maximum.
+RESPONSES_BUDGETS = {"schnell": 16384, "normal": 32768, "stark": 65536, "max": None}
+RESPONSES_HELFER = 16384
 
 
 # Ollama Cloud: Rückfall, solange ollama.com/api/show nicht geantwortet hat (cloudprovider liest live).
@@ -41,29 +48,37 @@ _OPENAI_MODELS = {
 # think = welche Denk-Werte reasoning_effort annimmt (None = an/aus geht nicht,
 # False in der Liste = abschaltbar → "none"), default = Voreinstellung.
 # reasoning_effort = none/low/medium/high/max (https://docs.ollama.com/api/openai-compatibility).
+# Werte wie ollama.com/api/show sie meldet (thinking.values/default, model_info.*.context_length); live
+# abgefragt gehen sie vor (cloudprovider.cloud_denken), die Tabelle gilt, wenn die Abfrage nicht geht.
 OLLAMA_CLOUD: dict[str, dict] = {
-    "deepseek-v4-flash":   {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "low"},
+    "beam":                {"ctx": 1_048_576, "think": ("low", "medium", "high", "xhigh", "max"), "default": "max"},
     "deepseek-v4-pro":     {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "low"},
     "deepseek-v4.1-flash": {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "high"},
     "gemma4":              {"ctx":   262_144, "think": (False, True), "default": False},
-    "glm-5.1":             {"ctx":   202_752, "think": (False, True), "default": True},
     "glm-5.2":             {"ctx": 1_048_576, "think": (False, "high", "max"), "default": "high"},
     "glm-5.3":             {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
     "glm-5.3-flash":       {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
     "gpt-oss":             {"ctx":   131_072, "think": ("low", "medium", "high"), "default": "medium"},
-    "kimi-k2.5":           {"ctx":   262_144, "think": (False, True), "default": True},
     "kimi-k2.6":           {"ctx":   262_144, "think": (False, True), "default": True},
     "kimi-k2.7-code":      {"ctx":   262_144, "think": (False, True), "default": True},
     "kimi-k3":             {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "max"},
-    # Kimi K3.1 Pro: Denken nicht abschaltbar (platform.kimi.ai, Quickstart)
-    "kimi-k3.1-pro":       {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
-    "kimi-k3.1-pro-highspeed": {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
+    "kimi-k3.1-pro":       {"ctx": 1_048_576, "think": (False, "low", "medium", "high", "max"), "default": "max"},
+    "mimo-v2.6-flash":     {"ctx": 1_048_576, "think": (False, True), "default": True},
+    "mimo-v2.6-pro":       {"ctx": 1_048_576, "think": (False, True), "default": True},
     "minimax-m2.7":        {"ctx":   196_608, "think": (True,), "default": True},
-    "minimax-m3":          {"ctx":   512_000, "think": None, "default": None},
+    "minimax-m3":          {"ctx":   512_000, "think": (True,), "default": True},
+    "minimax-m3.1-flash":  {"ctx": 1_000_000, "think": (True,), "default": True},
     "mistral-large-3":     {"ctx":   262_144, "think": None, "default": None},
+    "mistral-large-4":     {"ctx": 1_048_576, "think": (True,), "default": True},
+    "muse-spark-open":     {"ctx": 1_048_576, "think": (False, "low", "medium", "high", "max"), "default": "high"},
     "nemotron-3-nano":     {"ctx":   262_144, "think": (False, True), "default": True},
     "nemotron-3-super":    {"ctx":   262_144, "think": (False, True), "default": True},
     "nemotron-3-ultra":    {"ctx":   262_144, "think": (False, True), "default": True},
+    # nicht mehr in der Modell-Liste von ollama.com – bleiben für bestehende Einstellungen
+    "deepseek-v4-flash":   {"ctx": 1_048_576, "think": (False, "low", "high", "max"), "default": "low"},
+    "glm-5.1":             {"ctx":   202_752, "think": (False, True), "default": True},
+    "kimi-k2.5":           {"ctx":   262_144, "think": (False, True), "default": True},
+    "kimi-k3.1-pro-highspeed": {"ctx": 1_048_576, "think": ("low", "high", "max"), "default": "max"},
     "qwen3.5":             {"ctx":   262_144, "think": (False, True), "default": True},
 }
 # Helfer auf Denk-Modellen: das Nachdenken zählt ins Budget – daher mehr Luft und die niedrigste Denkstufe.
@@ -137,12 +152,37 @@ def profile(ref: str | None) -> str | None:
             return "ollama_cloud"
     if provider == "moonshot" and cloud_info(ollama_family(model)) is not None:
         return "moonshot"            # Kimi direkt beim Hersteller: dieselben Stufen, reasoning_effort oben
-    if provider == "openai":
-        # Offizielle datierte Snapshots derselben bekannten Modellfamilien.
-        base = re.sub(r"-\d{4}-\d{2}-\d{2}$", "", model)
-        if base in _OPENAI_MODELS:
+    if provider in ("openai", "chatgpt"):
+        # Offizielle datierte Snapshots derselben bekannten Modellfamilien (ChatGPT-Konto: dieselben Namen).
+        if _openai_basis(model) in _OPENAI_MODELS:
             return "openai_effort"
     return None
+
+
+def _openai_basis(model: str) -> str:
+    return re.sub(r"-\d{4}-\d{2}-\d{2}$", "", (model or "").lower())
+
+
+def openai_effort(model: str, strength: str | None) -> str:
+    """reasoning.effort für ein OpenAI-Modell: low/medium/high, bei „max“ die echte Stufe max, wo es sie gibt."""
+    strength = normalize_strength(strength)
+    basis = _openai_basis(model)
+    if strength == "max" and any(basis == f or basis.startswith(f + "-") for f in _OPENAI_BIS_MAX):
+        return "max"
+    return EFFORTS[strength]
+
+
+def responses_options(provider: str, model: str, strength: str | None, *, helper: bool = False) -> dict:
+    """Optionen für die Responses API. Beim ChatGPT-Konto ist max_output_tokens nicht erlaubt (Plan-Kontingent)."""
+    opts: dict = {}
+    denkt = profile(f"{provider}:{model}") == "openai_effort"
+    if denkt:
+        opts["reasoning"] = {"effort": "low" if helper else openai_effort(model, strength)}
+    if provider != "chatgpt":
+        budget = (RESPONSES_HELFER if denkt else HELPER_BUDGET) if helper else             RESPONSES_BUDGETS[normalize_strength(strength)] if denkt else None
+        if budget:
+            opts["max_output_tokens"] = budget
+    return opts
 
 
 def request_options(provider: str, model: str, strength: str | None,
@@ -212,6 +252,19 @@ def strength_menu(ref: str | None) -> dict[str, str]:
     if kind == "kimi":
         return {key: "Thinking an · bis zu " + f"{budget:,}".replace(",", ".")
                 + " Tokens für Denken und Antwort" for key, budget in BUDGETS.items()}
+    if kind == "openai_effort":
+        provider, _, model = (ref or "").partition(":")
+        out = {}
+        for key, budget in RESPONSES_BUDGETS.items():
+            stufe = {"low": "niedrige", "medium": "mittlere", "high": "hohe", "max": "höchste"}[openai_effort(model, key)]
+            if provider == "chatgpt":
+                umfang = "aus dem ChatGPT-Plan"
+            elif budget is None:
+                umfang = "ohne Deckel (bis zum Modell-Maximum)"
+            else:
+                umfang = "bis zu " + f"{budget:,}".replace(",", ".") + " Tokens für Denken und Antwort"
+            out[key] = f"{stufe} Denkstufe · {umfang}"
+        return out
     return {
         "schnell": "niedrige Denkstufe · bis zu 4.096 Tokens für Denken und Antwort",
         "normal": "mittlere Denkstufe · bis zu 8.192 Tokens für Denken und Antwort",
@@ -232,6 +285,8 @@ def strength_note(ref: str | None, strength: str | None) -> str:
         return description + " (Ollama Cloud)."
     if kind == "moonshot":
         return description + " (Moonshot)."
+    if kind == "openai_effort" and openai_effort((ref or "").partition(":")[2], strength) == "max":
+        return description + "."
     if strength == "max":
         return description + " für Denken und Antwort; keine zusätzliche Denkstufe."
     return description + "."

@@ -153,7 +153,6 @@ def bereit(art: str = "bild") -> list[str]:
 
 def gewaehlt(art: str = "bild") -> str | None:
     """Gewählter Anbieter (Config cloud_bild_anbieter / cloud_video_anbieter) – sonst der erste bereite."""
-    tabelle = BILD if art == "bild" else VIDEO
     wunsch = str(_config().get(f"cloud_{art}_anbieter") or "")
     da = bereit(art)
     return wunsch if wunsch in da else (da[0] if da else None)
@@ -679,6 +678,8 @@ def video_generate(prompt: str, *, sekunden: float = 5.0, startbild: str | None 
                 return _ablegen(_laden(j["video"]["url"]), ".mp4", video=True)
             if stand == "failed":
                 e = j.get("error") or {}
+                if not isinstance(e, dict):                  # manche Antworten liefern den Fehler als Text
+                    e = {"message": str(e)}
                 raise CloudFehler(f"xAI: {e.get('message') or e.get('code') or 'fehlgeschlagen'}")
             if on_status:
                 on_status(f"Video in der Cloud (xAI) – wartet ({stand or '…'}) …")

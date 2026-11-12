@@ -236,10 +236,20 @@ _QWEN_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
                r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
 
 
+_TOK_CACHE: dict = {}
+
+
 def _tokenizer():
-    """Qwen-Tokenizer aus dem lokalen Ordner: tokenizer.json oder vocab.json + merges.txt."""
-    from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers
+    """Qwen-Tokenizer aus dem lokalen Ordner, je Ordner einmal gebaut."""
     d = teile()["tokenizer"]
+    if (tok := _TOK_CACHE.get(str(d))) is None:
+        tok = _TOK_CACHE[str(d)] = _tokenizer_bauen(d)
+    return tok
+
+
+def _tokenizer_bauen(d: Path):
+    """Qwen-Tokenizer: tokenizer.json oder vocab.json + merges.txt."""
+    from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers
     if (d / "tokenizer.json").exists():
         tok = Tokenizer.from_file(str(d / "tokenizer.json"))
     else:
@@ -530,19 +540,74 @@ class _Qwen3Text:
         return torch.stack(out, 2)
 
 
-def _encode(prompt: str, te, device):
-    import torch
-    tok = _tokenizer()
-    ids = tok(_TEMPLATE.format(prompt))
+# Krea 2 liest höchstens 512 Text-Token (Prompt + Schluss der Vorlage); wie die Referenz-Pipeline wird der Rest
+# des Prompts abgeschnitten – längere Folgen hat das Modell nie gesehen.
+MAX_TEXT = 512
+_SCHLUSS = 5                                   # <|im_end|> \n <|im_start|> assistant \n
+
+
+def _ids(prompt: str) -> tuple[list[int], int, int]:
+    """Token der Vorlage, Beginn des Prompts darin und Zahl der abgeschnittenen Prompt-Token."""
+    ids = _tokenizer()(_TEMPLATE.format(prompt))
     ende, gesehen = 0, 0
     for i, t in enumerate(ids):
         if t == _IM_START and gesehen < 2:
             ende, gesehen = i, gesehen + 1
     if len(ids) > ende + 3 and ids[ende + 1] == _TOK_USER and ids[ende + 2] == _TOK_NL:
         ende += 3
+    zuviel = max(0, len(ids) - ende - MAX_TEXT)
+    if zuviel:
+        ids = ids[:len(ids) - _SCHLUSS - zuviel] + ids[-_SCHLUSS:]
+    return ids, ende, zuviel
+
+
+def ueberlang(prompt: str) -> int:
+    """Wie viele Token des Prompts Krea 2 abschneidet (0 = passt; auch 0, wenn der Tokenizer fehlt)."""
+    try:
+        return _ids(prompt)[2]
+    except Exception:
+        return 0
+
+
+def _encode(prompt: str, te, device):
+    import torch
+    ids, ende, zuviel = _ids(prompt)
+    if zuviel:
+        _DBG.ereignis(f"Krea 2: Prompt um {zuviel} Token gekürzt (höchstens {MAX_TEXT})")
     with torch.no_grad():
         h = te.taps(torch.tensor(ids, device=device))
     return h[:, ende:].contiguous()
+
+
+# Fertige Text-Einbettungen (im Arbeitsspeicher): derselbe Prompt – etwa der Gesichts-Satz für jedes Gesicht –
+# braucht den Text-Encoder nicht noch einmal auf der Karte.
+_TEXT_CACHE: dict = {}
+_TEXT_CACHE_MAX = 4
+
+
+def _text_schluessel(pfad: Path, prompt: str) -> tuple:
+    try:
+        st = Path(pfad).stat()
+        return str(pfad), st.st_size, st.st_mtime_ns, prompt
+    except OSError:
+        return str(pfad), 0, 0, prompt
+
+
+def _text_einbetten(prompt: str, pfad: Path, device, dtype):
+    """Einbettung des Prompts, aus dem Zwischenspeicher oder frisch mit dem Text-Encoder."""
+    schluessel = _text_schluessel(pfad, prompt)
+    if (ctx := _TEXT_CACHE.pop(schluessel, None)) is not None:
+        _TEXT_CACHE[schluessel] = ctx                # zuletzt benutzt nach hinten
+        _DBG.ereignis("Bildmotor: Text aus dem Zwischenspeicher")
+        return ctx.to(device)
+    te = _auf_gpu("text", pfad, lambda: _Qwen3Text(pfad, device, dtype), device)
+    ctx = _encode(prompt, te, device)
+    del te
+    _TEXT_CACHE[schluessel] = ctx.to("cpu")
+    while len(_TEXT_CACHE) > _TEXT_CACHE_MAX:
+        _TEXT_CACHE.pop(next(iter(_TEXT_CACHE)))
+    _frei()
+    return ctx
 
 
 # ===========================================================================
@@ -1025,6 +1090,7 @@ def entladen() -> None:
         while _RAM:                         # Stück für Stück: Freigeben hält Python kurz fest
             _RAM.popitem()
             time.sleep(0.02)
+        _TEXT_CACHE.clear()
         try:
             from trtmotor import bild as _tb
             _tb.entladen()
@@ -1184,10 +1250,7 @@ def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype
 
     if on_status:
         on_status("Krea 2: Text-Encoder …")
-    te = _auf_gpu("text", t["text"], lambda: _Qwen3Text(t["text"], device, dtype), device)
-    ctx = _encode(prompt, te, device)
-    del te
-    _frei()
+    ctx = _text_einbetten(prompt, t["text"], device, dtype)
 
     mean = torch.tensor(_LAT_MEAN, device=device).view(1, 16, 1, 1)
     std = torch.tensor(_LAT_STD, device=device).view(1, 16, 1, 1)
@@ -1319,6 +1382,8 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
     meta.add_text("params", f"steps={steps}, cfg=1, size={W}x{H}, seed={seed}, "
                             f"sampler={sampler}, shift={shift}, backend=krea2"
                             + (f", lora={lora.stem}:{lora_staerke:g}" if lora else ""))
+    if lora:
+        meta.add_text("lora_datei", str(lora))       # das Gesicht-Nachmalen nimmt dieselbe LoRA
     Image.fromarray(arr).save(out, pnginfo=meta)
     return str(out)
 
@@ -1360,12 +1425,26 @@ _GESICHT_HINWEIS = False          # fehlendes Seh-Modell nur einmal je Sitzung m
 GESICHTSZUEGE = "Gesichtszuege"      # Unterordner neben dem Original für nachgemalte Gesichter
 
 
+def _bild_lora(meta: dict) -> tuple[Path | None, float]:
+    """LoRA und Stärke, mit denen ein Bild gemalt wurde (aus seinen PNG-Angaben); fehlt die Datei: (None, 1.0)."""
+    import re
+    roh = str(meta.get("lora_datei") or "").strip()
+    if not roh or not Path(roh).is_file():
+        return None, 1.0
+    m = re.search(r"lora=[^,]*:([\d.]+)", str(meta.get("params", "")))
+    try:
+        return Path(roh), float(m.group(1)) if m else 1.0
+    except ValueError:
+        return Path(roh), 1.0
+
+
 def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None = None,
                         on_status=None) -> str | None:
     """Gesichter eines Krea-Bildes vergrößert nachmalen und weich einsetzen.
 
     Gesichter findet das Seh-Modell (gesichter.finden); nachgemalt wird nur mit GESICHT_SATZ,
-    nicht mit dem Szenen-Prompt. Das Original bleibt; das Ergebnis liegt im Unterordner
+    nicht mit dem Szenen-Prompt. Wurde das Bild mit einer LoRA gemalt (`lora_datei` im Bild), malt sie mit, in
+    derselben Stärke – sonst rutschte das Gesicht von ihrem Aussehen weg. Das Original bleibt; das Ergebnis liegt im Unterordner
     `Gesichtszuege/<name>.png` (GESICHTSZUEGE). None, wenn kein sicheres Gesicht gefunden wurde oder alle schon groß
     genug sind. Fehlt das Seh-Modell, einmal je Sitzung RuntimeError mit dem Grund, danach None.
     Blockiert."""
@@ -1399,6 +1478,7 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
     m = re.search(r"seed=(\d+)", params)
     seed = (int(m.group(1)) if m else int(time.time() * 1000)) + 1
     prompt = GESICHT_SATZ
+    lora, lora_staerke = _bild_lora(meta)
 
     modelle = discover()
     ref = _modell(meta.get("model"), modelle)
@@ -1420,7 +1500,8 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
                 if on_status:
                     melde = (lambda s, i=i: on_status(f"Gesicht {i + 1}/{len(boxen)} · {s}"))
                 neu = _male(prompt, ref, modelle[ref], t, steps, sampler, DEFAULTS["shift"],
-                            W, H, seed + i, device, dtype, melde, bild=ausschnitt, staerke=staerke)
+                            W, H, seed + i, device, dtype, melde, bild=ausschnitt, staerke=staerke,
+                            lora=lora, lora_staerke=lora_staerke)
                 arr = gesichter.einsetzen(arr, box, neu)
                 fertig += 1
         except Exception as e:
@@ -1441,6 +1522,7 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
     info = PngImagePlugin.PngInfo()
     for k, v in meta.items():
         info.add_text(k, str(v))
-    info.add_text("nachgebessert", f"gesicht x{fertig}, staerke={staerke}, steps={steps}")
+    info.add_text("nachgebessert", f"gesicht x{fertig}, staerke={staerke}, steps={steps}"
+                                   + (f", lora={lora.stem}:{lora_staerke:g}" if lora else ""))
     Image.fromarray(arr).save(ziel, pnginfo=info)
     return str(ziel)

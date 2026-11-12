@@ -68,8 +68,11 @@ def tokenizer(gew: dict, ordner: Path | None = None):
     from tokenizers import Tokenizer
     if "tokenizer_json" in gew:
         tok = Tokenizer.from_str(gew["tokenizer_json"].decode("utf-8"))
-    else:
+    elif ordner is not None and (Path(ordner) / "tokenizer.json").is_file():
         tok = Tokenizer.from_file(str(Path(ordner) / "tokenizer.json"))
+    else:
+        raise FileNotFoundError("Gemma-Text-Encoder: weder tokenizer_json in der Datei noch tokenizer.json "
+                                f"im Ordner ({ordner})")
     tok.no_padding()
     tok.no_truncation()
     return lambda text: tok.encode(text, add_special_tokens=True).ids

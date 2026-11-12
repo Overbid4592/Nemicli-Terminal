@@ -42,7 +42,7 @@ class Cmd:
 COMMAND_LIST: list[Cmd] = [
     Cmd("/help", "Alle Befehle anzeigen"),
     Cmd("/model", "KI-Modell wechseln (Cloud oder Lokal) · Modell von Hugging Face holen · Ersatzbank",
-        "[name · huggingface · ersatz]",
+        "[name · chatgpt · huggingface · ersatz]",
         "KI-Modell wechseln (Cloud oder Lokal) – ohne Name: Auswahl-Menü mit 37 Cloud-Anbietern; lange Listen "
         "(Anbieter, Modelle) haben oben 🔍 Suchen. '/model huggingface' holt ein "
         "lokales Modell: Größe und MoE wählen, Q4_K_M vorgeschlagen, Prüfung per SHA-256, fortsetzbar. "
@@ -52,7 +52,23 @@ COMMAND_LIST: list[Cmd] = [
         "springt ein – im Terminal, in der Kugel und beim Weckruf der Wache. "
         "Das laufende Gespräch geht weiter – das neue Modell liest den Verlauf als Text neu; "
         "frisch anfangen mit /reset. In der Liste steht auch ✨ Funke Groß, NemiCLIs eigenes kleines Modell "
-        "(ohne Schlüssel, ohne Werkzeuge und Bilder; du/Sie, Länge und Emojis wählbar)."),
+        "(ohne Schlüssel, ohne Werkzeuge und Bilder; du/Sie, Länge und Emojis wählbar). "
+        "🔐 ChatGPT-Konto (Plus/Pro): unter „Cloud-Anbieter hinzufügen“ oder '/model chatgpt' – Anmeldung im Browser "
+        "(Sign in with ChatGPT), es zählt dein ChatGPT-Plan statt eines API-Schlüssels; '/model chatgpt abmelden' "
+        "löscht den Zugang. OpenAI-Modelle laufen über die Responses API (Denkstufen bis max bei GPT-5.6/6.x)."),
+    Cmd("/llamacpp", "llama.cpp-Reserve 🦙: Stand · holen · einrichten · vergleich",
+        "[holen [auto|cuda-13.5|cuda-12.4|vulkan|cpu] · einrichten · vergleich [frage]]",
+        "🦙 llama.cpp als festgenagelte Reserve neben dem eigenen Motor: genau ein Build, jede Datei per SHA-256 "
+        "geprüft. '/llamacpp holen' wählt das Paket nach der Grafikkarte, lädt es nur von GitHub (Ladebalken, Esc "
+        "bricht ab, ein neuer Aufruf setzt fort) und richtet es ein; mit einem Cloud-Modell kann das auch die KI "
+        "(nach deinem OK). Von Hand: die offiziellen Pakete nach Motoren/llama.cpp im Datenordner legen, dann "
+        "'/llamacpp einrichten' – es prüft und entpackt sie. Danach steht im /model-Menü jedes lokale Modell auch mit 🦙 "
+        "(über llama.cpp; mit mmproj-Datei im Ordner sieht es auch dort Bilder). Kann der eigene Motor ein Modell "
+        "nicht laden, fragt NemiCLI, ob die Reserve "
+        "übernehmen darf. Der Server läuft nur auf 127.0.0.1 mit zufälligem Schlüssel, ohne Web-Oberfläche, Jinja, "
+        "Werkzeuge, RPC, Slot-Speicher und Schlafmodus. '/llamacpp vergleich [frage]' stellt dem aktiven lokalen "
+        "Modell dieselbe Frage in beiden Motoren (gierig): wo weichen die Token ab, was hätte llama.cpp gewählt, "
+        "wie schnell ist jeder – das Ergebnis steht auch in Debugbericht/motorvergleich.md."),
     Cmd("/staerke", "Denk-Stärke oder Denkbudget wählen", "[stufe]",
         "Zeigt die passenden Stufen für dein Modell. Bei Kimi steuern sie das "
         "gemeinsame Tokenbudget für Denken und Antwort. Eigener Motor: das Denk-Budget "
@@ -78,11 +94,12 @@ COMMAND_LIST: list[Cmd] = [
         "🎭 Wer spricht? Ohne Name: Menü (eingebaute Nemi + deine eigenen). "
         "'/persönlichkeiten neu' legt per Fragen eine neue an – als Markdown-Datei "
         "in Persoenlichkeiten/, die du frei umschreiben kannst. Gilt sofort, bleibt gespeichert."),
-    Cmd("/bild", "Bild erzeugen 🎨 (Krea 2 · WebUI · ComfyUI)", "<beschreibung> | schritte",
-        "Malt ein Bild mit dem aktiven Motor. '/bild schritte' stellt die Krea-2-Schritte "
-        "dauerhaft ein (8 bis 16, Auswahl mit Enter)."),
+    Cmd("/bild", "Bild erzeugen 🎨 (Krea 2 · WebUI · ComfyUI)", "<beschreibung> [--figur] | schritte",
+        "Malt ein Bild mit dem aktiven Motor, den Prompt genau so, wie er dasteht. Mit --figur malt es die Figur der "
+        "aktiven Persönlichkeit: der 🔒 Kern steht davor, dazu ihr Seed und die gebundene Bild-LoRA (Kern · [name] · "
+        "Prompt). '/bild schritte' stellt die Krea-2-Schritte dauerhaft ein (8 bis 16, Auswahl mit Enter)."),
     Cmd("/video", "Video erzeugen 🎬 (eigener Motor, bis 20 s)",
-        "<beschreibung> [--sekunden 10] [--start bild.png] [--seed 1] [--schaerfe mittel] | modell [name] | "
+        "<beschreibung> [--sekunden 10] [--start bild.png] [--figur] [--seed 1] [--schaerfe mittel] | modell [name] | "
         "einstellungen [name wert] | cloud [google|xai|runway|fal|minimax|luma|aus|neu] | ordner | motorordner",
         "🎞 Video-Motoren mit Ton (LTX-2.5: Dateien in Models/Videomodelle/<Name>/, Gemma 4 mit Projektion in "
         "text_encoders/, Faltungs-VAE und Ton-VAE in vae/; `/video modell <name>` wählt, `/video einstellungen` zeigt "
@@ -94,7 +111,14 @@ COMMAND_LIST: list[Cmd] = [
         "Ohne Zusatz: Menü (Video 5/10/20 s, Modell wählen, Ordner öffnen). `/video cloud google|xai|runway|fal`: "
         "Videos aus der Cloud statt lokal (Google bis 10 s, xAI bis 15 s, Runway 5/10 s, MiniMax H3 bis 15 s, Luma Ray 3.2 5/10 s, fal.ai je nach Modell; mit "
         "Startbild; ohne Schlüsselbilder, Seed, Schärfe), `/video cloud neu` richtet einen Anbieter mit Schlüssel ein, "
-        "`/video cloud aus` zurück."),
+        "`/video cloud aus` zurück. "
+        "🎬 SD-Video ist ein weiterer Video-Motor: Stable Diffusion 1.5 oder SDXL mit Zeit-Schichten, 8 Bilder/s, "
+        "ohne Ton, bis 20 s. Dafür liegt ein ganzer Bild-Checkpoint in Models/Videomodelle/<Name>/, dazu ein "
+        "Bewegungs-Modul (AnimateDiff-Lightning oder AnimateDiff v3 für SD 1.5, Hotshot-XL für SDXL) im Modellordner "
+        "oder in bewegung/ und der CLIP-Tokenizer in tokenizer_clip/. Die offiziellen Bewegungs-Module werden per "
+        "SHA-256 geprüft. Jedes SD-Video beginnt mit einem Startbild, das die Figur hält: ohne --start malt der "
+        "Bild-Motor zuerst eines aus der Beschreibung, mit --figur die Figur der aktiven Persönlichkeit mit Kern, "
+        "Seed und Bild-LoRA. Abschalten: `/video einstellungen startbild aus`."),
     Cmd("/bildmodel", "Bild-Modell wählen 🎨 (Krea 2, Z-Image, FLUX.2, WebUI/ComfyUI oder Cloud)", "[name|cloud …]",
         "🟣 Krea 2 (eigene Pipeline) ODER weitere eigene Bild-Motoren (🟩 Z-Image, 🟦 FLUX.2 klein, 🟧 Qwen-Image, "
         "🟪 FLUX.1, 🟥 Chroma; Dateien in Models/Bildmodelle/<Name>/, Zubehör laut LIES-MICH im Ordner; "
@@ -110,17 +134,18 @@ COMMAND_LIST: list[Cmd] = [
         "(NVIDIA: pip3 install torch torchvision --index-url …/cu132)."),
     Cmd("/wissen", "Zeigt, was NemiCLI gelernt hat"),
     Cmd("/gedaechtnis",
-        "Langzeitgedächtnis ansehen/löschen · `indexieren` = Vektor-Rückstand jetzt aufholen · "
+        "Langzeitgedächtnis ansehen/löschen · "
         "`archiv` = Ersetztes und Vergessenes · `zurueck <Nr>` = aus dem Archiv zurückholen",
         "",
-        "indexieren holt alles auf einmal nach – auf der GPU, wenn genug frei ist (höchstens 25 % des "
-        "Grafikspeichers, Config embedding_vram_anteil), sonst auf der CPU."),
-    Cmd("/embeddingtimer", "Wann das Gedächtnis eingebettet wird ⏱ · Low-Modus",
-        "aus · 15 · 30 · 45 · 60 · 90 · low [an|aus]",
-        "Takt in Minuten (Vorgabe 30): NemiCLI sammelt, was ins Gedächtnis soll, und bettet es höchstens so oft "
-        "in einem Lauf ein. aus = nach jeder Runde. Aufgeräumter Kontext (/compact) und /gedaechtnis indexieren "
-        "laufen immer sofort. 🐢 Low-Modus (Vorgabe an): bei Chat oder Bild rechnet der Bibliothekar langsam "
-        "weiter – nur CPU, zwei Kerne, Leerlauf-Priorität – statt aufzuhören; aus = er pausiert."),
+        "Notizen, Archiv und was noch offen ist. Einbetten: /einlesen."),
+    Cmd("/einlesen", "Einlese-Speicher jetzt ins Gedächtnis einlesen 📦 · stand", "[stand]",
+        "📦 Chats, Notizen, Skills, Berichte, Wissen und Bilder sammeln sich im Einlese-Speicher: gleich nach "
+        "Stichworten findbar, nach Bedeutung erst nach dem Einlesen. Der Balken zeigt den Stand („38k │ 100k“) und füllt sich "
+        "in halben Feldern, ändert er sich, leuchtet er kurz auf: bis 50k grün, dann orange, ab 80k dunkelrot. Bei 99k startet das Einlesen von selbst, sobald keine Antwort "
+        "läuft und die GPU Platz hat. Es rechnet nur auf der GPU (höchstens 25 % des Grafikspeichers, Config "
+        "embedding_vram_anteil, ohne Grafikkarte auf der CPU) und trennt einen festen Block ab: Was du danach "
+        "schreibst, sammelt der nächste Speicher. /einlesen startet es früher. Ein Bild zählt 800 Token, Text "
+        "Zeichen / 4."),
     Cmd("/embeddings", "Embedding-Modell fürs Gedächtnis 🧬: wählen · Hugging Face",
         "[<Ordner>|huggingface]",
         "🧬 Welches Modell aus Models/embeddings die Texte fürs Gedächtnis in Vektoren "
@@ -248,7 +273,9 @@ COMMAND_LIST: list[Cmd] = [
         "🛑 Mehr als das Limit (Standard 20) auf einmal oder in Summe → STOPP, ohne Rückfrage. "
         "Nur du änderst es: '/limit 50'. Die KI hat dafür kein Werkzeug."),
     Cmd("/whitelist", "Befehls-Whitelist ✅: welche `befehl`-Kommandos als harmlos gelten", "[befehl]",
-        "✅ `befehl` fragt einmal, wenn das Kommando nur liest oder auf der Whitelist steht "
+        "🟢 Reine Abfragen von der offenen Liste (Get-Process, nvidia-smi --query, git status …) laufen in jedem Modus "
+        "ohne Frage; die Liste steht hier und in tools/shellfrei.py. "
+        "✅ Sonst fragt `befehl` einmal, wenn das Kommando nur liest oder auf der Whitelist steht "
         "(git status, pip list …) – sonst zweimal, rot markiert. Im Modus Auto laufen dazu die "
         "Einträge der Auto-Liste und Python-Skripte im Arbeitsordner; alles andere hält an. "
         "'/whitelist git push' prüft einen Befehl. Die Liste liegt in befehl_whitelist.json im Programm-Ordner."),
@@ -309,6 +336,51 @@ COMMAND_LIST: list[Cmd] = [
         "verbessert); nach Problemen wird er im Hintergrund nachgebessert. '/skills selbst aus' holt das "
         "Prüffenster zurück. 'alte' zeigt alte Notizen aus learned/skills zum Übernehmen."),
     Cmd("/gui", "Desktop-Fenster öffnen (Chat | Work, Galerie, Persönlichkeiten, ⚙ Einstellungen) – mit dieser Sitzung verbunden"),
+    Cmd("/einstellungen", "⚙ Einstellungen: die wichtigsten Schalter auf einen Blick · Für Profis", "",
+        "⚙ Dieselbe Seite wie im Desktop-Fenster, hier im Terminal: vorne Stimme, Arbeitsweise, Nachdenken, Farben, "
+        "Schriftgröße, Startart und Kugel; unter „🔧 Für Profis“ der Rest. Erst den Punkt wählen, dann den Wert "
+        "(✔️ = so ist es gerade)."),
+    Cmd("/schriftgröße", "Schrift größer oder kleiner 🔠: ganze Oberfläche · KI · du · Terminal (in px)",
+        "[oberflaeche|ki|du|terminal] <px> · zurück",
+        "🔠 Ohne Zusatz: erst die Rolle wählen, dann die Größe (✔️ = so ist es gerade). Rollen: 🪟 oberflaeche "
+        "(die ganzen Fenster, Vorgabe 14 px), 🤖 ki (nur die Antworten der KI, Vorgabe 15 px), 💬 du (deine "
+        "Nachrichten, Vorgabe 15 px), 🖥 terminal (das eigene Terminal-Fenster, Vorgabe 15 px, ab dem nächsten "
+        "Start). Beispiele: '/schriftgröße ki 18' – nur die KI größer; '/schriftgröße 16' – alles größer; "
+        "'/schriftgröße zurück' – alles auf die Vorgabe. Gilt in Desktop-Fenster, Kugel, Charakter-, Musik- und "
+        "Store-Fenster; neue Nachrichten sofort, schon offene Fenster beim nächsten Öffnen."),
+    Cmd("/schriftgroesse", "Schriftgröße (ohne Umlaut getippt)", "[rolle] <px>"),
+    Cmd("/terminal", "Eigenes Terminal-Fenster 🖥: Leuchten, weiches Rollen, geteilte Ansicht",
+        "[leuchten|weich|geteilt an|aus · thema auto|breeze|mint]",
+        "🖥 Schalter für das eigene Terminal-Fenster (NemiCLI.exe). leuchten: sanftes Leuchten im Hintergrund, das "
+        "atmet, solange die KI arbeitet. weich: weiches Rollen und gleitender Cursor. geteilt: der Reiter „KI“ steht "
+        "rechts neben dem Chat (auch Strg+Umschalt+G). Diese drei wirken sofort. thema: auto nimmt die Farben von "
+        "/theme, breeze und mint sind feste Farben – ab dem nächsten Start."),
+    Cmd("/startart", "Wie NemiCLI startet 🚀: im Terminal oder gleich im Desktop-Fenster", "terminal · fenster",
+        "🚀 terminal (Vorgabe): wie bisher. fenster: beim Start öffnet sich das Desktop-Fenster (/gui) von selbst, "
+        "das Terminal wartet im Tray. Gilt ab dem nächsten Start."),
+    Cmd("/kern", "Kern 🧬: das feste Aussehen und die Sprechweise der Figur ansehen, ändern, sperren (nur du)",
+        "[aendern · sprechweise · sperren · entsperren · zurueck]",
+        "🧬 Der Kern ist das Grundskelett der Figur: Gesicht, Augen, Haarfarbe und -länge, Haut, Körperbau, Bleibendes wie "
+        "Tattoos. Er liegt in einer eigenen Datei neben der Charakter-Datei (mit Sicherung) und steht vor JEDEM "
+        "Selbstbild – bei bild_malen, Serien, Comics und /kugel malen, mit Bild-LoRA zusammen mit ihrem [name]. "
+        "Kleidung, Frisur, Make-up, Pose und Szene bleiben je Bild frei. 🔒 Gesperrt ändert ihn nur der Nutzer: Will "
+        "eine KI ihn mit charakter_aendern ändern, fragt NemiCLI in jedem Modus und zeigt alt → neu. ⏪ holt einen der "
+        "letzten fünf Stände zurück. 🗣 Die Sprechweise (wie die Figur redet, z. B. frech, duzt, kurze Sätze) gehört "
+        "dazu, ist mit dem Kern gesperrt und geht mit jeder Nachricht an die KI. Diesen Befehl nutzt nur der Nutzer "
+        "selbst; eine KI kann ihn nicht aufrufen."),
+    Cmd("/lora", "LoRA-Werkstatt 🧬: aus eigenen Bildern eine Bild-LoRA (Krea 2) trainieren und an einen Charakter binden",
+        "",
+        "🧬 Fenster: Bilder hineinziehen oder wählen, 🔍 prüfen (doppelt, unscharf, kein oder mehrere Gesichter – "
+        "mit Seh-Modell), auswählen, Namen geben, trainieren mit Fortschritt in Prozent, Schritt und Restzeit; "
+        "⏸ Pause sichert den Stand, ▶ Weiter macht dort weiter. Mit Seh-Modell bekommt jedes Bild vorher einen Satz "
+        "(Kleidung, Pose, Ort, Licht – texte/<kennung>.txt, von Hand änderbar): so lernt der Name nur die Person, "
+        "nicht Kleidung und Hintergrund. Hoch-, Quer- und quadratische Bilder lernen in ihrem Format statt "
+        "beschnitten. Wahlweise ein Testbild alle 200 Schritte und danach "
+        "Probebilder bei Stärke 0,6 · 0,8 · 1,0. Ablage LoRA/Bild/<name>/ im Daten-Ordner, die Originalbilder bleiben "
+        "unberührt. Binden an einen Charakter schreibt die SHA-256 in seine Charakter-Datei (lora_bild): malt er sich "
+        "selbst, kommt die LoRA immer zu seinem Kern dazu (Kern · [name] · was passiert); fehlt sie oder hat sie sich "
+        "verändert, gilt nur der Kern. Im Prompt: [name] Szene – [name] wählt die LoRA, der Rest sagt nur, was passiert. "
+        "Nur Bilder mit Krea 2; Video kommt später."),
     Cmd("/musik", "Musik 🎵: Fenster für Songwünsche – die KI arbeitet Stil und Liedtext aus, dann komponieren",
         "",
         "🎵 Wunsch auf Deutsch eintippen (Länge, mit oder ohne Gesang). ✨ Ausarbeiten: die KI macht daraus einen "
@@ -317,7 +389,9 @@ COMMAND_LIST: list[Cmd] = [
         "🎙 Als Cover: den markierten Song (oder eine eigene Datei: WAV, MP3, M4A, FLAC) im Stil oben neu "
         "einspielen – Melodie und Aufbau bleiben, „Nähe“ hält auch den Klang näher am Original. "
         "Ohne Fenster: einfach der KI sagen, welchen Song sie machen oder covern soll."),
-    Cmd("/webui", "Browser-Oberfläche öffnen (gut lesbar, mit Vorlesen)"),
+    Cmd("/webui", "Browser-Oberfläche öffnen (gut lesbar, mit Vorlesen) – das Desktop-Fenster /gui kann das auch",
+        "", "Die ältere Oberfläche im Browser. Ihre Stärken hat jetzt auch das Desktop-Fenster (/gui): gut lesbare, "
+        "größere Schrift mit /schriftgröße, Vorlesen per 🔊 an jeder Antwort, dazu Galerie, Persönlichkeiten und ⚙."),
     Cmd("/spiel", "Spielen 🎲: Schach · Mühle · Dame · TicTacToe im Browser gegen die Persönlichkeit"),
     Cmd("/appstore", "Appstore 🛍: Apps aus HTML/CSS/JS, deren Funktionen die KI nutzt · 🐞 debugAI",
         "[<app> | debug <app> | liste | ordner]",
@@ -407,6 +481,44 @@ COMMAND_LIST: list[Cmd] = [
 
 # Name -> Kurzbeschreibung (das Vorschlags-Menü beim Tippen nutzt genau das)
 COMMANDS: dict[str, str] = {c.name: c.short for c in COMMAND_LIST}
+
+# Sechs Themen für das /-Menü und /help statt einer langen Liste. Ein Befehl ohne Thema landet unter „🔧 System“;
+# VERSTECKT erscheint nur beim Tippen des Namens (Gegenstück eines anderen Befehls).
+THEMEN: list[tuple[str, str, tuple[str, ...]]] = [
+    ("💬", "Chat & Bedienung", ("/help", "/einstellungen", "/gui", "/schriftgröße", "/startart", "/terminal", "/modus", "/voice", "/theme",
+                                "/anzeige", "/emoji", "/reset", "/compact", "/kontext", "/clear", "/undo", "/restart",
+                                "/exit")),
+    ("🧠", "Modell & Gedächtnis", ("/model", "/llamacpp", "/staerke", "/denken", "/auto", "/vision", "/gedaechtnis",
+                                   "/einlesen", "/embeddings", "/reflektieren", "/aufraeumen", "/wissen", "/skills",
+                                   "/subagenten", "/uebung")),
+    ("🎨", "Erschaffen", ("/bild", "/bildmodel", "/lora", "/kern", "/video", "/musik", "/appstore", "/spiel", "/code")),
+    ("👤", "Persönlichkeit", ("/persönlichkeiten", "/charaktere", "/charakter", "/kugel", "/name", "/nemi")),
+    ("🛡️", "Sicherheit", ("/wache", "/web", "/whitelist", "/limit", "/schluessel", "/sandbox", "/backup")),
+    ("🔧", "System", ("/update", "/einrichten", "/systemcheck", "/selbsttest", "/venv", "/start", "/statistik",
+                     "/version", "/protokoll", "/debug", "/doku", "/ml", "/ordner", "/chrome", "/kontextmenue",
+                     "/webui")),
+]
+VERSTECKT = frozenset({"/codeend", "/schriftgroesse"})
+
+
+def thema_von(name: str) -> tuple[str, str]:
+    """(Zeichen, Titel) des Themas eines Befehls."""
+    for zeichen, titel, namen in THEMEN:
+        if name in namen:
+            return zeichen, titel
+    return THEMEN[-1][0], THEMEN[-1][1]
+
+
+def nach_themen() -> list[tuple[str, str, list[Cmd]]]:
+    """Alle sichtbaren Befehle, nach Thema geordnet: (Zeichen, Titel, Befehle)."""
+    nach_name = {c.name: c for c in COMMAND_LIST}
+    gruppen = [(z, t, [nach_name[n] for n in namen if n in nach_name]) for z, t, namen in THEMEN]
+    vergeben = {n for _, _, namen in THEMEN for n in namen} | VERSTECKT
+    rest = [c for c in COMMAND_LIST if c.name not in vergeben]
+    if rest:
+        z, t, befehle = gruppen[-1]
+        gruppen[-1] = (z, t, befehle + rest)
+    return gruppen
 
 # Schreibweisen, die alle /persönlichkeiten meinen (ohne Umlaut tippt sich's leichter).
 PERSONA_CMDS = ("/persönlichkeiten", "/persoenlichkeiten", "/persönlichkeit",
@@ -527,6 +639,17 @@ UNTERMENUES: dict[str, list[tuple[str, str, str | None]]] = {
         ("", "🧬 Charakter-Datei ansehen", None),
         ("oeffnen", "📝 Im Editor öffnen", None),
     ],
+    "/terminal": [
+        ("leuchten an", "✨ Leuchten im Hintergrund an", None),
+        ("leuchten aus", "✨ Leuchten im Hintergrund aus", None),
+        ("weich an", "🌊 Weiches Rollen an", None),
+        ("weich aus", "🌊 Weiches Rollen aus", None),
+        ("geteilt an", "🪟 Reiter „KI“ neben dem Chat an", None),
+        ("geteilt aus", "🪟 Reiter „KI“ neben dem Chat aus", None),
+        ("thema auto", "🎨 Farben von /theme", None),
+        ("thema breeze", "🎨 Feste Farben: Breeze", None),
+        ("thema mint", "🎨 Feste Farben: Mint", None),
+    ],
     "/kugel": [
         ("", "🔮 Status", None),
         ("malen {}", "🎨 Gesicht malen lassen", "Wie soll sie aussehen? (leer = aus der Charakter-Datei, sonst beschreibt sie sich selbst)"),
@@ -579,6 +702,11 @@ def help_rows() -> list[tuple[str, str]]:
     return [(c.usage, c.help_text) for c in COMMAND_LIST]
 
 
+def help_gruppen() -> list[tuple[str, list[tuple[str, str]]]]:
+    """/help nach Themen: (Überschrift, [(Befehl mit Argument, Kurztext)])."""
+    return [(f"{z} {t}", [(c.usage, c.short) for c in befehle]) for z, t, befehle in nach_themen()]
+
+
 def _fold(s: str) -> str:
     """Vergleichsform: klein, Umlaute ausgeschrieben."""
     s = s.lower()
@@ -592,8 +720,8 @@ def find_commands(text: str, ausfuehrlich: bool = False) -> list[tuple[str, str]
     im Namen, dann im Kurztext (ab 3 Zeichen; `ausfuehrlich`: auch im langen Text).
     Liefert (Name, Kurztext)."""
     q = _fold(text.lstrip("/"))
-    if not q:
-        return [(c.name, c.short) for c in COMMAND_LIST]
+    if not q:                                    # nur „/“: nach Themen geordnet, das Thema vorne im Kurztext
+        return [(c.name, f"{z} {c.short}") for z, _t, befehle in nach_themen() for c in befehle]
     anfang, im_namen, in_text = [], [], []
     for c in COMMAND_LIST:
         name = _fold(c.name[1:])
@@ -609,7 +737,10 @@ def find_commands(text: str, ausfuehrlich: bool = False) -> list[tuple[str, str]
 TASTEN = ("Enter senden · Strg+J neue Zeile · Esc abbrechen · F2 Denktext · F8 Änderung freigeben · "
           "F12 Gespräch sichern · Shift+Tab Modus · Tab/↑↓ im /-Menü · Strg+C markierten Text kopieren · "
           "Strg+K Suche (alle Befehle, Einstellungen, Modelle; Tippfehler okay) · F3 Cockpit (Grafikkarte, Tempo, "
-          "Kontext, Hintergrund-Aufgaben, Todo) · Klick auf ✓/⚙-Zeilen klappt Werkzeug-Ergebnisse auf")
+          "Kontext, Hintergrund-Aufgaben, Todo) · Klick auf ✓/⚙-Zeilen klappt Werkzeug-Ergebnisse auf · "
+          "Strg+F im Verlauf suchen (Enter/↑ älterer Treffer, ↓ neuerer, Esc schließt) · Rechtsklick auf einen "
+          "Block kopiert ihn ganz · Klick auf die Titelzeile einer Antwort klappt sie ein und auf · "
+          "Alt+↑/↓ von Antwort zu Antwort · Bild↑/↓ blättert")
 
 EINSTELLUNGEN = """\
 ## Einstellungen und Dateien
@@ -619,10 +750,14 @@ allowlist_eigen.json im Programm-Ordner, die mitgelieferte Liste in allowlist.js
 Gefällt kein Farbschema: mit theme_erstellen ein eigenes entwerfen (themes_eigen.json im Programm-Ordner),
 danach /theme mit menue_oeffnen öffnen.
 Nur der Nutzer selbst – nenne ihm den Weg:
-- Im Desktop-Fenster (/gui) unter ⚙ Einstellungen per Klick: Stimme, Arbeitsweise, Denkstufe, Farben; unter
+- Im Terminal mit /einstellungen oder im Desktop-Fenster (/gui) unter ⚙ Einstellungen per Klick: Stimme,
+  Arbeitsweise, Denkstufe, Farben, Schriftgröße je Rolle (/schriftgröße), Start im Terminal oder Fenster (/startart),
+  Terminal-Fenster (/terminal: Leuchten, weiches Rollen, geteilte Ansicht, Farben); unter
   „Für Profis“ Kontext, Gedächtnis-Modell, Gedächtnis-Takt, Reflektieren, Skills, Übung, Helfer, Fremdseiten, Kugel,
   Rechtsklick-Menü, Debugbericht
-- Modell, Cloud-Key: /model → „Cloud-Anbieter hinzufügen“ (Key wird verschlüsselt gespeichert)
+- Modell, Cloud-Key: /model → „Cloud-Anbieter hinzufügen“ (Key wird verschlüsselt gespeichert); ChatGPT-Konto
+  (Plus/Pro) ohne Key: dort „ChatGPT-Konto“ oder /model chatgpt – Anmeldung im Browser, Abmelden mit
+  /model chatgpt abmelden. Ist das Plan-Kontingent aufgebraucht, sagt NemiCLI das; Bilder malt weiter Krea 2
 - Lösch-Limit /limit · Befehls-Whitelist /whitelist (befehl_whitelist.json) · Projekt für die
   Sandbox freigeben /sandbox · Programm-Ordner auf Zeit öffnen /schluessel · Sperrliste
   schreibsperre.json im Programm-Ordner (nur von Hand)
@@ -633,8 +768,8 @@ Nur der Nutzer selbst – nenne ihm den Weg:
   Modell-Familie: ModelGGUF/<Familie>/<Mitglied>/ (Ordner ohne eigene .gguf) erscheint in /model → Lokal
   als ein Team (🧬): es chattet das Mitglied ohne Bild-Teil, bei Bildern sieht das Mitglied mit Bild-Teil
   (der Seher wird nur dafür geladen); jedes Mitglied ist auch einzeln wählbar („Familie-Mitglied“).
-  Gedächtnis-Modelle: Models/embeddings (/embeddings); wann eingebettet wird: /embeddingtimer (Takt
-  aus/15–90 min, Low-Modus); Config embedding_vram_anteil (Prozent VRAM für den Bibliothekar, Vorgabe 25)
+  Gedächtnis-Modelle: Models/embeddings (/embeddings); eingebettet wird gesammelt auf der GPU: /einlesen (Balken 100k);
+  Config embedding_vram_anteil (Prozent VRAM für den Bibliothekar, Vorgabe 25)
 - Charakter-LoRA beim Malen (Krea 2, nur wenn die Persönlichkeit selbst im Bild ist): Config-Schlüssel
   bild_lora (Vorgabe an) und bild_lora_staerke (Vorgabe 1.0); Bilder mit LoRA laufen ohne TensorRT
 - Mausrad-Tempo im Vollbild: Config-Schlüssel scroll_zeilen (Zeilen je Raste, 1–20, Vorgabe 4),
@@ -648,8 +783,13 @@ Nur der Nutzer selbst – nenne ihm den Weg:
 - Eigenes Terminal-Fenster (NemiCLI.exe): Reiter wie bei GNOME-Terminal – Strg+Umschalt+T neue
   Kommandozeile, Strg+Umschalt+W schließen, Strg+Bild↑/↓ wechseln. Reiter „🤖 KI“ (Strg+Umschalt+K)
   zeigt jeden Befehl der KI mit Ausgabe live, nur zum Lesen; geht beim ersten Befehl von selbst auf.
-  Aus: Config-Schlüssel terminal_ki_reiter false. Aussehen: terminal_thema (breeze | mint),
-  terminal_hintergrund (Durchsicht 0.3–1.0), terminal_schrift, terminal_groesse – ab dem nächsten Start"""
+  Strg+Umschalt+G stellt ihn rechts neben den Chat (geteilte Ansicht, bleibt gemerkt). Im Reiter „KI“ und in
+  der Kommandozeile sucht Strg+F (Treffer als Marken am rechten Rand); der Reiter „KI“ rollt weich mit
+  Mausrad, Bild↑/↓, Pos1/Ende. Strg+Klick öffnet Web-Adressen und vorhandene Pfade aus dem Text – nur
+  https; Ordner, Bilder, Text, PDF und Medien gehen auf, alles andere wird nur im Ordner gezeigt.
+  Schalter mit /terminal (auch auf ⚙): leuchten, weich, geteilt an|aus wirken sofort, thema auto|breeze|mint
+  ab dem nächsten Start. Nur in der Config: terminal_ki_reiter false (Reiter „KI“ aus), terminal_hintergrund
+  (Durchsicht 0.3–1.0), terminal_schrift, terminal_groesse – ab dem nächsten Start"""
 
 
 # Auswahl nach laufendem Stand (Theme, Modus, Stärke …); main.py setzt das beim Start.
@@ -671,9 +811,9 @@ def auswahl(name: str) -> list[tuple[str, str, str | None]]:
 # /compact und /uebung brauchen TURN_LOCK, den der Zug der KI selbst hält (asyncio.Lock ist nicht
 # wiedereintrittsfähig).
 MENUE_GESPERRT = {"/schluessel", "/schlüssel", "/limit", "/whitelist", "/sandbox", "/modus", "/auto",
-                  "/wache", "/code", "/compact", "/uebung", "/restart", "/neustart"}
+                  "/wache", "/code", "/compact", "/uebung", "/restart", "/neustart", "/kern"}
 # /appstore öffnet nur das Store-Fenster – Bauen, Entfernen und debugAI löst dort der Nutzer selbst aus.
-MENUE_EIGENE = {"/theme", "/emoji", "/staerke", "/denken", "/kontext", "/embeddings", "/embeddingtimer", "/model",
+MENUE_EIGENE = {"/theme", "/emoji", "/staerke", "/denken", "/kontext", "/embeddings", "/model",
                 "/bildmodel",
                 "/video", "/debug", "/vision", "/appstore"}
 MENUE_UNTERPUNKTE = {"/bild": {"schritte"}, "/model": {"huggingface", "ersatz"}}   # Zusatz öffnet ein weiteres Menü

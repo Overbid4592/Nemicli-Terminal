@@ -100,7 +100,12 @@ def _windows(pfad: Path) -> tuple[np.ndarray, int]:
     rw.MFCreateSourceReaderFromURL.restype = ctypes.c_long
     ole = ctypes.WinDLL("ole32")
     com = ole.CoInitializeEx(None, 0)
-    VD._pruefen(plat.MFStartup(VD.MF_VERSION, 0), "MFStartup")
+    try:
+        VD._pruefen(plat.MFStartup(VD.MF_VERSION, 0), "MFStartup")
+    except Exception:
+        if com in (0, 1):
+            ole.CoUninitialize()
+        raise
     leser, typ, aktuell = c_void_p(), c_void_p(), c_void_p()
     teile: list[np.ndarray] = []
     try:

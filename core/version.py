@@ -21,8 +21,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "9.47 Alpha"
-STAND = "2026.11.04"
+VERSION = "9.64 Alpha"
+STAND = "2026.11.12"
 GEBURTSTAG = _dt.date(2026, 6, 19)
 AUTHOR = "D. Hoffmann (Vibecoder)"
 BUILT_WITH = "Claude Opus 5.5 · Anthropic"

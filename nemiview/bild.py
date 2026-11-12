@@ -31,7 +31,7 @@ def aufnehmen(datei: Path, breite: int, hoehe: int, png: Path) -> dict:
     try:
         lz = AppLaufzeit(datei.parent, breite, hoehe, dunkel=False, virtuelle_zeit=True, einstieg=datei.name)
         lz.laden()
-        lz.js.zeitgeber_laufen(SEITENZEIT_MS)
+        lz.zeitgeber_laufen(SEITENZEIT_MS)
     except (OSError, RecursionError) as e:
         return {"ok": False, "fehler": [f"Die Seite lässt sich nicht laden: {e}"], "konsole": [], "hinweise": [],
                 "titel": ""}

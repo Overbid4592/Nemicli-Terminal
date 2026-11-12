@@ -6,6 +6,7 @@ Normaler Text geht ans aktive Modell, /befehle steuern das Programm.
 # main.py ist auf vier Dateien verteilt (siehe _teil_laden): Imports nutzen die Teile mit, Namen kommen von dort.
 # ruff: noqa: F401, F821
 import asyncio
+import contextlib
 import itertools
 import os
 import re
@@ -69,11 +70,13 @@ import learn
 import memory
 import indexdb
 import persona
+import rolle
 import emoji
 import mascot
 import subagents
 import models as M
 import providers as P
+import llamareserve
 import pricing
 import setup as S
 import practice as PRAC
@@ -98,6 +101,7 @@ import notstopp
 import plan
 import modes
 import ersatzbank
+import webanzeige
 import stats
 from commands import SlashCompleter, parse, PERSONA_CMDS
 from confirm import ask as ask_confirm, ask_text, ask_suche as _ask_suche
@@ -187,9 +191,9 @@ async def _bilder_fuer_chat(model: str | None, text: str,
         )
     pfade = list(bilder)
     tmp: list = []
-    if imgs and not pfade:
+    if imgs:                                         # Data-URIs auch neben Bildpfaden im Text mitnehmen
         tmp = _uris_nach_temp(imgs)
-        pfade = tmp
+        pfade += tmp
         imgs = []
     if not pfade:
         return text, imgs or None, None
@@ -268,12 +272,14 @@ AUTO_ALLOW: set[str] = set()    # Werkzeuge, die diese Sitzung nicht mehr abgefr
 WEB_BRIDGE = None               # aktive WebUI-Brücke (None = kein /webui gestartet)
 GUI_BRUECKE = None              # Verbindung zum GUI-Fenster (None = kein /gui gestartet)
 MUSIK_BRUECKE = None            # Verbindung zum Musik-Fenster (/musik)
+LORA_BRUECKE = None             # Verbindung zur LoRA-Werkstatt (/lora)
 CHARAKTER_BRUECKE = None        # Verbindung zur Charakter-Galerie (/charaktere)
 # Im GUI-Modus „Chat“ erlaubt: nichts am PC ändern – malen, Bilder ansehen, Gedächtnis, Skills (Prüffenster).
 CHAT_WERKZEUGE = frozenset({"plan", "bild_malen", "bild_serie", "portraet_bewegen", "charakter_zeigen",
                             "charakter_aendern",
                             "bild_ansehen", "bild_fragen", "bild_protokoll", "bilder_suchen",
-                            "gedaechtnis_suchen", "gedaechtnis_lesen", "gedaechtnis_aufraeumen", "merken",
+                            "gedaechtnis_suchen", "gedaechtnis_lesen", "gedaechtnis_aufraeumen", "gedaechtnis_einlesen",
+                            "gedaechtnis_status", "merken", "bild_bewerten",
                             "tagebuch", "lieblingsbild",
                             "profilbild",
                             "vorschau_schliessen",
@@ -467,6 +473,8 @@ def _denkwerk_start(backend, denk) -> str:
     Der eigene Motor bekommt die Einschätzung selbst (denk_runde): ob er nachdenkt, hängt vom Chat-Format ab."""
     if hasattr(backend, "denk_runde"):
         backend.denk_runde = denk
+    if hasattr(backend, "rollen_anker"):
+        backend.rollen_anker = persona.rollen_anker()
     if denk is None or not hasattr(backend, "denk_hinweis"):
         return ""
     backend.denk_hinweis = denkwerk.hinweis(denk, bool(getattr(backend, "denkt_selbst", False)))
@@ -542,6 +550,14 @@ def _close_records(records) -> None:
 # Risikostufe bestimmt Frage und Optionen, `befehl` außerhalb der Whitelist fragt zweimal,
 # Löschen hat eine Obergrenze, harmlose Änderungen einer Runde werden gebündelt.
 
+async def _befehle_vorpruefen(acts: list[dict]) -> None:
+    """Die offene Liste startet den PowerShell-Parser: nicht in der Hauptschleife. Das Ergebnis bleibt gemerkt."""
+    import shellfrei
+    for a in acts:
+        if a.get("tool") == "befehl":
+            await asyncio.to_thread(shellfrei.grund, actions._befehl_text(a))
+
+
 async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
                     frei: set | None = None, abgelehnt: set | None = None):
     """Entscheidet, ob `act` laufen darf.
@@ -549,6 +565,7 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
     ("block"/"stopp"/"rejected"/"no_run", ActionResult) – die Aktion läuft nicht,
     das Ergebnis geht ans Modell. Protokoll für die Nicht-Ausführung ist erledigt.
     frei/abgelehnt: ids der Aktionen aus der Sammelfrage (sicherheit.buendel)."""
+    await _befehle_vorpruefen([act])
     tool = act.get("tool")
     desc = actions.describe(act)
     stufe = sicherheit.stufe(act)
@@ -581,7 +598,8 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
         confirm = False
         act["_frei"] = "Arbeitsbereich"
         desc = actions.describe(act)
-    zeige_aktion(desc, confirm, act)
+    if confirm or tool not in webanzeige.WERKZEUGE or not getattr(zeige_aktion, "web_live", False):
+        zeige_aktion(desc, confirm, act)      # sonst zeigt die lebendige Web-Zeile (_web_live) das Ziel selbst
     if not confirm:
         return "run", None
     try:
@@ -602,6 +620,8 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
     if choice not in ("yes", "always"):
         protokoll.schreibe(tool, desc, "rejected", veraendernd=True, wer=wer, stufe=stufe)
         return "rejected", None
+    if tool == "charakter_aendern":
+        act["_kern_ja"] = True                # der Nutzer hat diese Änderung gesehen (auch am gesperrten Kern)
     if choice == "always":
         AUTO_ALLOW.add(tool)
     return "run", None
@@ -619,6 +639,8 @@ async def _buendel_freigabe(acts: list[dict], frage) -> tuple[set, set]:
     """Sammelfrage für mehrere harmlose Änderungen in einer Runde.
     Gibt (freigegebene ids, abgelehnte ids) zurück – leer, wenn es nichts zu bündeln gab
     oder der Nutzer einzeln gefragt werden will."""
+    await _befehle_vorpruefen(acts)
+
     def _fragt(a: dict) -> bool:
         return (modes.decide(a, actions.needs_confirm(a)) == "ask"
                 and not _immer_erlaubt(a)
@@ -738,8 +760,10 @@ def _recherche_plan_text(teilfragen: list[str]) -> str:
 
 
 async def _recherche_lauf(act: dict, backend, records: list, melde, plan_zeigen,
-                          abbruch=lambda: False) -> str:
-    """Führt das Werkzeug `recherche` aus und liefert die Rückmeldung fürs Modell."""
+                          abbruch=lambda: False, fortschritt=None, leiste=None) -> str:
+    """Führt das Werkzeug `recherche` aus und liefert die Rückmeldung fürs Modell.
+    fortschritt(stand): Stand der Schritt-Leiste (Fenster). leiste(): Kontext, der eine Funktion
+    zeigen(stand, sekunden) liefert (Terminal, läuft mit der Zeit mit)."""
     import recherche
     import webfetch
     frage = " ".join(str(act.get("frage") or "").split())
@@ -761,16 +785,36 @@ async def _recherche_lauf(act: dict, backend, records: list, melde, plan_zeigen,
     actions.fremdinhalt()                     # Bericht stammt aus Fremdquellen: Netz-Taint wie web_lesen
     record = {"tool": "recherche", "status": "running"}
     records.append(record)
-    umgebung = recherche.Umgebung(ask=ask, plan_zeigen=plan_zeigen, melde=melde,
-                                  parallel=not lokal, lokal=lokal, abbruch=abbruch)
-    try:
-        stand = await recherche.lauf(frage, umgebung, Path(paths.DATEN) / "Berichte", act.get("tiefe") or 1)
-    except asyncio.CancelledError:
-        record["status"] = "failed"
-        raise
-    except Exception as exc:
-        record["status"] = "failed"
-        return f"Recherche fehlgeschlagen: {exc}"
+    beginn, letzter = time.monotonic(), {}
+    with (leiste() if leiste else contextlib.nullcontext(None)) as zeigen:
+
+        def melden(stand: dict) -> None:
+            letzter.update(stand)
+            if fortschritt:
+                fortschritt(dict(stand))
+            if zeigen:
+                zeigen(dict(letzter), time.monotonic() - beginn)
+
+        async def ticken() -> None:                  # Radar und Zeit laufen auch zwischen den Schritten
+            while True:
+                await asyncio.sleep(0.25)
+                if letzter:
+                    zeigen(dict(letzter), time.monotonic() - beginn)
+
+        umgebung = recherche.Umgebung(ask=ask, plan_zeigen=plan_zeigen, melde=melde, parallel=not lokal,
+                                      lokal=lokal, abbruch=abbruch, fortschritt=melden)
+        ticker = asyncio.create_task(ticken()) if zeigen else None
+        try:
+            stand = await recherche.lauf(frage, umgebung, Path(paths.DATEN) / "Berichte", act.get("tiefe") or 1)
+        except asyncio.CancelledError:
+            record["status"] = "failed"
+            raise
+        except Exception as exc:
+            record["status"] = "failed"
+            return f"Recherche fehlgeschlagen: {exc}"
+        finally:
+            if ticker:
+                ticker.cancel()
     record["status"] = "unverified" if stand.pfad else "not_run"
     protokoll.schreibe("recherche", f"Recherche: {frage}", record["status"], veraendernd=False,
                        wer=PS.active().name, pfad=stand.pfad, ergebnis=stand.abgebrochen or None)
@@ -863,6 +907,8 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
         notstopp.runde_aktiv(False)
         if hasattr(backend, "denk_hinweis"):
             backend.denk_hinweis = ""        # nicht abgeholt (Abbruch, Fehler): gilt nicht für die nächste Runde
+        if hasattr(backend, "rollen_anker"):
+            backend.rollen_anker = ""
         _close_records(records)
         _DBG.ereignis("Runde fertig")
         if plan.neu_seit_anzeige():          # Endstand der Todo-Liste
@@ -903,6 +949,20 @@ async def _warten_mit_stopp(task: "asyncio.Task") -> "actions.ActionResult":
     return await task
 
 
+async def _web_live(act: dict) -> "actions.ActionResult":
+    """Web-Werkzeug mit lebendiger Zeile: „🌐 sucht im Netz ◜ „…“ · 2,1 s“ (Radar und Zeit laufen mit)."""
+    info = webanzeige.laeuft(act)
+    task = asyncio.create_task(actions.run(act))
+    beginn = time.monotonic()
+    with ui.live_view(ui.web_laeuft(info, 0.0)) as live:
+        while not task.done():
+            if _abbruch_taste():
+                notstopp.ausloesen()
+            live.update(ui.web_laeuft(info, time.monotonic() - beginn))
+            await asyncio.sleep(0.15)
+    return await task
+
+
 def _ankunft_melden(ankunft: dict, denk_zeichen: int, gesamt: float) -> None:
     """Wann kamen Denken und Antwort an (Sekunden ab Absenden) – zeigt, ob Wartezeit vor dem
     Anbieter liegt oder das Denken gesammelt statt fortlaufend eintrifft."""
@@ -920,7 +980,30 @@ _HINTERGRUND_TITEL = {"bild_serie": "🎨 male deine Serie", "video_erstellen": 
                       "lora_trainieren": "🧬 trainiere deine LoRA",
                       "coding_lora_trainieren": "🧠 trainiere das Coding-LoRA",
                       "musik_machen": "🎵 komponiere deinen Song", "musik_cover": "🎵 spiele das Cover ein"}
-_FORTSCHRITT_WERKZEUGE = ("bild_malen", "bild_serie", "kugel_anziehen", "backup_erstellen", "video_erstellen")
+_FORTSCHRITT_WERKZEUGE = ("bild_malen", "bild_serie", "kugel_anziehen", "backup_erstellen", "video_erstellen",
+                          "llamacpp_holen")
+
+
+async def _antworten_mit_reserve(aus: dict, backend, next_input, imgs):
+    """Antwort holen. Kann der eigene Motor das Modell nicht laden und ist die llama.cpp-Reserve
+    eingerichtet, wird erst gefragt; mit Ja lädt die Reserve das Modell und antwortet."""
+    try:
+        return await aus["antworten"](backend, next_input, imgs)
+    except llamareserve.ReserveFrage as frage:
+        wahl = await aus["frage"](frage.frage, [("ja", f"Ja, mit llama.cpp {llamareserve.BUILD}"),
+                                                ("nein", "Nein")])
+        if wahl != "ja":
+            aus["warn"](str(frage))
+            return None
+        import gguflokal
+        gguflokal.motor_setzen(frage.name, gguflokal.LLAMACPP)
+        aus["info"](f"🦙 {frage.name} läuft jetzt über llama.cpp {llamareserve.BUILD} "
+                    "(zurück zum eigenen Motor: /model).")
+        try:
+            return await aus["antworten"](backend, next_input, imgs)
+        except llamareserve.ReserveFrage as noch:     # kann nicht vorkommen, aber nie im Kreis fragen
+            aus["warn"](str(noch))
+            return None
 
 
 async def _schleife(backend, user_text, images, records, denk, aus: dict) -> None:
@@ -941,6 +1024,7 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
     gegenprobe_gemacht = False               # höchstens eine Gegenprobe je Runde
     block_nachgefragt = False                # unlesbarer Aktionsblock: höchstens einmal neu anfordern
     gestupst = False                         # angekündigt, aber nichts aufgerufen: höchstens einmal je Runde
+    rolle_gestupst = False                   # dritte Person statt Ich-Form: höchstens einmal je Runde
     gesamt =CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
     for schritt in itertools.count():
         if notstopp.ausgeloest():            # Not-Stopp: kein weiterer Schritt
@@ -960,7 +1044,7 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
         imgs = images if first else (naechste_bilder or None)
         first = False
         naechste_bilder = []
-        r = await aus["antworten"](backend, next_input, imgs)
+        r = await _antworten_mit_reserve(aus, backend, next_input, imgs)
         if r is None:                        # Fehler schon gemeldet
             return
         SESSION["tokens"] += r["tokens"]
@@ -1000,6 +1084,14 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
                 _DBG.ereignis(f"Wort halten: {satz}", speicher=False)
                 _denkwerk_start(backend, denkwerk.nachfass_runde(satz))
                 next_input = denkwerk.nachfassen(satz)
+                continue
+            if not letzter and not rolle_gestupst and (
+                    stelle := rolle.dritte_person(cleaned, PS.active().name, user_text)):
+                rolle_gestupst = True        # über sich in der dritten Person: einmal neu in der Ich-Form
+                aus["info"]("🎭 Dritte Person statt Ich-Form – die KI schreibt die Antwort neu.")
+                import debugbericht as _DBG
+                _DBG.ereignis(f"Rolle: dritte Person – {stelle}", speicher=False)
+                next_input = rolle.stups(stelle, PS.active().name)
                 continue
             if not letzter and not gegenprobe_gemacht and (gp := _gegenprobe(cleaned, records)):
                 gegenprobe_gemacht = True    # die KI sieht ihre Antwort noch einmal gegen die Ergebnisse
@@ -1310,6 +1402,11 @@ def _terminal_ausgabe() -> dict:
     async def pruefe_helfer(titel, preview):
         return "yes" if await review_action_confirm(titel, preview) else "no"
 
+    def zeige_aktion(d, c, a) -> None:
+        ui.console.print(ui.action_request(d, c, kopf=sicherheit.kopf(a, c),
+                                           risiko=sicherheit.stufe(a) == sicherheit.RISKANT, act=a))
+    zeige_aktion.web_live = True                    # Web-Werkzeuge zeigen hier ihre eigene, lebendige Zeile
+
     async def ausfuehren(act, tool, titel):
         if tool in _FORTSCHRITT_WERKZEUGE:
             # Bildmalen und Backup zeigen einen echten Ladebalken (Schritt i/n), genau wie die Befehle.
@@ -1329,6 +1426,8 @@ def _terminal_ausgabe() -> dict:
             return await run_task
         if tool == "befehl" or coding.pruefbefehl(act):
             return await _befehl_live(act)
+        if tool in webanzeige.WERKZEUGE:
+            return await _web_live(act)
         with ui.thinking("führe aus"):
             return await _warten_mit_stopp(asyncio.create_task(actions.run(act)))
 
@@ -1336,9 +1435,12 @@ def _terminal_ausgabe() -> dict:
         if tool == "plan" and res.ok:
             _plan_zeigen()
         else:
-            web = tool in ("web_lesen", "web_wiki", "web_suche", "fach_suche")
-            ui.console.print(ui.action_result(ui.anzeige_kurz(res.text) if web else res.text, ok=res.ok,
-                                              sekunden=sekunden))
+            web = tool in webanzeige.WERKZEUGE
+            if web and getattr(res, "anzeige", None):
+                ui.console.print(ui.web_ergebnis(res.anzeige, sekunden))
+            else:
+                ui.console.print(ui.action_result(ui.anzeige_kurz(res.text) if web else res.text, ok=res.ok,
+                                                  sekunden=sekunden))
             if vorher is not None and res.ok:
                 _diff_zeigen(act, vorher)
             if tool in ("musik_machen", "musik_cover") and res.ok:
@@ -1358,9 +1460,7 @@ def _terminal_ausgabe() -> dict:
         "info": ui.info, "warn": ui.warn, "hinweis": ui.warn,
         "ergebnis": lambda text, ok: ui.console.print(ui.action_result(text, ok=ok)),
         "frage": ask_confirm, "pruefe": review_action_confirm,
-        "zeige_aktion": lambda d, c, a: ui.console.print(
-            ui.action_request(d, c, kopf=sicherheit.kopf(a, c),
-                              risiko=sicherheit.stufe(a) == sicherheit.RISKANT, act=a)),
+        "zeige_aktion": zeige_aktion,
         "helfer": {"zeige_aktion": lambda d, c: ui.console.print(ui.action_request(d, c)),
                    "zeige_ergebnis": lambda t, ok, rc: ui.console.print(ui.action_result(t, ok=ok)),
                    "frage": ask_confirm, "pruefe": pruefe_helfer, "warne": ui.warn},
@@ -1370,7 +1470,7 @@ def _terminal_ausgabe() -> dict:
                         "zeige_bericht": lambda i, h, b: ui.console.print(
                             ui.subagent_panel(i, h["rolle"], h["aufgabe"], b)),
                         "frage": ask_confirm},
-        "recherche": {"melde": ui.info, "abbruch": _stopp_taste,
+        "recherche": {"melde": ui.info, "abbruch": _stopp_taste, "leiste": ui.recherche_live,
                       "plan_zeigen": lambda tf: ui.console.print(
                           ui.action_request(_recherche_plan_text(tf), confirm=False))},
         "menue": menue, "ausfuehren": ausfuehren, "nach_aktion": nach_aktion,
@@ -1403,6 +1503,8 @@ def _web_ausgabe(emit, confirm, erlaubt=None) -> dict:
                 else:
                     answer += ev["text"]
                     emit({"t": "answer", "delta": ev["text"]})
+        except llamareserve.ReserveFrage:
+            raise                                    # die Schleife fragt, ob die Reserve übernimmt
         except Exception as exc:
             emit({"t": "error", "text": f"Fehler bei der Antwort: {exc}"})
             return None
@@ -1438,7 +1540,17 @@ def _web_ausgabe(emit, confirm, erlaubt=None) -> dict:
         return await actions.run(act)
 
     def nach_aktion(act, tool, res, sekunden, vorher, abgehakt, uris) -> None:
-        emit({"t": "action_result", "ok": res.ok, "text": res.text, "returncode": res.returncode})
+        ev = {"t": "action_result", "ok": res.ok, "text": res.text, "returncode": res.returncode}
+        if tool in webanzeige.WERKZEUGE and getattr(res, "anzeige", None):
+            ev.update(web=res.anzeige, sekunden=round(sekunden, 1))
+        emit(ev)
+
+    def zeige_aktion(d, c, a) -> None:
+        ev = {"t": "action", "desc": d, "needs_confirm": c, "risiko": sicherheit.stufe(a) == sicherheit.RISKANT,
+              "stufe": sicherheit.stufe(a)}
+        if not c and str((a or {}).get("tool") or "") in webanzeige.WERKZEUGE:
+            ev["web"] = webanzeige.laeuft(a)          # das Fenster zeigt dazu die lebendige Web-Zeile
+        emit(ev)
 
     note = lambda t: emit({"t": "note", "text": t})       # noqa: E731
     warn = lambda t: emit({"t": "warn", "text": t})       # noqa: E731
@@ -1447,9 +1559,7 @@ def _web_ausgabe(emit, confirm, erlaubt=None) -> dict:
         "info": note, "warn": warn, "hinweis": note,
         "ergebnis": lambda text, ok: emit({"t": "action_result", "ok": ok, "text": text}),
         "frage": confirm, "pruefe": pruefe,
-        "zeige_aktion": lambda d, c, a: emit({"t": "action", "desc": d, "needs_confirm": c,
-                                              "risiko": sicherheit.stufe(a) == sicherheit.RISKANT,
-                                              "stufe": sicherheit.stufe(a)}),
+        "zeige_aktion": zeige_aktion,
         "helfer": {"zeige_aktion": lambda d, c: emit({"t": "action", "desc": d, "needs_confirm": c}),
                    "zeige_ergebnis": lambda t, ok, rc: emit({"t": "action_result", "ok": ok, "text": t,
                                                              "returncode": rc}),
@@ -1465,7 +1575,8 @@ def _web_ausgabe(emit, confirm, erlaubt=None) -> dict:
                             "t": "action_result", "ok": None,
                             "text": f"🤝 {subagents.label(i, h)} – {h['aufgabe']}\n\n{b}"}),
                         "frage": confirm},
-        "recherche": {"melde": note, "plan_zeigen": lambda tf: note(_recherche_plan_text(tf))},
+        "recherche": {"melde": note, "plan_zeigen": lambda tf: note(_recherche_plan_text(tf)),
+                      "fortschritt": lambda stand: emit({"t": "recherche", "stand": stand})},
         "menue": None, "ausfuehren": ausfuehren, "nach_aktion": nach_aktion,
         "abbruch": lambda: False, "erlaubt": erlaubt, "mit_stopp": False, "mitschrift": False, "diff": False,
     }
@@ -1577,6 +1688,8 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
         notstopp.runde_aktiv(False)
         if hasattr(backend, "denk_hinweis"):
             backend.denk_hinweis = ""
+        if hasattr(backend, "rollen_anker"):
+            backend.rollen_anker = ""
         _close_records(records)
         emit({"t": "receipt", "records": records})
 

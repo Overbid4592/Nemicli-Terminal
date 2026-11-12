@@ -37,9 +37,21 @@ class Provider:
     keyless: bool = False         # braucht keinen API-Key (z.B. lokales Ollama)
 
     def key(self) -> str | None:
+        if self.kind == "chatgpt":                  # ChatGPT-Konto: Zugangs-Token statt Schlüssel (chatgpt_login)
+            try:
+                import chatgpt_login
+                return chatgpt_login.zugang()
+            except Exception:
+                return None
         return os.getenv(self.env)
 
     def available(self) -> bool:
+        if self.kind == "chatgpt":                  # ohne Netzanfrage: angemeldet und Plan-Nutzung freigegeben
+            try:
+                import chatgpt_login
+                return chatgpt_login.nutzbar()
+            except Exception:
+                return False
         if self.keyless:
             # Keyless-Anbieter sind lokal: nur „verfügbar", wenn der Dienst läuft.
             import providers
@@ -83,6 +95,13 @@ CLOUD: dict[str, Provider] = {
         chat_base="https://api.openai.com/v1",
         list_url="https://api.openai.com/v1/models",
         keep=_any("gpt", "o1", "o3", "o4", "chatgpt"),
+    ),
+    "chatgpt": Provider(
+        "chatgpt", "ChatGPT-Konto (Plus/Pro)", "NEMICLI_CHATGPT_KONTO",
+        chat_base="https://api.openai.com/v1",
+        kind="chatgpt",
+        list_url="https://api.openai.com/v1/models",
+        note="mit deinem ChatGPT-Plan, ohne API-Schlüssel – Anmeldung im Browser",
     ),
     "google": Provider(
         "google", "Google (Gemini)", "GEMINI_API_KEY",
@@ -328,6 +347,9 @@ _CLOUD_VISION_HINTS = (
     "-vl", "vision", "llava", "internvl", "qwen2-vl", "qwen2.5-vl",  # generische VLMs
     "qwen3-vl", "minicpm-v", "molmo", "moondream", "cogvlm",
     "llama-3.2-11b", "llama-3.2-90b", "llama-4",                    # Llama-Vision
+    # Ollama Cloud mit „vision“ in /api/show
+    "gemma4", "glm-5.3-flash", "kimi-k2.6", "kimi-k2.7", "kimi-k3", "mimo-v2.6", "minimax-m3",
+    "mistral-large-3", "mistral-large-4", "muse-spark",
 )
 
 
@@ -371,6 +393,11 @@ def _eintraege(p: Provider, data: dict | list) -> list[tuple[str, dict]]:
             name = (m.get("name") or "").split("/")[-1]
             if name:
                 aus.append((name, m))
+    elif p.id == "chatgpt":
+        # {"models":[{"slug":"…","display_name":"…","visibility":"list"}]} – nur „list“, Reihenfolge des Servers
+        for m in (data.get("models", []) if isinstance(data, dict) else []):
+            if isinstance(m, dict) and m.get("visibility") == "list" and isinstance(m.get("slug"), str):
+                aus.append((m["slug"], m))
     elif p.id == "cohere":
         # {"models":[{"name":"command-r-plus","endpoints":[...], "context_length": …}]}
         for m in (data.get("models", []) if isinstance(data, dict) else []):
@@ -382,6 +409,9 @@ def _eintraege(p: Provider, data: dict | list) -> list[tuple[str, dict]]:
     else:
         # OpenAI-Form: {"data":[{"id":"..."}]} (auch Anthropic, Mistral, ...); Together und GitHub: gleich die Liste
         eintraege = data if isinstance(data, list) else data.get("data", [])
+        # Ollama Cloud: neben "data" steht "models" je slug mit Kontext und supported_in_api
+        zusatz = ({m["slug"]: m for m in data.get("models", []) if isinstance(m, dict) and isinstance(m.get("slug"), str)}
+                  if isinstance(data, dict) else {})
         for m in eintraege:
             if not isinstance(m, dict):
                 continue
@@ -390,8 +420,13 @@ def _eintraege(p: Provider, data: dict | list) -> list[tuple[str, dict]]:
             if art and art not in ("chat", "language", "code", "model", "llm", "text", "base", "fine-tuned"):
                 continue                          # Embeddings, Bilder, Audio aus gemischten Katalogen
             mid = m.get("id") or m.get("name")
-            if mid:
-                aus.append((str(mid), m))
+            if not mid:
+                continue
+            if (mehr := zusatz.get(str(mid))) is not None:
+                if mehr.get("supported_in_api") is False:
+                    continue                      # steht in der Liste, ist über die API aber nicht nutzbar
+                m = {**mehr, **m}
+            aus.append((str(mid), m))
     return aus
 
 

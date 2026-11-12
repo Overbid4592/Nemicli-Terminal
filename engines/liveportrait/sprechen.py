@@ -251,7 +251,7 @@ def koerpersprache(klang: list[Bildklang], fps: int, text: str = "", seed: int =
     if not blinzeln:
         blinzeln = [r.uniform(0.8, 1.6)]
     zuletzt = -9.0
-    for s in blinzeln + [s + r.uniform(2.5, 4.0) for s in blinzeln]:
+    for s in sorted(blinzeln + [s + r.uniform(2.5, 4.0) for s in blinzeln]):    # Abstand gilt in Zeitfolge
         if s < d - 0.3 and s - zuletzt > 1.5:
             k += [{"t": s, "augen": None}, {"t": s + 0.08, "augen": 0.0}, {"t": s + 0.2, "augen": None}]
             zuletzt = s

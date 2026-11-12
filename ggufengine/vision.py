@@ -87,7 +87,7 @@ class Gemma4Vision:
     def __init__(self, path: str, device, dtype=torch.bfloat16):
         self.gg = GGUFFile(path)
         g = self.gg
-        if g.get("clip.vision.projector_type") != "gemma4v" or not g.get("clip.has_vision_encoder"):
+        if projector_type(g) != "gemma4v" or not g.get("clip.has_vision_encoder"):
             raise GGUFError("not a Gemma 4 vision projector (clip.vision.projector_type != gemma4v)")
         self.n_embd = int(g.require("clip.vision.embedding_length"))
         self.n_head = int(g.require("clip.vision.attention.head_count"))
@@ -228,7 +228,7 @@ class Gemma4UnifiedVision(Gemma4Vision):
         from .models.common import PREFILL_CHUNK
         self.gg = GGUFFile(path)
         g = self.gg
-        if g.get("clip.vision.projector_type") != "gemma4uv" or not g.get("clip.has_vision_encoder"):
+        if projector_type(g) != "gemma4uv" or not g.get("clip.has_vision_encoder"):
             raise GGUFError("not a Gemma 4 unified vision projector (clip.vision.projector_type != gemma4uv)")
         self.n_embd = int(g.require("clip.vision.embedding_length"))
         self.merge_in_patch = int(g.get("clip.vision.projector.scale_factor", 3))

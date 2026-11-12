@@ -126,7 +126,7 @@ class Mamba2:
         z, xbc, dt = proj.split([self.d_inner, self.conv_dim, self.H], dim=-1)
         xbc_ein = xbc
         full = torch.cat([self.conv_state, xbc], dim=0)              # causal conv with carried window
-        self.conv_state.copy_(full[-(self.K - 1):])
+        self.conv_state.copy_(full[full.shape[0] - (self.K - 1):])
         xbc = F.conv1d(full.t().unsqueeze(0), self.conv_w, self.conv_b, groups=self.conv_dim)[0].t()
         xbc = F.silu(xbc)
         xs, B, C = xbc.split([self.d_inner, self.G * self.N, self.G * self.N], dim=-1)
@@ -194,7 +194,7 @@ class ShortConv:
         if zeilen_merken():
             self._merk[bx.shape[0]] = bx
         full = torch.cat([self.state, bx], dim=0)
-        self.state.copy_(full[-(self.K - 1):])
+        self.state.copy_(full[full.shape[0] - (self.K - 1):])
         conv = F.conv1d(full.t().unsqueeze(0), self.conv_w, self.conv_b, groups=self.E)[0].t()
         return self.out(c * conv)
 

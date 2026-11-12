@@ -107,6 +107,7 @@ class CloudChat:
         self._puffer_hinweis = ""
         self._kontext_gemessen = False
         self.denk_hinweis = ""                       # Denkwerk: nur mit der nächsten gesendeten Nachricht
+        self.rollen_anker = ""                       # Ich-Form/Sprechweise: ebenso, getrennt vom Denk-Hinweis
         self._hat_gedacht = False                    # das Modell lieferte schon eigenes Nachdenken
 
         # --- Auto-Stark-Modus (nur lokales Ollama, nur leichtes Gemma) ----------
@@ -367,6 +368,27 @@ class CloudChat:
             # Denkparameter und Budget bleiben bei diesem einen Retry erhalten.
             return await self.client.chat.completions.create(**kwargs)
 
+    async def _auswerten(self, stream) -> AsyncIterator[dict]:
+        """Stücke des Anbieter-Streams einheitlich: usage · thinking · text · length (Budget erreicht).
+        Der Responses-Motor (openai_responses.py) liest seine Ereignisse hier anders."""
+        async for chunk in stream:
+            u = getattr(chunk, "usage", None)
+            if u:
+                yield {"type": "usage",
+                       "input": getattr(u, "prompt_tokens", 0) or 0,
+                       "output": getattr(u, "completion_tokens", 0) or 0}
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            if getattr(choice, "finish_reason", None) == "length":
+                yield {"type": "length"}
+            d = choice.delta
+            think = getattr(d, "reasoning_content", None) or getattr(d, "reasoning", None)
+            if think:
+                yield {"type": "thinking", "text": think}
+            if d.content:
+                yield {"type": "text", "text": d.content}
+
     async def _ist_schwer(self, user_text: str) -> bool:
         """Fragt das LEICHTE Modell selbst, ob die Anfrage schwer ist. Ein kurzer
         Ein-Wort-Aufruf (~1 s) – bei einem Ja übernimmt danach das große Modell.
@@ -428,12 +450,13 @@ class CloudChat:
         if self._lokal:
             await self._hintergrund_anhaengen(self.messages[-1], user_text)
         hinweis, self.denk_hinweis = self.denk_hinweis, ""
+        anker, self.rollen_anker = self.rollen_anker, ""
         gebeten = bool(hinweis) and not self.denkt_selbst    # <think> im Text ist dann erbetenes Nachdenken
-        if hinweis:
+        if (zusatz := "\n\n".join(t for t in (hinweis, anker) if t)):
             frage = self.messages[-1]
             self._gesendet = {k: v for k, v in self._gesendet.items() if any(v[0] is m for m in self.messages)}
             g = self._gesendet.get(id(frage))
-            self._gesendet[id(frage)] = (frage, denkwerk.mit_hinweis(g[1] if g else user_text, hinweis))
+            self._gesendet[id(frage)] = (frage, denkwerk.mit_hinweis(g[1] if g else user_text, zusatz))
         sys_msg = {"role": "system",
                    "content": await persona.build_system_prompt_async(
                        "" if self._lokal else user_text, kompakt_fuer_lokal=self._lokal,
@@ -482,23 +505,19 @@ class CloudChat:
         feed, flush = think_splitter()
         truncated = False
         try:
-            async for chunk in stream:
-                u = getattr(chunk, "usage", None)
-                if u:
-                    yield {"type": "usage",
-                           "input": getattr(u, "prompt_tokens", 0) or 0,
-                           "output": getattr(u, "completion_tokens", 0) or 0}
-                if not chunk.choices:
+            async for teil in self._auswerten(stream):
+                art = teil["type"]
+                if art == "usage":
+                    yield teil
                     continue
-                choice = chunk.choices[0]
-                if getattr(choice, "finish_reason", None) == "length":
+                if art == "length":
                     truncated = True
-                d = choice.delta
-                think = getattr(d, "reasoning_content", None) or getattr(d, "reasoning", None)
-                if think:
+                    continue
+                if art == "thinking":
                     self._hat_gedacht = True
-                    yield {"type": "thinking", "text": think}
-                delta = d.content or ""
+                    yield teil
+                    continue
+                delta = teil["text"]
                 if delta:
                     for kind, txt in feed(delta):
                         if kind == "text":

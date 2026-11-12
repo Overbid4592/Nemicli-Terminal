@@ -25,6 +25,7 @@ class Fenster(Wirt):
     def __init__(self, lz: "AppLaufzeit"):
         self.lz = lz
         self.hoerer: dict[str, list] = {}
+        self.eigen_hoerer: dict = {}          # window.on<typ>: höchstens einer je Typ
         self.eltern = None
 
     def hoeren(self, typ, fn, einmal=False):
@@ -32,6 +33,14 @@ class Fenster(Wirt):
 
     def nicht_mehr_hoeren(self, typ, fn):
         self.hoerer[typ] = [(f, e) for f, e in self.hoerer.get(typ, []) if f is not fn]
+
+    def eigen_setzen(self, typ, fn):
+        alt = self.eigen_hoerer.pop(typ, None)
+        if alt is not None:
+            self.nicht_mehr_hoeren(typ, alt)
+        if ist_aufrufbar(fn):
+            self.eigen_hoerer[typ] = fn
+            self.hoeren(typ, fn)
 
     def js_get(self, key, js):
         lz = self.lz
@@ -50,11 +59,13 @@ class Fenster(Wirt):
             return js.nativ(lambda js_, t, a: self.nicht_mehr_hoeren(zu_text(a[0]), a[1]) if len(a) > 1 else UNDEF, key)
         if key == "document":
             return lz.dok
+        if key.startswith("on") and key[2:] in self.eigen_hoerer:
+            return self.eigen_hoerer[key[2:]]
         return js.global_scope.vars.get(key, UNDEF)
 
     def js_set(self, key, wert, js):
-        if key.startswith("on") and ist_aufrufbar(wert):
-            self.hoeren(key[2:], wert)
+        if key.startswith("on") and len(key) > 2 and (ist_aufrufbar(wert) or key[2:] in self.eigen_hoerer):
+            self.eigen_setzen(key[2:], wert)
             return
         js.global_scope.vars[key] = wert
 
@@ -173,9 +184,13 @@ class AppLaufzeit:
             if ziel is not None:
                 self.dok.ausloesen(ziel, ev)
             else:
-                for fn, _e in list(self.fenster.hoerer.get(typ, [])):
+                hoerer = [(fn, self.fenster) for fn, _e in self.fenster.hoerer.get(typ, [])]
+                body = self.dok.finden("body") if typ == "load" else None
+                if body is not None:                 # <body onload> und body.onload gehören zu window.onload
+                    hoerer += [(fn, body) for fn, _e in body.hoerer.get("load", [])]
+                for fn, this in hoerer:
                     self.js.einstieg()
-                    self.js.rufen(fn, self.fenster, [ev])
+                    self.js.rufen(fn, this, [ev])
                 self.js.mikro_abarbeiten()
         except (JSFehler, Grenze) as e:
             self.melden(f"❌ {typ}: {e}")
@@ -196,7 +211,12 @@ class AppLaufzeit:
         try:
             self.speicher_datei.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.speicher_datei.with_suffix(".tmp")
-            tmp.write_text(json.dumps(daten, ensure_ascii=False), encoding="utf-8")
+            text = json.dumps(daten, ensure_ascii=False)
+            try:
+                text.encode("utf-8")
+            except UnicodeEncodeError:               # einzelne UTF-16-Hälfte aus JS: als \u-Escape ablegen
+                text = json.dumps(daten)
+            tmp.write_text(text, encoding="utf-8")
             tmp.replace(self.speicher_datei)
         except OSError:
             pass
@@ -232,3 +252,13 @@ class AppLaufzeit:
 
     def zeitgeber(self) -> None:
         self.sicher(self.js.faellige_ausfuehren)
+
+    def zeitgeber_laufen(self, bis_ms: float, max_fehler: int = 100) -> None:
+        """Headless: Zeitgeber bis bis_ms (virtuelle Zeit); ein Fehler meldet sich und hält die übrigen nicht an."""
+        ende = self.js.jetzt() + bis_ms
+        for _ in range(max_fehler):
+            try:
+                self.js.zeitgeber_laufen(max(0.0, ende - self.js.jetzt()))
+                return
+            except (JSFehler, Grenze) as e:
+                self.melden(f"❌ Zeitgeber: {e}")

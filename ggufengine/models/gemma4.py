@@ -172,6 +172,8 @@ class _Layer:
 class Gemma4Model:
     alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
     arch_names = ("gemma4",)
+    mtp = None               # Hilfskopf (gemma4hilfe.Hilfskopf) für Vorschläge, siehe hilfskopf_setzen
+    MTP_SICHER = 0.1         # weitere Vorschläge ab dieser Wahrscheinlichkeit (der erste immer); E4B gemessen: 0.5 zu streng
 
     def __init__(self, gg: GGUFFile, device: torch.device, dtype: torch.dtype, n_ctx: int = 8192, progress=None,
                  quant: bool = True, ple_ram: bool = True, kv_bits: int = 16, experten_vram: Optional[int] = None):
@@ -211,6 +213,7 @@ class Gemma4Model:
         self.hp = hp
         self.n_ctx = n_ctx
         self.device = device
+        self.dtype = dtype
         n_kv_layers = n_layer - n_shared
 
         ld = WeightLoader(gg, device, dtype, progress, quant=quant, kv_bits=kv_bits, experten_vram=experten_vram)
@@ -263,6 +266,11 @@ class Gemma4Model:
         for layer in self.layers:
             if layer.has_kv and layer.cache.pos is not None:
                 layer.cache.pos.fill_(-1)
+        self._hidden_vergessen()
+
+    def _hidden_vergessen(self) -> None:
+        if self.mtp is not None:              # die gemerkten Hidden-States gehören nicht mehr zum Cache
+            self._h_bereich.zero_()
 
     def snapshot_state(self):
         return None
@@ -286,6 +294,7 @@ class Gemma4Model:
             cache.k.copy_(k)
             cache.v.copy_(v)
             cache.pos.copy_(pos)
+        self._hidden_vergessen()
 
     def restore_state(self, snap):
         pass
@@ -317,14 +326,76 @@ class Gemma4Model:
             proj = (self.pl_proj(h).float() / self.embd_scale).view(L, n_layer, self.n_pl)
             proj = rms_norm(proj, self.pl_norm, self.hp["eps"])
             ple = (proj + pl) * (1.0 / math.sqrt(2.0))                   # (L, n_layer, Epl)
+        erste_geteilte = next((i for i, l in enumerate(self.layers) if not l.has_kv), None)
         for i, layer in enumerate(self.layers):
+            if i == erste_geteilte and L > 1 and not self.alle_logits:
+                # Ab hier schreiben die Schichten keinen KV-Speicher mehr (sie lesen den der unteren): nur die
+                # Zeile mit Logits rechnen. Die letzte Zeile sieht keine späteren Bild-Token, spans entfallen.
+                h, pos_idx, spans = h[-1:], pos_idx[-1:], None
+                if ple is not None:
+                    ple = ple[-1:]
             h = layer(h, pos_idx, kv_len, ple[:, i] if ple is not None else None, spans)
         h = rms_norm(letzte_zeilen(self, h), self.out_norm, self.hp["eps"])
+        if self.mtp is not None:              # Hidden-States für den Hilfskopf, mit der Position der ersten Zeile
+            n = h.shape[0]
+            self._h_zeilen[:n].copy_(h)
+            self._h_bereich.copy_(torch.cat([pos_idx[-1:] - (n - 1), pos_idx[-1:] + 1]))
         logits = logit_zeilen(self, self.lm_head(h)).float()
         cap = self.hp["softcap"]
         if cap > 0:
             logits = cap * torch.tanh(logits / cap)
         return logits
+
+    # -- Hilfskopf (MTP-Assistent) ---------------------------------------------
+    def hilfskopf_setzen(self, pfad: str) -> None:
+        """Lädt den Hilfskopf aus `pfad` (GGUF oder safetensors). Die schon aufgenommenen Graphen werden
+        verworfen: ab jetzt merkt sich jeder Lauf seine Hidden-States."""
+        from .gemma4hilfe import Hilfskopf
+        kopf = Hilfskopf(pfad, self)
+        self.hilfskopf_weg()
+        if self.graph is not None:
+            self.graph.leeren()
+        self._h_zeilen = torch.zeros(PREFILL_CHUNK, self.hp["n_embd"], device=self.device, dtype=torch.float32)
+        self._h_bereich = torch.zeros(2, device=self.device, dtype=torch.long)   # Positionen [von, bis) der Zeilen
+        self._ketten = {}                     # Anzahl Vorschläge -> (HilfeKette, GraphDecoder oder None)
+        self.mtp = kopf
+
+    def hilfskopf_weg(self) -> None:
+        if self.mtp is None:
+            return
+        if self.graph is not None:
+            self.graph.leeren()
+        kopf = self.mtp
+        self.mtp, self._ketten = None, {}
+        self._h_zeilen = self._h_bereich = None
+        kopf.schliessen()
+
+    @torch.inference_mode()
+    def mtp_vorschlag(self, token: int, pos: int, n: int) -> List[int]:
+        """Bis zu n Vorschläge (gierig) für die Tokens nach `token` an Platz `pos` (die Plätze davor hat das
+        Modell gelesen); nach dem ersten nur, solange der Hilfskopf sicher ist (`MTP_SICHER`)."""
+        if self.mtp is None or not 0 < pos < self.n_ctx or n < 1:
+            return []
+        if n not in self._ketten:
+            from .gemma4hilfe import HilfeKette
+            kette = HilfeKette(self.mtp, self, n)
+            self._ketten[n] = (kette, GraphDecoder(kette, self.n_ctx, haupt=self.graph, name=f"mtp{n}")
+                               if self.graph is not None else None)
+        kette, graph = self._ketten[n]
+        if graph is not None and self.graph is not None:
+            aus = graph(token, pos)
+        else:
+            aus = kette._run(torch.tensor([token], device=self.device), torch.tensor([pos], device=self.device),
+                             pos + 1)
+        zeilen = aus.tolist()                 # das einzige Warten auf die GPU in dieser Runde
+        if not zeilen[0][0]:
+            return []                         # der letzte Lauf hat pos - 1 nicht gerechnet
+        raus = []
+        for tid, sicher in zeilen[1:]:
+            if raus and sicher < self.MTP_SICHER:
+                break
+            raus.append(int(tid))
+        return raus
 
     def vor_graph(self, tokens: List[int]) -> None:
         """Host-side step before every run, also before a captured graph: the per-layer rows of

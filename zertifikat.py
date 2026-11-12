@@ -24,6 +24,8 @@ JAHRE = 5
 
 
 def _ps(skript: str) -> subprocess.CompletedProcess:
+    # Windows PowerShell gibt umgeleitet in der OEM-Codepage aus; UTF-8 ohne BOM erzwingen.
+    skript = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false\n" + skript
     return subprocess.run(["powershell", "-NoProfile", "-Command", skript],
                           capture_output=True, text=True, encoding="utf-8", errors="replace")
 

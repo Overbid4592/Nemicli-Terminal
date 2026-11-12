@@ -130,7 +130,7 @@ def _move_tensors(root, select, convert, ansichten: bool = False) -> set:
     return {id(t) for t in memo.values()}
 
 
-def _haelt_tensor(v, tiefe: int = 3) -> bool:
+def _haelt_tensor(v, tiefe: int = 8) -> bool:
     """Does `v` (a tensor, or a list/tuple/dict a few levels deep) hold a tensor?"""
     if isinstance(v, torch.Tensor):
         return True
@@ -163,6 +163,23 @@ def _dry_frei(erzeugt: bytes, marken: tuple) -> bool:
         a = erzeugt.rfind(auf)
         if a >= 0 and (not zu or erzeugt.rfind(zu) < a):
             return True
+    return False
+
+
+def _gleiche_form(geladen, soll, n_ctx: int) -> bool:
+    """Has a stored model state exactly the structure of the current one (nesting, shapes,
+    dtypes)?  Integer tensors are positions and must lie in [-1, n_ctx]."""
+    if soll is None or geladen is None:
+        return soll is None and geladen is None
+    if isinstance(soll, torch.Tensor):
+        if not isinstance(geladen, torch.Tensor) or geladen.shape != soll.shape or geladen.dtype != soll.dtype:
+            return False
+        if not geladen.dtype.is_floating_point and geladen.dtype != torch.bool and geladen.numel():
+            return bool(int(geladen.min()) >= -1 and int(geladen.max()) <= n_ctx)
+        return True
+    if isinstance(soll, (list, tuple)):
+        return (isinstance(geladen, (list, tuple)) and len(geladen) == len(soll)
+                and all(_gleiche_form(a, b, n_ctx) for a, b in zip(geladen, soll)))
     return False
 
 
@@ -535,7 +552,8 @@ class Engine:
 
     def _uhr(self) -> float:
         if self.device.type == "cuda":      # the sampler waits for the GPU right after anyway
-            torch.cuda.synchronize()
+            with GPU_SPERRE:                # not during a graph capture in another thread
+                torch.cuda.synchronize()
         return time.perf_counter()
 
     def _graph_aufnahmen(self) -> int:
@@ -584,6 +602,7 @@ class Engine:
         platz = min(self.n_ctx - self._pos - 1, PREFILL_CHUNK - 1)
         # the sampler has just waited for the GPU: the clock starts without a synchronize
         t0 = time.perf_counter()                     # proposing counts as part of the check
+        vorher = self._graph_aufnahmen() if entwurf is not None else 0   # before proposing: MTP captures too
         if isinstance(entwurf, MtpEntwurf) and vorschlagen and platz > 0:
             self._kv_room(self._pos + min(entwurf.mtp_n, platz))   # MTP writes its KV cache from _pos on
         vorschlag = entwurf.vorschlag(platz) if entwurf is not None and vorschlagen else []
@@ -591,7 +610,6 @@ class Engine:
         k = next((s for s in VORSCHLAG_STUFEN if s <= min(len(vorschlag), grenze)), 0)
         vorschlag = vorschlag[:k]                    # few sizes: few captured graphs
         if not vorschlag:
-            vorher = self._graph_aufnahmen() if entwurf is not None else 0
             logits = self.feed([tid], own=[True])
             if entwurf is not None and self._nutzen.einzeln_messen():   # a synchronize only now and then
                 dauer = self._uhr() - t0
@@ -599,7 +617,7 @@ class Engine:
                     self._nutzen.einzeln(dauer)
             return logits
         self._nutzen.start(len(vorschlag))
-        self._aufnahmen = self._graph_aufnahmen()
+        self._aufnahmen = vorher
         zustand = self.model.snapshot_state() if self._rekurrent() else None
         self._spek_basis = (self._pos, zustand)
         self._spek_L = 1 + len(vorschlag)
@@ -700,6 +718,7 @@ class Engine:
                 logits = self._weiter(tid, entwurf)
         finally:
             self._verwerfen()
+            self._spek_basis = None                          # its state snapshot would stay in VRAM
 
     # -- high level ----------------------------------------------------------
     def complete(self, text: str, **kw) -> Iterator[str]:
@@ -836,8 +855,9 @@ class Engine:
             moved |= c.ensure(n)
         graph = getattr(self.model, "graph", None)
         if moved and graph is not None:            # graphs and their memory pool, as in offload()
-            torch.cuda.synchronize()
-            graph.leeren()
+            with GPU_SPERRE:
+                torch.cuda.synchronize()
+                graph.leeren()
 
     def _full_caches(self) -> list:
         """Full-context KV caches of the model in a fixed order (ring caches belong to
@@ -984,6 +1004,8 @@ class Engine:
                         return f.get_tensor(form).to(self.device)
                     return [build(x) for x in form]
                 state = build(json.loads(meta["state"]))
+                if not _gleiche_form(state, self.model.checkpoint_state(), self.n_ctx):
+                    return False                     # anderer Aufbau oder Positionen außerhalb des Kontexts
         except Exception:
             return False
         self.reset()
@@ -1013,12 +1035,6 @@ class Engine:
         if self.device.type != "cuda" or self.offloaded:
             return 0.0
         t0 = time.time()
-        torch.cuda.synchronize()
-        from .models.common import GraphDecoder
-        for decoder in self._objekte(GraphDecoder):  # captured graphs point at VRAM addresses – all of
-            decoder.leeren()                         # them, also the MTP proposals (qwen35 _mtp_graph)
-        if (leser := getattr(self.model, "schnell", None)) is not None:
-            leser.parken()                          # TensorRT-Leser: Gewichte aus dem VRAM
 
         def to_ram(t):
             n = t.numel() * t.element_size()
@@ -1028,14 +1044,21 @@ class Engine:
                 host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
             host.copy_(t, non_blocking=True)
             return host
-        punkte = _Pruefpunkte(self)
-        self._moved = (_move_tensors(self.model, _im_vram, to_ram, ansichten=True)
-                       | _move_tensors(punkte, _im_vram, to_ram, ansichten=True))
-        punkte.zurueck(self)
-        torch.cuda.synchronize()
-        # die alten VRAM-Tensoren hängen teils in Referenz-Kreisen: ohne Einsammeln blieben sie belegt
-        gc.collect()
-        torch.cuda.empty_cache()
+        with GPU_SPERRE:                             # synchronize, moves, empty_cache: not during a capture
+            torch.cuda.synchronize()
+            from .models.common import GraphDecoder
+            for decoder in self._objekte(GraphDecoder):  # captured graphs point at VRAM addresses – all of
+                decoder.leeren()                         # them, also the MTP proposals (qwen35 _mtp_graph)
+            if (leser := getattr(self.model, "schnell", None)) is not None:
+                leser.parken()                          # TensorRT-Leser: Gewichte aus dem VRAM
+            punkte = _Pruefpunkte(self)
+            self._moved = (_move_tensors(self.model, _im_vram, to_ram, ansichten=True)
+                           | _move_tensors(punkte, _im_vram, to_ram, ansichten=True))
+            punkte.zurueck(self)
+            torch.cuda.synchronize()
+            # die alten VRAM-Tensoren hängen teils in Referenz-Kreisen: ohne Einsammeln blieben sie belegt
+            gc.collect()
+            torch.cuda.empty_cache()
         dbg.event(f"ausgelagert in {time.time() - t0:.2f}s, VRAM {torch.cuda.memory_allocated() / 2**30:.2f} GiB")
         return time.time() - t0
 
@@ -1050,14 +1073,15 @@ class Engine:
         if (leser := getattr(self.model, "schnell", None)) is not None:
             leser.aufwecken()
         zurueck = lambda t: t.to(self.device, non_blocking=True)          # noqa: E731
-        punkte = _Pruefpunkte(self)
-        _move_tensors(self.model, lambda t: id(t) in moved, zurueck, ansichten=True)
-        _move_tensors(punkte, lambda t: id(t) in moved, zurueck, ansichten=True)
-        punkte.zurueck(self)
-        for lager in self._lager():                  # the slots got new addresses
-            lager.verankern()
-        torch.cuda.synchronize()
-        release_pinned_memory()                      # the RAM copies are no longer needed
+        with GPU_SPERRE:                             # moves and synchronize: not during a capture
+            punkte = _Pruefpunkte(self)
+            _move_tensors(self.model, lambda t: id(t) in moved, zurueck, ansichten=True)
+            _move_tensors(punkte, lambda t: id(t) in moved, zurueck, ansichten=True)
+            punkte.zurueck(self)
+            for lager in self._lager():              # the slots got new addresses
+                lager.verankern()
+            torch.cuda.synchronize()
+            release_pinned_memory()                  # the RAM copies are no longer needed
         dbg.event(f"zurück auf der GPU in {time.time() - t0:.2f}s")
         return time.time() - t0
 
@@ -1075,10 +1099,13 @@ class Engine:
             return
         self._geleert = True
         if self.device.type == "cuda":
-            torch.cuda.synchronize(self.device)
+            with GPU_SPERRE:
+                torch.cuda.synchronize(self.device)
         for name in ("graph", "_mtp_graph"):
             if (decoder := getattr(self.model, name, None)) is not None:
                 decoder.leeren()
+        if (hilfskopf_weg := getattr(self.model, "hilfskopf_weg", None)) is not None:
+            hilfskopf_weg()                          # closes the assistant's GGUF file
         if getattr(self.model, "schnell", None) is not None:
             self.model.schnell = None
         leer = torch.empty(0, device="meta")

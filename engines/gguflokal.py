@@ -355,9 +355,44 @@ def _ist_mmproj(p: Path) -> bool:
 
 def _ist_beiwerk(p: Path) -> bool:
     """Keine Sprachmodell-Datei: Bild-Teil, Wichtigkeits-Matrix der Quantisierung (imatrix…gguf),
-    eigener MTP-Kopf (mtp-….gguf, der Motor nimmt den aus der Modelldatei)."""
+    eigener MTP-Kopf (mtp-….gguf, der Motor nimmt den aus der Modelldatei), Hilfskopf (…assistant….gguf)."""
     name = p.name.lower()
-    return _ist_mmproj(p) or "imatrix" in name or name.startswith("mtp-")
+    return _ist_mmproj(p) or "imatrix" in name or name.startswith("mtp-") or _ist_hilfsname(p)
+
+
+_HILFSNAME = re.compile(r"[-_.]assistant[-_.]")
+
+
+def _ist_hilfsname(p: Path) -> bool:
+    return bool(_HILFSNAME.search(p.name.lower()))
+
+
+def hilfskopf_datei(datei: Path) -> Path | None:
+    """Hilfskopf (MTP-Assistent) zum Modell: eine GGUF mit „assistant“ im Namen oder eine safetensors-Datei
+    im Modell-Ordner oder in einem Unterordner davon, die nach ihrem Inhalt ein Hilfskopf ist."""
+    from ggufengine.models.gemma4hilfe import ist_hilfskopf
+    ordner = datei.parent
+    kandidaten = sorted(p for p in ordner.glob("*.gguf") if _ist_hilfsname(p))
+    kandidaten += sorted(ordner.glob("*.safetensors")) + sorted(ordner.glob("*/*.safetensors"))
+    return next((p for p in kandidaten if ist_hilfskopf(p)), None)
+
+
+def _hilfskopf_anbinden(engine, datei: Path) -> None:
+    """Liegt ein Hilfskopf beim Modell, schlägt er Tokens vor (das Modell prüft sie, die Antwort bleibt
+    gleich). Abschalten: Config gguf_hilfskopf = false."""
+    setzen = getattr(getattr(engine, "model", None), "hilfskopf_setzen", None)
+    if setzen is None or _config().get("gguf_hilfskopf", True) is False:
+        return
+    pfad = hilfskopf_datei(datei)
+    if pfad is None:
+        return
+    from ggufengine.models.common import GPU_SPERRE
+    try:
+        with GPU_SPERRE:
+            setzen(str(pfad))
+        _DBG.ereignis(f"Hilfskopf geladen: {pfad.name}")
+    except Exception as e:
+        _DBG.ereignis(f"Hilfskopf nicht nutzbar ({pfad.name}): {e}")
 
 
 def _gguf_in(ordner: Path) -> Path | None:
@@ -673,9 +708,55 @@ def wirksamer_kontext(name: str) -> int:
     return kontext(name)
 
 
+EIGEN, LLAMACPP = "eigen", "llamacpp"
+# Ladefehler des eigenen Motors, die llama.cpp abfangen kann: unbekannte Bauart oder RoPE-Art.
+# Datei- und Tokenizer-Fehler nicht – die Datei muss durch den eigenen GGUF-Leser.
+_RESERVE_FEHLER = re.compile(r"architecture .* is not supported|unsupported rope\.scaling\.type")
+
+
+def motor_wahl(name: str) -> str:
+    """Config `gguf_motor` {Modell: "eigen"|"llamacpp"}; ohne Eintrag der eigene Motor."""
+    wahl = _config().get("gguf_motor")
+    return LLAMACPP if isinstance(wahl, dict) and wahl.get(name) == LLAMACPP else EIGEN
+
+
+def motor_setzen(name: str, wahl: str) -> None:
+    import config
+    alt = _config().get("gguf_motor")
+    neu = dict(alt) if isinstance(alt, dict) else {}
+    if wahl == LLAMACPP:
+        neu[name] = LLAMACPP
+    else:
+        neu.pop(name, None)
+    config.update(gguf_motor=neu)
+
+
+def ist_fremd(engine) -> bool:
+    return bool(getattr(engine, "fremd", False))
+
+
 def _schluessel(name: str) -> tuple:
     """Einstellungen, mit denen eine geladene Engine weiterverwendet werden kann."""
-    return kontext(name), str(_config().get("gguf_experten", "auto")).lower(), schichten_modus()
+    return (kontext(name), str(_config().get("gguf_experten", "auto")).lower(), schichten_modus(),
+            motor_wahl(name))
+
+
+def _reserve_laden(name: str, datei: Path, ctx: int):
+    """Das Modell über die festgenagelte llama.cpp-Reserve (llamamotor) laden; mit mmproj im Ordner sieht es."""
+    import llamamotor
+    bildteil = _mmproj(name) if sieht(name) else None
+    _DBG.motor_log()
+    _DBG.ereignis(f"Modell laden über {llamamotor.LlamaCppEngine.motor_name}: {name} (Kontext {ctx}"
+                  + (f", Bildteil {bildteil.name})" if bildteil else ")"))
+    meldung = None
+    try:
+        engine = llamamotor.LlamaCppEngine(str(datei), n_ctx=ctx, bildteil=str(bildteil) if bildteil else None)
+    except Exception as e:
+        meldung = str(e) or type(e).__name__
+    if meldung is not None:
+        raise RuntimeError(meldung)
+    _DBG.ereignis(f"Modell geladen über llama.cpp: {name} (Kontext {engine.n_ctx})")
+    return engine
 
 
 def motor(name: str):
@@ -697,6 +778,16 @@ def _motor_laden(name: str):
     entladen()
     auftrag = _abbestellt
     _torch_bereit()
+    if motor_wahl(name) == LLAMACPP:
+        _stimme_platz_machen()
+        engine = _reserve_laden(name, datei, ctx)
+        _motor = (datei, _schluessel(name), engine)
+        if _abbestellt != auftrag:
+            del engine
+            entladen("während des Ladens abgewählt")
+            raise MotorWeg(f"{name} wurde während des Ladens abgewählt")
+        _leerlauf_starten()
+        return engine
     from ggufengine import Engine
     frei = _frei_vram()
     v = verteilen(name, ctx, frei)
@@ -716,6 +807,12 @@ def _motor_laden(name: str):
         meldung, art = str(e) or type(e).__name__, type(e)
     if meldung is not None:
         _nach_fehlschlag_aufraeumen()
+        if _RESERVE_FEHLER.search(meldung):
+            import llamareserve
+            if llamareserve.bereit():
+                raise llamareserve.ReserveFrage(name, meldung)
+            meldung += (f" – die Reserve llama.cpp {llamareserve.BUILD} könnte es laden "
+                        "(/llamacpp zeigt, wie man sie einrichtet)")
         raise (art if art in (RuntimeError, ValueError, MemoryError, OSError) else RuntimeError)(meldung)
     engine.kv_im_vram = v.kv_vram
     engine.kv_bits_wahl = v.bits
@@ -725,6 +822,7 @@ def _motor_laden(name: str):
             engine.enable_vision(str(mm))
         except Exception:
             engine.vision = None                  # Modell ohne Bildeingang: nur Text
+    _hilfskopf_anbinden(engine, datei)
     if experten_laden(name, engine):
         _DBG.ereignis("Experten-Lager: Zählung vom letzten Mal übernommen")
     _trt_anbinden(engine, datei)
@@ -741,7 +839,7 @@ def _motor_laden(name: str):
 def _trt_anbinden(engine, datei) -> None:
     """TensorRT-RTX abgelegt (Models/TensorRT-RTX): lange Prompts liest ein TensorRT-Netz, die Antwort
     schreibt der GGUF-Motor (trtmotor.chat). Abschalten: Config trt_chat = false."""
-    if not _config().get("trt_chat", True):
+    if ist_fremd(engine) or not _config().get("trt_chat", True):
         return
     try:
         from trtmotor import chat as TC
@@ -754,6 +852,8 @@ def _trt_anbinden(engine, datei) -> None:
 
 def _lora_abgleich(engine, datei) -> None:
     """Coding-Assistent an: der LoRA-Motor klinkt das Coding-LoRA dieses Modells an, aus: wieder ab."""
+    if ist_fremd(engine):
+        return
     try:
         from loramotor import adapter
         if adapter.abgleich(engine, datei):
@@ -872,8 +972,9 @@ def _belegt() -> int:
 
 def entladen(grund: str = "") -> None:
     """Gibt VRAM und RAM des Sprachmodells frei (Modellwechsel, Leerlauf), samt Bildbeschreiber – wie Ollama:
-    keine neuen Leihen, laufende Arbeit hört auf (Stopp-Signal) und wird abgewartet (höchstens LEIHE_WARTEN_S),
-    dann wird die Engine geleert. Ihr Speicher ist damit frei, auch wenn noch irgendwo jemand sie hält."""
+    keine neuen Leihen, laufende Arbeit hört auf (Stopp-Signal); auf offene Leihen wird höchstens LEIHE_WARTEN_S
+    gewartet, auf eine laufende Rechnung unter `_lock` immer (Leeren mitten in einer Rechnung ist unsicher).
+    Dann wird die Engine geleert. Ihr Speicher ist damit frei, auch wenn noch irgendwo jemand sie hält."""
     global _motor, _entladen_laeuft, _abbestellt
     _abbestellt += 1                                 # auch ohne geladenes Modell: ein laufendes Laden behält es nicht
     if gpuzustand.kaputt():                          # Freigeben in einer unbrauchbaren CUDA-Sitzung kann abstürzen
@@ -1201,6 +1302,7 @@ class GgufChat:
         self._kompakt_text = ""                      # Bilanz des letzten Aufräumens (/compact)
         self._platz_cache: tuple = (None, (0, 0))
         self.denk_hinweis = ""                       # Denkwerk: nur mit der nächsten gesendeten Nachricht
+        self.rollen_anker = ""                       # Ich-Form/Sprechweise: ebenso, getrennt vom Denk-Hinweis
         self.denk_runde = _KEINE_RUNDE               # neue Nutzer-Runde (main): Denkwerk-Einschätzung, einmal abgeholt
         self._denkt_jetzt = False                    # eigenes Nachdenken in dieser Runde (denkweise.nativ)
 
@@ -1594,7 +1696,9 @@ class GgufChat:
                             # Nach einem fertigen Werkzeug-Block ist Schluss: was danach käme,
                             # wären vorweggenommene oder erfundene Ergebnisse.
                             bisher += stueck
-                            if (strom is not None and strom.aufrufe) or ("```" in stueck and werkzeug_block_fertig(bisher)):
+                            # ``` kann über mehrere Stücke verteilt ankommen
+                            if (strom is not None and strom.aufrufe) or ("```" in bisher[-len(stueck) - 2:]
+                                                                         and werkzeug_block_fertig(bisher)):
                                 break
                     finally:
                         gen.close()
@@ -1709,6 +1813,8 @@ class GgufChat:
                 denk = denkwerk.hinweis(runde_neu, self._denkt_jetzt)
                 _DBG.ereignis(f"Denkweise: {denkweise.stufe()} · eigenes Nachdenken "
                               f"{'an' if self._denkt_jetzt else 'aus'}", speicher=False)
+            anker, self.rollen_anker = self.rollen_anker, ""
+            denk = "\n\n".join(t for t in (denk, anker) if t)
             vorsatz = [t.strip() for t in (treffer, self._anleitungen_fuer(user_text)) if t and t.strip()]
             if vorsatz or denk:                          # Denkwerk-Hinweis hinter die Nachricht
                 gesendet = "\n\n".join(vorsatz + [NACHRICHT_MARKE + user_text]) if vorsatz else user_text
@@ -1726,17 +1832,19 @@ class GgufChat:
             self._kontext_melden()
             if hinweis := pricing.aufraeum_hinweis(self):
                 yield {"type": "note", "text": hinweis}
-        except BaseException:
+        except Exception:
+            # nur bei Fehlern; bei Abbruch (Esc) bleibt die Frage, der Aufrufer hängt die Teilantwort an
             self.messages.pop()
             raise
 
-        t = time.time()
-        if await asyncio.to_thread(prefix_laden, self.name, engine, system):
-            yield {"type": "note", "text": "⚡ Anleitung aus dem Zwischenspeicher – kein erneutes Einlesen."}
-        zeiten["zwischenspeicher"] = time.time() - t
-        trenner, voll, abbruch = _trenner(engine, self._denkt_jetzt), "", threading.Event()
-        gedacht = False
+        abbruch = threading.Event()
         try:
+            t = time.time()
+            if await asyncio.to_thread(prefix_laden, self.name, engine, system):
+                yield {"type": "note", "text": "⚡ Anleitung aus dem Zwischenspeicher – kein erneutes Einlesen."}
+            zeiten["zwischenspeicher"] = time.time() - t
+            trenner, voll = _trenner(engine, self._denkt_jetzt), ""
+            gedacht = False
             t = time.time()
             async for stueck in self._erzeugen(engine, self._nachrichten(system, self.messages,
                                                                          engine.chat_format.drops_old_thinking,
@@ -1755,9 +1863,9 @@ class GgufChat:
                     voll += text
                 gedacht = gedacht or (art == "thinking" and bool(text.strip()))
                 yield {"type": art, "text": text}
-        except BaseException:
+        except BaseException as exc:
             abbruch.set()
-            if self.messages and self.messages[-1]["role"] == "user":
+            if isinstance(exc, Exception) and self.messages and self.messages[-1]["role"] == "user":
                 self.messages.pop()
             raise
         erzeugt = len(engine.last_ids)
@@ -1781,7 +1889,7 @@ class GgufChat:
 
 
 LADE_PHASEN = {"file": "Datei", "tokenizer": "Tokenizer", "weights": "Gewichte", "warmup": "Aufwärmen",
-               "vision": "Bildteil"}
+               "vision": "Bildteil", "llamacpp": "llama.cpp-Server"}
 
 
 def _sek(x: float) -> str:
@@ -1901,6 +2009,112 @@ def prefix_speichern(name: str, engine) -> bool:
             return engine.save_prefix(str(pfad), _prefix_kennung(name, engine))
     except Exception:
         return False
+
+
+VERGLEICH_TOKEN = 64
+VERGLEICH_FRAGE = "Erkläre in drei Sätzen, wie ein Regenbogen entsteht."
+VERGLEICH_KANDIDATEN = 5
+VERGLEICH_DATEI = "motorvergleich.md"
+
+
+def _rate(n: int, sekunden: float) -> float:
+    return n / sekunden if sekunden and sekunden > 0 else 0.0
+
+
+def motorvergleich(name: str, frage: str = "", n: int = VERGLEICH_TOKEN) -> dict:
+    """Dieselbe Frage gierig an den eigenen Motor und an llama.cpp (gleiche Token-Folge, ohne Denken):
+    erste abweichende Stelle samt den Kandidaten von llama.cpp und das Tempo beider. Der eigene Motor
+    liegt im RAM, solange llama.cpp rechnet. Das Gespräch wird danach einmal neu gelesen."""
+    import llamamotor
+    import llamareserve
+    from ggufengine.chat import Message
+    from ggufengine.sampling import SamplerConfig
+    if (grund := llamareserve.pruefen()) is not None:
+        raise RuntimeError(grund)
+    if motor_wahl(name) == LLAMACPP:
+        raise RuntimeError("Der Vergleich braucht den eigenen Motor – im /model-Menü das Modell ohne 🦙 wählen.")
+    datei = modelle().get(name)
+    if datei is None:
+        raise RuntimeError(f"Kein lokales Modell '{name}'")
+    frage = (frage or VERGLEICH_FRAGE).strip()
+    eng = motor(name)
+    gierig = SamplerConfig(temperature=0.0, top_k=1, top_p=1.0, repeat_penalty=1.0, dry_multiplier=0.0,
+                           quelle="Motorvergleich")
+    nachrichten = [Message("user", frage)]
+    with geliehen(eng), _lock:
+        denken_vorher = eng.chat_format.thinking
+        eng.chat_format.thinking = False
+        try:
+            ids = eng.chat_format.encode(nachrichten, add_generation_prompt=True)
+            for _ in eng.chat(nachrichten, reuse=False, checkpoint_system=False, max_tokens=n, sampler=gierig):
+                pass
+            eigen_ids, eigen_st = list(eng.last_ids), dict(eng.last_stats)
+        finally:
+            eng.chat_format.thinking = denken_vorher
+    with gpu_fuer_bild():                            # das eigene Modell geht so lange in den RAM
+        fremd = llamamotor.LlamaCppEngine(str(datei), n_ctx=max(4096, len(ids) + n + 64))
+        try:
+            lauf = fremd.gierig(ids, n, VERGLEICH_KANDIDATEN)
+        finally:
+            fremd.leeren()
+            fremd.gg.close()
+    tok = eng.tokenizer
+    fremd_ids = lauf["tokens"]
+    stelle = next((i for i, (a, b) in enumerate(zip(eigen_ids, fremd_ids)) if a != b), None)
+    if stelle is None and len(eigen_ids) != len(fremd_ids):
+        stelle = min(len(eigen_ids), len(fremd_ids))
+    kandidaten = []
+    if stelle is not None and stelle < len(lauf["kandidaten"]):
+        import math
+        kandidaten = [(tok.decode([t], skip_special=False) if 0 <= t < tok.n_vocab else "?", math.exp(lp),
+                       t == (eigen_ids[stelle] if stelle < len(eigen_ids) else None))
+                      for t, lp in lauf["kandidaten"][stelle]]
+    zeiten = lauf["timings"]
+    ergebnis = {
+        "modell": name, "frage": frage, "prompt_token": len(ids), "token": n, "gleich_bis": stelle,
+        "eigen_text": tok.decode(eigen_ids), "fremd_text": tok.decode(fremd_ids),
+        "eigen_n": len(eigen_ids), "fremd_n": len(fremd_ids),
+        "eigen_tok_s": _rate(eigen_st.get("generated", 0), eigen_st.get("decode_seconds", 0)),
+        "eigen_lesen_tok_s": _rate(eigen_st.get("prompt_tokens", 0), eigen_st.get("prefill_seconds", 0)),
+        "fremd_tok_s": float(zeiten.get("predicted_per_second") or 0.0),
+        "fremd_lesen_tok_s": float(zeiten.get("prompt_per_second") or 0.0),
+        "eigen_token_dort": (tok.decode([eigen_ids[stelle]], skip_special=False)
+                             if stelle is not None and stelle < len(eigen_ids) else None),
+        "kandidaten": kandidaten, "build": llamareserve.BUILD,
+    }
+    _vergleich_ablegen(ergebnis)
+    return ergebnis
+
+
+def vergleich_zeilen(e: dict) -> list[str]:
+    """Das Ergebnis von motorvergleich() als Tabelle für Anzeige und Bericht."""
+    gleich = (f"alle {e['eigen_n']} Token gleich" if e["gleich_bis"] is None
+              else f"gleich bis Token {e['gleich_bis']} von {max(e['eigen_n'], e['fremd_n'])}")
+    zeilen = [f"⚖ Motorvergleich · {e['modell']} · eigener Motor gegen llama.cpp {e['build']} · gierig, "
+              f"{e['prompt_token']} Token Frage",
+              f"Ergebnis: {gleich}",
+              "| | Eigener Motor | llama.cpp |", "|---|---|---|",
+              f"| Schreiben | {e['eigen_tok_s']:.1f} Token/s | {e['fremd_tok_s']:.1f} Token/s |",
+              f"| Lesen | {e['eigen_lesen_tok_s']:.0f} Token/s | {e['fremd_lesen_tok_s']:.0f} Token/s |"]
+    if e["gleich_bis"] is not None and e["kandidaten"]:
+        zeilen.append(f"An der Stelle schrieb der eigene Motor {e['eigen_token_dort']!r}; llama.cpp hätte gewählt:")
+        zeilen += [f"  {'➜' if eigen else ' '} {text!r}  {p * 100:.1f} %" for text, p, eigen in e["kandidaten"]]
+    zeilen += [f"Eigener Motor: {e['eigen_text'][:300]}", f"llama.cpp: {e['fremd_text'][:300]}"]
+    return zeilen
+
+
+def _vergleich_ablegen(e: dict) -> None:
+    """Hängt das Ergebnis an Debugbericht/motorvergleich.md an (zum Nachlesen und Auswerten)."""
+    try:
+        import debugbericht
+        pfad = debugbericht.ordner() / VERGLEICH_DATEI
+        pfad.parent.mkdir(parents=True, exist_ok=True)
+        if pfad.is_file() and pfad.stat().st_size > 1 << 20:
+            pfad.unlink()
+        with open(pfad, "a", encoding="utf-8") as f:
+            f.write(f"\n## {time.strftime('%Y-%m-%d %H:%M')}\n\n" + "\n".join(vergleich_zeilen(e)) + "\n")
+    except Exception as exc:
+        _DBG.fehler("Motorvergleich ablegen", exc)
 
 
 def werkzeug_block_fertig(text: str) -> bool:

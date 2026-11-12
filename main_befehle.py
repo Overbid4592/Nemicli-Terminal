@@ -307,6 +307,7 @@ async def setup_ollama() -> None:
 
 # Sitzungs-Zähler für den Übungsmodus (wie viele Runden bisher gelaufen sind)
 PRACTICE_STATE = {"count": 0}
+_RESERVE_MARKE = "llamacpp|"             # Auswahl im /model-Menü: dasselbe Modell über die Reserve
 
 
 def _practice_emit(kind: str, payload) -> None:
@@ -351,6 +352,27 @@ async def practice_round(ctx: "Ctx", should_stop) -> str:
         PRACTICE_STATE["count"] += 1
         return await PRAC.one_round(ctx.backend, _practice_emit, should_stop,
                                     n=PRACTICE_STATE["count"], approve=approve)
+
+
+async def chatgpt_anmelden() -> bool:
+    """ChatGPT-Konto verbinden: im Browser anmelden und der Nutzung des Plans zustimmen (Sign in with ChatGPT)."""
+    import chatgpt_login
+    ui.info("🔐 Gleich öffnet sich dein Browser: bei ChatGPT anmelden und zustimmen. NemiCLI bekommt dabei kein "
+            "Passwort und keinen API-Schlüssel – nur die Erlaubnis, deinen ChatGPT-Plan (Plus/Pro) zu nutzen. "
+            "Ich warte bis zu 5 Minuten.")
+    try:
+        with ui.thinking("warte auf die Anmeldung im Browser"):
+            stand = await asyncio.to_thread(chatgpt_login.anmelden)
+    except Exception as e:
+        ui.error(f"ChatGPT-Anmeldung: {e}")
+        return False
+    if not stand["plan"]:
+        ui.warn("Angemeldet, aber die Nutzung deines Plans wurde nicht freigegeben – ohne sie kann NemiCLI das Konto "
+                "nicht für Antworten nutzen. Nochmal: /model chatgpt anmelden")
+        return False
+    ui.success(f"✅ ChatGPT-Konto verbunden{': ' + stand['email'] if stand['email'] else ''} – "
+               "Zugang verschlüsselt gespeichert.")
+    return True
 
 
 async def pick_model(current: str | None) -> str | None:
@@ -425,6 +447,13 @@ async def pick_model(current: str | None) -> str | None:
         if pid == "__cancel__":
             return None
         prov = P.get(pid)
+        if prov.kind == "chatgpt":                # kein Schlüssel: Anmeldung im Browser
+            if not await chatgpt_anmelden():
+                return None
+            wahl = f"cloud:{pid}"
+        else:
+            wahl = "__schluessel__"
+    if wahl == "__schluessel__":
         ui.info(f"{prov.label}: Key holen unter  {P.KEY_URLS.get(pid, '(siehe Anbieter-Website)')}")
         key = await ask_text(f"{prov.label} API-Key einfügen (leer = abbrechen):", password=True)
         if not key:
@@ -439,12 +468,25 @@ async def pick_model(current: str | None) -> str | None:
 
     # --- Stufe 2: konkretes Modell ---
     if wahl == "gguf":
-        opts = [(M.make_ref("gguf", name), gguflokal.beschreibung(name)) for name in lokale]
+        import llamareserve
+        reserve = llamareserve.eingerichtet()
+        opts = []
+        for name in lokale:
+            opts.append((M.make_ref("gguf", name), gguflokal.beschreibung(name)))
+            if reserve:                      # dasselbe Modell über die festgenagelte llama.cpp-Reserve
+                opts.append((_RESERVE_MARKE + M.make_ref("gguf", name),
+                             f"🦙 {name}  ·  über llama.cpp {llamareserve.BUILD} (Reserve"
+                             + (", 👁 sieht Bilder)" if gguflokal.sieht(name) else ")")))
         opts.append(("__cancel__", "Zurück / Abbrechen"))
         n = gguflokal.kontext() if gguflokal.kontext_einstellung() > 0 else 0
         ref = await ask_suche(f"Welches lokale Modell?  (Kontext {f'{n:,} Token' if n else 'max'}, "
                               f"höchstens {gguflokal.tok_s() or '∞'} Token/s)".replace(",", "."), opts)
-        return None if ref == "__cancel__" else ref
+        if ref == "__cancel__":
+            return None
+        ueber_reserve = ref.startswith(_RESERVE_MARKE)
+        ref = ref.removeprefix(_RESERVE_MARKE)
+        gguflokal.motor_setzen(M.split_ref(ref)[1], gguflokal.LLAMACPP if ueber_reserve else gguflokal.EIGEN)
+        return ref
     if wahl == "ollama":
         ids = P.ollama_models()
         if not ids:
@@ -477,8 +519,11 @@ async def pick_model(current: str | None) -> str | None:
 
 
 def _video_opts(text: str) -> dict:
-    """`/video <prompt> [--sekunden 10] [--start pfad] [--seed 1] [--steps 30] [--schaerfe mittel]`."""
+    """`/video <prompt> [--sekunden 10] [--start pfad] [--figur] [--seed 1] [--steps 30] [--schaerfe mittel]`."""
     opts: dict = {}
+    if re.search(r"(?<!\S)--figur(?!\S)", text):
+        opts["figur"] = True
+        text = re.sub(r"(?<!\S)--figur(?!\S)", "", text)
     muster = re.compile(r'--(sekunden|start|seed|steps|schaerfe)\s+("[^"]+"|\S+)')
     for m in muster.finditer(text):
         wert = m.group(2).strip('"')
@@ -560,6 +605,96 @@ async def _rauswurf_uebernehmen(ctx) -> None:
     ui.warn("Kein Ersatz auf der Bank. Wähle ein neues Modell mit /model.")
 
 
+async def _llamacpp_holen_mit_balken(art: str, namen: list[str]) -> None:
+    """llamareserve.holen im Thread, mit Ladebalken je Paket; Esc bricht ab (fortsetzbar)."""
+    import threading
+    import llamareserve
+    stopp = threading.Event()
+    st = {"name": namen[0] if namen else "", "erledigt": 0, "gesamt": 1, "tempo": 0.0, "letzt": None}
+
+    def fortschritt(name: str, erledigt: int, gesamt: int) -> None:
+        jetzt = time.monotonic()
+        if name != st["name"] or st["letzt"] is None:
+            st["letzt"], st["tempo"] = (jetzt, erledigt), 0.0
+        elif jetzt - st["letzt"][0] >= 0.5:
+            momentan = (erledigt - st["letzt"][1]) / (jetzt - st["letzt"][0])
+            st["tempo"] = momentan if not st["tempo"] else 0.7 * st["tempo"] + 0.3 * momentan
+            st["letzt"] = (jetzt, erledigt)
+        st.update(name=name, erledigt=erledigt, gesamt=gesamt)
+
+    def panel():
+        nr = namen.index(st["name"]) + 1 if st["name"] in namen else 1
+        return ui.hf_fortschritt(st["name"], "lade", st["erledigt"], st["gesamt"], st["tempo"], nr, len(namen))
+
+    task = asyncio.create_task(asyncio.to_thread(llamareserve.holen, art, fortschritt, stopp))
+    try:
+        with ui.live_view(panel()) as live:
+            while not task.done():
+                if ui.TUI.consume_abort() if ui.TUI is not None else _esc_pressed():
+                    stopp.set()
+                live.update(panel())
+                await asyncio.wait({task}, timeout=0.25)
+    except asyncio.CancelledError:
+        stopp.set()
+        task.add_done_callback(lambda t: t.exception())
+        raise
+    ok, zeilen = task.result()
+    for z in zeilen:
+        ui.info(z)
+    if ok:
+        ui.success("🦙 Im /model-Menü steht jedes lokale Modell jetzt auch mit 🦙 (über llama.cpp).")
+
+
+async def llamacpp_befehl(ctx, arg: str) -> None:
+    """/llamacpp: Stand der Reserve · einrichten (Pakete prüfen und entpacken) · vergleich [frage]."""
+    import llamareserve
+    teile = arg.strip().split(maxsplit=1)
+    was = teile[0].lower() if teile else ""
+    if was in ("holen", "laden"):
+        art = teile[1].strip().lower() if len(teile) > 1 else "auto"
+        try:
+            namen, grund = await asyncio.to_thread(llamareserve.passende_pakete, None, art)
+        except ValueError as exc:
+            ui.error(str(exc))
+            return
+        mb = sum(llamareserve.GROESSE[n] for n in namen) / 2**20
+        ui.info(f"🦙 Für diesen Rechner: {', '.join(namen)} ({grund}) · {mb:.0f} MB von GitHub · Esc bricht ab, "
+                "ein neuer Aufruf setzt fort.")
+        await _llamacpp_holen_mit_balken(art, namen)
+        return
+    if was == "einrichten":
+        llamareserve.ablage().mkdir(parents=True, exist_ok=True)
+        with ui.thinking("prüfe die llama.cpp-Pakete (SHA-256) und entpacke"):
+            ok, zeilen = await asyncio.to_thread(llamareserve.einrichten)
+        for z in zeilen:
+            ui.info(z)
+        if ok:
+            ui.success("🦙 Im /model-Menü steht jedes lokale Modell jetzt auch mit 🦙 (über llama.cpp).")
+        return
+    if was in ("vergleich", "vergleichen"):
+        prov, name = M.split_ref(ctx.model or "")
+        if prov != "gguf":
+            ui.warn("Der Vergleich braucht ein lokales Modell im eigenen Motor (/model → Lokal).")
+            return
+        import gguflokal
+        try:
+            with ui.thinking(f"stelle {name} dieselbe Frage im eigenen Motor und in llama.cpp"):
+                ergebnis = await asyncio.to_thread(gguflokal.motorvergleich, name, teile[1] if len(teile) > 1 else "")
+        except Exception as exc:
+            ui.error(f"Motorvergleich: {exc}")
+            return
+        for z in gguflokal.vergleich_zeilen(ergebnis):
+            ui.info(z)
+        ui.info("Das Gespräch wird bei der nächsten Nachricht einmal neu gelesen.")
+        return
+    llamareserve.ablage().mkdir(parents=True, exist_ok=True)
+    zeilen = await asyncio.to_thread(llamareserve.status_zeilen)
+    for z in zeilen:
+        ui.info(z)
+    if not llamareserve.eingerichtet() and llamareserve.pakete_in_ablage():
+        ui.info("📦 Pakete liegen bereit – /llamacpp einrichten prüft und entpackt sie.")
+
+
 async def switch_model(ref: str, backend, model, strength):
     """Wechselt das aktive Modell. Gibt (backend, model) zurück (alt bei Fehler)."""
     carry = backend.messages if backend else None
@@ -578,7 +713,12 @@ async def switch_model(ref: str, backend, model, strength):
     if M.split_ref(ref)[0] == "ollama":
         where = "lokal über Ollama"
     elif M.split_ref(ref)[0] == "gguf":
-        where = "lokal im eigenen Motor – das erste Laden dauert ein paar Sekunden"
+        import gguflokal
+        if gguflokal.motor_wahl(M.split_ref(ref)[1]) == gguflokal.LLAMACPP:
+            import llamareserve
+            where = f"lokal über die Reserve llama.cpp {llamareserve.BUILD}"
+        else:
+            where = "lokal im eigenen Motor – das erste Laden dauert ein paar Sekunden"
     elif M.split_ref(ref)[0] == "funke":
         where = "NemiCLIs eigenes kleines Modell auf diesem PC – ohne Werkzeuge und Bilder"
     else:
@@ -807,6 +947,23 @@ def model_completions() -> dict[str, str]:
     return out
 
 
+async def _einlesen_starten(ctx: "Ctx") -> None:
+    """/einlesen: den Einlese-Speicher jetzt abarbeiten; hat die GPU keinen Platz, wartet der Durchgang."""
+    import einlesen
+    token = await asyncio.to_thread(einlesen.stand)
+    if token is None:
+        ui.warn("Kein Embedding-Modell da – mit /embeddings eins wählen.")
+        return
+    kann, grund = await asyncio.to_thread(memory.gpu_platz)
+    if not kann:
+        ui.info(f"📦 Gerade geht es nicht: {grund}. Der Speicher wartet und startet von selbst, sobald es geht.")
+        einlesen_vormerken(ctx.current_chat, gewuenscht=True)
+        return
+    ui.info(f"📦 {einlesen.kurz(token)} abgetrennt, wird jetzt eingelesen"
+            + (". Was ab jetzt dazukommt, sammelt der nächste Speicher." if ui.TUI is not None else " …"))
+    await bibliothekar(ctx.current_chat, alles=True)
+
+
 class Ctx:
     """Veränderlicher Sitzungs-Status, den sich Klassik-Loop und TUI teilen."""
 
@@ -848,9 +1005,17 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
     """Auswahl für einen Befehl ohne Zusatz – fest aus commands.UNTERMENUES oder
     nach aktuellem Stand (Modus, Theme, Denkstufe)."""
     import commands as C
+    haken = lambda an: "✓ " if an else "   "
+    if cmd == "/startart":
+        jetzt = config.load().get("startart", "terminal")
+        return [(k, f"{haken(k == jetzt)}{t}", None) for k, t in (("terminal", "🖥 Im Terminal"),
+                                                                   ("fenster", "🪟 Im Desktop-Fenster"))]
+    if cmd == "/terminal":                           # Schalter-Paare wie fest, beim Thema der Haken
+        thema = str(config.load().get("terminal_thema") or "auto").lower()
+        return [(z, f"{haken(z == 'thema ' + thema)}{t}" if z.startswith("thema ") else t, f)
+                for z, t, f in C.UNTERMENUES[cmd]]
     if cmd in C.UNTERMENUES:
         return C.UNTERMENUES[cmd]
-    haken = lambda an: "✓ " if an else "   "
     if cmd == "/modus":
         return [(k, f"{haken(k == modes.current())}{sym} {name}", None) for k, sym, name in modes.MODES]
     if cmd == "/emoji":
@@ -862,11 +1027,6 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
         import denkweise
         jetzt = denkweise.stufe()
         return [(k, f"{haken(k == jetzt)}{denkweise.TEXT[k]}", None) for k in denkweise.STUFEN]
-    if cmd == "/embeddingtimer":
-        import einbetttakt as ET
-        jetzt = ET.minuten()
-        return ([("aus" if not m else str(m), f"{haken(m == jetzt)}{ET.text(m)}", None) for m in ET.STUFEN]
-                + [("low an", "   🐢 Low-Modus an", None), ("low aus", "   🐢 Low-Modus aus", None)])
     if cmd == "/theme":
         return [(k, f"{haken(k == ui.current_theme())}{k}  · {p.get('label', k)}"
                  + ("  ✨ eigenes" if k not in ui.EINGEBAUT else ""), None) for k, p in ui.THEMES.items()]
@@ -903,13 +1063,13 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
             import video
             import videomotoren
             motor = videomotoren.gewaehlt() if videomotoren.aktiv() else None
-            eintraege += [(f"modell {n}", f"{haken(n == motor)}🎞 Modell: {n} (Video mit Ton)", None)
+            eintraege += [(f"modell {n}", f"{haken(n == motor)}🎞 Modell: {n} ({videomotoren.merkmal(n)})", None)
                           for n in videomotoren.modelle()]
             akt = None if motor else video.gewaehlt()
             eintraege += [(f"modell {n}", f"{haken(n == akt)}🎞 Modell: {n}", None) for n in video.modelle()]
             if videomotoren.modelle():
                 eintraege.append(("einstellungen", "   ⚙ Video-Einstellungen (Auflösung, Ton, Kacheln …)", None))
-            eintraege.append(("motorordner", "   📂 Video-Modelle-Ordner (LTX-2.5 … ablegen)", None))
+            eintraege.append(("motorordner", "   📂 Video-Modelle-Ordner (LTX-2.5, SD-Video … ablegen)", None))
         except Exception:
             pass
         try:
@@ -1066,6 +1226,38 @@ def _embedding_art(ordner) -> str:
     return "GGUF, gepackt auf der GPU" if embedder.gguf_datei(ordner) is not None else "safetensors (transformers)"
 
 
+# /terminal: Schalter -> (Config-Schlüssel, Vorgabe, Name)
+TERMINAL_SCHALTER = {"leuchten": ("terminal_leuchten", True, "✨ Leuchten im Hintergrund"),
+                     "weich": ("terminal_weich", True, "🌊 Weiches Rollen"),
+                     "geteilt": ("terminal_geteilt", False, "🪟 Reiter „KI“ neben dem Chat")}
+TERMINAL_THEMEN = ("auto", "breeze", "mint")
+
+
+def terminal_befehl(arg: str) -> None:
+    """/terminal: Schalter des eigenen Terminal-Fensters. Leuchten, weiches Rollen und geteilte Ansicht gehen
+    als Steuerbefehl sofort ans Fenster, die Farben gelten ab dem nächsten Start."""
+    teile = arg.strip().lower().split()
+    eigenes = os.environ.get("NEMICLI_FENSTER") == "1"
+    if len(teile) == 2 and teile[0] in TERMINAL_SCHALTER and teile[1] in ("an", "aus"):
+        schluessel, _vorgabe, name = TERMINAL_SCHALTER[teile[0]]
+        an = teile[1] == "an"
+        config.update(**{schluessel: an})
+        _fenster_steuern(f"{teile[0]}={int(an)}")
+        if teile[0] == "weich" and ui.TUI is not None and hasattr(ui.TUI, "_weich"):
+            ui.TUI._weich = an                       # das Blättern im Verlauf gleich mit
+        ui.success(f"{name}  {'✔️' if an else '🛑'}"
+                   + ("" if eigenes else "  ·  gilt im eigenen Terminal-Fenster (NemiCLI.exe)"))
+    elif len(teile) == 2 and teile[0] == "thema" and teile[1] in TERMINAL_THEMEN:
+        config.update(terminal_thema=teile[1])
+        ui.success(f"🎨 Farben des Terminal-Fensters: {teile[1]} – ab dem nächsten Start.")
+    else:
+        c = config.load()
+        stand = "  ·  ".join(f"{name} {'✔️' if c.get(schluessel, vorgabe) else '🛑'}"
+                             for schluessel, vorgabe, name in TERMINAL_SCHALTER.values())
+        ui.info(f"🖥 {stand}  ·  🎨 {c.get('terminal_thema') or 'auto'}")
+        ui.info("   /terminal leuchten|weich|geteilt an|aus  ·  /terminal thema auto|breeze|mint")
+
+
 def _schalter_an(cmd: str, basis: str) -> bool | None:
     """Stand eines An/Aus-Schalters im Menü – None, wenn es keiner ist (dann bleiben beide Einträge)."""
     try:
@@ -1089,9 +1281,9 @@ def _schalter_an(cmd: str, basis: str) -> bool | None:
             return bool(config.load().get("uebung", True))
         if (cmd, basis) == ("/auto", ""):
             return bool(config.load().get("auto_stark"))
-        if (cmd, basis) == ("/embeddingtimer", "low"):
-            import einbetttakt
-            return einbetttakt.low()
+        if cmd == "/terminal" and basis in TERMINAL_SCHALTER:
+            schluessel, vorgabe, _name = TERMINAL_SCHALTER[basis]
+            return bool(config.load().get(schluessel, vorgabe))
     except Exception:
         return None
     return None
@@ -1104,8 +1296,9 @@ _SCHALTER_NAME = {("/kugel", "auto"): "✨ AUTO", ("/kugel", "vorne"): "📌 Imm
                   ("/skills", "selbst"): "🧩 Selbst anlegen/ändern ohne Rückfrage",
                   ("/kontextmenue", ""): "🖱 Im Rechtsklick-Menü", ("/uebung", ""): "🎓 Übungsmodus",
                   ("/auto", ""): "🧠 Auto-Stark",
-                  ("/embeddingtimer", "low"): "🐢 Low-Modus"}
-_SCHALTER_ZEICHEN = {("/embeddingtimer", "low"): ("aktiv 💚", "aus 🛑")}   # sonst ✔️ / 🛑
+                  ("/terminal", "leuchten"): "✨ Leuchten im Hintergrund",
+                  ("/terminal", "weich"): "🌊 Weiches Rollen", ("/terminal", "geteilt"): "🪟 Reiter „KI“ neben dem Chat"}
+_SCHALTER_ZEICHEN = {}   # sonst ✔️ / 🛑
 
 
 def _wahl_stand(cmd: str) -> str | None:
@@ -1189,6 +1382,89 @@ async def _untermenue(ctx: Ctx, cmd: str) -> str | None:
             return None
         zusatz = zusatz.replace("{}", antwort)
     return " ".join(zusatz.split())
+
+
+_SCHRIFT_ROLLE = {"oberflaeche": "fenster", "oberfläche": "fenster", "fenster": "fenster", "alles": "fenster",
+                  "ki": "ki", "du": "du", "ich": "du", "terminal": "terminal"}
+
+
+async def schriftgroesse_befehl(arg: str) -> None:
+    """/schriftgröße [rolle] <px> · zurück – ohne Zusatz erst die Rolle, dann die Größe wählen."""
+    import commands as C
+    import design
+    teile = arg.strip().lower().split()
+    werte = dict(config.load().get("schriftgroesse") or {})
+    if teile and teile[0] in ("zurück", "zurueck", "reset", "vorgabe"):
+        config.update(schriftgroesse={})
+        ui.success("🔠 Alle Schriftgrößen wieder auf der Vorgabe.")
+        return
+    rolle = _SCHRIFT_ROLLE.get(teile[0]) if teile else None
+    zahl = next((t for t in teile if t.removesuffix("px").isdigit()), None)
+    if teile and rolle is None and zahl is None:
+        ui.warn("🔠 Rollen: oberflaeche · ki · du · terminal – z. B. /schriftgröße ki 18")
+        return
+    if rolle is None and zahl is not None:
+        rolle = "fenster"
+    if rolle is None:
+        optionen = [(r, f"{z} {t}  ·  {design.px(r)} px") for r, (z, t, _v) in design.ROLLEN.items()]
+        optionen.append(("zurueck_alle", "↺ Alles auf die Vorgabe"))
+        optionen.append((C.ZURUECK, "↩ Zurück"))
+        rolle = await ask_confirm("🔠 Welche Schrift möchtest du größer oder kleiner?", optionen)
+        if rolle == "zurueck_alle":
+            config.update(schriftgroesse={})
+            ui.success("🔠 Alle Schriftgrößen wieder auf der Vorgabe.")
+            return
+        if rolle not in design.ROLLEN:
+            return
+    zeichen, titel, vorgabe = design.ROLLEN[rolle]
+    if zahl is None:
+        jetzt = design.px(rolle)
+        optionen = [(str(g), f"{g} px" + ("  ✔️" if g == jetzt else "") + ("  (Vorgabe)" if g == vorgabe else ""))
+                    for g in design.GROESSEN]
+        optionen.append((C.ZURUECK, "↩ Zurück"))
+        wahl = await ask_confirm(f"{zeichen} {titel} – wie groß?  (jetzt {jetzt} px)", optionen)
+        if not str(wahl).isdigit():
+            return
+        zahl = wahl
+    px = max(design.KLEINSTE, min(design.GROESSTE, int(str(zahl).removesuffix("px"))))
+    werte[rolle] = px
+    config.update(schriftgroesse=werte)
+    wann = ("ab dem nächsten Start" if rolle == "terminal" else
+            "neue Nachrichten sofort, schon offene Fenster beim nächsten Öffnen")
+    ui.success(f"🔠 {zeichen} {titel}: {px} px – {wann}.")
+
+
+async def einstellungen_menue(ctx: Ctx) -> None:
+    """/einstellungen: die ⚙-Seite des Desktop-Fensters im Terminal – erst der Punkt, dann der Wert. Jede Wahl
+    ist ein vorhandener Befehl; das Menü bleibt offen, bis „Zurück“ gewählt wird."""
+    import commands as C
+    import einstellseite
+    bereich = einstellseite.EINFACH
+    while True:
+        eintraege = [e for e in einstellseite.seite() if e["bereich"] == bereich]
+        optionen = []
+        for i, e in enumerate(eintraege):
+            aktiv = next((o["text"] for o in e["optionen"] if o["aktiv"]), "")
+            optionen.append((str(i), f"{e['titel']}" + (f"  ·  {aktiv} ✔️" if aktiv else "")))
+        if bereich == einstellseite.EINFACH:
+            optionen.append(("profi", "🔧 Für Profis …"))
+        optionen.append((C.ZURUECK, "↩ Zurück"))
+        titel = "⚙ Einstellungen" if bereich == einstellseite.EINFACH else "🔧 Für Profis"
+        wahl = await ask_confirm(f"{titel} – was möchtest du ändern?  (↑/↓, Enter)", optionen)
+        if wahl == "profi":
+            bereich = einstellseite.PROFI
+            continue
+        if wahl == C.ZURUECK or not str(wahl).isdigit():
+            if bereich == einstellseite.PROFI:
+                bereich = einstellseite.EINFACH
+                continue
+            return
+        e = eintraege[int(wahl)]
+        werte = [(o["wert"], o["text"] + ("  ✔️" if o["aktiv"] else "")) for o in e["optionen"]]
+        wert = await ask_confirm(f"{e['titel']} – {e['erklaerung']}", werte + [(C.ZURUECK, "↩ Zurück")])
+        if wert == C.ZURUECK or not (befehl := einstellseite.befehl_fuer(e["befehl"], str(wert))):
+            continue
+        await handle_line(ctx, befehl)
 
 
 async def handle_line(ctx: Ctx, text: str) -> str | None:
@@ -1322,12 +1598,8 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
         ui.knowledge_menu(learn.list_skills(), learn.list_snippets())
     elif cmd == "/gedaechtnis":
         sub = arg.strip().lower()
-        if sub in ("indexieren", "index", "vektorisieren"):
-            o = indexdb.offen()
-            ui.info(f"📚 Gedächtnis-DB: {o['brocken']} Brocken · {o['ohne_vektor']} ohne Vektor · "
-                    f"{o['berichte_offen']} Berichte noch nicht drin – hole alles nach "
-                    + ("(Balken in der Statuszeile, du kannst weiterchatten)." if ui.TUI is not None else "…"))
-            await bibliothekar(ctx.current_chat, alles=True)
+        if sub in ("indexieren", "index", "vektorisieren"):      # früherer Name von /einlesen
+            await _einlesen_starten(ctx)
         elif sub in ("leeren", "loeschen", "clear"):
             if not memory.count():
                 ui.info("Das Langzeitgedächtnis ist schon leer.")
@@ -1387,7 +1659,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                         f"{o['berichte_offen']} Berichte offen"
                         + (f" · {o['alt_geschnitten']} Quellen werden noch neu geschnitten"
                            if o.get("alt_geschnitten") else "")
-                        + "  →  /gedaechtnis indexieren holt alles nach")
+                        + "  →  /einlesen holt alles nach")
             except Exception:
                 pass
     elif cmd == "/aufraeumen":
@@ -1488,21 +1760,17 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                 ui.error(str(exc))
         else:
             ui.info(f"Denkweise von {wer}: {denkweise.TEXT[denkweise.stufe()]} · /denken auto · an · aus")
-    elif cmd == "/embeddingtimer":
-        import einbetttakt as ET
+    elif cmd == "/einlesen":
         teile = arg.lower().split()
-        try:
-            if teile and teile[0] == "low":
-                an = ET.low_setzen(teile[1] if len(teile) > 1 else None)
-                ui.success(ET.low_text(an))
-            elif teile and ET.normal(teile[0]) is not None:
-                m = ET.setzen(teile[0])
-                ui.success(f"Gedächtnis-Takt: {ET.text(m)}"
-                           + (" – Gesammeltes wird dann in einem Lauf eingebettet." if m else "."))
-            else:
-                ui.info(takt_stand() + " · /embeddingtimer aus · 15 · 30 · 45 · 60 · 90 · low")
-        except ValueError as exc:
-            ui.error(str(exc))
+        if teile[:1] in (["stand"], ["status"]):
+            await speicher_pruefen()
+            import einlesen
+            ui.info("📦 Einlese-Speicher: " + (einlesen.kurz(_BIB["speicher"]) if _BIB["speicher"] is not None
+                                               else "kein Embedding-Modell da"))
+        else:
+            await _einlesen_starten(ctx)
+    elif cmd == "/llamacpp":
+        await llamacpp_befehl(ctx, arg)
     elif cmd == "/name":
         await name_befehl(arg)
     elif cmd == "/skills":
@@ -1517,6 +1785,20 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
         else:
             gui_oeffnen(GUI_BRUECKE)
             ui.success("🖥 Das GUI-Fenster öffnet sich – es ist mit dieser Sitzung verbunden.")
+    elif cmd == "/einstellungen":
+        await einstellungen_menue(ctx)
+    elif cmd in ("/schriftgröße", "/schriftgroesse"):
+        await schriftgroesse_befehl(arg)
+    elif cmd == "/terminal":
+        terminal_befehl(arg)
+    elif cmd == "/startart":
+        sub = arg.strip().lower()
+        if sub in ("terminal", "fenster"):
+            config.update(startart=sub)
+            ui.success("🚀 Ab dem nächsten Start öffnet sich gleich das Desktop-Fenster." if sub == "fenster"
+                       else "🚀 NemiCLI startet wieder im Terminal.")
+        else:
+            ui.info(f"🚀 Startart: {config.load().get('startart', 'terminal')} – /startart terminal oder fenster.")
     elif cmd == "/musik":
         global MUSIK_BRUECKE  # noqa: PLW0603
         from musik import gewichte as _musik_gewichte
@@ -1531,7 +1813,19 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
         else:
             gui_oeffnen(MUSIK_BRUECKE, "--musik")
             ui.success("🎵 Das Musik-Fenster öffnet sich: Wunsch eintippen, ausarbeiten lassen, komponieren.")
-    elif cmd in ("/charaktere", "/charakter", "/galerie"):
+    elif cmd == "/kern":
+        await kern_befehl(arg)
+    elif cmd == "/lora":
+        global LORA_BRUECKE  # noqa: PLW0603
+        if LORA_BRUECKE is None:
+            LORA_BRUECKE = await start_lora(ctx)
+        if LORA_BRUECKE.verbunden():
+            LORA_BRUECKE.senden({"t": "vorne"})
+            ui.info("🧬 Die LoRA-Werkstatt ist schon offen.")
+        else:
+            gui_oeffnen(LORA_BRUECKE, "--lora")
+            ui.success("🧬 Die LoRA-Werkstatt öffnet sich: Bilder hineinziehen, prüfen, auswählen, trainieren.")
+    elif cmd in ("/charaktere", "/galerie"):
         global CHARAKTER_BRUECKE  # noqa: PLW0603
         if CHARAKTER_BRUECKE is None:
             CHARAKTER_BRUECKE = await start_charaktere(ctx)
@@ -1816,7 +2110,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             ui.success(f"🧬 Embedding-Modell: {ordner.name} ({_embedding_art(ordner)}) – lädt bei Bedarf.")
             if alt and neu != alt:
                 ui.info("Andere Vektoren als bisher: der Bibliothekar rechnet das Gedächtnis nach und "
-                        "nach neu um (/gedaechtnis indexieren = sofort). Bis dahin hilft die Stichwortsuche.")
+                        "nach neu um (/einlesen = sofort). Bis dahin hilft die Stichwortsuche.")
     elif cmd == "/kontext":
         prov, name = M.split_ref(ctx.model or "")
         wahl = arg.strip().lower().replace(",", ".").replace(" ", "")

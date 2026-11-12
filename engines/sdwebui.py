@@ -65,7 +65,7 @@ DEFAULTS = {
 
 # Diese Tags fliegen aus jedem Prompt – im Code, egal was das Modell schreibt
 # (feste Vorgabe: eine erwachsene Frau, keine Männer, keine Gruppen).
-# Zusätzlich alles, was "pov" enthält.
+# Einzige Ausnahme: die Ich-Perspektive (POV_ERLAUBT), siehe ist_pov.
 STRIP_TAGS = {
     "male pov", "1boy", "2boys", "2girls", "3girls", "man", "men", "male", "boy", "boys",
     "hetero", "penetration", "penis", "cock", "dick", "couple", "multiple people",
@@ -73,18 +73,35 @@ STRIP_TAGS = {
 }
 
 
+# Ich-Perspektive: Ein Gegenüber darf im Bild sein, aber nur mit Körperteilen, nie mit Kopf oder Gesicht.
+POV_ERLAUBT = {"male pov", "hetero", "penetration", "penis", "cock", "dick"}
+POV_ZUSATZ = "first-person view, faceless male, head out of frame"
+POV_NEGATIV = "male face, second face, man's head, visible head of second person"
+
+
+def ist_pov(prompt: str) -> bool:
+    """Ist das Bild aus der Ich-Perspektive? Ein Tag mit „pov“ oder „first-person“ sagt es."""
+    return any("pov" in t.lower() or "first-person" in t.lower() for t in (prompt or "").split(","))
+
+
+def _gestrichen(key: str, pov: bool) -> bool:
+    return key in STRIP_TAGS and not (pov and key in POV_ERLAUBT)
+
+
 def merge_prompt(prompt: str, positiv: str | None = None) -> str:
-    """Positiv-Vorsatz + Modell-Prompt, kommagetrennt, ohne Doppelte, ohne Sperrwörter."""
+    """Positiv-Vorsatz + Modell-Prompt, kommagetrennt, ohne Doppelte, ohne Sperrwörter. In der Ich-Perspektive
+    entfällt „solo“, dafür kommt POV_ZUSATZ dazu: Das Gegenüber bleibt ohne Kopf und Gesicht."""
     vorsatz = _wcfg("positiv", DEFAULTS["positiv"]) if positiv is None else positiv
+    pov = ist_pov(prompt)
     parts: list[str] = []
-    seen: set[str] = set()
-    for chunk in (vorsatz or "", prompt or ""):
+    seen: set[str] = {"solo"} if pov else set()
+    for chunk in (vorsatz or "", prompt or "", POV_ZUSATZ if pov else ""):
         for tag in chunk.split(","):
             t = tag.strip()
             if not t:
                 continue
             key = t.lower()
-            if key in seen or key in STRIP_TAGS or "pov" in key:
+            if key in seen or _gestrichen(key, pov):
                 continue
             seen.add(key)
             parts.append(t)
@@ -93,10 +110,11 @@ def merge_prompt(prompt: str, positiv: str | None = None) -> str:
 
 def stripped_tags(prompt: str) -> list[str]:
     """Welche Tags würden aus diesem Prompt gestrichen? (für Hinweise/Tests)"""
+    pov = ist_pov(prompt)
     out: list[str] = []
     for tag in (prompt or "").split(","):
         t = tag.strip()
-        if t and (t.lower() in STRIP_TAGS or "pov" in t.lower()):
+        if t and _gestrichen(t.lower(), pov):
             out.append(t)
     return out
 
@@ -270,12 +288,14 @@ def generate(prompt: str, *, model: str | None = None, neg: str | None = None,
             if not set_model(want, on_status):
                 raise RuntimeError(f"Konnte das WebUI-Modell '{want}' nicht laden.")
 
-    W, H = size or _wcfg("size", DEFAULTS["size"])
-    if isinstance((W, H), tuple) and isinstance(W, str):        # "832x1216" aus der Config
-        W, H = (int(x) for x in W.lower().split("x"))
+    groesse = size or _wcfg("size", DEFAULTS["size"])
+    if isinstance(groesse, str):                 # "832x1216" aus der Config
+        groesse = [int(x) for x in groesse.lower().split("x")]
+    W, H = groesse
     payload = {
         "prompt": merge_prompt(prompt),
-        "negative_prompt": (neg if neg is not None else _wcfg("neg", DEFAULTS["neg"])) or "",
+        "negative_prompt": ", ".join(x for x in ((neg if neg is not None else _wcfg("neg", DEFAULTS["neg"])) or "",
+                                                 POV_NEGATIV if ist_pov(prompt) else "") if x),
         "steps": int(steps or _wcfg("steps", DEFAULTS["steps"])),
         "cfg_scale": float(_wcfg("cfg", DEFAULTS["cfg"]) if cfg is None else cfg),
         "width": int(W),

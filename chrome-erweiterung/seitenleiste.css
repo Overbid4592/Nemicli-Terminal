@@ -1,4 +1,4 @@
-/* Farben wie das Desktop-Fenster (ui/gui_fenster.py, FARBE). */
+/* Farben wie alle NemiCLI-Fenster (ui/design.py, FARBE). */
 :root {
   --grund: #0c0c10; --leiste: #111116; --flaeche: #1b1b22; --flaeche-hell: #26262f;
   --rand: #2c2c36; --text: #ececf1; --dim: #a3a3ae; --blass: #6f6f7b;

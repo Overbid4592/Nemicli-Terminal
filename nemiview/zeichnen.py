@@ -56,11 +56,14 @@ class QtMesser(Messer):
 
     def _m(self, s):
         f = schrift(s)
-        m = self._metrik.get(id(f))
-        if m is None:
-            m = QFontMetricsF(f)
-            self._metrik[id(f)] = m
-        return m
+        eintrag = self._metrik.get(id(f))
+        if eintrag is None:
+            if len(self._metrik) > 500:
+                self._metrik.clear()
+            # Schrift mit ablegen: solange sie lebt, kann ihre id nicht an eine andere Schrift gehen.
+            eintrag = (f, QFontMetricsF(f))
+            self._metrik[id(f)] = eintrag
+        return eintrag[1]
 
     def breite(self, text, s):
         return self._m(s).horizontalAdvance(text)

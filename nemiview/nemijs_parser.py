@@ -139,7 +139,7 @@ def _string(q: str, i: int, zeile: int) -> tuple[str, int, int]:
     while i < len(q):
         c = q[i]
         if c == ende:
-            return "".join(out), i + 1, zeile
+            return surrogate_verbinden("".join(out)), i + 1, zeile
         if c == "\n":
             raise SyntaxFehler("Zeilenumbruch in einer Zeichenkette", zeile)
         if c == "\\":
@@ -151,19 +151,31 @@ def _string(q: str, i: int, zeile: int) -> tuple[str, int, int]:
     raise SyntaxFehler("Zeichenkette nicht geschlossen", zeile)
 
 
+def surrogate_verbinden(s: str) -> str:
+    """UTF-16-Paare (z. B. aus "\\uD83D\\uDE00") zu einem Zeichen verbinden; einzelne Hälften bleiben."""
+    if not any("\ud800" <= c <= "\udfff" for c in s):
+        return s
+    return s.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "surrogatepass")
+
+
 def _escape(q: str, i: int, zeile: int) -> tuple[str, int, int]:
     if i >= len(q):
         raise SyntaxFehler("Escape am Ende", zeile)
     c = q[i]
     if c in _ESCAPE and not (c == "0" and i + 1 < len(q) and q[i + 1].isdigit()):
         return _ESCAPE[c], i + 1, zeile
-    if c == "x":
-        return chr(int(q[i + 1:i + 3], 16)), i + 3, zeile
-    if c == "u":
-        if q[i + 1:i + 2] == "{":
-            j = q.index("}", i)
-            return chr(int(q[i + 2:j], 16)), j + 1, zeile
-        return chr(int(q[i + 1:i + 5], 16)), i + 5, zeile
+    if c in "xu":
+        if c == "x":
+            ziffern, weiter, laenge = q[i + 1:i + 3], i + 3, 2
+        elif q[i + 1:i + 2] == "{":
+            j = q.find("}", i)
+            ziffern, weiter, laenge = (q[i + 2:j], j + 1, None) if j > 0 else ("", i, None)
+        else:
+            ziffern, weiter, laenge = q[i + 1:i + 5], i + 5, 4
+        if not re.fullmatch(r"[0-9a-fA-F]+", ziffern) or (laenge is not None and len(ziffern) != laenge) or \
+                int(ziffern, 16) > 0x10FFFF:
+            raise SyntaxFehler(f"Ungültige Escape-Folge \\{c}{ziffern[:8]}", zeile)
+        return chr(int(ziffern, 16)), weiter, zeile
     if c == "\r" and q[i + 1:i + 2] == "\n":
         return "", i + 2, zeile + 1
     if c == "\n":
@@ -179,14 +191,14 @@ def _vorlage(q: str, i: int, zeile: int) -> tuple[list, int, int]:
     while i < len(q):
         c = q[i]
         if c == "`":
-            teile.append("".join(out))
+            teile.append(surrogate_verbinden("".join(out)))
             return teile, i + 1, zeile
         if c == "\\":
             s, i, zeile = _escape(q, i + 1, zeile)
             out.append(s)
             continue
         if c == "$" and q[i + 1:i + 2] == "{":
-            teile.append("".join(out))
+            teile.append(surrogate_verbinden("".join(out)))
             out = []
             j, tiefe, start = i + 2, 1, i + 2
             while j < len(q) and tiefe:
@@ -769,6 +781,17 @@ class Parser:
             links = {"t": art, "op": op, "l": links, "r": rechts, "z": t.zeile}
 
     def unaer(self) -> dict:
+        t = self.t
+        if not ((t.art == "punkt" and t.wert in ("!", "-", "+", "~", "++", "--")) or
+                (t.art == "wort" and t.wert in ("typeof", "void", "delete", "await"))):
+            return self._unaer()
+        self._tiefer()                                # Ketten wie !!!!…x zählen zur Verschachtelung
+        try:
+            return self._unaer()
+        finally:
+            self.tiefe -= 1
+
+    def _unaer(self) -> dict:
         t = self.t
         if t.art == "punkt" and t.wert in ("!", "-", "+", "~"):
             self.i += 1

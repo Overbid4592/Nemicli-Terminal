@@ -17,7 +17,7 @@ import re
 import sys
 import time
 from collections import deque
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from .nemijs_parser import SyntaxFehler, _zahl_text, parsen
 
@@ -261,6 +261,21 @@ def zu_uint32(v) -> int:
     return int(x) & 0xFFFFFFFF
 
 
+GANZ_MAX = 2 ** 53
+
+
+def zu_ganz(v, vorgabe: int = 0) -> int:
+    """Zahl → int (ToIntegerOrInfinity): NaN → vorgabe, ±Infinity und Riesenwerte → ±GANZ_MAX."""
+    x = zu_zahl(v)
+    if x != x:
+        return vorgabe
+    if x >= GANZ_MAX:
+        return GANZ_MAX
+    if x <= -GANZ_MAX:
+        return -GANZ_MAX
+    return int(x)
+
+
 def typ_von(v) -> str:
     if v is UNDEF:
         return "undefined"
@@ -285,7 +300,7 @@ def schluessel(v) -> str:
 
 def _index(key):
     """'3' → 3 (Listen-Index), sonst None."""
-    if isinstance(key, float) and key == int(key) and key >= 0:
+    if isinstance(key, float) and key.is_integer() and key >= 0:
         return int(key)
     if isinstance(key, str) and key.isdigit() and (key == "0" or not key.startswith("0")):
         return int(key)
@@ -326,10 +341,63 @@ def lose_gleich(a, b) -> bool:
 
 
 def _datum_text(d: JSObject) -> str:
-    z = d.props.get("__zeit", math.nan)
-    if z != z:
+    t = lokale_zeit(d.props.get("__zeit", math.nan))
+    if t is None:
         return "Invalid Date"
-    return datetime.fromtimestamp(z / 1000).strftime("%a %b %d %Y %H:%M:%S")
+    return t.strftime("%a %b %d %Y %H:%M:%S")
+
+
+# Zeitrechnung über die Epoche statt fromtimestamp/timestamp: die scheitern unter Windows vor 1970 (OSError).
+_EPOCHE = datetime(1970, 1, 1)
+_ZYKLUS_S = 146097 * 86400            # 400 gregorianische Jahre: gleicher Kalender, gleiche Wochentage
+
+
+def _versatz_s(t: float) -> float:
+    """Lokaler UTC-Versatz in Sekunden zum Zeitpunkt t (s seit 1970); außerhalb von localtime per 400-Jahre-Zyklus."""
+    if not 0 <= t < _ZYKLUS_S:
+        t %= _ZYKLUS_S
+    try:
+        return float(time.localtime(t).tm_gmtoff or 0)
+    except (OSError, OverflowError, ValueError):
+        return 0.0
+
+
+def zeit_klemmen(z: float) -> float:
+    """TimeClip: ganze ms, höchstens ±8.64e15, sonst NaN."""
+    if z != z or abs(z) > 8.64e15:
+        return math.nan
+    return float(int(z))
+
+
+def utc_zeit(z: float) -> datetime | None:
+    """ms seit 1970 → naive UTC-Zeit; None bei NaN oder außerhalb von datetime."""
+    if z != z:
+        return None
+    try:
+        return _EPOCHE + timedelta(milliseconds=z)
+    except OverflowError:
+        return None
+
+
+def lokale_zeit(z: float) -> datetime | None:
+    """ms seit 1970 → naive lokale Zeit; None bei NaN oder außerhalb von datetime."""
+    t = utc_zeit(z)
+    if t is None:
+        return None
+    try:
+        return t + timedelta(seconds=_versatz_s(z / 1000))
+    except OverflowError:
+        return None
+
+
+def zeit_von(d: datetime, utc: bool = False) -> float:
+    """Naive Zeit (lokal oder UTC) → ms seit 1970."""
+    z = (d - _EPOCHE) / timedelta(milliseconds=1)
+    if utc:
+        return z
+    versatz = _versatz_s(z / 1000)
+    neu = _versatz_s(z / 1000 - versatz)              # zweiter Blick an Sommerzeit-Grenzen
+    return z - neu * 1000
 
 
 # ---------------------------------------------------------------------------
@@ -428,6 +496,8 @@ class NemiJS:
         except SyntaxFehler as e:
             raise JSFehler(self.fehler("SyntaxError", f"{name}: {e}")) from None
         self.einstieg()
+        for n in _var_namen(baum["body"]):
+            self.global_scope.vars.setdefault(n, UNDEF)
         self._block(baum["body"], self.global_scope)
         self.mikro_abarbeiten()
 
@@ -542,6 +612,8 @@ class NemiJS:
                 proto = self.objekt()
                 proto.props["constructor"] = obj
                 obj.props["prototype"] = proto
+            if k == "size" and obj.klasse in ("Map", "Set") and "__daten" in obj.props:
+                return float(len(obj.props["__daten"]))
             return obj.suchen(k)
         if isinstance(obj, str):
             i = _index(key)
@@ -577,9 +649,10 @@ class NemiJS:
                 return
             k = schluessel(key)
             if k == "length":
-                n = int(zu_zahl(wert))
-                if n < 0 or n > MAX_LISTE:
+                x = zu_zahl(wert)
+                if not x.is_integer() or x < 0 or x > MAX_LISTE:
                     self.werfen("RangeError", "Ungültige Listenlänge")
+                n = int(x)
                 del obj.items[n:]
                 obj.items.extend([UNDEF] * (n - len(obj.items)))
                 return
@@ -632,6 +705,11 @@ class NemiJS:
                 scope = Scope(f.scope, funktion=True, this=this if f.this_fest is None else f.this_fest, fn=f)
             scope.vars["arguments"] = self.liste(args) if not k["pfeil"] else _arguments_von(f.scope)
             self._parameter(k["params"], args, scope)
+            namen = k.get("__var")
+            if namen is None:
+                namen = k["__var"] = _var_namen(k["body"])
+            for n in namen:                                # var-Deklarationen heben
+                scope.vars.setdefault(n, UNDEF)
             if k["async"]:
                 p = Promise(self.protos["Promise"])
                 try:
@@ -772,7 +850,7 @@ class NemiJS:
             ziel_scope = scope.funktions_scope() if a["art"] == "var" else scope
             for ziel, init in a["teile"]:
                 wert = self.wert(init, scope) if init is not None else UNDEF
-                if init is None and a["art"] == "var" and ziel["t"] == "Name" and ziel_scope.finden(ziel["name"]):
+                if init is None and a["art"] == "var" and ziel["t"] == "Name" and ziel["name"] in ziel_scope.vars:
                     continue
                 self._binden(ziel, wert, ziel_scope, a["art"])
         elif t == "If":
@@ -873,7 +951,7 @@ class NemiJS:
 
     def _ziel_setzen(self, a, wert, s):
         if a["art"] is not None:
-            self._binden(a["ziel"], wert, s, a["art"])
+            self._binden(a["ziel"], wert, s.funktions_scope() if a["art"] == "var" else s, a["art"])
         else:
             self._zuweisen(a["ziel"], wert, s)
 
@@ -1063,6 +1141,13 @@ class NemiJS:
             return self._unaer(e, scope)
         if t == "Aendern":
             ziel = e["ziel"]
+            if ziel["t"] == "Glied" and ziel["obj"]["t"] != "Super":     # Objekt und Schlüssel nur einmal auswerten
+                obj = self.wert(ziel["obj"], scope)
+                key = self._prop(ziel, scope)
+                alt = zu_zahl(self.holen(obj, key))
+                neu = alt + 1 if e["op"] == "++" else alt - 1
+                self.setzen(obj, key, neu)
+                return neu if e["vorn"] else alt
             alt = zu_zahl(self.wert(ziel, scope))
             neu = alt + 1 if e["op"] == "++" else alt - 1
             self._zuweisen(ziel, neu, scope)
@@ -1264,7 +1349,7 @@ class NemiJS:
         if op == "!=":
             return not lose_gleich(a, b)
         if op in ("<", ">", "<=", ">="):
-            pa, pb = self._primitiv(a), self._primitiv(b)
+            pa, pb = self._primitiv(a, "number"), self._primitiv(b, "number")
             if isinstance(pa, str) and isinstance(pb, str):
                 x, y = pa, pb
             else:
@@ -1297,10 +1382,10 @@ class NemiJS:
             self.werfen("TypeError", "„in“ braucht ein Objekt")
         self.werfen("SyntaxError", f"Unbekannter Operator {op}")
 
-    def _primitiv(self, v):
+    def _primitiv(self, v, hinweis: str = "default"):
         if isinstance(v, JSObject) and not isinstance(v, (JSArray, JSFunktion, Nativ)):
-            if v.klasse == "Date":
-                return zu_text(v)
+            if v.klasse == "Date":                       # Vergleiche rechnen mit der Zeit, „+“ mit dem Text
+                return v.props.get("__zeit", math.nan) if hinweis == "number" else zu_text(v)
             vo = v.suchen("valueOf")
             if isinstance(vo, JSFunktion):
                 r = self.rufen(vo, v, [])
@@ -1470,6 +1555,62 @@ def _arguments_von(scope):
             return s.vars["arguments"]
         s = s.eltern
     return UNDEF
+
+
+def _var_namen(body) -> list[str]:
+    """Mit var deklarierte Namen eines Funktionskörpers (ohne innere Funktionen und Klassen)."""
+    namen: list[str] = []
+    stapel = list(body)
+    while stapel:
+        a = stapel.pop()
+        t = a.get("t")
+        if t == "Var":
+            if a["art"] == "var":
+                for ziel, _init in a["teile"]:
+                    _muster_namen(ziel, namen)
+        elif t in ("ForOf", "ForIn"):
+            if a["art"] == "var":
+                _muster_namen(a["ziel"], namen)
+            stapel.append(a["body"])
+        elif t == "For":
+            if a["init"] is not None:
+                stapel.append(a["init"])
+            stapel.append(a["body"])
+        elif t == "If":
+            stapel.append(a["dann"])
+            if a["sonst"] is not None:
+                stapel.append(a["sonst"])
+        elif t in ("While", "DoWhile"):
+            stapel.append(a["body"])
+        elif t == "Block":
+            stapel.extend(a["body"])
+        elif t == "Try":
+            for teil in (a["block"], a["fang"], a["schluss"]):
+                if teil is not None:
+                    stapel.extend(teil["body"])
+        elif t == "Switch":
+            for _test, faelle in a["faelle"]:
+                stapel.extend(faelle)
+    return namen
+
+
+def _muster_namen(ziel, namen: list) -> None:
+    t = ziel["t"]
+    if t == "Name":
+        namen.append(ziel["name"])
+    elif t == "ObjMuster":
+        for _k, _berechnet, unterziel, _vorgabe in ziel["props"]:
+            _muster_namen(unterziel, namen)
+        if ziel["rest"]:
+            namen.append(ziel["rest"])
+    elif t == "ListMuster":
+        for el in ziel["elemente"]:
+            if el is not None:
+                _muster_namen(el[0], namen)
+        if ziel["rest"] is not None:
+            _muster_namen(ziel["rest"], namen)
+    elif t == "MitVorgabe":
+        _muster_namen(ziel["ziel"], namen)
 
 
 def _hat_let(init) -> bool:

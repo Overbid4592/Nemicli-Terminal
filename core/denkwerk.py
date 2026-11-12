@@ -139,7 +139,8 @@ def runde(text: str) -> Runde | None:
 _TUN = (r"(male|malen|zeichne|zeichnen|starte|starten|lese|lesen|schaue|schauen|suche|suchen|öffne|öffnen|"
         r"erstelle|erstellen|schreibe|schreiben|speichere|speichern|rufe|rufen|mache|machen|lege|legen|"
         r"installiere|installieren|probiere|probieren|zeige|zeigen|hole|holen)")
-_JETZT = r"(jetzt|sofort|gleich|direkt|nun)"
+# „direkt an/in/vor …“ beschreibt einen Ort oder Blick, keine Zeit
+_JETZT = r"(jetzt|sofort|gleich|direkt(?!\s+(?:an|ans|auf|aus|hinter|in|ins|neben|über|unter|vor|zu|zum|zur)\b)|nun)"
 _DO = (r"(paint|draw|create|generate|make|start|read|open|search|look|check|write|save|show|try|call|run|"
        r"install|fetch|get)")
 _DOING = r"(painting|drawing|creating|generating|making|starting|reading|opening|searching|writing|saving)"
@@ -151,21 +152,26 @@ _ANKUENDIGUNG = re.compile(
     rf"|\b(i'll|i will|i'm going to|i am going to|i'm gonna)\s+([\w'-]+\s+){{0,3}}?{_DO}\b[^.!?\n]{{0,60}}?\b{_NOW}\b"
     rf"|\blet me\s+([\w'-]+\s+){{0,2}}?{_DO}\b"
     rf"|\b(i'm|i am)\s+(now\s+)?{_DOING}\b", re.I)
+_VERNEINT = re.compile(r"\b(nicht|nichts|kein\w*|nie|niemals|not|never)\b", re.I)
+_BEDINGT = re.compile(r"\b(wenn|falls|sobald|sag mir|sag einfach|sag bescheid|if|once|as soon as|tell me)\b", re.I)
 _SCHLUSS = re.compile(r"[\s*_~)\"'\u00bb\u201c\u201d\u2600-\u27bf\U0001f000-\U0001faff\ufe0f\u200d]+$")
 
 
 def ankuendigung(antwort: str) -> str | None:
     """Der Satz, mit dem eine Antwort eine Handlung ankündigt – None, wenn keiner oder wenn sie mit einer
-    Frage endet (dann wartet die KI zu Recht auf ihr Gegenüber)."""
+    Frage endet (dann wartet die KI zu Recht auf ihr Gegenüber). Eine Absage („das male ich nicht“) und ein
+    Angebot unter Bedingung („sag es, und ich mache es sofort“) kündigen nichts an."""
     t = re.sub(r"(?s)<think>.*?</think>", "", antwort or "").strip()
     if not t or _SCHLUSS.sub("", t).endswith("?"):
         return None
-    m = _ANKUENDIGUNG.search(t.replace(chr(0x2019), "'"))          # typografischer Apostroph wie '
-    if m is None:
-        return None
-    anfang = max(t.rfind(z, 0, m.start()) for z in ".!?\n") + 1
-    ende = min((i for i in (t.find(z, m.end()) for z in ".!?\n") if i >= 0), default=len(t))
-    return t[anfang:ende + 1].strip()[:160]
+    such = t.replace(chr(0x2019), "'")                             # typografischer Apostroph wie '
+    for m in _ANKUENDIGUNG.finditer(such):
+        anfang = max(t.rfind(z, 0, m.start()) for z in ".!?\n") + 1
+        ende = min((i for i in (t.find(z, m.end()) for z in ".!?\n") if i >= 0), default=len(t))
+        teilsatz = m.group() + re.split(r"[,;:–—]", such[m.end():ende], maxsplit=1)[0]
+        if not _VERNEINT.search(teilsatz) and not _BEDINGT.search(such[anfang:ende]):
+            return t[anfang:ende + 1].strip()[:160]
+    return None
 
 
 def nachfassen(satz: str) -> str:

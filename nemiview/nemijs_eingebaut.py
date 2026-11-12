@@ -11,11 +11,13 @@ import math
 import random
 import re
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta
 
 from .nemijs import (MAX_LISTE, REGEX_MAX_EINGABE, UNDEF, Grenze, JSArray, JSFehler, JSObject, Nativ,
-                     Promise, Wirt, _index, ist_aufrufbar, lose_gleich, schluessel, streng_gleich, typ_von, zu_bool,
-                     zu_int32, zu_text, zu_zahl)
+                     Promise, Wirt, _index, _versatz_s, ist_aufrufbar, lokale_zeit, lose_gleich, schluessel,
+                     streng_gleich, typ_von, utc_zeit, zeit_klemmen, zeit_von, zu_bool, zu_ganz, zu_int32, zu_text,
+                     zu_uint32, zu_zahl)
+from .nemijs_parser import surrogate_verbinden
 
 
 def _arg(a, i):
@@ -201,7 +203,7 @@ def einrichten(js) -> None:
         items = _liste(t, js_).items
         n = len(items)
         s, _ = _start_ende(n, a)
-        anzahl = n - s if len(a) < 2 else max(0, min(int(zu_zahl(a[1]) or 0), n - s))
+        anzahl = n - s if len(a) < 2 else max(0, min(zu_ganz(a[1]), n - s))
         weg = items[s:s + anzahl]
         items[s:s + anzahl] = list(a[2:])
         return js_.liste(weg)
@@ -225,7 +227,13 @@ def einrichten(js) -> None:
     def _index_of(js_, t, a, letzter=False):
         items = _liste(t, js_).items
         x = _arg(a, 0)
-        reihe = range(len(items) - 1, -1, -1) if letzter else range(len(items))
+        n = len(items)
+        if letzter:
+            k = n - 1 if len(a) < 2 else zu_ganz(a[1])
+            reihe = range(min(k, n - 1) if k >= 0 else n + k, -1, -1)
+        else:
+            k = zu_ganz(_arg(a, 1))
+            reihe = range(max(0, n + k) if k < 0 else k, n)
         for i in reihe:
             if streng_gleich(items[i], x):
                 return float(i)
@@ -233,7 +241,9 @@ def einrichten(js) -> None:
 
     def _includes(js_, t, a):
         x = _arg(a, 0)
-        for y in _liste(t, js_).items:
+        items = _liste(t, js_).items
+        k = zu_ganz(_arg(a, 1))
+        for y in items[max(0, len(items) + k) if k < 0 else k:]:
             if streng_gleich(x, y) or (isinstance(x, float) and isinstance(y, float) and x != x and y != y):
                 return True
         return False
@@ -251,13 +261,15 @@ def einrichten(js) -> None:
         return float(len(items))
 
     def _flat(js_, t, a):
-        tiefe = 1 if _arg(a, 0) is UNDEF else int(zu_zahl(a[0]))
+        tiefe = 1 if _arg(a, 0) is UNDEF else min(zu_ganz(a[0]), 1000)     # Grenze auch für Listen, die sich enthalten
 
         def flach(items, d):
             out = []
             for x in items:
                 if isinstance(x, JSArray) and d > 0:
                     out.extend(flach(x.items, d - 1))
+                    if len(out) > MAX_LISTE:
+                        raise Grenze("Liste zu groß")
                 else:
                     out.append(x)
             return out
@@ -278,7 +290,7 @@ def einrichten(js) -> None:
 
     def _at(js_, t, a):
         items = _liste(t, js_).items if isinstance(t, JSArray) else t
-        i = int(zu_zahl(_arg(a, 0)) or 0)
+        i = zu_ganz(_arg(a, 0))
         if i < 0:
             i += len(items)
         return items[i] if 0 <= i < len(items) else UNDEF
@@ -307,7 +319,7 @@ def einrichten(js) -> None:
     def _array_neu(js_, a):
         if len(a) == 1 and isinstance(a[0], float):
             n = a[0]
-            if n != int(n) or n < 0 or n > MAX_LISTE:
+            if not n.is_integer() or n < 0 or n > MAX_LISTE:
                 js_.werfen("RangeError", "Ungültige Listenlänge")
             return js_.liste([UNDEF] * int(n))
         return js_.liste(list(a))
@@ -316,7 +328,7 @@ def einrichten(js) -> None:
         q = _arg(a, 0)
         f = _arg(a, 1)
         if isinstance(q, JSObject) and not isinstance(q, JSArray) and q.klasse not in ("Map", "Set"):
-            n = int(zu_zahl(js_.holen(q, "length")) or 0)
+            n = max(0, zu_ganz(js_.holen(q, "length")))
             if n > MAX_LISTE:
                 raise Grenze("Liste zu groß")
             items = [js_.holen(q, float(i)) for i in range(n)]
@@ -382,7 +394,7 @@ def einrichten(js) -> None:
             sep = zu_text(sep)
             teile = list(s) if sep == "" else s.split(sep)
         if grenze is not UNDEF:
-            teile = teile[:int(zu_zahl(grenze))]
+            teile = teile[:zu_uint32(grenze)]
         return js_.liste(teile)
 
     def _match(js_, t, a):
@@ -398,11 +410,13 @@ def einrichten(js) -> None:
     def _match_all(js_, t, a):
         s = _s(t, js_)
         r = _arg(a, 0)
+        if not (isinstance(r, JSObject) and r.klasse == "RegExp"):
+            r = js_.regex(re.escape(zu_text(r)), "g")
         return js_.liste([_exec_ergebnis(js_, m, s) for m in r.props["__re"].finditer(s)])
 
     def _pad(js_, t, a, vorn):
         s = _s(t, js_)
-        n = int(zu_zahl(_arg(a, 0)) or 0)
+        n = zu_ganz(_arg(a, 0))
         f = " " if _arg(a, 1) is UNDEF else zu_text(a[1])
         if n <= len(s) or not f:
             return s
@@ -426,7 +440,7 @@ def einrichten(js) -> None:
         return s[x:y]
 
     def _repeat(js_, t, a):
-        n = int(zu_zahl(_arg(a, 0)) or 0)
+        n = zu_ganz(_arg(a, 0))
         s = _s(t, js_)
         if n < 0:
             js_.werfen("RangeError", "repeat braucht eine Zahl ≥ 0")
@@ -446,39 +460,48 @@ def einrichten(js) -> None:
         "trimEnd": lambda js_, t, a: _s(t, js_).rstrip(),
         "includes": lambda js_, t, a: zu_text(_arg(a, 0)) in _s(t, js_),
         "startsWith": lambda js_, t, a: _s(t, js_).startswith(zu_text(_arg(a, 0)),
-                                                              int(zu_zahl(_arg(a, 1)) or 0) if _arg(a, 1) is not UNDEF else 0),
+                                                              max(0, zu_ganz(_arg(a, 1)))),
         "endsWith": lambda js_, t, a: _s(t, js_).endswith(zu_text(_arg(a, 0))),
         "indexOf": lambda js_, t, a: float(_s(t, js_).find(zu_text(_arg(a, 0)),
-                                                           int(zu_zahl(_arg(a, 1)) or 0) if _arg(a, 1) is not UNDEF else 0)),
+                                                           max(0, zu_ganz(_arg(a, 1))))),
         "lastIndexOf": lambda js_, t, a: float(_s(t, js_).rfind(zu_text(_arg(a, 0)))),
         "slice": _slice_s, "substring": _sub,
-        "substr": lambda js_, t, a: _s(t, js_)[int(zu_zahl(_arg(a, 0)) or 0):][:None if _arg(a, 1) is UNDEF
-                                                                                else max(0, int(zu_zahl(a[1])))],
+        "substr": lambda js_, t, a: _s(t, js_)[zu_ganz(_arg(a, 0)):][:None if _arg(a, 1) is UNDEF
+                                                                     else max(0, zu_ganz(a[1]))],
         "replace": _replace, "replaceAll": lambda js_, t, a: _replace(js_, t, a, True),
         "split": _split, "match": _match, "matchAll": _match_all,
         "search": lambda js_, t, a: float(m.start()) if (m := (_arg(a, 0).props["__re"] if isinstance(_arg(a, 0), JSObject)
                                                                 else re.compile(re.escape(zu_text(_arg(a, 0))))).search(_s(t, js_))) else -1.0,
         "padStart": lambda js_, t, a: _pad(js_, t, a, True), "padEnd": lambda js_, t, a: _pad(js_, t, a, False),
         "repeat": _repeat,
-        "charAt": lambda js_, t, a: (lambda s, i: s[i] if 0 <= i < len(s) else "")(_s(t, js_), int(zu_zahl(_arg(a, 0)) or 0)),
+        "charAt": lambda js_, t, a: (lambda s, i: s[i] if 0 <= i < len(s) else "")(_s(t, js_), zu_ganz(_arg(a, 0))),
         "charCodeAt": lambda js_, t, a: (lambda s, i: float(ord(s[i])) if 0 <= i < len(s) else math.nan)(
-            _s(t, js_), int(zu_zahl(_arg(a, 0)) or 0)),
+            _s(t, js_), zu_ganz(_arg(a, 0))),
         "codePointAt": lambda js_, t, a: (lambda s, i: float(ord(s[i])) if 0 <= i < len(s) else UNDEF)(
-            _s(t, js_), int(zu_zahl(_arg(a, 0)) or 0)),
+            _s(t, js_), zu_ganz(_arg(a, 0))),
         "at": lambda js_, t, a: _at(js_, _s(t, js_), a),
         "concat": lambda js_, t, a: js_.text_pruefen(_s(t, js_) + "".join(zu_text(x) for x in a)),
         "localeCompare": _locale_vgl, "normalize": lambda js_, t, a: _s(t, js_),
         "toString": lambda js_, t, a: _s(t, js_), "valueOf": lambda js_, t, a: _s(t, js_),
     })
+    def _code_punkte(js_, t, a):
+        out = []
+        for x in a:
+            c = zu_zahl(x)
+            if not (c.is_integer() and 0 <= c <= 0x10FFFF):
+                js_.werfen("RangeError", f"Ungültiger Codepunkt {zu_text(x)}")
+            out.append(chr(int(c)))
+        return surrogate_verbinden("".join(out))
+
     konstruktor("String", lambda js_, t, a: js_._zu_text(_arg(a, 0)) if a else "",
                 lambda js_, a: js_._zu_text(_arg(a, 0)) if a else "",
-                {"fromCharCode": lambda js_, t, a: "".join(chr(int(zu_zahl(x)) & 0xFFFF) for x in a),
-                 "fromCodePoint": lambda js_, t, a: "".join(chr(int(zu_zahl(x))) for x in a)})
+                {"fromCharCode": lambda js_, t, a: surrogate_verbinden("".join(chr(zu_ganz(x) & 0xFFFF) for x in a)),
+                 "fromCodePoint": _code_punkte})
 
     # -- Number / Boolean ------------------------------------------------------------
     def _to_fixed(js_, t, a):
         x = zu_zahl(t)
-        n = int(zu_zahl(_arg(a, 0)) or 0)
+        n = zu_ganz(_arg(a, 0))
         if not 0 <= n <= 100:
             js_.werfen("RangeError", "toFixed: 0 bis 100 Stellen")
         if x != x:
@@ -489,16 +512,25 @@ def einrichten(js) -> None:
         return str(Decimal(repr(x)).quantize(Decimal(1).scaleb(-n), rounding=ROUND_HALF_UP)) if n else \
             str(int(Decimal(repr(x)).quantize(Decimal(1), rounding=ROUND_HALF_UP)))
 
+    def _to_precision(js_, t, a):
+        x = zu_zahl(t)
+        if _arg(a, 0) is UNDEF or not math.isfinite(x):
+            return zu_text(x)
+        p = zu_ganz(a[0])
+        if not 1 <= p <= 100:
+            js_.werfen("RangeError", "toPrecision: 1 bis 100 Stellen")
+        return f"{x:.{p}g}"
+
     def _zahl_to_string(js_, t, a):
         x = zu_zahl(t)
         basis = _arg(a, 0)
         if basis is UNDEF or zu_zahl(basis) == 10:
             return zu_text(x)
-        b = int(zu_zahl(basis))
+        b = zu_ganz(basis)
         if not 2 <= b <= 36:
             js_.werfen("RangeError", "toString: Basis 2 bis 36")
-        if x != x:
-            return "NaN"
+        if not math.isfinite(x):
+            return zu_text(x)
         ganz = int(abs(x))
         ziffern = "0123456789abcdefghijklmnopqrstuvwxyz"
         out = ""
@@ -520,12 +552,14 @@ def einrichten(js) -> None:
 
     def _locale_zahl(js_, t, a):
         x = zu_zahl(t)
+        if not math.isfinite(x):
+            return zu_text(x)
         opt = _arg(a, 1)
         stellen = None
         if isinstance(opt, JSObject):
             m = opt.props.get("maximumFractionDigits", opt.props.get("minimumFractionDigits"))
-            if isinstance(m, float):
-                stellen = int(m)
+            if isinstance(m, float) and math.isfinite(m):
+                stellen = max(0, min(20, int(m)))
         text = f"{x:,.{stellen}f}" if stellen is not None else (f"{x:,.0f}" if x == int(x) else f"{x:,}")
         if zu_text(_arg(a, 0)).startswith("en"):
             return text
@@ -533,12 +567,12 @@ def einrichten(js) -> None:
 
     methoden(P["Number"], {"toFixed": _to_fixed, "toString": _zahl_to_string, "toLocaleString": _locale_zahl,
                            "valueOf": lambda js_, t, a: zu_zahl(t),
-                           "toPrecision": lambda js_, t, a: f"{zu_zahl(t):.{int(zu_zahl(_arg(a, 0)) or 1)}g}"})
+                           "toPrecision": _to_precision})
     methoden(P["Boolean"], {"toString": lambda js_, t, a: zu_text(t), "valueOf": lambda js_, t, a: t})
 
     def _parse_int(js_, t, a):
         s = zu_text(_arg(a, 0)).strip()
-        b = int(zu_zahl(_arg(a, 1))) if _arg(a, 1) is not UNDEF and zu_zahl(a[1]) == zu_zahl(a[1]) else 0
+        b = zu_int32(_arg(a, 1))
         neg = s.startswith("-")
         s = s.lstrip("+-")
         if (b in (0, 16)) and s[:2].lower() == "0x":
@@ -581,12 +615,14 @@ def einrichten(js) -> None:
     konstruktor("Boolean", lambda js_, t, a: zu_bool(_arg(a, 0)), lambda js_, a: zu_bool(_arg(a, 0)))
 
     # -- Math ----------------------------------------------------------------------
-    def m1(fn):
+    def m1(fn, name=""):
         def f(js_, t, a):
             x = zu_zahl(_arg(a, 0))
             try:
                 return float(fn(x))
-            except (ValueError, OverflowError):
+            except OverflowError:                       # exp, sinh, cosh: Ergebnis zu groß
+                return -math.inf if name == "sinh" and x < 0 else math.inf
+            except ValueError:
                 return math.nan
         return f
 
@@ -611,7 +647,8 @@ def einrichten(js) -> None:
                      "trunc": math.trunc, "sign": lambda x: x if x != x or x == 0 else math.copysign(1.0, x),
                      "sinh": math.sinh, "cosh": math.cosh, "tanh": math.tanh}.items():
         mathe.props[name] = nativ(m1(lambda x, fn=fn: x if not math.isfinite(x) and fn in (math.floor, math.ceil,
-                                                                                            math.trunc, _rund) else fn(x)), name)
+                                                                                            math.trunc, _rund) else fn(x),
+                                      name), name)
     mathe.props["max"] = nativ(_minmax(max, -math.inf), "max")
     mathe.props["min"] = nativ(_minmax(min, math.inf), "min")
     mathe.props["pow"] = nativ(lambda js_, t, a: js_.binaer("**", _arg(a, 0), _arg(a, 1)), "pow")
@@ -663,7 +700,7 @@ def einrichten(js) -> None:
         ein = _arg(a, 2)
         indent = None
         if isinstance(ein, float):
-            indent = max(0, min(10, int(ein))) or None
+            indent = max(0, min(10, zu_ganz(ein))) or None
         elif isinstance(ein, str) and ein:
             indent = ein[:10]
         text = json.dumps(_nach_py(js_, v, set()), ensure_ascii=False, indent=indent,
@@ -834,28 +871,62 @@ def einrichten(js) -> None:
             else:
                 z = _datum_lesen(zu_text(x))
         else:
-            from datetime import timedelta
-            teile = [int(zu_zahl(x)) for x in a[:7]] + [0] * (7 - len(a[:7]))
-            try:
-                jahr, monat = teile[0] + teile[1] // 12, teile[1] % 12 + 1     # Monat 0–11, Überlauf ins Jahr
-                d = datetime(jahr, monat, 1) + timedelta(days=(teile[2] if len(a) > 2 else 1) - 1, hours=teile[3],
-                                                         minutes=teile[4], seconds=teile[5], milliseconds=teile[6])
-                z = d.timestamp() * 1000
-            except (ValueError, OverflowError):
-                z = math.nan
-        return JSObject(P["Date"], "Date", {"__zeit": float(z)})
+            teile = [zu_zahl(x) for x in a[:7]]
+            teile += [1.0, 0.0, 0.0, 0.0, 0.0][len(teile) - 2:]          # Tag 1, Rest 0
+            z = _aus_teilen(teile)
+        return JSObject(P["Date"], "Date", {"__zeit": zeit_klemmen(float(z))})
 
-    def _dt(t, js_) -> datetime | None:
+    def _aus_teilen(teile, utc=False) -> float:
+        """[Jahr, Monat 0–11, Tag, Std, Min, Sek, ms] mit Überläufen → ms seit 1970; NaN, wenn ungültig."""
+        if not all(math.isfinite(x) for x in teile):
+            return math.nan
+        jahr, monat, tag, std, mi, sek, ms = (int(x) for x in teile)
+        try:
+            d = datetime(jahr + monat // 12, monat % 12 + 1, 1) + timedelta(days=tag - 1, hours=std, minutes=mi,
+                                                                             seconds=sek, milliseconds=ms)
+        except (ValueError, OverflowError):
+            return math.nan
+        return zeit_klemmen(zeit_von(d, utc))
+
+    def _dt(t, js_, utc=False) -> datetime | None:
         if not (isinstance(t, JSObject) and t.klasse == "Date"):
             js_.werfen("TypeError", "Das ist kein Datum")
         z = t.props["__zeit"]
-        return None if z != z else datetime.fromtimestamp(z / 1000)
+        return utc_zeit(z) if utc else lokale_zeit(z)
 
-    def holer(fn):
+    def holer(fn, utc=False):
         def f(js_, t, a):
-            d = _dt(t, js_)
+            d = _dt(t, js_, utc)
             return math.nan if d is None else float(fn(d))
         return f
+
+    def setzer(feld, anzahl, utc=False):
+        """setFullYear … setMilliseconds: ab Feld feld (0 = Jahr … 6 = ms) bis zu anzahl Werte ersetzen."""
+        def f(js_, t, a):
+            d = _dt(t, js_, utc)
+            if d is None:
+                if feld:
+                    return math.nan
+                d = utc_zeit(0.0) if utc else lokale_zeit(0.0)       # setFullYear auf ungültigem Datum: ab 0
+            teile = [float(d.year), float(d.month - 1), float(d.day), float(d.hour), float(d.minute), float(d.second),
+                     float(d.microsecond // 1000)]
+            werte = [zu_zahl(x) for x in a[:anzahl]] or [math.nan]
+            teile[feld:feld + len(werte)] = werte
+            z = _aus_teilen(teile, utc)
+            t.props["__zeit"] = z
+            return z
+        return f
+
+    def _set_time(js_, t, a):
+        _dt(t, js_)
+        z = zeit_klemmen(zu_zahl(_arg(a, 0)))
+        t.props["__zeit"] = z
+        return z
+
+    def _tz_versatz(js_, t, a):
+        if _dt(t, js_) is None:
+            return math.nan
+        return float(-(_versatz_s(t.props["__zeit"] / 1000) // 60))
 
     def _lokal(js_, t, a, art):
         d = _dt(t, js_)
@@ -873,12 +944,19 @@ def einrichten(js) -> None:
         "getDate": holer(lambda d: d.day), "getDay": holer(lambda d: (d.weekday() + 1) % 7),
         "getHours": holer(lambda d: d.hour), "getMinutes": holer(lambda d: d.minute),
         "getSeconds": holer(lambda d: d.second), "getMilliseconds": holer(lambda d: d.microsecond // 1000),
+        "getUTCFullYear": holer(lambda d: d.year, True), "getUTCMonth": holer(lambda d: d.month - 1, True),
+        "getUTCDate": holer(lambda d: d.day, True), "getUTCDay": holer(lambda d: (d.weekday() + 1) % 7, True),
+        "getUTCHours": holer(lambda d: d.hour, True), "getUTCMinutes": holer(lambda d: d.minute, True),
+        "getUTCSeconds": holer(lambda d: d.second, True),
+        "getUTCMilliseconds": holer(lambda d: d.microsecond // 1000, True),
+        "setFullYear": setzer(0, 3), "setMonth": setzer(1, 2), "setDate": setzer(2, 1), "setHours": setzer(3, 4),
+        "setMinutes": setzer(4, 3), "setSeconds": setzer(5, 2), "setMilliseconds": setzer(6, 1), "setTime": _set_time,
         "toISOString": lambda js_, t, a: _iso(t), "toJSON": lambda js_, t, a: _iso(t),
         "toString": lambda js_, t, a: zu_text(t),
         "toLocaleDateString": lambda js_, t, a: _lokal(js_, t, a, "datum"),
         "toLocaleTimeString": lambda js_, t, a: _lokal(js_, t, a, "zeit"),
         "toLocaleString": lambda js_, t, a: _lokal(js_, t, a, "beides"),
-        "getTimezoneOffset": lambda js_, t, a: float(-(datetime.now().astimezone().utcoffset().total_seconds() // 60)),
+        "getTimezoneOffset": _tz_versatz,
     })
     dk = konstruktor("Date", lambda js_, t, a: zu_text(_date_neu(js_, [])), _date_neu,
                      {"now": lambda js_, t, a: float(int(time.time() * 1000)),
@@ -902,7 +980,7 @@ def einrichten(js) -> None:
         s = zu_text(_arg(a, 0))
         if len(s) > REGEX_MAX_EINGABE:
             js_.werfen("RangeError", "Text zu lang für einen regulären Ausdruck")
-        start = int(zu_zahl(r.props.get("lastIndex", 0.0)) or 0) if r.props.get("global") else 0
+        start = max(0, zu_ganz(r.props.get("lastIndex", 0.0))) if r.props.get("global") else 0
         m = r.props["__re"].search(s, start) if start <= len(s) else None
         if r.props.get("global"):
             r.props["lastIndex"] = float(m.end() if m and m.end() > m.start() else (m.end() + 1 if m else 0))
@@ -980,12 +1058,23 @@ def einrichten(js) -> None:
 
     # -- localStorage (je App eine Datei, vom Gastgeber gesetzt) -------------------------
     class Speicher(Wirt):
+        """localStorage (dauerhaft, vom Gastgeber gespeichert) oder sessionStorage (nur im Speicher)."""
         js_klasse = "Storage"
 
+        def __init__(self, dauerhaft: bool = True):
+            self._dauerhaft = dauerhaft
+            self._sitzung: dict = {}
+
         def _daten(self) -> dict:
+            if not self._dauerhaft:
+                return self._sitzung
             if js.storage is None:
                 js.storage = {}
             return js.storage
+
+        def _melden(self):
+            if self._dauerhaft and js.storage_geaendert:
+                js.storage_geaendert(self._daten())
 
         def js_get(self, key, js_):
             d = self._daten()
@@ -994,8 +1083,7 @@ def einrichten(js) -> None:
                 "setItem": lambda js2, t, a: self._setzen(zu_text(_arg(a, 0)), zu_text(_arg(a, 1))),
                 "removeItem": lambda js2, t, a: self._weg(zu_text(_arg(a, 0))),
                 "clear": lambda js2, t, a: self._leeren(),
-                "key": lambda js2, t, a: (list(d)[int(zu_zahl(_arg(a, 0)))] if 0 <= int(zu_zahl(_arg(a, 0)) or 0) < len(d)
-                                          else None),
+                "key": lambda js2, t, a: (lambda i: list(d)[i] if 0 <= i < len(d) else None)(zu_ganz(_arg(a, 0))),
             }
             if key in tabelle:
                 return nativ(tabelle[key], key)
@@ -1015,24 +1103,21 @@ def einrichten(js) -> None:
             if groesse > js.storage_max:
                 js.werfen("RangeError", "localStorage voll (höchstens 1 MB je App)")
             d[k] = v
-            if js.storage_geaendert:
-                js.storage_geaendert(d)
+            self._melden()
             return UNDEF
 
         def _weg(self, k):
             self._daten().pop(k, None)
-            if js.storage_geaendert:
-                js.storage_geaendert(self._daten())
+            self._melden()
             return UNDEF
 
         def _leeren(self):
             self._daten().clear()
-            if js.storage_geaendert:
-                js.storage_geaendert(self._daten())
+            self._melden()
             return UNDEF
 
     g["localStorage"] = Speicher()
-    g["sessionStorage"] = Speicher()
+    g["sessionStorage"] = Speicher(dauerhaft=False)
 
     class Global(Wirt):
         js_klasse = "Window"
@@ -1095,11 +1180,11 @@ def _exec_ergebnis(js, m, s):
 
 
 def _iso(d) -> str:
-    z = d.props.get("__zeit", math.nan)
-    if z != z:
+    t = utc_zeit(d.props.get("__zeit", math.nan))
+    if t is None:
         return "Invalid Date"
-    t = datetime.fromtimestamp(z / 1000, tz=timezone.utc)
-    return t.strftime("%Y-%m-%dT%H:%M:%S.") + f"{int(z % 1000):03d}Z"
+    return (f"{t.year:04d}-{t.month:02d}-{t.day:02d}T{t.hour:02d}:{t.minute:02d}:{t.second:02d}."
+            f"{t.microsecond // 1000:03d}Z")
 
 
 def _datum_lesen(s: str) -> float:
@@ -1108,9 +1193,7 @@ def _datum_lesen(s: str) -> float:
                 "%d.%m.%Y", "%d.%m.%Y %H:%M"):
         try:
             d = datetime.strptime(s, fmt)
-            if fmt.endswith("Z") or fmt == "%Y-%m-%d":
-                d = d.replace(tzinfo=timezone.utc)
-            return d.timestamp() * 1000
+            return zeit_klemmen(zeit_von(d, utc=fmt.endswith("Z") or fmt == "%Y-%m-%d"))
         except ValueError:
             continue
     return math.nan

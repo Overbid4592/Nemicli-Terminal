@@ -1,7 +1,8 @@
 {
   "manifest_version": 3,
   "name": "NemiCLI – Nemi antwortet",
-  "version": "2.3.5",
+  "version": "2.3.6",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAs6fE1+mtp1N+/hcHfx8OstA1HKZKtBjwNmvJxc8dDnrgZIQgFQTTDOWS8aCHTuOUvq3Lz36bjtvOHdZ50xnBfLWDuzomcyZIsWfMZFEfFd49a+8FcH1JT4FE+u5xUGpTxfFZ45gk/UOSPSPlrSutmcByEwYTsLKQnNvQUTcA3YJnKaKDOmDe3SOJzaFt2wZmAZYA285GqE2WU7H6r1fClMnmN9UfZWZtXfvEO+rxdWUygk9wUEn/hbfEjrxv4fUPRQPAjPNkz4FdjIy9RWrDyl41uuL/jp7Xmvb0Lhn22XYL4Jo3a0Wmj6TmWhHHE+/tHZoNgAvwX1sf1OE0OLSGAwIDAQAB",
   "minimum_chrome_version": "116",
   "description": "Chat in der Seitenleiste und Rechtsklick-Hilfe: die aktive Persönlichkeit antwortet, liest die Seite oder ein Bildschirmfoto mit. Redet nur mit dem laufenden NemiCLI auf 127.0.0.1.",
   "permissions": ["contextMenus", "storage", "activeTab", "scripting", "notifications", "sidePanel"],

@@ -46,10 +46,20 @@ def _rechtsklick() -> str:
 
 AN_AUS = (("an", "An"), ("aus", "Aus"))
 
+# /schriftgröße je Rolle (ui/design.py): Wert „<rolle> <px>“
+_SCHRIFT_ROLLEN = (("oberflaeche", "ganze Oberfläche"), ("ki", "Antworten der KI"), ("du", "deine Nachrichten"),
+                   ("terminal", "Terminal-Fenster"))
+_GROESSEN = (12, 13, 14, 15, 16, 18, 20, 22, 24, 28)
 
-def _low() -> bool:
-    import einbetttakt
-    return einbetttakt.low()
+
+def _chatgpt() -> bool:
+    import chatgpt_login
+    return chatgpt_login.nutzbar()
+
+
+def _px_von(rolle: str) -> int:
+    import design
+    return design.px("fenster" if rolle == "oberflaeche" else rolle)
 
 
 def _kugel_auto() -> str:
@@ -66,15 +76,28 @@ EINTRAEGE: list[tuple] = [
      ("auto", "an", "aus")),
     (EINFACH, "/staerke", "🧠 Denkstufe", "Wie gründlich das Modell nachdenkt.", None, None, None),
     (EINFACH, "/theme", "🎨 Farben im Terminal", "Farbschema des Terminals.", None, None, None),
+    *[(EINFACH, "/schriftgröße", f"🔠 Schrift: {_titel}", f"Schriftgröße für: {_titel}.",
+       tuple((f"{_rolle} {_px}", f"{_px} px") for _px in _GROESSEN), (lambda r=_rolle: f"{r} {_px_von(r)}"), None)
+      for _rolle, _titel in _SCHRIFT_ROLLEN],
+    (EINFACH, "/startart", "🚀 Start", "Ob NemiCLI im Terminal oder gleich im Desktop-Fenster startet.",
+     (("terminal", "Im Terminal"), ("fenster", "Im Desktop-Fenster")),
+     lambda: str(config.load().get("startart", "terminal")), None),
+    (EINFACH, "/terminal", "✨ Terminal: Leuchten", "Sanftes Leuchten im Hintergrund des Terminal-Fensters.",
+     (("leuchten an", "An"), ("leuchten aus", "Aus")),
+     lambda: "leuchten " + _schalter("terminal_leuchten", True), None),
+    (EINFACH, "/terminal", "🪟 Terminal: KI neben dem Chat", "Der Reiter „KI“ steht rechts neben dem Chat.",
+     (("geteilt an", "An"), ("geteilt aus", "Aus")),
+     lambda: "geteilt " + _schalter("terminal_geteilt", False), None),
+    (PROFI, "/terminal", "🌊 Terminal: weiches Rollen", "Weiches Rollen und gleitender Cursor.",
+     (("weich an", "An"), ("weich aus", "Aus")), lambda: "weich " + _schalter("terminal_weich", True), None),
+    (PROFI, "/terminal", "🎨 Terminal: Farben", "Farben des Terminal-Fensters – ab dem nächsten Start.",
+     (("thema auto", "Wie /theme"), ("thema breeze", "Breeze"), ("thema mint", "Mint")),
+     lambda: "thema " + str(config.load().get("terminal_thema") or "auto").lower(), None),
     (EINFACH, "/emoji", "😊 Emojis", "Wie viele Emojis die Persönlichkeit nimmt.", None, None,
      ("low", "middle", "strong", "frei")),
     (PROFI, "/kontext", "📏 Kontext (lokales Modell)", "Wie viel vom Gespräch das Modell im Blick hat.",
      None, None, None),
     (PROFI, "/embeddings", "🧩 Gedächtnis-Modell", "Modell für die Suche im Gedächtnis.", None, None, None),
-    (PROFI, "/embeddingtimer", "⏱ Gedächtnis-Takt", "Wie oft das Gesammelte ins Gedächtnis eingebettet wird.",
-     None, None, ("aus", "15", "30", "45", "60", "90")),
-    (PROFI, "/embeddingtimer", "🐢 Gedächtnis: Low-Modus", "Bei Chat und Bild langsam weiterrechnen statt pausieren.",
-     (("low an", "An"), ("low aus", "Aus")), lambda: "low an" if _low() else "low aus", None),
     (PROFI, "/reflektieren", "🪞 Selbst reflektieren", "Nach Korrekturen, Fehlern und größeren Aufgaben lernen.",
      (("auto an", "An"), ("auto aus", "Aus")), _reflektieren, None),
     (PROFI, "/skills", "🧩 Skills selbst anlegen", "Neue Skills ohne Rückfrage anlegen und ändern.",
@@ -102,6 +125,9 @@ EINTRAEGE: list[tuple] = [
     (PROFI, "/kugel", "🎮 Kugel: beim Spielen zuschauen", "Ab und zu aufs Spiel schauen und etwas dazu sagen.",
      (("zuschauen an", "An"), ("zuschauen aus", "Aus")), lambda: "zuschauen " + _schalter("kugel_zuschauen", False),
      None),
+    (PROFI, "/model", "🔐 ChatGPT-Konto", "Mit deinem ChatGPT-Plan (Plus/Pro) antworten – An öffnet die Anmeldung "
+     "im Browser, Aus löscht den Zugang.", (("chatgpt anmelden", "An"), ("chatgpt abmelden", "Aus")),
+     lambda: "chatgpt anmelden" if _chatgpt() else "chatgpt abmelden", None),
     (PROFI, "/kontextmenue", "🖱 Rechtsklick-Menü", "NemiCLI im Rechtsklick-Menü von Windows.",
      AN_AUS, _rechtsklick, None),
     (PROFI, "/debug", "🐞 Debugbericht", "Bericht, in den die Cloud-KI hineinsehen kann.", None, None,

@@ -184,8 +184,8 @@ class Dialekt:
                 except ValueError:
                     continue
             else:
-                text = _text_felder(m.group(1).strip())
-                felder = {k.strip(): v if k.strip() in text else _wert_lesen(v)
+                als_text = _text_felder(m.group(1).strip())
+                felder = {k.strip(): v if k.strip() in als_text else _wert_lesen(v)
                           for k, v in self._feld_re.findall(m.group(2))}
             raus.append((m.start(), m.end(), m.group(1).strip(), felder))
         return raus

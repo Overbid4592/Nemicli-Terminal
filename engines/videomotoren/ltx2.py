@@ -20,6 +20,7 @@ from . import ltx2_netz
 
 TITEL = "LTX-2"
 SYMBOL = "🎞"
+MERKMAL = "Video mit Ton"
 DESTILLIERT = [1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875]
 STANDARD_DEV = {"schritte": 30, "cfg": 3.0, "ton_cfg": 7.0}
 TEXT_LAENGE = 1024
@@ -102,7 +103,7 @@ def text_projiziert(prompts: list[str], teile: dict, device, dtype, on_status=No
         on_status(f"{TITEL}: Text-Encoder …")
     freigeben("dit")
     gew = gemma_text.laden(teile["text"], dtype)
-    tok = gemma_text.tokenizer(gew)
+    tok = gemma_text.tokenizer(gew, Path(teile["text"]).parent)
     pv, pa = (gew[s + "_proj"].zu(device) for s in ("video", "audio"))
     aus = []
     for p_ in prompts:

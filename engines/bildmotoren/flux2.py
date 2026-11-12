@@ -362,7 +362,10 @@ def text_zustand(prompt: str, teile: dict, device, dtype, on_status=None):
     tok = tokenizer_fuer(pfad, teile["tokenizer"])
     ids = tok(VORLAGE.format(prompt))[:TEXT_LAENGE]
     echt = len(ids)
-    ids += tok(PAD_TOKEN) * (TEXT_LAENGE - echt)
+    pad = tok(PAD_TOKEN)
+    if len(pad) != 1:
+        raise RuntimeError(f"{TITEL}: Tokenizer kennt {PAD_TOKEN} nicht als Sondermarke")
+    ids += pad * (TEXT_LAENGE - echt)
     z = qwen3_zustaende(gew, ids, device, dtype, TEXT_ABGRIFFE, echt=echt)
     h = torch.cat(z, -1).detach().clone()
     aufraeumen()

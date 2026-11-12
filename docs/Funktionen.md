@@ -8,6 +8,16 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 - **Ein Schema für alles:** `anthropic:claude-…`, `openai:gpt-…`, `ollama:gemma4:12b`, `gguf:Gemma4`.
   Drei Motoren (Anthropic nativ, OpenAI-kompatibel, eigener GGUF-Motor), eine Schnittstelle.
 - **Modelle live** vom Anbieter abgefragt – nichts hartkodiert, neuer Key = neue Modelle.
+- **OpenAI über die Responses API** (`engines/openai_responses.py`): empfohlene Schnittstelle von OpenAI, Streaming
+  mit Denk-Zusammenfassung, `store: false`; Denkstufen der GPT-5.6/6.x-Modelle bis `max` (`/staerke`). Wer lieber
+  Chat Completions will: Config `openai_api` = `"chat"`. Alle anderen Anbieter laufen unverändert.
+- **🔐 ChatGPT-Konto** (`/model chatgpt`, auch unter „Cloud-Anbieter hinzufügen“ und auf ⚙): offizielles „Sign in
+  with ChatGPT“ für Open-Source-Apps – im Browser anmelden und zustimmen, dann antwortet NemiCLI mit dem Plan von
+  ChatGPT Plus/Pro statt mit einem API-Schlüssel. PKCE, Rückruf nur auf 127.0.0.1, keine Client-Secrets; der
+  Zugang liegt mit dem Windows-Umschlag verschlüsselt in `chatgpt_konto.json` (Programm-Ordner, für die KI
+  gesperrt) und erneuert sich vor Ablauf. Persönlichkeit, Gedächtnis, Werkzeuge und Bilder-Ansehen gehen wie bei
+  jedem Modell; Bilder malt weiter Krea 2 bei dir. Ist das Plan-Kontingent aufgebraucht, sagt NemiCLI das und
+  wechselt nicht von selbst. `/model chatgpt abmelden` löscht den Zugang.
 - **Eigener GGUF-Motor 🧠** (`ggufengine/`, `/model` → „Lokal (eigener Motor)“): lokale Modelle
   ohne llama.cpp, Ollama oder Server – reines Python + torch **im NemiCLI-Prozess**, kein Port, kein
   Kindprozess. Gehärteter GGUF-Leser (jede Zahl aus der Datei wird vor Gebrauch geprüft, das
@@ -30,6 +40,32 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     Experten gewählt werden, und sortiert auch während einer Antwort alle 32 Token nach – bei Gemma 4
     26B-A4B mit 3–5 GB Experten-VRAM bis zu 80 % schneller, Antwort Token für Token gleich. Die Zählung
     bleibt für den nächsten Start gespeichert.
+  - **Gemma-4-Hilfskopf (MTP-Assistent):** Liegt der offizielle Hilfskopf von Google
+    (`gemma-4-…-it-assistant`, `model.safetensors` + `config.json`, auch in einem Unterordner) oder eine
+    GGUF mit „-assistant-“ im Namen im Modell-Ordner, schlägt er bei jedem Schritt bis zu drei Token vor. Er
+    liest den Gesprächsspeicher des Hauptmodells mit und schreibt keinen eigenen. Das Hauptmodell prüft die
+    Vorschläge in einem Durchgang; die Antwort bleibt Token für Token gleich, lohnt es sich nicht, schaltet
+    es sich von selbst ab. Abschalten: Config `gguf_hilfskopf: false`.
+  - **llama.cpp als festgenagelte Reserve 🦙** (`/llamacpp`): genau ein Build (b12199, der CVE-Stand vom
+    08.11.2026 ist eingerechnet), jedes offizielle Paket mit fester SHA-256. `/llamacpp holen` wählt das Paket
+    nach der Grafikkarte (NVIDIA: CUDA 13.5 samt Laufzeit, ältere Treiber CUDA 12.4 oder Vulkan, andere Karten
+    Vulkan, sonst CPU), lädt nur von GitHub (keine Umleitung woandershin, fortsetzbar) und richtet ein; mit einem
+    Cloud-Modell übernimmt das auf Wunsch die KI (`llamacpp_stand`, `llamacpp_holen` nach Freigabe, auch im Modus
+    Auto). Von Hand: Pakete nach `Motoren/llama.cpp/` im Datenordner, `/llamacpp einrichten` prüft und entpackt sie
+    (kein Pfad aus dem Archiv heraus) und hält die Hashes aller Dateien fest; vor jedem Start wird geprüft,
+    auch auf dazugelegte Dateien. Danach steht jedes lokale Modell im `/model`-Menü auch mit 🦙. Kann der
+    eigene Motor eine Bauart nicht laden, fragt NemiCLI, ob die Reserve übernehmen darf. Die Datei geht
+    vorher durch den gehärteten GGUF-Leser; Tokenizer und Chat-Format kommen vom eigenen Motor, llama-server
+    bekommt nur fertige Token-Folgen (kein Jinja, Sondermarken im Text bleiben Text). Der Server läuft nur auf
+    127.0.0.1 mit zufälligem Schlüssel aus der Umgebung, ohne Web-Oberfläche, Werkzeuge, RPC, Slot-Speicher,
+    Schlafmodus, offline, mit zwei Plätzen (gemeinsamer Gesprächsspeicher), und endet mit NemiCLI. Hauptprogramm
+    und Wache teilen sich einen Server je Modell (der Schlüssel liegt nur mit DPAPI verschlüsselt im Cache); er
+    läuft, solange ihn einer der beiden in den letzten 15 Minuten genutzt hat. Die Wache kennt ihn (Pfad, Prüfliste,
+    Elternprozess) und meldet ihn nicht bei jedem Neustart. Mit mmproj im Modell-Ordner sieht das Modell auch hier
+    Bilder (Text-Prompt mit Platzhalter, vorher auf eingeschleuste Steuermarken geprüft). Beim Malen wird er
+    beendet (die Wache wartet) und erst bei der nächsten Anfrage neu gestartet. **Lehren und lernen:** `/llamacpp vergleich [frage]` stellt dem aktiven Modell dieselbe Frage
+    gierig in beiden Motoren und zeigt die erste abweichende Stelle, was llama.cpp dort gewählt hätte, und das
+    Tempo beider; das Ergebnis steht auch in `Debugbericht/motorvergleich.md`.
   - **Modelle von Hugging Face holen** (`/model huggingface`): Größe und MoE wählen, gezeigt werden nur
     Modelle, die der Motor laden kann (ab 4B), jede Datei mit SHA-256 geprüft, Abbruch wird fortgesetzt.
   - **Modelle der Motoren** (`/einrichten modelle`, auch am Ende von `/einrichten`): Gedächtnis, Reranker,
@@ -164,6 +200,7 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 - **Befehle direkt** (`befehl`): PowerShell-Befehle – auch `python`, `pip` und `pytest` – laufen nach deiner
   Freigabe im Arbeitsordner (Coding-Projekt, sonst Startordner), ohne Zeitgrenze, mit Live-Anzeige; **Esc** beendet
   den ganzen Prozessbaum. Die Sandbox bleibt der Ort zum gefahrlosen Ausprobieren.
+- **Erinnerungen und Wecker** (`erinnern`): „Erinnere mich in 20 Minuten an …“ gilt dem Nutzer – die Erinnerung erscheint zur Zeit im Chat, ohne offenes Fenster an der Kugel oder neben der Uhr. Mit „erinnere dich …“ stellt sich die KI einen Wecker für sich selbst (`fuer: selbst`): Zur Zeit bekommt sie den Text als Nachricht und arbeitet ihn ab, nach dem eingestellten Modus. Mit `alle` („2 tage“, „6 stunden“, „täglich“; mindestens 10 Minuten) wiederholt sich beides nach der Uhr des Rechners; verpasste Male werden nicht nachgeholt. Der Wecker der KI läuft nur mit offenem NemiCLI-Fenster, sonst sagt die Wache einmal Bescheid und die KI holt es beim nächsten Öffnen nach. Höchstens 10 Wecker der KI; nach Inhalt aus dem Netz fragt das Anlegen. `/kugel erinnerungen` zeigt alle (🔁 wiederholt, 🤖 für die KI).
 - **Zeitplan** (`zeitplan`): Die Persönlichkeit trägt sich selbst in die **Windows-Aufgabenplanung** ein –
   „täglich 09:00", „alle 2 stunden", „wöchentlich montag 08:30", „anmeldung", „einmal 20.09.2026 14:00".
   Zur Zeit startet NemiCLI ohne Fenster, arbeitet den Auftrag im Nur-Lesen-Modus ab und legt die Antwort als
@@ -185,6 +222,10 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Änderung mit Begründung im Protokoll, `/wache rueckgaengig`). Bericht in `Berichte/Wache_….md` –
   als Datei bleiben die drei neuesten, ältere leben als Vektoren im Gedächtnis weiter (Papierkorb 30 Tage).
   `/wache selbsttest`: 7 von 7 Angriffsmustern, 2 % Fehlalarm auf synthetischem Alltag.
+  **Urteile nur mit einem Cloud-Modell:** Ist das aktive Modell lokal, beurteilt das erste Cloud-Modell der
+  Ersatzbank (`/model ersatz`) die Alarme; gibt es keines, bleibt der Weckruf aus und die Alarme bleiben offen
+  im Tray. Kleine lokale Modelle verwechseln dabei Programme. Die Erkennung selbst (Isolation Forest, GRU) braucht
+  kein Sprachmodell; das Kugel-Gespräch läuft weiter mit dem aktiven Modell, auch lokal.
   **Gegen eingeschleuste Urteile:** Im Weckruf stehen Alarme als gerahmte Messwerte (Kennung je Weckruf, jede
   Kommandozeile einzeilig) – ein Programm, das sich „harmlos“ nennt, macht sich damit verdächtig. „Bekannt“
   hängt am Programmpfad. R001, R002, R006, R013 und R014 schaltest nur du stumm. Kam im Gespräch Inhalt aus dem
@@ -384,10 +425,15 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   `auto` (Config `embedding_geraet`: auto · cuda · cpu) liegt es im **RAM** und belegt keinen Grafikspeicher;
   große Aufträge bekommen für ihre Dauer eine GPU-Fassung. Kurze Texte rechnen gepackt in einem Durchgang,
   Suchfragen tragen eine Anweisung je Aufgabe (Notizen, Chat, Dokumente, Code) und bleiben gemerkt. Nach jeder
-  Antwort räumt der **Bibliothekar** im Hintergrund ein (Chat, Notizen, Skills, Berichte → Vektoren)
-  – sichtbar als 📚-Balken in der Statuszeile, ohne den Chat zu blockieren: er rechnet in einem eigenen
-  Prozess mit niedriger Priorität, der danach endet und seinen Speicher mitnimmt. `/gedaechtnis indexieren`
-  holt einen Rückstand auf einmal nach.
+  Antwort sammelt der **Bibliothekar** ohne Modell im **📦 Einlese-Speicher** (Chat, Notizen, Skills, Berichte,
+  Wissen, Bilder): sofort nach Stichworten findbar, nach Bedeutung nach dem Einlesen. Der Balken zeigt den Stand
+  vor dem Maß (**38k │ 100k**), füllt sich in halben Feldern (alle rund 3.600 Token ein Schritt) und leuchtet kurz
+  auf, wenn er sich ändert: bis 50k grün, ab 50k orange, ab 80k dunkelrot. Bei 99k startet das Einlesen von selbst, sobald
+  keine Antwort läuft und die GPU Platz hat; `/einlesen` startet es früher. Es rechnet nur auf der GPU (gemessen: 100k
+  in rund 30 bis 40 s, ein CPU-Kern steuert; ohne Grafikkarte auf der CPU), in einem eigenen Prozess, der danach endet und seinen Speicher mitnimmt.
+  Beim Start wird ein fester Block abgetrennt: Der Chat läuft weiter, Neues sammelt der nächste Speicher. Hat die GPU
+  länger keinen Platz, wartet der Block und die KI sagt Bescheid. Nach einem aufgeräumten Kontext bekommt der laufende
+  Chat seine Vektoren sofort, wenn die GPU Platz hat.
   - **So sucht es:** Stichworte (BM25) und Vektoren, per RRF vereint. Texte sind an Absätzen, Sätzen,
     Code-Blöcken und Überschriften geschnitten, jeder Brocken trägt seine Herkunft; alte Brocken werden im
     Hintergrund nachgeschnitten. Sucht die KI selbst (`gedaechtnis_suchen`), kann sie weitere Fassungen
@@ -530,6 +576,7 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   `text_encoders/` und `vae/`. Bauart und Zubehör erkennt NemiCLI an den Dateien. Wahl über `/video modell`, im
   Menü ✔️ hinter dem aktiven; `video.generate` leitet dann weiter, `/video`, `video_erstellen` und Hintergrund-Läufe
   gelten für beide.
+  - **🎬 SD-Video** (Stable Diffusion mit Zeit-Schichten): ein ganzer Bild-Checkpoint von SD 1.5 oder SDXL plus ein Bewegungs-Modul (AnimateDiff-Lightning, AnimateDiff v3/v2, AnimateDiff-SDXL, Hotshot-XL). 8 Bilder je Sekunde, ohne Ton, 512×768 hochkant (quer, quadratisch), bis 20 s. Die Zeit-Schichten kennen 8 bis 32 Bilder am Stück; längere Videos entstehen in überlappenden Fenstern, deren Vorhersagen je Schritt gemittelt werden. Ein Startbild hält die Figur: alle Bilder beginnen als verrauschtes Startbild, das erste bleibt es. Ohne `--start` malt der Bild-Motor das Startbild selbst aus der Beschreibung (im Format des Videos, bei Krea 2 832×1216), mit `--figur` bzw. `figur: true` die Figur der Persönlichkeit mit Kern, Seed und Bild-LoRA; abschalten mit `/video einstellungen startbild aus`. Schritte und CFG kommen aus dem Bewegungs-Modul (Lightning: 4 oder 8 Schritte ohne CFG) oder aus `/video einstellungen`.
   - **🎞 LTX-2.5** (Lightricks, 22 B): Gemma 4 12B als Text-Encoder (alle 49 Zustände, Fenster- und globale
     Schichten, Tokenizer und Video-/Ton-Projektion aus der LTX-Datei), Text-Verbinder mit Registern, Video-und-Ton-
     Transformer (Ton→Video- und Video→Ton-Attention, Gates je Kopf, split-RoPE), Faltungs-VAE (1 Latent = 8 Bilder,
@@ -605,6 +652,26 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   laufen im Browser; die Persönlichkeit bekommt Brett und erlaubte Züge, wählt selbst und redet dazu.
 
 ### 🎭 Oberfläche & Persönlichkeit
+- **Einfache Bedienung:** Das `/`-Menü und `/help` ordnen alle Befehle in sechs Themen (💬 Chat & Bedienung ·
+  🧠 Modell & Gedächtnis · 🎨 Erschaffen · 👤 Persönlichkeit · 🛡️ Sicherheit · 🔧 System). `/einstellungen` zeigt
+  die ⚙-Seite des Desktop-Fensters auch im Terminal (erst der Punkt, dann der Wert, ✔️ = aktiv; „🔧 Für Profis“).
+  Die Startseite hat klickbare Kacheln (⚙ Einstellungen · 🎨 Malen · 🎵 Musik · 🎭 Charaktere · 🛍 Apps ·
+  🖥 Fenster · ❓ Hilfe). Das Desktop-Fenster kennt Tastenkürzel (Strg+N neuer Chat, Strg+1–4 Seiten, Strg+, ⚙)
+  und öffnet Musik, Charaktere und Apps per Knopf in der Seitenleiste.
+- **🔠 Schriftgröße je Rolle** (`/schriftgröße [oberflaeche|ki|du|terminal] <px>`, auch auf ⚙): die ganze Oberfläche (Vorgabe 14 px), nur die Antworten der KI, nur die eigenen Nachrichten (je 15 px) oder das Terminal-Fenster einzeln größer oder kleiner – z. B. `/schriftgröße ki 18`. `/schriftgröße zurück` stellt alles auf die Vorgabe. Neue Nachrichten nehmen es sofort, offene Fenster beim nächsten Öffnen.
+- **🖥 Terminal-Fenster** (`/terminal`, auch auf ⚙): `leuchten`, `weich` und `geteilt` mit `an`/`aus` – wirken sofort; `thema auto|breeze|mint` ab dem nächsten Start. Ohne Zusatz ein Menü, je Schalter ein Eintrag mit ✔️/🛑.
+- **🚀 Startart** (`/startart terminal|fenster`, auch auf ⚙): mit „fenster“ öffnet sich beim Start gleich das
+  Desktop-Fenster, das Terminal wartet im Tray.
+- **Ein Design für alle Fenster** (`ui/design.py`): Desktop-Fenster, Charakter, Musik, Kugel und Wache, App-Store,
+  Porträt-Vorschau und Chrome-Seitenleiste nehmen dieselben Farben (dunkle Flächen, Cyan für die Persönlichkeit,
+  Lila für dich) und dieselbe Schrift.
+- **🎨 Themes für alles** (`/theme nachtglas · pastell · neon`): 🌌 Nachtglas (tiefes Blau, Cyan → Lila), 🌸 Pastell-Nacht
+  (Mint und Rosé), ⚡ Neon-Klar (Schwarz mit kräftigem Cyan und Pink) färben Terminal **und** Fenster; die übrigen
+  Terminal-Themes lassen die Fenster bei „Klassik“. Fenster übernehmen es beim nächsten Öffnen, die Kugel nach /restart.
+- **Neues Aussehen:** Glas-Flächen (oben heller, feiner Rand, Lichtstreif), Verlauf-Ring um den Avatar, schwebende
+  Eingabe mit Schatten, sanftes Leuchten oben im Fenster; Kugel-Panel mit weichem Leuchtrand, runden Blasen und einem
+  Senden-Knopf im Verlauf; im Terminal Überschriften und Rahmen-Titel im Farbverlauf des Themes und Kacheln in den
+  Theme-Farben.
 - **Emojis nach Maß** (`/emoji low · middle · strong · frei`): low = selten, höchstens eins; middle =
   ab und zu; strong = gerne und lebendig. Welche Emojis passen, wählt die KI aus dem Inhalt – nie in
   Code oder Pfaden. Ohne Einstellung (frei) entscheidet die Persönlichkeit. Einfach sagen („nimm
@@ -632,8 +699,13 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
     Debugbericht). Ein Klick führt den passenden Befehl aus wie im Terminal; Werte zum Eintippen bleiben dort.
   - Verbindung über eine Windows Named Pipe ohne Port, mit neuem Geheimschlüssel je Sitzung; nur
     JSON, nie pickle. Links aus Antworten öffnen nur mit `http`/`https`, nachgeladen wird nichts.
-- **Eigenes Terminal-Fenster** (`NemiCLI.exe`): selbst gezeichnet (pyte + ConPTY), Themes Breeze und Mint,
-  durchscheinender Hintergrund. **Reiter** wie bei GNOME-Terminal: Strg+Umschalt+T öffnet eine Kommandozeile im
+- **Eigenes Terminal-Fenster** (`NemiCLI.exe`): selbst gezeichnet (pyte + ConPTY), Farben von `/theme` (oder
+  fest Breeze/Mint über `terminal_thema`), durchscheinender Hintergrund mit sanftem Leuchten, das atmet, solange
+  die KI arbeitet (`terminal_leuchten`). Jede Zeile wird als Bild gemerkt – neu gezeichnet wird nur, was sich
+  geändert hat. `Strg+Klick` öffnet Web-Adressen und Pfade, `Strg+F` sucht im Reiter „🤖 KI“ und in der
+  Kommandozeile, `Strg+Umschalt+G` stellt den Reiter „🤖 KI“ rechts neben den Chat; er rollt weich
+  (`terminal_weich`). Im Chat selbst: `Strg+F` sucht im Verlauf, Rechtsklick kopiert einen Block, ein Klick auf
+  die Titelzeile klappt eine Antwort ein, `Alt+↑/↓` springt von Antwort zu Antwort. **Reiter** wie bei GNOME-Terminal: Strg+Umschalt+T öffnet eine Kommandozeile im
   selben Ordner, Strg+Umschalt+W schließt, Strg+Bild↑/↓ wechselt. Der Reiter **„🤖 KI“** (Strg+Umschalt+K) zeigt
   jeden Befehl der KI mit Ausgabe live, nur zum Lesen, und geht beim ersten Befehl von selbst auf
   (`terminal_ki_reiter`; Aussehen: `terminal_thema`, `terminal_hintergrund`, `terminal_schrift`, `terminal_groesse`).

@@ -351,7 +351,8 @@ async def list_models(provider_id: str, limit: int = 40,
         CP._liste_merken(p, data)
 
     ids = [mid for mid in _parse_models(p, data) if p.keep(mid)]
-    ids = sorted(set(ids))
+    # ChatGPT-Konto: Reihenfolge des Servers (empfohlene zuerst), sonst alphabetisch
+    ids = list(dict.fromkeys(ids)) if p.kind == "chatgpt" else sorted(set(ids))
     # Lange Listen (OpenRouter!) kappen, sonst sprengt das Menü den Bildschirm.
     if len(ids) > limit:
         ids = ids[:limit]

@@ -34,6 +34,11 @@ braucht dafür einen Geheimschlüssel. Nichts geht ins Internet.
 War die Erweiterung schon geladen: unter `chrome://extensions` bei NemiCLI auf **↻ Neu laden**
 klicken (Chrome fragt dann einmal nach dem Zugriff auf Seiten, das braucht das Bildschirmfoto).
 
+Die Erweiterung hat eine feste ID (`hcohibkliiknikhanecidedfnehdoico`, aus `key` im Manifest).
+NemiCLI antwortet nur ihr, keiner anderen Erweiterung. Wer eine Fassung vor 2.3.6 geladen hat,
+entfernt sie einmal unter `chrome://extensions`, lädt den Ordner neu und trägt Port und Schlüssel
+wieder ein.
+
 Läuft NemiCLI nicht, sagt die Leiste: „NemiCLI läuft nicht“.
 
 ## Dateien

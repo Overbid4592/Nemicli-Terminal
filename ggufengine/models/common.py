@@ -957,6 +957,8 @@ def attention(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, q_pos: torch.Te
         mask = mask & (segmente.index_select(0, q_pos).unsqueeze(1) == segmente[:kv_len].unsqueeze(0))
     if L == 1:
         return _attention_step(q, kh[0], vh[0], mask, scale, sinks)
+    if L <= WENIGE_ZEILEN and sinks is None:
+        return _attention_wenige(q, kh[0], vh[0], mask, scale)
     if sinks is not None:
         return _attention_sinks(q, kh[0], vh[0], mask, scale, sinks)
     qh = q.transpose(0, 1).unsqueeze(0).to(k.dtype)   # (1,H,L,D)
@@ -1019,6 +1021,23 @@ def _attention_step(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: tor
     else:
         p = torch.softmax(s, dim=-1)
     return torch.bmm(p.to(v.dtype), v).view(1, H, v.shape[-1])
+
+
+WENIGE_ZEILEN = 9      # bis hierhin wie _attention_step statt SDPA: Prüfen = 1 + längster Vorschlag (engine.VORSCHLAG_STUFEN)
+
+
+def _attention_wenige(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor,
+                      scale: float) -> torch.Tensor:
+    """Wenige Queries (L, H, D) mit Maske (L, S): die Query-Köpfe einer KV-Gruppe für alle L Zeilen als
+    Zeilen eines Batch-Matmuls. SDPA mit Maske brauchte für L = 4 ein Vielfaches eines Einzelschritts."""
+    L, H, D = q.shape
+    Hkv = k.shape[0]
+    G = H // Hkv
+    qg = q.transpose(0, 1).to(k.dtype).reshape(Hkv, G * L, D)              # Kopf h = Gruppe h // G
+    s = (torch.bmm(qg, k.transpose(1, 2)).float() * scale).view(Hkv, G, L, -1)
+    p = torch.softmax(s.masked_fill(~mask.view(1, 1, L, -1), float("-inf")), dim=-1)
+    o = torch.bmm(p.view(Hkv, G * L, -1).to(v.dtype), v)                     # (Hkv, G*L, Dv)
+    return o.view(H, L, -1).transpose(0, 1)
 
 
 def _attention_sinks(q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, mask: torch.Tensor,
@@ -1123,7 +1142,7 @@ class ZeilenMerken:
 def fenster_nachholen(fenster: torch.Tensor, zeilen: torch.Tensor, n: int) -> None:
     """Carried convolution window after the first n of `zeilen` (from the window before them)."""
     voll = torch.cat([fenster, zeilen[:n]], dim=0)
-    fenster.copy_(voll[-fenster.shape[0]:])
+    fenster.copy_(voll[voll.shape[0] - fenster.shape[0]:])      # Fenster mit 0 Zeilen: [-0:] wäre alles
 
 
 def delta_nachholen(S: torch.Tensor, zerfall: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
@@ -1256,6 +1275,8 @@ class GraphDecoder:
             self.pool_mehr = g.pool()
         self.graphs[self._schluessel(kv_len, L)] = (g, out)
         self.aufnahmen += 1
+        if self._haupt is not None:       # the engine reads the count of the main decoder
+            self._haupt.aufnahmen += 1
 
     def leeren(self) -> None:
         """Drops all captured graphs and their memory (caches moved, model offloaded)."""
@@ -1301,12 +1322,14 @@ class GraphDecoder:
             # (L, V) logits).  Single-token graphs can point into that pool (library workspaces):
             # they are dropped with it, else their replay reads freed memory
             if any(self._mehrfach(k) and k[-1] != kv_len for k in self.graphs):
-                torch.cuda.synchronize()
-                self.leeren()
+                with GPU_SPERRE:
+                    torch.cuda.synchronize()
+                    self.leeren()
             try:
                 self._capture(kv_len, L)
-            except Exception:
+            except Exception as e:
                 self.mehrere_aus = True
+                dbg.event(f"CUDA-Graph für {L} Token nicht aufnehmbar, Prüfen ab jetzt ohne Graph: {e}")
                 return None
         g, out = self.graphs[key]
         g.replay()

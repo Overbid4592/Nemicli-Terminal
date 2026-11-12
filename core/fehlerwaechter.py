@@ -37,6 +37,7 @@ _sperre = threading.Lock()
 _puls: float | None = None
 _haupt_ident: int | None = None
 _faden: threading.Thread | None = None
+_schlag_schleife = None       # Schleife mit laufendem Herzschlag
 _fehler_zeiten: dict[str, list[float]] = {}
 _bremsen_zeiten: list[float] = []
 
@@ -171,19 +172,27 @@ def alle_faeden() -> str:
 # ---------------------------------------------------------------------------
 
 def starten(loop) -> None:
-    """Herzschlag in der Hauptschleife und den Prüf-Faden anwerfen (einmal je Prozess)."""
-    global _faden
-    if D.datei() is None or (_faden is not None and _faden.is_alive()):
+    """Herzschlag in der Hauptschleife und den Prüf-Faden anwerfen – je ein Exemplar, auch nach aus → an.
+    Beide enden mit dem Bericht."""
+    global _faden, _schlag_schleife, _puls
+    if D.datei() is None:
         return
+    if _schlag_schleife is not loop:
+        _schlag_schleife, _puls = loop, None          # ein alter Puls aus dem letzten Lauf wäre ein falscher Hänger
 
-    def schlag():
-        global _puls, _haupt_ident
-        _haupt_ident = threading.get_ident()
-        _puls = time.monotonic()
-        loop.call_later(PULS_S, schlag)
-    loop.call_soon_threadsafe(schlag)
-    _faden = threading.Thread(target=_pruefen, name="fehlerwaechter", daemon=True)
-    _faden.start()
+        def schlag():
+            global _puls, _haupt_ident, _schlag_schleife
+            if D.datei() is None:
+                if _schlag_schleife is loop:
+                    _schlag_schleife = None
+                return
+            _haupt_ident = threading.get_ident()
+            _puls = time.monotonic()
+            loop.call_later(PULS_S, schlag)
+        loop.call_soon_threadsafe(schlag)
+    if _faden is None or not _faden.is_alive():
+        _faden = threading.Thread(target=_pruefen, name="fehlerwaechter", daemon=True)
+        _faden.start()
 
 
 def _bremse_melden(dauer: float, wo: str, prozess_stand: bool, faeden: str = "") -> None:

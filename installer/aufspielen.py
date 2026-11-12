@@ -145,6 +145,8 @@ def aufspielen(zip_pfad: Path, ziel: Path, fortschritt: Optional[Callable[[int, 
             t.rename(ziel / t.name)
     for rest in (neu, alt):                          # Reste eines abgebrochenen Laufs (nur eigene Ordner)
         shutil.rmtree(rest, ignore_errors=True)
+        if rest.exists():
+            raise OSError(f"Reste eines früheren Laufs lassen sich nicht entfernen (Datei in Benutzung?): {rest}")
     with zipfile.ZipFile(zip_pfad) as z:
         # Nur die festen Programmteile tauschen: läge im Paket versehentlich eine Konfiguration oder ein
         # chats-Ordner, würde sonst der des Empfängers ersetzt und gelöscht.

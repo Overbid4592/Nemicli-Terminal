@@ -530,6 +530,63 @@ async def name_befehl(arg: str) -> None:
                                   ("Über dich", alt["ueber"] or "–")])
 
 
+async def kern_befehl(arg: str) -> None:
+    """/kern – das feste Aussehen und die Sprechweise der aktiven Persönlichkeit ansehen, ändern, sperren,
+    zurückholen. Nur der Nutzer (MENUE_GESPERRT): eine KI ändert Gesperrtes nur nach seinem Ja."""
+    import charakter
+    name = PS.active().name
+    sub = arg.strip().lower()
+    stand = charakter.kern_stand(name)
+    ui.text_panel(f"🧬 Kern von {name}", (stand["kern"] or "– noch keiner –") + "\n\n🗣 Sprechweise: "
+                  + (stand["sprechweise"] or "– keine festgelegt –") + "\n\n"
+                  + ("🔒 gesperrt – jedes Selbstbild beginnt mit dem Kern; Kern und Sprechweise ändert eine KI nur "
+                     "nach deinem Ja." if stand["gesperrt"] else "🔓 offen – sperren mit /kern sperren."))
+    if not sub:
+        sub = await ask_confirm("Was möchtest du?", [
+            ("aendern", "✏️  Kern ändern"),
+            ("sprechweise", "🗣 Sprechweise ändern"),
+            ("sperre", f"🔒 Gesperrt {'✔️' if stand['gesperrt'] else '🛑'}"),
+            ("zurueck", "⏪ Alten Stand zurückholen" + (f"  ({len(stand['vorher'])} gemerkt)" if stand["vorher"] else "")),
+            ("fertig", "Fertig")]) or "fertig"
+    if sub in ("sperre", "sperren", "entsperren"):
+        an = (not stand["gesperrt"]) if sub == "sperre" else sub == "sperren"
+        try:
+            charakter.kern_sperren(an, name)
+        except ValueError as e:
+            ui.warn(f"🧬 {e}")
+            return
+        ui.success("🔒 Kern gesperrt – Selbstbilder beginnen immer damit." if an else "🔓 Kern wieder offen.")
+    elif sub in ("aendern", "ändern"):
+        ui.info("🧬 Der Kern ist das Grundskelett: Gesicht, Augen, Haarfarbe und -länge, Haut, Körperbau, Bleibendes "
+                "wie Tattoos – englisch, ein Satz. Keine Kleidung und keine Frisur (die bleiben je Bild frei).")
+        text = (await ask_text("Neuer Kern (leer = abbrechen):")).strip()
+        if not text:
+            ui.info("Nichts geändert.")
+            return
+        if (kleidung := charakter.kleidung_im_kern(text)) and await ask_confirm(
+                f"Kleidung im Kern erkannt ({', '.join(kleidung)}) – die gehört eigentlich in die Outfits. Trotzdem?",
+                [("nein", "Nein, nochmal"), ("ja", "Ja, so speichern")]) != "ja":
+            return
+        charakter.kern_setzen(text, name, grund="kern_nutzer")
+        ui.success("🧬 Kern gespeichert (der alte ist gemerkt: /kern zurueck).")
+    elif sub == "sprechweise":
+        ui.info("🗣 Wie redet die Persönlichkeit? Zum Beispiel: frech, duzt, kurze Sätze, gern mit Emojis. "
+                "Sie geht mit jeder Nachricht an die KI.")
+        text = (await ask_text("Neue Sprechweise (leer = abbrechen, „-“ = entfernen):")).strip()
+        if not text:
+            ui.info("Nichts geändert.")
+            return
+        charakter.sprechweise_setzen("" if text == "-" else text, name, grund="sprechweise_nutzer")
+        ui.success("🗣 Sprechweise entfernt." if text == "-" else "🗣 Sprechweise gespeichert.")
+    elif sub in ("zurueck", "zurück"):
+        try:
+            frueher = charakter.kern_zurueck(name)
+        except ValueError as e:
+            ui.warn(f"🧬 {e}")
+            return
+        ui.success(f"⏪ Früherer Kern ist wieder da: „{frueher}“")
+
+
 def _gui_zustand(ctx: "Ctx") -> dict:
     import nutzerprofil
     import skills
@@ -543,7 +600,8 @@ def _gui_zustand(ctx: "Ctx") -> dict:
                         "fuer_alle": s.fuer_alle} for s in skills.alle()],
             "skills_selbst": skills.selbst(),
             "profil": nutzerprofil.laden(),
-            "stimme": _stimme_zustand()}
+            "stimme": _stimme_zustand(),
+            "speicher": _BIB["speicher"]}
 
 
 def _stimme_zustand() -> dict:
@@ -890,6 +948,12 @@ async def start_gui(ctx: "Ctx"):
             return
         einstellungen(f"✓ {zeile}")
 
+    async def fenster_oeffnen(was: str) -> None:
+        """Knöpfe „Öffnen“ der Seitenleiste: nur diese festen Fenster, als Befehl wie im Terminal."""
+        zeile = {"musik": "/musik", "charaktere": "/charaktere", "apps": "/appstore oeffnen"}.get(was)
+        if zeile is not None:
+            await handle_line(ctx, zeile)
+
     vorlese_nr = [0]
 
     async def vorlesen(text: str) -> None:
@@ -920,6 +984,7 @@ async def start_gui(ctx: "Ctx"):
     handlers = {
         "vorlesen": lambda a: plane(vorlesen(str(a.get("text") or ""))),
         "vorlesen_stopp": lambda a: vorlesen_stopp(),
+        "oeffnen": lambda a: plane(fenster_oeffnen(str(a.get("was") or ""))),
         "einstellungen": lambda a: loop.call_soon_threadsafe(einstellungen),
         "einstellung": lambda a: plane(einstellung(str(a.get("befehl") or ""), str(a.get("wert") or ""))),
         "senden": lambda a: plane(zug(str(a.get("text") or ""),
@@ -938,21 +1003,38 @@ async def start_gui(ctx: "Ctx"):
 
 
 _STEUER_NR = 0
+_STEUER_ABSTAND_S = 0.08        # die Pseudokonsole reicht je Bild nur den zuletzt gesetzten Titel weiter
+_STEUER_SCHLANGE = None
 
 
 def _fenster_steuern(befehl: str) -> None:
     """Befehl ans eigene Terminal-Fenster (terminal_fenster.py) über den Konsolentitel –
-    nur dort; in anderen Terminals bliebe der Titel sonst sichtbar stehen."""
-    global _STEUER_NR  # noqa: PLW0603
+    nur dort; in anderen Terminals bliebe der Titel sonst sichtbar stehen. Die Befehle gehen
+    nacheinander mit Abstand hinaus: Von zwei Titeln kurz hintereinander käme nur der zweite an."""
+    global _STEUER_SCHLANGE  # noqa: PLW0603
     if os.name != "nt" or os.environ.get("NEMICLI_FENSTER") != "1":
         return
-    _STEUER_NR += 1
-    try:
-        import ctypes
-        schluessel = os.environ.get("NEMICLI_STEUER_KEY", "")
-        ctypes.windll.kernel32.SetConsoleTitleW(f"nemicli-steuer:{schluessel}:{befehl}:{_STEUER_NR}")
-    except Exception:
-        pass
+    if _STEUER_SCHLANGE is None:
+        import queue
+        import threading
+        _STEUER_SCHLANGE = queue.Queue()
+        threading.Thread(target=_steuer_senden, args=(_STEUER_SCHLANGE,), name="fenster-steuern",
+                         daemon=True).start()
+    _STEUER_SCHLANGE.put(befehl)
+
+
+def _steuer_senden(schlange) -> None:
+    global _STEUER_NR  # noqa: PLW0603
+    schluessel = os.environ.get("NEMICLI_STEUER_KEY", "")
+    while True:
+        befehl = schlange.get()
+        _STEUER_NR += 1
+        try:
+            import ctypes
+            ctypes.windll.kernel32.SetConsoleTitleW(f"nemicli-steuer:{schluessel}:{befehl}:{_STEUER_NR}")
+        except Exception:
+            pass
+        time.sleep(_STEUER_ABSTAND_S)
 
 
 def gui_oeffnen(bruecke, schalter: str = "--gui") -> None:
@@ -1063,6 +1145,185 @@ async def start_musik(ctx: "Ctx"):
     }
     bruecke = gui_bruecke.GuiBruecke(loop, handlers)
     return bruecke
+
+LORA_PROBE_STAERKEN = (0.6, 0.8, 1.0)
+LORA_PROBE_SEED = 7
+LORA_VORSCHAU_ALLE = 200
+
+
+async def start_lora(ctx: "Ctx"):
+    """Brücke zur LoRA-Werkstatt (/lora): eigene Bilder prüfen, eine Bild-LoRA (Krea 2) trainieren – mit
+    Fortschritt, Pause, Testbildern und Probebildern – und sie an einen Charakter binden (SHA-256)."""
+    import shutil
+    import threading
+    import gui_bruecke
+    import hintergrund
+    import lorabild
+    loop = asyncio.get_running_loop()
+    bruecke = None
+    halt = threading.Event()
+    lauf: dict = {}
+
+    def senden(art: str, **felder) -> None:
+        if bruecke is not None:
+            bruecke.senden({"t": art, **felder})
+
+    def krea_grund() -> str:
+        try:
+            import krea
+            return krea.missing_reason() or ""
+        except Exception as e:
+            return str(e)
+
+    def stand(_a: dict | None = None) -> None:
+        import charakter
+        namen = [p.name for p in PS.list_all().values()]
+        gebunden = {}
+        for n in namen:
+            b = lorabild.bindung_sauber(charakter.roh(n).get("lora_bild"))
+            if b:
+                gebunden.setdefault(b["name"], []).append(n)
+        import lora_training as LT
+        senden("stand", personas=namen, aktiv=PS.active().name, krea=krea_grund(), laeuft=LT.laeuft(),
+               loras=[{**e, "gebunden": gebunden.get(e["name"], [])} for e in lorabild.liste()],
+               min_bilder=lorabild.MIN_BILDER)
+
+    async def pruefen(a: dict) -> None:
+        bilder = lorabild.bilder_sammeln(a.get("pfade") or [])
+        senden("status", text=f"🔍 prüfe {len(bilder)} Bilder …", laeuft=True)
+        try:
+            import gesichter
+            finder = gesichter.finden if gesichter.verfuegbar() else None
+        except Exception:
+            finder = None
+        try:
+            erg = await asyncio.to_thread(lorabild.pruefung, bilder, finder)
+        except Exception as e:
+            senden("fehler", text=f"Prüfen fehlgeschlagen: {e}")
+            return
+        senden("pruefung", bilder=erg, gesichter=finder is not None)
+
+    def _proben(name: str, pfad: Path, melden) -> list[dict]:
+        import krea
+        ziel = lorabild.ordner(name, anlegen=True) / "proben"
+        ziel.mkdir(parents=True, exist_ok=True)
+        prompt = lorabild.prompt_bauen(name, "a portrait, looking at the camera, soft natural light")
+        raus = []
+        for staerke in LORA_PROBE_STAERKEN:
+            melden(f"Probebild Stärke {staerke:g} …")
+            roh = krea.generate(prompt, seed=LORA_PROBE_SEED, lora=pfad, lora_staerke=staerke)
+            fertig = ziel / f"staerke_{int(staerke * 100):03d}.png"
+            shutil.move(roh, fertig)
+            raus.append({"staerke": staerke, "pfad": str(fertig)})
+        return raus
+
+    def _training(a: dict) -> str:
+        """Läuft im Faden: Kopien anlegen, trainieren, SHA-256, Probebilder, binden."""
+        import imagegen
+        import lora_training as LT
+        import malsperre
+        name = lorabild.name_sauber(a.get("name") or "")
+        bilder = lorabild.bilder_sammeln(a.get("pfade") or [])
+        daten = lorabild.daten_kopieren(name, bilder)
+        ordner = lorabild.ordner(name, anlegen=True)
+
+        def melden(text: str) -> None:
+            import actions
+            actions._BILD_STATUS["msg"] = text
+            senden("status", text="🧬 " + text, laeuft=True)
+
+        def fortschritt(f: dict) -> None:
+            senden("fortschritt", **f)
+        vorschau = ({"alle": LORA_VORSCHAU_ALLE, "ordner": str(ordner / "vorschau"), "seed": LORA_PROBE_SEED,
+                     "text": lorabild.prompt_bauen(name, "a portrait, looking at the camera, soft natural light")}
+                    if a.get("vorschau") else None)
+        try:
+            with malsperre.halten(melden, "LoRA-Training"):
+                texte = lorabild.bildtexte(name, daten, melden)
+                if texte is None:
+                    melden("Kein Seh-Modell unter Vision/ – alle Bilder lernen mit dem Auslöser allein")
+                pfad = imagegen._gpu_fuer_bild(LT.trainieren)(
+                    None, bilder=daten, schritte=int(a.get("schritte") or 0) or None, motor="bild",
+                    ziel=lorabild.datei(name), text=lorabild.ausloeser(name), on_status=melden,
+                    abbruch=halt.is_set, fortschritt=fortschritt, vorschau=vorschau, ausloeser=name,
+                    texte=texte)
+                sha = lorabild.sha_schreiben(pfad)
+                proben = _proben(name, pfad, melden) if a.get("proben", True) else []
+        finally:
+            import actions
+            actions._BILD_STATUS["msg"] = None
+        gebunden = ""
+        if a.get("binden"):
+            lorabild.binden(name, str(a["binden"]))
+            gebunden = str(a["binden"])
+        senden("fertig", name=name, datei=str(pfad), sha256=sha, proben=proben, gebunden=gebunden)
+        return (f"Bild-LoRA „{name}“ fertig: {pfad} (SHA-256 {sha[:16]}…)"
+                + (f", gebunden an {gebunden}" if gebunden else "") + f". Im Prompt: [{name}] …")
+
+    def starten(a: dict) -> None:
+        import lora_training as LT
+        name = lorabild.name_sauber(a.get("name") or "")
+        bilder = lorabild.bilder_sammeln(a.get("pfade") or [])
+        grund = ("Gib der LoRA einen Namen (Buchstaben oder Ziffern)." if not name
+                 else f"Zu wenige Bilder ({len(bilder)}, mindestens {lorabild.MIN_BILDER})."
+                 if len(bilder) < lorabild.MIN_BILDER else krea_grund()
+                 or hintergrund.sperre("lora_trainieren") or ("Es läuft schon ein LoRA-Training." if LT.laeuft() else ""))
+        if grund:
+            senden("fehler", text=grund)
+            return
+        halt.clear()
+        lauf.update(a)
+
+        async def arbeit():
+            try:
+                return await asyncio.to_thread(_training, a)
+            except Exception as e:
+                text = str(e) or type(e).__name__
+                if "angehalten bei Schritt" in text:
+                    senden("pausiert", text=text)
+                else:
+                    senden("fehler", text=f"Training: {text}")
+                raise
+        hintergrund.starten("lora_trainieren", f"🧬 LoRA-Werkstatt: {name}", arbeit, PS.active().key)
+        senden("status", text=f"🧬 Training „{name}“ startet …", laeuft=True)
+
+    def pause(_a: dict) -> None:
+        halt.set()
+        senden("status", text="⏸ halte an – der Stand wird gesichert …", laeuft=True)
+
+    def weiter(_a: dict) -> None:
+        if lauf:
+            starten(dict(lauf))
+
+    def binden(a: dict) -> None:
+        try:
+            if a.get("charakter"):
+                b = lorabild.binden(str(a.get("lora") or ""), str(a["charakter"]))
+                senden("gebunden", lora=b["name"], charakter=str(a["charakter"]), sha256=b["sha256"])
+            else:
+                senden("fehler", text="Erst einen Charakter wählen.")
+        except Exception as e:
+            senden("fehler", text=f"Binden fehlgeschlagen: {e}")
+        stand()
+
+    def loesen(a: dict) -> None:
+        if lorabild.loesen(str(a.get("charakter") or "")):
+            senden("status", text=f"Bindung gelöst: {a.get('charakter')}", laeuft=False)
+        stand()
+
+    plane = lambda coro: asyncio.run_coroutine_threadsafe(coro, loop)     # noqa: E731
+    handlers = {
+        "stand": stand,
+        "pruefen": lambda a: plane(pruefen(a)),
+        "starten": lambda a: loop.call_soon_threadsafe(starten, a),
+        "pause": pause,
+        "weiter": lambda a: loop.call_soon_threadsafe(weiter, a),
+        "binden": binden,
+        "loesen": loesen,
+    }
+    bruecke = gui_bruecke.GuiBruecke(loop, handlers)
+    return bruecke
+
 
 async def start_charaktere(ctx: "Ctx"):
     """Brücke zur Charakter-Galerie (/charaktere): Vorlagen mit Porträt, Vorschläge der KI, Porträts mit Krea,
@@ -1471,7 +1732,14 @@ async def cloud_backend(ref: str, strength: str = M.DEFAULT_STRENGTH):
     if prov is None:
         raise RuntimeError(f"Unbekannter Anbieter: '{provider}'.")
     if not prov.available():
+        if prov.kind == "chatgpt":
+            raise RuntimeError("Das ChatGPT-Konto ist nicht (mehr) angemeldet – /model chatgpt anmelden.")
         raise RuntimeError(f"Kein Key für {prov.label} – {prov.env} in der .env setzen.")
+    # OpenAI über die Responses API (empfohlen; Config openai_api = "chat" nimmt Chat Completions),
+    # das ChatGPT-Konto geht nur so
+    if provider == "chatgpt" or (provider == "openai" and config.load().get("openai_api", "responses") != "chat"):
+        from openai_responses import ResponsesChat
+        return ResponsesChat(provider, model_id, strength=strength)
     from cloud import CloudChat
     return CloudChat(provider, model_id, strength=strength)
 
@@ -1508,30 +1776,110 @@ async def _run_with_status(title: str, work) -> str:
     return state["result"] or ""
 
 
-# Bibliothekar nach jeder Runde: im TUI als Hintergrund-Task mit Badge (läuft einer, wird nur „nochmal“
-# vorgemerkt), in der Klassik-Oberfläche inline mit Panel (rich.Live verträgt sich nicht mit dem Prompt).
-# wartet: im Takt (/embeddingtimer) gesammelt, läuft beim nächsten Schlag · letzter: Start des letzten Laufs
+# Bibliothekar nach jeder Runde: Er sammelt ohne Modell in den Einlese-Speicher (einlesen.py), auch während eines
+# Einlesens: Dafür hat er eine eigene Aufgabe (sammler). Mit Modell rechnet er nur beim Einlesen (alles) und nach einem
+# aufgeräumten Kontext (erzwingen), dann im eigenen Prozess: im TUI als Hintergrund-Task mit Badge (task, läuft einer,
+# wird nur „nochmal“ vorgemerkt), in der Klassik-Oberfläche inline mit Panel.
+# wartet: gesammelt wird beim nächsten Schlag · letzter: letzter Lauf · voll_gesammelt: letzter Lauf mit allen Quellen
+# einlesen: wartet auf Ruhe und GPU · gewuenscht: früher als AUTO_AB · nicht_vor: Pause nach einem Durchgang
 _BIB: dict = {"task": None, "nochmal": None, "wartet": False, "wartet_chat": None, "takt": None,
-              "letzter": time.monotonic()}
-TAKT_PRUEF_S = 30.0        # so oft schaut der Takt nach, ob er fällig ist (eine geänderte Einstellung greift)
-LOW_RUHE_S = 3.0           # Low-Modus: so kurz wird auf Ruhe gewartet, danach geht es gedrosselt los
+              "letzter": time.monotonic() - 3600.0, "voll_gesammelt": 0.0, "speicher": None, "sammler": None,
+              "einlesen": None, "gewuenscht": False, "chat": None, "nicht_vor": 0.0, "anlass": None, "gemeldet": None}
+SAMMELN_ALLE_S = 120.0     # so oft schreibt der Bibliothekar Chat, Notizen und Skills in den Speicher
+QUELLEN_ALLE_S = 900.0     # so oft liest er auch Berichte, Wissen und Bilder
+TAKT_PRUEF_S = 30.0        # so oft schaut der Takt nach, ob er fällig ist
+SPEICHER_PRUEF_S = 3.0     # so oft zeigt der Balken beim Einlesen den neuen Füllstand
+EINLESEN_PRUEF_S = 30.0    # so oft schaut ein wartender Durchgang, ob es jetzt geht
+EINLESEN_PAUSE_S = 60.0    # frühestens so lange nach einem Durchgang der nächste
+EINLESEN_FEHLER_S = 1800.0 # nach einem misslungenen Durchgang
+SPEICHER_MELDEN_TOKEN = 5000   # ab so viel Bewegung steht der Füllstand im Debugbericht
+
+
+def _einlesen_bericht(text: str) -> None:
+    try:
+        import debugbericht
+        debugbericht.ereignis(text, speicher=False)
+    except Exception:
+        pass
+
+
+def _token_text(token: int | None) -> str:
+    return "?" if token is None else f"{token:,}".replace(",", ".")
 
 
 def _takt_rest_s() -> float:
-    """Sekunden bis zum nächsten Schlag des Takts (0 = fällig oder Takt aus)."""
-    import einbetttakt
-    m = einbetttakt.minuten()
-    return max(0.0, m * 60 - (time.monotonic() - _BIB["letzter"])) if m else 0.0
+    """Sekunden bis zum nächsten Sammeln (0 = fällig)."""
+    return max(0.0, SAMMELN_ALLE_S - (time.monotonic() - _BIB["letzter"]))
 
 
-def takt_stand() -> str:
-    """Eine Zeile für /embeddingtimer: Takt, Low-Modus, nächster Lauf."""
-    import einbetttakt
-    m = einbetttakt.minuten()
-    zeile = f"Gedächtnis-Takt: {einbetttakt.text(m)} · {einbetttakt.low_text(einbetttakt.low())}"
-    if m and _BIB["wartet"]:
-        zeile += f" · nächster Lauf in ~{max(1, round(_takt_rest_s() / 60))} min"
-    return zeile
+def _speicher_zeigen(token: int | None) -> None:
+    """Füllstand an den Balken der Statuszeile und des GUI-Fensters."""
+    _BIB["speicher"] = token
+    tui = ui.TUI
+    if tui is not None:
+        try:
+            tui.set_speicher(token)
+        except Exception:
+            pass
+    if GUI_BRUECKE is not None:
+        GUI_BRUECKE.senden({"t": "speicher", "token": token})
+
+
+async def speicher_pruefen() -> None:
+    """Füllstand neu lesen und anzeigen; ist der Speicher voll, startet der Durchgang, sobald es geht."""
+    import einlesen
+    token = await asyncio.to_thread(einlesen.stand)
+    _speicher_zeigen(token)
+    alt = _BIB["gemeldet"]
+    if token is not None and (alt is None or abs(token - alt) >= SPEICHER_MELDEN_TOKEN):
+        _BIB["gemeldet"] = token
+        _einlesen_bericht(f"Einlese-Speicher: {_token_text(token)} Token")
+    if token is not None and (token >= einlesen.AUTO_AB or _BIB["gewuenscht"]):
+        einlesen_vormerken()
+
+
+def einlesen_vormerken(chat_id=None, gewuenscht: bool = False) -> None:
+    """Einen Durchgang anstoßen: Er wartet auf eine freie Runde und Platz auf der GPU."""
+    _BIB["chat"] = chat_id or _BIB["chat"]
+    _BIB["gewuenscht"] = _BIB["gewuenscht"] or gewuenscht
+    if ui.TUI is None:                    # Klassik-Oberfläche: rich.Live verträgt sich nicht mit dem Prompt
+        if gewuenscht:
+            ui.info("📦 Gerade geht es nicht, versuch /einlesen gleich noch einmal.")
+        return
+    if _BIB["einlesen"] is None or _BIB["einlesen"].done():
+        _BIB["einlesen"] = asyncio.create_task(_einlesen_warten())
+
+
+async def _einlesen_warten() -> None:
+    """Startet den Durchgang, sobald keine Runde und kein Bild läuft und die GPU Platz hat. Wartet es länger,
+    erfährt die KI einmal davon."""
+    import einlesen
+    import lernschleife as LS
+    seit, gemeldet = time.monotonic(), False
+    while True:
+        token = await asyncio.to_thread(einlesen.stand)
+        if token is None or not (token >= einlesen.AUTO_AB or _BIB["gewuenscht"]):
+            _BIB["gewuenscht"] = False
+            return
+        if _BIB["task"] is not None and not _BIB["task"].done():
+            return                            # läuft schon; speicher_pruefen schaut danach wieder nach
+        grund = "der letzte Versuch ist gerade erst vorbei"
+        if time.monotonic() >= _BIB["nicht_vor"]:
+            kann, grund = await asyncio.to_thread(memory.gpu_platz)
+            if kann and _beschaeftigt(ui.TUI):
+                kann, grund = False, "gerade läuft eine Antwort oder ein Bild"
+            if kann:
+                _BIB["anlass"] = "Auftrag" if _BIB["gewuenscht"] else "voll"
+                _BIB["gewuenscht"] = False
+                ui.info(f"📦 {einlesen.kurz(token)} abgetrennt, wird jetzt auf der GPU eingelesen. Was ab jetzt "
+                        "dazukommt, sammelt der nächste Speicher.")
+                await bibliothekar(_BIB["chat"], alles=True)
+                return
+        if not gemeldet and time.monotonic() - seit >= einlesen.MELDEN_NACH_S:
+            gemeldet = True
+            ui.info(f"📦 Der Einlese-Speicher wartet: {grund}. Er startet von selbst, sobald es geht.")
+            LS.melden(einlesen.hinweis(token, grund), PS.active().key)
+        await asyncio.sleep(EINLESEN_PRUEF_S)
 
 
 def _vormerken(chat_id) -> None:
@@ -1557,25 +1905,45 @@ async def _takt_schleife() -> None:
 
 
 def _chat_jetzt(ctx) -> bool:
-    """Laufenden Chat sofort einbetten? Ja, wenn das Kontext-Aufräumen (pricing.kuerzen) in
-    dieser Runde Nachrichten ausgelagert hat. Bei kleinem Fenster (lokale Modelle) wird schon
-    nach der Hälfte des Verlaufs-Budgets eingebettet – dort wird vor CHAT_SCHRITT aufgeräumt."""
-    if getattr(ctx.backend, "weggefallen", None):
-        return True
-    try:
-        schritt = int(pricing.context_window(ctx.backend.model) * pricing.HISTORY_SHARE / 2)
-        return (schritt < indexdb.CHAT_SCHRITT and bool(ctx.current_chat)
-                and indexdb.chat_faellig(ctx.current_chat, schritt))
-    except Exception:
-        return False
+    """Laufenden Chat sofort einbetten? Ja, wenn das Kontext-Aufräumen (pricing.kuerzen) in dieser Runde
+    Nachrichten ausgelagert hat: Sie stehen nicht mehr im Kontext und sollen gleich nach Bedeutung findbar sein."""
+    return bool(getattr(ctx.backend, "weggefallen", None))
 
 
-def _bibliothekar_lauf(chat_id, alles: bool, on_status, erzwingen: bool = False, langsam: bool = False) -> dict:
-    """Blockierend (im Thread): ein Lauf im eigenen Prozess (bibkind), Ergebnis wie after_turn.
-    `langsam`: im Low-Modus gleich gedrosselt beginnen (gerade läuft Chat oder Bild)."""
+def _bibliothekar_lauf(chat_id, alles: bool, on_status, erzwingen: bool = False) -> dict:
+    """Blockierend (im Thread), Ergebnis wie after_turn. Sammeln braucht kein Modell und läuft hier; mit Modell
+    rechnet ein eigener Prozess (bibkind)."""
     import bibkind
-    _BIB["letzter"] = time.monotonic()
-    return bibkind.laufen(chat_id, alles, on_status, erzwingen, langsam=langsam)
+    jetzt = time.monotonic()
+    _BIB["letzter"] = jetzt
+    if not (alles or erzwingen):
+        nur_kurz = jetzt - _BIB["voll_gesammelt"] < QUELLEN_ALLE_S
+        if not nur_kurz:
+            _BIB["voll_gesammelt"] = jetzt
+        return bibkind.lauf_hier(chat_id, False, None, False, nur_kurz=nur_kurz)
+    anlass = (_BIB["anlass"] or "/einlesen") if alles else "Kontext aufgeräumt"
+    if alles:
+        _BIB["anlass"] = None
+    vorher = _stand_oder_none()
+    _einlesen_bericht(f"Einlesen startet ({anlass}), Füllstand {_token_text(vorher)} Token")
+    res = bibkind.laufen(chat_id, alles, on_status, erzwingen)
+    ergebnis = (f"{time.monotonic() - jetzt:.0f} s ({anlass}): Füllstand {_token_text(vorher)} → "
+                f"{_token_text(_stand_oder_none())} Token, {res.get('neu', 0)} Brocken neu, {res.get('mit_vektor', 0)} "
+                "mit Vektor" + (f", Fehler: {res['err']}" if res.get("err") else ""))
+    _einlesen_bericht("Einlesen fertig nach " + ergebnis)
+    try:                                        # für das Werkzeug gedaechtnis_status
+        indexdb._stand(actions.EINLESEN_STAND, time.strftime("%Y-%m-%d %H:%M") + ", " + ergebnis)
+    except Exception:
+        pass
+    return res
+
+
+def _stand_oder_none() -> int | None:
+    try:
+        import einlesen
+        return einlesen.stand()
+    except Exception:
+        return None
 
 
 def _bibliothekar_text(res: dict) -> str:
@@ -1606,15 +1974,9 @@ def _beschaeftigt(tui) -> bool:
     return memory.gpu_pause()
 
 
-async def _ruhe_abwarten(tui, erzwingen: bool) -> bool:
+async def _ruhe_abwarten(tui, erzwingen: bool) -> None:
     """Vektorisiert wird in ruhigen Phasen: BIB_RUHE_S ohne Runde, Bild oder Video und ohne
-    Eingabe (ein ausgelagerter Chat soll schneller findbar sein: dann ein Viertel davon).
-    Im Low-Modus nur LOW_RUHE_S – dann geht es auch mitten in Chat oder Bild los, gedrosselt.
-    Liefert True, wenn gedrosselt begonnen werden soll."""
-    import einbetttakt
-    if einbetttakt.low():
-        await asyncio.sleep(LOW_RUHE_S)
-        return _beschaeftigt(tui)
+    Eingabe (ein ausgelagerter Chat soll schneller findbar sein: dann ein Viertel davon)."""
     noetig = BIB_RUHE_S / 4 if erzwingen else BIB_RUHE_S
     ruhig_seit, marke = time.monotonic(), indexdb._unterbrechung
     while True:
@@ -1624,16 +1986,35 @@ async def _ruhe_abwarten(tui, erzwingen: bool) -> bool:
             ruhig_seit, marke = time.monotonic(), indexdb._unterbrechung
             continue
         if time.monotonic() - max(ruhig_seit, eingabe) >= noetig:
-            return False
+            return
+
+
+async def _sammeln_hintergrund(chat_id) -> None:
+    """Sammeln ohne Modell: läuft auch neben einem Einlesen, zeigt sich nur im Balken."""
+    try:
+        res = await asyncio.to_thread(_bibliothekar_lauf, chat_id, False, None)
+        if res["err"]:
+            ui.info(f"📚 Bibliothekar: {res['err']}")
+        indexdb.vorwaermen()
+        await speicher_pruefen()
+    finally:
+        _BIB["sammler"] = None
+
+
+async def _speicher_beobachten() -> None:
+    """Beim Einlesen: Der Balken läuft sichtbar leer."""
+    import einlesen
+    while True:
+        await asyncio.sleep(SPEICHER_PRUEF_S)
+        _speicher_zeigen(await asyncio.to_thread(einlesen.stand))
 
 
 async def _bibliothekar_hintergrund(chat_id, alles: bool, erzwingen: bool = False) -> None:
     tui = ui.TUI
     try:
         while True:
-            langsam = False
-            if not alles:                              # /gedaechtnis indexieren will es jetzt
-                langsam = await _ruhe_abwarten(tui, erzwingen)
+            if erzwingen and not alles:                # das Einlesen hat schon auf Ruhe gewartet
+                await _ruhe_abwarten(tui, erzwingen)
             def on_status(m: str) -> None:
                 if tui is not None:
                     try:
@@ -1641,27 +2022,24 @@ async def _bibliothekar_hintergrund(chat_id, alles: bool, erzwingen: bool = Fals
                     except Exception:
                         pass
 
-            res = await asyncio.to_thread(_bibliothekar_lauf, chat_id, alles, on_status, erzwingen, langsam)
+            balken = asyncio.create_task(_speicher_beobachten()) if alles else None
+            try:
+                res = await asyncio.to_thread(_bibliothekar_lauf, chat_id, alles, on_status, erzwingen)
+            finally:
+                if balken is not None:
+                    balken.cancel()
             memory.release_encoder()
             indexdb.vorwaermen()                       # neue Brocken jetzt einlesen, nicht in der nächsten Suche
             if res["err"]:
                 ui.info(f"📚 Bibliothekar: {res['err']}")
             elif res["n"]:
-                rest = ""
-                try:
-                    o = indexdb.offen()
-                    offen = o["berichte_offen"] + o["ohne_vektor"]
-                    if offen and not alles:
-                        import einbetttakt
-                        m = einbetttakt.minuten()
-                        wann = f"in {m} min" if m else "nächste Runde"
-                        rest = f" – noch {o['berichte_offen']} Berichte / {o['ohne_vektor']} Brocken offen, geht {wann} weiter (/gedaechtnis indexieren = alles jetzt)"
-                        if m:
-                            _vormerken(None)
-                except Exception:
-                    pass
-                ui.info(_bibliothekar_text(res) + rest + ".")
+                ui.info(_bibliothekar_text(res) + ".")
+            if alles:
+                misslungen = res["err"] or not res.get("mit_vektor")
+                _BIB["nicht_vor"] = time.monotonic() + (EINLESEN_FEHLER_S if misslungen else EINLESEN_PAUSE_S)
             if _BIB["nochmal"] is None:
+                _BIB["task"] = None
+                await speicher_pruefen()
                 break
             chat_id, alles, erzwingen = _BIB["nochmal"]
             _BIB["nochmal"] = None
@@ -1676,18 +2054,35 @@ async def _bibliothekar_hintergrund(chat_id, alles: bool, erzwingen: bool = Fals
 
 async def bibliothekar(chat_id: int | None = None, alles: bool = False, erzwingen: bool = False,
                        sofort: bool = False) -> int:
-    """Nach der Runde: Notizen und Skills einbetten, den Chat je indexdb.CHAT_SCHRITT Token
-    (`erzwingen`: sofort, z. B. nach dem Kontext-Aufräumen), dann Rückstände, bis die nächste
-    Runde beginnt. Im TUI im Hintergrund (Badge in der Statuszeile, Rückgabe 0), in der
-    Klassik-Oberfläche inline mit Panel.
-    Mit Takt (/embeddingtimer) wird vorgemerkt und erst beim nächsten Schlag gerechnet – außer `alles`,
-    `erzwingen` (ausgelagerter Kontext muss gleich findbar sein) und `sofort` (ausdrücklicher Befehl)."""
+    """Nach der Runde: Chat, Notizen und Skills ohne Modell in den Einlese-Speicher schreiben, höchstens alle
+    SAMMELN_ALLE_S – außer `sofort` (ausdrücklicher Befehl). `alles` (Einlesen) rechnet den Speicher ab, `erzwingen`
+    (Kontext aufgeräumt) gibt dem laufenden Chat seine Vektoren, wenn die GPU Platz hat; sonst wartet er im Speicher.
+    Im TUI im Hintergrund (Rückgabe 0), in der Klassik-Oberfläche inline mit Panel."""
+    import einlesen
+    _BIB["chat"] = chat_id or _BIB["chat"]
+    if einlesen.abholen():                              # vom Werkzeug vorgemerkt
+        einlesen_vormerken(chat_id, gewuenscht=True)
+    if erzwingen and not alles and not memory.gpu_platz()[0]:
+        erzwingen = False
     if not (alles or erzwingen or sofort) and _takt_rest_s() > 0:
         _vormerken(chat_id)
         return 0
     if _BIB["wartet"]:                                  # Vorgemerktes läuft gleich mit
         chat_id = chat_id or _BIB["wartet_chat"]
         _BIB["wartet"], _BIB["wartet_chat"] = False, None
+    if not (alles or erzwingen):
+        if ui.TUI is not None:
+            if _BIB["sammler"] is not None and not _BIB["sammler"].done():
+                _BIB["letzter"] = time.monotonic()      # ein Sammeln läuft: das nächste einen Schlag später
+                _vormerken(chat_id)
+                return 0
+            _BIB["sammler"] = asyncio.create_task(_sammeln_hintergrund(chat_id))
+            return 0
+        res = await asyncio.to_thread(_bibliothekar_lauf, chat_id, False, None)
+        if res["err"]:
+            ui.info(f"📚 Bibliothekar: {res['err']}")
+        await speicher_pruefen()
+        return res["n"]
     if ui.TUI is not None:
         if _BIB["task"] is not None and not _BIB["task"].done():
             alt = _BIB["nochmal"] or (None, False, False)
@@ -1725,8 +2120,9 @@ async def bibliothekar(chat_id: int | None = None, alles: bool = False, erzwinge
     res = state["res"] or {"n": 0, "err": None, "mit_vektor": 0}
     if res["err"]:
         ui.info(f"📚 Bibliothekar: {res['err']}")
-    elif res["n"]:
+    elif res["n"] and (alles or erzwingen):
         ui.info(_bibliothekar_text(res) + ".")
+    await speicher_pruefen()
     return res["n"]
 
 
@@ -1974,7 +2370,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         else:
             ui.info("⏰ Offene Erinnerungen:")
             for d in offen:
-                ui.info(f"   #{d['id']} · {ER.zeit_text(float(d['zeit']))} · {d['text']}")
+                ui.info("   " + ER.zeile(d))
         return
     if sub == "motive" and rest:
         if rest.lower() == "alle" or KM.bereich_finden(rest):
@@ -2037,6 +2433,11 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         ui.info(grund)
         return
     beschreibung, seed = rest, None
+    import charakter as _charakter
+    if beschreibung and _charakter.kern_gesperrt(name):
+        ui.info("🔒 Der Kern ist gesperrt – gemalt wird mit dem Kern aus der Charakter-Datei, nicht mit dieser "
+                "Beschreibung. Ändern: /kern")
+        beschreibung = ""
     if not beschreibung and (aus_datei := KB.charakter_aussehen(name)):
         beschreibung, seed = aus_datei
         ui.info(f"🔮 Aussehen aus {name}s Charakter-Datei: „{beschreibung}“")

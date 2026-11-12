@@ -15,7 +15,7 @@ import threading
 from pathlib import Path
 
 from PySide6.QtCore import QEasingCurve, QObject, QPointF, QRectF, Qt, QTimer, QVariantAnimation, Signal
-from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QImage, QPainter, QPen, QPixmap, QTextCursor
+from PySide6.QtGui import QColor, QCursor, QFont, QIcon, QImage, QKeySequence, QPainter, QPen, QPixmap, QTextCursor
 from PySide6.QtWidgets import (QApplication, QColorDialog, QDialog, QFrame, QGridLayout, QHBoxLayout, QInputDialog,
                                QLabel, QMenu, QMessageBox, QPlainTextEdit, QPushButton, QScrollArea, QVBoxLayout,
                                QWidget)
@@ -28,18 +28,26 @@ MAX_NACHRICHT = 4 * 1024 * 1024
 DUNKEL = "#0f1117"
 KARTE = "#1a1d27"
 AKZENT = "#8b7cff"
+try:                                                     # gemeinsames Design aller NemiCLI-Fenster (ui/design.py)
+    import design as _D
+    DUNKEL, KARTE, AKZENT = _D.FARBE["grund"], _D.FARBE["flaeche"], _D.FARBE["lila"]
+    _px, _FAMILIE = _D.css_px, "Segoe UI"
+except ImportError:
+    def _px(px: int) -> int:
+        return px
+    _FAMILIE = "Segoe UI"
 STIL = f"""
-QWidget {{ background: {DUNKEL}; color: #e8eaf2; font: 14px 'Segoe UI'; }}
+QWidget {{ background: {DUNKEL}; color: #e8eaf2; font: {_px(14)}px '{_FAMILIE}'; }}
 QLabel {{ background: transparent; }}
 QFrame#karte, QFrame#debug {{ background: {KARTE}; border: 1px solid #2a2f3d; border-radius: 14px; }}
 QFrame#debug {{ border: 1px solid {AKZENT}; }}
 QPushButton {{ background: {AKZENT}; color: white; border: 0; border-radius: 15px; padding: 7px 14px; }}
 QPushButton:disabled {{ background: #3a3550; color: #9aa1b5; }}
 QPushButton#leise {{ background: transparent; border: 1px solid #2a2f3d; color: #e8eaf2; }}
-QPushButton#kaefer {{ background: {KARTE}; border: 1px solid {AKZENT}; border-radius: 23px; font-size: 22px; padding: 0; }}
+QPushButton#kaefer {{ background: {KARTE}; border: 1px solid {AKZENT}; border-radius: 23px; font-size: {_px(22)}px; padding: 0; }}
 QPlainTextEdit {{ background: {DUNKEL}; border: 1px solid #2a2f3d; border-radius: 8px; padding: 4px; }}
-QLabel#leise {{ color: #9aa1b5; font-size: 12px; }}
-QLabel#titel {{ font-size: 16px; font-weight: 600; }}
+QLabel#leise {{ color: #9aa1b5; font-size: {_px(12)}px; }}
+QLabel#titel {{ font-size: {_px(16)}px; font-weight: 600; }}
 """
 _FOKUSBAR = {"input", "select", "textarea", "button"}
 
@@ -117,6 +125,7 @@ class AppAnsicht(QWidget):
         self._zieht = None
         self._groesse = None
         self.fehler_text = ""
+        self.im_dialog = False
         self.laden()
         self.uhr = QTimer(self)
         self.uhr.timeout.connect(self._takt)
@@ -124,6 +133,9 @@ class AppAnsicht(QWidget):
 
     # -- Laden ---------------------------------------------------------------------
     def laden(self):
+        if self.im_dialog:                             # erst nach dem Dialog des laufenden Skripts
+            QTimer.singleShot(200, self.laden)
+            return
         self._bilder.clear()
         self.layout_ = None
         self.scroll = 0.0
@@ -143,6 +155,21 @@ class AppAnsicht(QWidget):
     def dialog(self, art, text, vorgabe):
         if self.nur_ansehen:
             return {"alert": None, "confirm": False, "prompt": None}[art]
+        # Der Dialog hat eine eigene Ereignisschleife: Zeitgeber und Neu-Laden würden sonst mitten im
+        # laufenden Skript JavaScript starten.
+        uhr = getattr(self, "uhr", None)
+        lief = uhr is not None and uhr.isActive()
+        if lief:
+            uhr.stop()
+        self.im_dialog = True
+        try:
+            return self._dialog_zeigen(art, text, vorgabe)
+        finally:
+            self.im_dialog = False
+            if lief:
+                uhr.start(16)
+
+    def _dialog_zeigen(self, art, text, vorgabe):
         if art == "alert":
             QMessageBox.information(self, self.titel(), text)
             from .nemijs import UNDEF
@@ -213,7 +240,7 @@ class AppAnsicht(QWidget):
         p.end()
 
     def _takt(self):
-        if self.lz is None:
+        if self.lz is None or self.im_dialog:
             return
         self.lz.zeitgeber()
         if self.lz.dok.geaendert:
@@ -391,8 +418,14 @@ class AppAnsicht(QWidget):
                 if form is not None:
                     self.lz.ausloesen(form, "submit")
                 return
-        elif ev.matches(ev.StandardKey.Paste) if hasattr(ev, "StandardKey") else False:
-            el.wert += QApplication.clipboard().text()
+        elif ev.matches(QKeySequence.StandardKey.Paste):
+            t = QApplication.clipboard().text()
+            if el.tag != "textarea":                       # einzeiliges Feld: Zeilenumbrüche fallen weg
+                t = t.replace("\r", "").replace("\n", "")
+            laenge = int(el.attrs.get("maxlength", "0") or 0)
+            if laenge:
+                t = t[:max(0, laenge - len(el.wert))]
+            el.wert += t
         elif ev.text() and ev.text().isprintable():
             t = ev.text()
             if el.attrs.get("type") == "number" and not (t.isdigit() or t in "-.,eE"):
@@ -578,6 +611,17 @@ class AppFenster(QWidget):
         if debug_offen or self._sicherung() is not None:
             QTimer.singleShot(50, self.debug_auf)
 
+    def closeEvent(self, ev):
+        # Geschlossen heißt beendet: App und Dateiwache anhalten, keine Ereignisse der Leitung mehr.
+        self.wache.stop()
+        self.ansicht.uhr.stop()
+        if self.leitung is not None:
+            try:
+                self.leitung.ereignis.disconnect(self._ereignis)
+            except (RuntimeError, TypeError):
+                pass
+        super().closeEvent(ev)
+
     def resizeEvent(self, ev):
         w, h = self.width(), self.height()
         self.ansicht.setGeometry(0, 0, w, h)
@@ -652,7 +696,8 @@ class AppFenster(QWidget):
         self.leitung.senden({"op": "zeigen", "app": self.name, "wunsch": wunsch, "element": info})
 
     def _ereignis(self, ev):
-        if ev.get("app") not in (None, self.name):
+        app = ev.get("app")
+        if app is not None and str(app).lower() != self.name.lower():    # die Sitzung schreibt Namen klein
             return
         t = ev.get("t")
         d = self.debug
@@ -726,10 +771,15 @@ class AppFenster(QWidget):
         kopf.addWidget(zurueck)
         lay.addLayout(kopf)
         reihe = QHBoxLayout()
-        reihe.addWidget(AppAnsicht(vorher, None, nur_ansehen=True), 1)
-        reihe.addWidget(AppAnsicht(self.ordner, None, nur_ansehen=True), 1)
+        ansichten = [AppAnsicht(vorher, None, nur_ansehen=True), AppAnsicht(self.ordner, None, nur_ansehen=True)]
+        for a in ansichten:
+            reihe.addWidget(a, 1)
         lay.addLayout(reihe, 1)
         dlg.exec()
+        for a in ansichten:                          # beide Apps anhalten, der Dialog wird freigegeben
+            a.uhr.stop()
+            a.lz = None
+        dlg.deleteLater()
 
     def _dateien_pruefen(self):
         if self.laeuft:
@@ -990,6 +1040,18 @@ class StoreFenster(QWidget):
             self.fuellen()
 
     def oeffnen(self, name, debug=False):
+        for f in [f for f in self.offen if not f.isVisible()]:      # geschlossene Fenster freigeben
+            self.offen.remove(f)
+            f.deleteLater()
+        f = next((f for f in self.offen if f.name == name), None)
+        if f is not None:                                            # schon offen: nach vorn statt zweite Instanz
+            if f.isMinimized():
+                f.showNormal()
+            f.raise_()
+            f.activateWindow()
+            if debug:
+                f.debug_auf()
+            return
         f = AppFenster(self.apps, name, self.speicher, self.leitung, debug_offen=debug)
         f.show()
         self.offen.append(f)

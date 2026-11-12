@@ -421,6 +421,7 @@ def pip_install(pakete: list[str], on_status=None, extra: list[str] | None = Non
     Anzeigenamen für die Fortschrittszeile."""
     if not venv_python():
         ensure_venv(on_status)
+    ensure_uv(on_status)      # venv kann ohne uv da sein (z. B. per python -m venv angelegt)
     cmd = [str(UV_EXE), "pip", "install", "--python", str(venv_python())]
     cmd += list(extra or [])
     cmd += list(pakete)

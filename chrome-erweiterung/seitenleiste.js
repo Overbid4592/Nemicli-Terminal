@@ -60,6 +60,17 @@ async function anfrage(pfad, daten = {}) {
   return r;
 }
 
+// Fehlercodes aus anfrage() als lesbarer Text für Zeilen im Chat.
+const FEHLER_TEXTE = {
+  "ohne-schluessel": "Noch kein Schlüssel eingetragen – in NemiCLI /chrome tippen und ihn in den Einstellungen eintragen.",
+  "nicht-erreichbar": "NemiCLI ist nicht erreichbar (läuft nicht oder anderer Port).",
+  "falscher-partner": "Auf diesem Port antwortet nicht NemiCLI – es wurde nichts gesendet.",
+};
+function fehlerText(e) {
+  const m = String((e && e.message) || e);
+  return Object.hasOwn(FEHLER_TEXTE, m) ? FEHLER_TEXTE[m] : m;
+}
+
 function hinweis(fehler) {
   const box = $("hinweis");
   if (!fehler) { box.hidden = true; return; }
@@ -174,12 +185,17 @@ function tippenAn() {
 }
 function tippenAus() { if (zustand.tippen) { zustand.tippen.remove(); zustand.tippen = null; } }
 
+const bildUrls = new Set();              // ObjectURLs der Bilder im Chat; frei beim Neuzeichnen des Verlaufs
+
 async function bilderZeigen(text, ziel) {
   const pfade = [...new Set(String(text || "").match(BILDPFAD) || [])];
   for (const pfad of pfade) {
     try {
       const r = await anfrage("/bild", { pfad });
-      const url = URL.createObjectURL(await r.blob());
+      const blob = await r.blob();
+      if (!ziel.isConnected) return;           // Verlauf inzwischen neu gezeichnet
+      const url = URL.createObjectURL(blob);
+      bildUrls.add(url);
       const img = el("img");
       img.src = url;
       img.title = pfad;
@@ -224,6 +240,8 @@ async function kugelZeigen() {
 function verlaufZeigen(eintraege) {
   const chat = $("chat");
   [...chat.children].forEach((k) => { if (k.id !== "leer") k.remove(); });
+  bildUrls.forEach((u) => URL.revokeObjectURL(u));
+  bildUrls.clear();
   zustand.ki = zustand.karte = zustand.fortschritt = zustand.tippen = null;
   $("leer").hidden = eintraege.length > 0;
   for (const e of eintraege) {
@@ -328,7 +346,7 @@ async function blockAktion(knopf) {
       knopf.textContent = vorher.length > 2 ? "✓ Kopiert" : "✓";
     }
   } catch (e) {
-    zeile("⚠ " + (e.message || e), "warn");
+    zeile("⚠ " + fehlerText(e), "warn");
     return;
   }
   setTimeout(() => (knopf.textContent = vorher), 1600);
@@ -457,7 +475,7 @@ function ereignis(ev) {
           wahl.querySelectorAll("button").forEach((x) => (x.disabled = true));
           b.textContent = "✓ " + text;
           try { await anfrage("/entscheiden", { id: ev.id, wahl: wert }); }
-          catch (e) { zeile("⚠ " + e.message, "warn"); }
+          catch (e) { zeile("⚠ " + fehlerText(e), "warn"); }
           if (zustand.beschaeftigt) tippenAn();
         };
         wahl.append(b);
@@ -551,8 +569,8 @@ async function senden() {
       }
     }
   } catch (e) {
-    if (e.message === "ohne-schluessel" || e.message === "nicht-erreichbar") hinweis(e.message);
-    else zeile("✗  " + e.message, "fehler");
+    if (Object.hasOwn(FEHLER_TEXTE, String(e.message))) hinweis(e.message);
+    else zeile("✗  " + fehlerText(e), "fehler");
   } finally {
     zustand.beschaeftigt = false;
     zustand.ki = zustand.karte = zustand.fortschritt = null;

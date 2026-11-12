@@ -10,6 +10,7 @@ anderer Prozess (Terminal, Wache) das alte Modell nicht weiter benutzt.
 
 from __future__ import annotations
 
+import contextlib
 import threading
 import time
 
@@ -26,10 +27,31 @@ MELDUNG = ("Lieber Nutzer, die KI hat mehrfach versucht, die Sperre zu durchdrin
 _LOCK = threading.Lock()
 _treffer: dict[str, list[float]] = {}
 _wechsel: dict | None = None
+_einsatz: str | None = None             # Modell, das gerade statt des aktiven arbeitet (Weckruf)
 
 
 def ist_cloud(ref: str | None) -> bool:
     return bool(ref) and ":" in ref and ref.split(":", 1)[0] not in LOKAL
+
+
+@contextlib.contextmanager
+def einsatz(ref: str | None):
+    """Solange ein anderes Modell als das aktive arbeitet (Weckruf der Wache): Sperren zählen für dieses."""
+    global _einsatz
+    alt, _einsatz = _einsatz, ref
+    try:
+        yield
+    finally:
+        _einsatz = alt
+
+
+def urteils_modell(aktiv: str | None) -> str | None:
+    """Wer Alarme der Wache beurteilt: nur ein Cloud-Modell (kleine lokale Modelle verwechseln dabei Programme
+    und erfinden Belege) – das aktive, wenn es eines ist, sonst das erste der Bank. None: keines da."""
+    raus = set(rausgeflogen())
+    if ist_cloud(aktiv) and aktiv not in raus:
+        return aktiv
+    return next((r for r in liste() if r not in raus), None)
 
 
 def liste() -> list[str]:
@@ -70,7 +92,7 @@ def ist_sperre(text: str | None, ok: bool | None = False) -> bool:
 def sperre(ref: str | None = None, jetzt: float | None = None) -> bool:
     """Zählt eine Sperre für `ref` (Standard: das Modell aus der Config).
     True, wenn das Modell damit herausgefiltert wurde."""
-    ref = ref or config.load().get("model")
+    ref = ref or _einsatz or config.load().get("model")
     if not ref:
         return False
     jetzt = time.monotonic() if jetzt is None else jetzt

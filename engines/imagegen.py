@@ -226,11 +226,12 @@ def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
           steps: int | None = None, cfg: float | None = None,
           size: tuple[int, int] | None = None, seed: int | None = None,
           sampler: str | None = None, on_status=None, vorlage: str | None = None,
-          staerke: float | None = None, figur: bool = False) -> str:
+          staerke: float | None = None, figur: bool = False, lora: str | None = None) -> str:
     """Malt EIN Bild mit dem aktiven Motor und gibt den Pfad zurück. Krea 2 und die Bild-Motoren
     nehmen keinen Negativ-Prompt und keine CFG; die externen Stellen schon. `vorlage`/`staerke`
     (Bild umzeichnen) nur mit Krea 2 – ist ein Bild-Motor gewählt, zeichnet Krea 2 um, wenn es da ist.
     `figur`: die Persönlichkeit selbst ist im Bild – Krea nimmt dann ihre Charakter-LoRA dazu, falls es eine gibt.
+    `lora`: eine bestimmte Bild-LoRA (lorabild) – geht vor; nur Krea 2 kann sie (lora_moeglich).
     Ein geladenes lokales Sprachmodell wartet solange im RAM (gguflokal) – nicht bei der Cloud; dort gilt
     auch kein Modellname (er gehört zu Krea/WebUI/ComfyUI), der Anbieter nimmt sein Modell."""
     art = backend()
@@ -245,7 +246,7 @@ def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
         return malkind.auftrag("paint", {"prompt": prompt, "model": model, "steps": steps,
                                          "size": list(size) if size else None, "seed": seed,
                                          "sampler": sampler, "vorlage": vorlage, "staerke": staerke,
-                                         "figur": figur}, on_status)
+                                         "figur": figur, "lora": str(lora) if lora else None}, on_status)
     import krea
     if art == MOTOR and not (vorlage and krea.missing_reason() is None):
         import bildmotoren
@@ -255,11 +256,24 @@ def paint(prompt: str, *, model: str | None = None, neg: str | None = None,
     _motoren_entladen()
     extra ={"vorlage": vorlage, "staerke": staerke} if vorlage and staerke is not None else (
         {"vorlage": vorlage} if vorlage else {})
-    if figur and (lora := krea.lora_fuer_figur()):
+    if lora:
         extra["lora"] = lora
+    elif figur and (eigene := krea.lora_fuer_figur()):
+        extra["lora"] = eigene
     return krea.generate(prompt, model=model, steps=steps, size=size, seed=seed,
                          sampler=sampler if sampler in ("euler", "euler_ancestral") else None,
                          on_status=on_status, **extra)
+
+
+def lora_moeglich(vorlage: str | None = None) -> bool:
+    """Malt jetzt Krea 2? Nur dann wirkt eine Bild-LoRA – bei einem anderen Motor fehlte sonst das Aussehen."""
+    art = backend()
+    if art == KREA:
+        return True
+    if art == MOTOR and vorlage:                 # Umzeichnen übernimmt Krea 2, wenn es da ist
+        import krea
+        return krea.missing_reason() is None
+    return False
 
 
 def _motoren_entladen() -> None:
@@ -292,7 +306,7 @@ def _params(path: str) -> str:
 
 
 def parse_opts(text: str) -> dict:
-    """Zieht --neg/--steps/--cfg/--size/--seed/--model/--sampler/--ohne-gesicht aus dem Text.
+    """Zieht --neg/--steps/--cfg/--size/--seed/--model/--sampler/--ohne-gesicht/--figur aus dem Text.
     Rest = Prompt. --neg und --cfg wirken nur bei WebUI/ComfyUI."""
     opts: dict = {}
 
@@ -318,6 +332,7 @@ def parse_opts(text: str) -> dict:
     take(r'--sampler\s+(\S+)', lambda v: {"sampler": v.lower()})
     take(r'(--euler)\b', lambda v: {"sampler": "euler"})
     take(r'(--ohne-gesicht|--no-face)\b', lambda v: {"gesicht": False})
+    take(r'(--figur)\b', lambda v: {"figur": True})
 
     opts["prompt"] = re.sub(r"\s+", " ", text).strip()
     return opts

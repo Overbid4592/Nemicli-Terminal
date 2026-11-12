@@ -30,7 +30,9 @@ from __future__ import annotations
 
 import os
 import re
+import sys
 import threading
+import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -148,9 +150,32 @@ def _ordner_stand() -> tuple:
     return str(DIR), dateien
 
 
+# Die Wache fragt die aktive Persönlichkeit aus Kugel und Hauptschleife: Dort liest ein eigener Thread den Ordner,
+# damit eine schlafende Platte beide nicht anhält.
+STAND_ALT_S = 30.0
+_stand: dict = {"wert": None, "zeit": 0.0, "faden": None}
+
+
+def _stand_merken() -> tuple:
+    wert = _ordner_stand()
+    _stand.update(wert=wert, zeit=time.monotonic())
+    return wert
+
+
+def _stand_holen() -> tuple:
+    wert = _stand["wert"]
+    if not getattr(sys.modules.get("modes"), "_wache_dienst", False) or wert is None or wert[0] != str(DIR):
+        return _stand_merken()
+    faden = _stand["faden"]
+    if time.monotonic() - _stand["zeit"] > STAND_ALT_S and (faden is None or not faden.is_alive()):
+        _stand["faden"] = threading.Thread(target=_stand_merken, name="nemi-persona-stand", daemon=True)
+        _stand["faden"].start()
+    return wert
+
+
 def list_all() -> dict[str, Persoenlichkeit]:
     """Nemi zuerst, dann alle .md aus Persoenlichkeiten/ (alphabetisch)."""
-    stand = _ordner_stand()
+    stand = _stand_holen()
     with _liste_lock:
         if _liste["stand"] == stand:
             return dict(_liste["werte"])
@@ -192,7 +217,11 @@ def resolve(name: str) -> Persoenlichkeit | None:
 
 def active() -> Persoenlichkeit:
     key = str(config.load().get(CONFIG_KEY) or NEMI_KEY)
-    return list_all().get(key, NEMI)
+    alle = list_all()
+    if key not in alle:                 # eben erst angelegt? Der gemerkte Ordnerstand der Wache kennt sie noch nicht.
+        _stand["wert"] = None
+        alle = list_all()
+    return alle.get(key, NEMI)
 
 
 def set_active(key: str) -> None:

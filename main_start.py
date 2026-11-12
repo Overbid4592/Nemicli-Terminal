@@ -176,13 +176,21 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
         liste = sicherheit.whitelist()
         if arg.strip():
             w = arg.strip()
-            ui.info(f"'{w}' → " + ("harmlos (eine Frage)" if sicherheit.befehl_harmlos(w)
-                                   else "NICHT auf der Whitelist (fragt zweimal)")
-                    + " · Auto: " + ("läuft" if sicherheit.auto_befehl_frei(w) else "hält an"))
+            import shellfrei
+            if (nicht_frei := await asyncio.to_thread(shellfrei.grund, w)) is None:
+                ui.info(f"'{w}' → steht auf der offenen Liste: läuft in jedem Modus ohne Frage.")
+            else:
+                ui.info(f"'{w}' → nicht auf der offenen Liste ({nicht_frei}) · "
+                        + ("harmlos (eine Frage)" if sicherheit.befehl_harmlos(w)
+                           else "NICHT auf der Whitelist (fragt zweimal)")
+                        + " · Auto: " + ("läuft" if sicherheit.auto_befehl_frei(w) else "hält an"))
         else:
+            import shellfrei
             auto = sicherheit.auto_liste()
             ui.text_panel(
                 f"✅ Befehls-Whitelist ({len(liste)} Einträge) – {sicherheit.WHITELIST_DATEI}",
+                "🟢 Offene Liste: reine Abfragen, die in jedem Modus ohne Frage laufen. Die Schalter werden mitgeprüft, "
+                "Unbekanntes fragt, und nach Inhalt aus dem Netz gilt sie nicht.\n\n" + shellfrei.liste_text() + "\n\n"
                 "Diese Befehlsanfänge gelten bei `befehl` als harmlos: eine Frage statt zwei.\n"
                 "Alles, was nur liest (wie bei `abfragen`), zählt automatisch dazu.\n"
                 "Bearbeiten: die JSON-Datei im Programm-Ordner – die KI kommt da nicht ran.\n\n"
@@ -358,6 +366,11 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             ui.banner(animate=False)
             ui.welcome(model=ctx.model or "—", mode="Chat",
                        strength=ctx.strength if ctx.strength_active() else None)
+            import design
+            fenster = design.palette_name()
+            ui.info(f"🎨 Die Fenster (Desktop-Fenster, Kugel, Charakter, Musik, Store) nehmen „{fenster}“ – "
+                    "beim nächsten Öffnen; die Kugel nach /restart." if fenster != "klassik" else
+                    "🎨 Die Fenster bleiben bei „Klassik“ – nachtglas, pastell und neon färben auch sie.")
         else:
             ui.warn(f"Theme '{arg}' gibt es nicht. Verfügbar: {', '.join(ui.THEMES)}")
     elif cmd == "/model":
@@ -371,16 +384,25 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 ref = await hf_downloader()
             elif head == "ersatz":
                 await ersatzbank_waehlen(ctx)
+            elif head == "chatgpt" and len(tokens) > 1 and tokens[1].lower() in ("abmelden", "logout"):
+                import chatgpt_login
+                chatgpt_login.abmelden()
+                ui.success("🔐 ChatGPT-Konto abgemeldet – der Zugang ist gelöscht.")
+            elif head == "chatgpt" and len(tokens) > 1 and tokens[1].lower() in ("anmelden", "login"):
+                await chatgpt_anmelden()
             elif ":" in arg:                     # direkte Referenz: anbieter:modell
                 ref = arg.strip()
             elif len(tokens) > 1 and P.get(head):   # "openai gpt-4o"
                 ref = M.make_ref(head, tokens[1])
             elif P.get(head):
+                if P.get(head).kind == "chatgpt" and not P.get(head).available():
+                    await chatgpt_anmelden()             # ChatGPT-Konto: erst anmelden, dann die Modelle
                 if not P.get(head).available():
                     prov = P.get(head)
-                    ui.warn(f"Für {prov.label} ist noch kein Key gesetzt.")
-                    ui.info("Tippe /model (ohne Text) und wähle "
-                            "'Cloud-Anbieter hinzufügen', um den Key direkt einzugeben.")
+                    if prov.kind != "chatgpt":           # ChatGPT-Konto: die Anmeldung hat schon berichtet
+                        ui.warn(f"Für {prov.label} ist noch kein Key gesetzt.")
+                        ui.info("Tippe /model (ohne Text) und wähle "
+                                "'Cloud-Anbieter hinzufügen', um den Key direkt einzugeben.")
                     picked = "__cancel__"
                 else:
                     try:
@@ -441,9 +463,21 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 import bildmotoren
                 ui.info(f"{bildmotoren.titel()} – kein Negativ-Prompt, {bildmotoren.schritte()} Schritte. "
                         f"Modelle in {bildmotoren.ordner()}. /bildmodel wechselt das Modell.")
-            ui.info('Nutzung:  /bild <beschreibung>  [--steps 8] [--size 1024x1024] [--seed 123] '
+            ui.info('Nutzung:  /bild <beschreibung>  [--figur] [--steps 8] [--size 1024x1024] [--seed 123] '
                     '[--model name] [--ohne-gesicht]  ·  bei WebUI/ComfyUI auch [--neg "..."] [--cfg 7]')
+            ui.info("--figur malt die Figur der Persönlichkeit: Kern, Seed und gebundene Bild-LoRA kommen dazu.")
             return None
+        lora, lora_hinweis = None, ""
+        if opts.get("figur"):                    # Figur: derselbe Weg wie bei den Selbstbildern der KI
+            import actions
+            fig = actions._figur({"figur": True}, opts["prompt"])
+            if isinstance(fig, actions.ActionResult):
+                ui.warn(fig.text)
+                return None
+            opts["prompt"], figur_seed, lora, lora_hinweis = fig
+            if opts.get("seed") is None:
+                opts["seed"] = figur_seed
+            ui.info("🧍 Figur mit Kern" + (" und Bild-LoRA" if lora else ""))
         if not _grafikkarte_frei():
             return None
         modell, hinweis = imagegen.modell_aufloesen(opts.get("model"))
@@ -456,8 +490,15 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                     opts["prompt"], model=modell, neg=opts.get("neg"),
                     steps=opts.get("steps"), cfg=opts.get("cfg"),
                     size=opts.get("size"), seed=opts.get("seed"),
-                    sampler=opts.get("sampler"), on_status=on_status))
+                    sampler=opts.get("sampler"), on_status=on_status,
+                    figur=bool(opts.get("figur")), lora=lora))
             ui.success(f"🖼 Fertig: {path}")
+            if lora_hinweis.strip():
+                ui.info(lora_hinweis.strip())
+            import krea
+            if akt_backend == "krea" and (zuviel := krea.ueberlang(opts["prompt"])):
+                ui.info(f"✂ Der Prompt war {zuviel} Token zu lang – Krea 2 liest höchstens {krea.MAX_TEXT} "
+                        "(etwa 380 englische Wörter), der Rest fiel weg.")
             if opts.get("gesicht", True):
                 try:
                     besser = await _run_with_status(
@@ -552,7 +593,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 motor = videomotoren.gewaehlt() if videomotoren.aktiv() else None
                 for n, m in videomotoren.modelle().items():
                     fehlt = "  ⚠ unvollständig" if videomotoren.missing_reason(n) else ""
-                    ui.info(f"   🎞 {n}  ({videomotoren.BAUARTEN[m['bauart']].TITEL}, Video mit Ton){fehlt}"
+                    ui.info(f"   🎞 {n}  ({videomotoren.BAUARTEN[m['bauart']].TITEL}, {videomotoren.merkmal(n)}){fehlt}"
                             f"{'  ✔️' if n == motor else ''}")
                 akt = None if motor else video.gewaehlt()
                 for n, m in alle.items():
@@ -598,11 +639,25 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                     + ("noch keine" if not s["da"] else "fertig, aber ausgeschaltet (video_lora)" if not s["an"]
                        else f"fertig, passt aber nicht zum gewählten Modell ({s['familie']} ≠ {s['modell_familie']})"
                        if not s["passt"] else "fertig – kommt in jedes Video ohne Schlüsselbilder"))
-            ui.info('Nutzung:  /video <beschreibung (englisch)>  [--sekunden 10] [--start bild.png] '
+            ui.info('Nutzung:  /video <beschreibung (englisch)>  [--sekunden 10] [--start bild.png] [--figur] '
                     '[--seed 123] [--steps 30]  ·  /video modell [name]')
             return None
         if not _grafikkarte_frei():
             return None
+        start_malen = None
+        if not opts.get("start") and video.motor_aktiv() and videomotoren.nimmt_startbild() \
+                and videomotoren.einstellung("startbild") == "auto":
+            start_malen = {"prompt": opts["prompt"], "seed": opts.get("seed")}
+            if opts.get("figur"):                    # Figur: derselbe Weg wie bei /bild --figur
+                import actions
+                fig = actions._figur({"figur": True}, opts["prompt"])
+                if isinstance(fig, actions.ActionResult):
+                    ui.warn(fig.text)
+                    return None
+                bild_prompt, figur_seed, lora, _hinweis = fig
+                start_malen = {"prompt": bild_prompt, "lora": lora, "figur": True,
+                               "seed": opts.get("seed") if opts.get("seed") is not None else figur_seed}
+                ui.info("🧍 Startbild: Figur mit Kern" + (" und Bild-LoRA" if lora else ""))
         try:
             import imagegen
             path = await _run_with_status(
@@ -610,7 +665,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 lambda on_status: imagegen._gpu_fuer_bild(video.generate)(
                     opts["prompt"], sekunden=opts.get("sekunden", 5.0), startbild=opts.get("start"),
                     seed=opts.get("seed"), steps=opts.get("steps"), schaerfe=opts.get("schaerfe"),
-                    on_status=on_status))
+                    on_status=on_status, start_malen=start_malen))
             ui.success(f"🎬 Fertig: {path}")
             if video.GENUTZT:
                 ui.info("🧬 Eingemischt: " + " · ".join(video.GENUTZT))
@@ -966,8 +1021,9 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
                        f"{st.get('harmlos', 0)} harmlos · {st.get('unpruefbar', 0)} nicht voll prüfbar · "
                        f"{st.get('echt', 0)} ECHT · {st.get('erledigt', 0)} erledigt"),
             ("ML-Schwelle", f"{e['schwelle']}  (Grenzen {e['grenzen']['schwelle_min']}–{e['grenzen']['schwelle_max']})"),
-            ("Training", f"erstes ab {e['min_training']} Ereignissen, dann alle {e['training_alle']}; "
-                         f"lernt nur aus Ereignissen älter als {e.get('ml_karenz_h', 24)} h"),
+            ("Training", f"erstes ab {e['min_training']} Ereignissen, dann alle {e['training_alle']}, "
+                         f"höchstens alle {e.get('training_stunden', 6)} h; aus der ganzen Woche, "
+                         f"nur aus Ereignissen älter als {e.get('ml_karenz_h', 24)} h"),
             ("Wecken ab", f"{e['trigger_ab']}" + (" + ML-Anomalien" if e.get("trigger_ml") else "")),
             ("Prüfen ab", f"{J.pruefen_ab(e)} ungeprüften Alarmen (jede Stufe; {J.PRUEFEN_MIN}–{J.PRUEFEN_MAX})"),
             ("Stumme Regeln", ", ".join(e.get("stumme_regeln") or []) or "keine"),
@@ -1313,6 +1369,9 @@ def vollscan_beobachten() -> None:
 
 
 KUGEL_MODELL_HALTEN_S = 300      # lokales Modell nach dem letzten Kugel-Gespräch so lange halten
+KEIN_CLOUD_WECKRUF = ("❌ Kein Cloud-Modell für die Wache: Alarme beurteilt nur ein Cloud-Modell, lokale Modelle "
+                      "verwechseln dabei zu leicht Programme. Die Alarme bleiben offen und stehen im Tray. Ein "
+                      "Cloud-Modell aktivieren (/model) oder auf die Ersatzbank setzen (/model ersatz).")
 
 
 def wache_lauf() -> int:
@@ -1408,12 +1467,15 @@ def wache_lauf() -> int:
             gespraech["lock"] = asyncio.Lock()
         return gespraech["lock"]
 
-    async def _backend_neu():
+    async def _backend_neu(ref: str | None = None):
         cfg = config.load()
-        ref = _migrate_ref(cfg.get("model"))
+        ref = ref or _migrate_ref(cfg.get("model"))
         if not ref:
             raise RuntimeError("Kein Modell eingestellt (/model).")
         return ref, await make_backend(ref, None, cfg.get("strength", M.DEFAULT_STRENGTH))
+
+    def _weck_ref() -> str | None:
+        return ersatzbank.urteils_modell(_migrate_ref(config.load().get("model")))
 
     async def wecken(alarme, nachhaken: bool = False) -> str:
         from wache import steuerung as _ST
@@ -1434,8 +1496,11 @@ def wache_lauf() -> int:
         text = _wecker.auftrag_text(alarme, _zugang.speicher(), name, nachhaken)
         raus_hinweis = ""
         for _ in range(1 + ersatzbank.MAX_ERSATZ):      # herausgefiltert: der Ersatz übernimmt den Weckruf
+            if (wahl := _weck_ref()) is None:
+                print(f"[{time.strftime('%H:%M:%S')}] Weckruf: {len(alarme)} Alarme warten – kein Cloud-Modell")
+                return raus_hinweis + KEIN_CLOUD_WECKRUF
             try:
-                ref, backend = await _backend_neu()
+                ref, backend = await _backend_neu(wahl)
             except Exception as e:
                 return raus_hinweis + f"❌ Die Wache kann niemanden wecken: {e}"
             mitschrift.leeren()
@@ -1443,16 +1508,17 @@ def wache_lauf() -> int:
                                              "modus": modes.label(), "ordner": str(Path.cwd())})
             fehler = ""
             try:
-                await asyncio.wait_for(converse(backend, text), timeout=15 * 60)
+                with ersatzbank.einsatz(ref):
+                    await asyncio.wait_for(converse(backend, text), timeout=15 * 60)
             except asyncio.TimeoutError:
                 fehler = "Abgebrochen: der Weckruf lief länger als 15 Minuten."
             except Exception as e:
                 fehler = f"Abgebrochen mit Fehler: {e}"
             if (raus := ersatzbank.abholen()) is None:
                 break
-            raus_hinweis += f"⚠️ {ersatzbank.meldung(raus['neu'])} ({raus['alt']})\n\n"
-            if not raus["neu"]:
-                return raus_hinweis.strip()
+            raus_hinweis += f"⚠️ {ersatzbank.meldung(_weck_ref())} ({raus['alt']})\n\n"
+            if _weck_ref() is None:
+                return (raus_hinweis + KEIN_CLOUD_WECKRUF).strip()
         antwort = raus_hinweis + (mitschrift.letzte_antwort() or "")
         if not antwort:
             antwort = "❌ Kein Bericht – " + (fehler or "die Persönlichkeit hat nichts geantwortet.")
@@ -1541,7 +1607,7 @@ def wache_lauf() -> int:
         uris = []
         for b in bilder or []:
             try:
-                uris.append(vision.to_data_uri_small(Path(b)))
+                uris.append(await asyncio.to_thread(vision.to_data_uri_small, Path(b)))
             except Exception:
                 pass
         start = time.time()
@@ -1558,13 +1624,18 @@ def wache_lauf() -> int:
         if (raus := ersatzbank.abholen()) is not None:
             gespraech["kugel_backend"] = None
             antwort = ersatzbank.meldung(raus["neu"])
-        neue = []
         import profilordner
-        for ordner in profilordner.bilder_ordner_alle():
-            try:
-                neue += [str(p) for p in ordner.glob("*.png") if p.stat().st_mtime >= start - 1]
-            except OSError:
-                pass
+
+        def neue_bilder() -> list[str]:
+            neue = []
+            for ordner in profilordner.bilder_ordner_alle():
+                try:
+                    neue += [str(p) for p in ordner.glob("*.png") if p.stat().st_mtime >= start - 1]
+                except OSError:
+                    pass
+            return neue
+
+        neue = await asyncio.to_thread(neue_bilder)      # große Bilderordner dürfen die Kugel nicht anhalten
         protokoll.schreibe("kugel_chat", f"Kugel: {text[:120]}", "success", veraendernd=False,
                            wer=name, ergebnis=antwort)
         return antwort, sorted(neue), plan.text_fuer_modell()
@@ -1869,6 +1940,7 @@ async def main():
         _sprueche_im_hintergrund(ctx)
     with start.schritt("Such-Index"):
         indexdb.vorwaermen()         # im Hintergrund, weicht einer laufenden Runde: die erste Suche findet ihn fertig
+        asyncio.get_running_loop().create_task(speicher_pruefen())   # Balken des Einlese-Speichers von Anfang an
     with start.schritt("Chrome-Brücke"):
         start_chrome_bridge(ctx)     # Chrome-Erweiterung: Empfang auf 127.0.0.1:9000
     with start.schritt("Skill-Wächter"):
@@ -1879,6 +1951,8 @@ async def main():
     start_text = _start_nachricht()
     if not start_text and ctx.backend is None and tui is not None:
         start_text = "/model"                  # ohne Modell: gleich die Begrüßung (Cloud-Key · Hugging Face)
+    elif not start_text and config.load().get("startart") == "fenster":
+        start_text = "/gui"                    # Startart „Fenster“ (/startart): gleich das Desktop-Fenster
     if start_text and tui is not None:
         tui.start_text = start_text
     elif start_text:
@@ -2071,6 +2145,9 @@ if __name__ == "__main__":
     if "--musik" in sys.argv:            # Musik-Fenster (/musik, verbindet sich mit einer laufenden Sitzung)
         import musik_fenster
         raise SystemExit(musik_fenster.starten())
+    if "--lora" in sys.argv:             # LoRA-Werkstatt (/lora, verbindet sich mit einer laufenden Sitzung)
+        import lora_fenster
+        raise SystemExit(lora_fenster.starten())
     if "--charaktere" in sys.argv:       # Charakter-Galerie (/charaktere, verbindet sich mit einer laufenden Sitzung)
         import charakter_fenster
         raise SystemExit(charakter_fenster.starten())

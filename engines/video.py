@@ -1877,6 +1877,33 @@ def _bedingung(vae, fam: dict, start, ende, W: int, H: int, bilder_n: int, n_lat
         return (vae.encode(start[:, None]) if start is not None else None), None
 
 
+STARTBILD_GROESSE = {"hochkant": (832, 1216), "quer": (1216, 832), "quadrat": (1024, 1024)}
+
+
+def _startbild_malen(auftrag: dict, p: dict, on_status=None) -> str | None:
+    """Malt das Startbild eines Videos mit dem aktiven Bild-Motor – im Format des Videos, in der Größe, die
+    der Bild-Motor gut kann. Die Grafikkarte gehört schon diesem Auftrag. Geht es nicht, entsteht das Video
+    aus dem Text, mit Hinweis."""
+    try:
+        import imagegen
+        grund = imagegen.missing_reason_aktiv()
+        if grund:
+            HINWEISE.append("Kein Startbild: der Bild-Motor kann gerade nicht malen – das Video entsteht aus dem Text")
+            return None
+        if on_status:
+            on_status("Startbild malen …")
+        form = "quer" if p["breite"] > p["hoehe"] else "quadrat" if p["breite"] == p["hoehe"] else "hochkant"
+        malen = getattr(imagegen.paint, "__wrapped__", imagegen.paint)
+        pfad = malen(auftrag["prompt"], size=STARTBILD_GROESSE[form], seed=auftrag.get("seed"),
+                     on_status=on_status, figur=bool(auftrag.get("figur")), lora=auftrag.get("lora"))
+        GENUTZT.append("gemaltes Startbild")
+        _DBG.ereignis(f"Videomotor: Startbild gemalt ({Path(str(pfad)).name})")
+        return str(pfad)
+    except Exception as e:
+        HINWEISE.append(f"Kein Startbild ({type(e).__name__}: {e}) – das Video entsteht aus dem Text")
+        return None
+
+
 def generate(prompt: str, *, sekunden: float = 5.0, startbild: str | None = None, negativ: str | None = None,
              steps: int | None = None, cfg: float | None = None, shift: float | None = None,
              size: tuple[int, int] | None = None, seed: int | None = None, modell: str | None = None,
@@ -1884,7 +1911,7 @@ def generate(prompt: str, *, sekunden: float = 5.0, startbild: str | None = None
              loeser: str | None = None, cfg_bis: float | None = None, vorstufe: float | None = None,
              lora: str | Path | None = None, schaerfe: str | None = None,
              on_status=None,
-             abbruch=None, motor_extra: dict | None = None) -> str:
+             abbruch=None, motor_extra: dict | None = None, start_malen: dict | None = None) -> str:
     """Erzeugt ein Video (bis MAX_SEKUNDEN) und gibt den MP4-Pfad zurück. Blockiert.
     Clips (5 s) hängen aneinander: das letzte Bild wird das Startbild des nächsten.
     `magcache`: Fehlerschwelle für MagCache (Config `video_magcache`, 0 = aus).
@@ -1892,13 +1919,22 @@ def generate(prompt: str, *, sekunden: float = 5.0, startbild: str | None = None
     (Fun InP; ist ein anderes gewählt, wird ein vorhandenes Fun-InP-Modell genommen), und jeder Clip startet
     am Schlüsselbild des vorigen – die Figur kann nicht von Clip zu Clip wegdriften.
     Ist ein Video-Motor gewählt (oder `modell` einer seiner Modelle), rechnet er; `motor_extra` überstimmt dort
-    einzelne Einstellungen für dieses Video (aufloesung, format, fps, ton)."""
+    einzelne Einstellungen für dieses Video (aufloesung, format, fps, ton). `start_malen` ({prompt, seed, lora,
+    figur}): Nimmt der Motor ein Startbild und ist keines da, malt der Bild-Motor zuerst eines daraus."""
     if motor_aktiv(modell):
         import videomotoren
         HINWEISE.clear()
         GENUTZT.clear()
-        if startbild or schluesselbilder:
-            HINWEISE.append("Start- und Schlüsselbilder gehen nur mit Wan 2.2 – dieses Video entsteht aus dem Text")
+        if (not startbild and start_malen and videomotoren.nimmt_startbild(modell)
+                and videomotoren.einstellung("startbild") == "auto"):
+            startbild = _startbild_malen(start_malen, videomotoren.plan(size, motor_extra, modell), on_status)
+        mit_start = bool(startbild) and videomotoren.nimmt_startbild(modell)
+        if mit_start:
+            motor_extra = {**(motor_extra or {}), "start": str(startbild)}
+            GENUTZT.append("Startbild")
+        if (startbild and not mit_start) or schluesselbilder:
+            HINWEISE.append("Schlüsselbilder gehen nur mit Wan 2.2" if mit_start else
+                            "Start- und Schlüsselbilder gehen mit diesem Modell nicht – das Video entsteht aus dem Text")
         return videomotoren.generate(prompt, sekunden=sekunden, size=size, seed=seed, steps=steps, modell=modell,
                                      on_status=on_status, abbruch=abbruch, extra=motor_extra)
     grund = missing_reason(modell)

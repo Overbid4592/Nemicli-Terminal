@@ -102,6 +102,7 @@ class Chat:
         self.messages: list[dict] = []
         self._tools: list[dict] | None = None
         self.denk_hinweis = ""                     # Denkwerk: nur mit der nächsten gesendeten Nachricht
+        self.rollen_anker = ""                     # Ich-Form/Sprechweise: ebenso
         self._kette_leeren()
 
     denkt_selbst = True                            # adaptives Thinking ist immer an
@@ -156,8 +157,9 @@ class Chat:
         pricing.kuerzen(self)
         if len(self.messages) < vorher:                # Kette verschoben: diesmal als Text
             self._kette_leeren()
-        api_verlauf = _mit_hinweis(self._api_verlauf(user_text), self.denk_hinweis)
-        self.denk_hinweis = ""
+        api_verlauf = _mit_hinweis(self._api_verlauf(user_text),
+                                   "\n\n".join(t for t in (self.denk_hinweis, self.rollen_anker) if t))
+        self.denk_hinweis = self.rollen_anker = ""
         if self._tools is None:
             self._tools = werkzeug_schemas()
         if hinweis := pricing.aufraeum_hinweis(self):

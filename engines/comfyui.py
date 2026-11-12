@@ -477,9 +477,10 @@ def generate(prompt: str, *, model: str | None = None, neg: str | None = None,
     art = model_art(gewaehlt)
     V = vorgaben(art)
 
-    W, H = size or _ccfg("size", V["size"])
-    if isinstance(W, str):                       # "832x1216" aus der Config
-        W, H = (int(x) for x in W.lower().split("x"))
+    groesse = size or _ccfg("size", V["size"])
+    if isinstance(groesse, str):                 # "832x1216" aus der Config
+        groesse = [int(x) for x in groesse.lower().split("x")]
+    W, H = groesse
     echter_seed = int(seed) if seed is not None and int(seed) >= 0 \
         else random.randint(0, 2 ** 32 - 1)
     vorsatz = str(_ccfg("positiv", V["positiv"]) or "").strip()

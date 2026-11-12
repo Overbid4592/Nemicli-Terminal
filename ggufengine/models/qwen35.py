@@ -155,7 +155,7 @@ class _GatedDeltaNetLayer:
 
         # causal depthwise conv over time with carried window
         full = torch.cat([self.conv_state, qkv], dim=0)             # (K-1+L, C)
-        self.conv_state.copy_(full[-(self.K - 1):])
+        self.conv_state.copy_(full[full.shape[0] - (self.K - 1):])
         conv = F.conv1d(full.t().unsqueeze(0), self.conv_w, groups=self.conv_channels)[0].t()  # (L, C)
         conv = F.silu(conv)
 

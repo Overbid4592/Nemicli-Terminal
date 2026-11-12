@@ -345,7 +345,8 @@ def prozesse() -> list[tuple[str, int, int]]:
         return []
     aus = []
     for pid, b in werte.items():
-        aus.append((_prozessname(pid), pid, b // 2 ** 20))
+        if b >= 2 ** 20:                         # unter 1 MB stünde der Prozess mit „0 MB“ in der Liste
+            aus.append((_prozessname(pid), pid, b // 2 ** 20))
     return sorted(aus, key=lambda x: -x[2])
 
 
@@ -586,7 +587,7 @@ def starten(rolle: str, ordner_pfad: Path | None = None, takt: bool = True) -> P
         atexit.register(beenden)
     except Exception:
         pass
-    if takt:
+    if takt and (_takt is None or not _takt.is_alive()):     # nach aus → an läuft der alte Takt evtl. noch
         _takt = threading.Thread(target=_takt_lauf, name="debugbericht", daemon=True)
         _takt.start()
     return _datei
@@ -680,20 +681,21 @@ def _fehlerhaken() -> None:
 
 def schleife(loop) -> None:
     """Fehler aus asyncio-Aufgaben (Hintergrund, Timer) mit aufzeichnen."""
-    if _datei is None or getattr(loop, "_debugbericht", False):
+    if _datei is None:
         return
-    loop._debugbericht = True
-    alt = loop.get_exception_handler()
+    if not getattr(loop, "_debugbericht", False):     # Haken nur einmal je Schleife
+        loop._debugbericht = True
+        alt = loop.get_exception_handler()
 
-    def haken(lp, kontext):
-        exc = kontext.get("exception")
-        fehler(f"asyncio: {kontext.get('message', '')}", exc)
-        if alt is not None:
-            alt(lp, kontext)
-        else:
-            lp.default_exception_handler(kontext)
-    loop.set_exception_handler(haken)
-    try:
+        def haken(lp, kontext):
+            exc = kontext.get("exception")
+            fehler(f"asyncio: {kontext.get('message', '')}", exc)
+            if alt is not None:
+                alt(lp, kontext)
+            else:
+                lp.default_exception_handler(kontext)
+        loop.set_exception_handler(haken)
+    try:                                         # auch nach aus → an: der Wächter endet mit dem Bericht
         import fehlerwaechter
         fehlerwaechter.starten(loop)             # Hänger und Bremsen der Hauptschleife
     except Exception:
@@ -701,7 +703,7 @@ def schleife(loop) -> None:
 
 
 def beenden() -> None:
-    global _datei
+    global _datei, _zaehler
     if _datei is None:
         return
     ereignis("Ende")
@@ -713,3 +715,4 @@ def beenden() -> None:
     _datei = None
     if _zaehler is not None:
         _zaehler.schliessen()
+        _zaehler = None                          # prozesse() legt beim nächsten Aufruf einen neuen an

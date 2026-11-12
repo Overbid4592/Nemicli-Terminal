@@ -19,6 +19,9 @@ ZIEL = "wan22-5b"
 GROESSE = (832, 1216)                                  # wie das Video (hochkant)
 KREA_ZIEL = "krea2"
 KREA_GROESSE = (640, 896)                              # hochkant, kleiner als beim Malen: passt mit Lernen in 13 GB
+# Formate statt Beschneiden: jedes Bild lernt in dem Format, das seinem Seitenverhältnis am nächsten kommt (alle
+# mit etwa gleich vielen Bildpunkten, damit der Speicher wie bei KREA_GROESSE reicht).
+KREA_FORMATE = {"hoch": (640, 896), "quer": (896, 640), "quadrat": (768, 768)}
 MOTOREN = {"video": ZIEL, "bild": KREA_ZIEL}
 VORGABEN = {"schritte": 1000, "rang": 16, "lr": 1e-4, "bilder": 40, "zwischenstand": 100, "shift": 5.0}
 ANHALTEN = threading.Event()                           # gesetzt -> Zwischenstand sichern und aufhören
@@ -61,6 +64,27 @@ def beschreibung(name: str | None = None) -> str:
         kern = ""
     anzeige = name or profilordner.aktiv()
     return f"{anzeige}. {kern}".strip() if kern else f"A photo of {anzeige}."
+
+
+def krea_format(pfad: Path) -> tuple[int, int]:
+    """(W, H) aus KREA_FORMATE, dessen Seitenverhältnis dem Bild am nächsten kommt; unlesbar: hochkant."""
+    try:
+        from PIL import Image
+        with Image.open(pfad) as im:
+            w, h = im.size
+    except Exception:
+        return KREA_FORMATE["hoch"]
+    return min(KREA_FORMATE.values(), key=lambda f: abs(math.log((w / max(h, 1)) / (f[0] / f[1]))))
+
+
+def lernsatz(text: str, bildtext: str) -> str:
+    """Auslöser-Satz + Satz zum einzelnen Bild (Kleidung, Pose, Ort, Licht)."""
+    return f"{text.strip()} {bildtext.strip()}".strip()
+
+
+def _texte_kennung(texte: list[str]) -> str:
+    import hashlib
+    return hashlib.sha256("\n".join(texte).encode("utf-8")).hexdigest()[:16]
 
 
 def _bild_tensor(pfad: Path, W: int, H: int):
@@ -143,16 +167,24 @@ def _bilder_kennung(bilder: list[Path]) -> str:
 
 def trainieren(name: str | None = None, *, bilder: list[Path] | None = None, schritte: int | None = None,
                rang: int | None = None, lr: float | None = None, modell: str | None = None, ziel: Path | None = None,
-               text: str | None = None, on_status=None, abbruch=None, motor: str = "video") -> Path:
+               text: str | None = None, on_status=None, abbruch=None, motor: str = "video",
+               fortschritt=None, vorschau: dict | None = None, ausloeser: str = "",
+               texte: list[str] | None = None) -> Path:
     """Trainiert die LoRA und gibt den Pfad zurück. Blockiert (Stunden möglich). Ein Zwischenstand gleicher
     Einstellungen wird fortgesetzt; `abbruch()` -> Zwischenstand speichern und RuntimeError.
-    `motor`: "video" (Wan) oder "bild" (Krea 2)."""
+    `motor`: "video" (Wan) oder "bild" (Krea 2). Nur Krea 2: `fortschritt(dict)` bekommt je Schritt
+    {schritt, schritte, prozent, verlust, rest_s}; `vorschau` = {alle, ordner, text, seed} malt alle `alle`
+    Schritte ein Testbild mit dem LoRA-Stand; `ausloeser` landet in den Metadaten der LoRA; `texte` (je Bild ein
+    Satz, gleiche Reihenfolge wie `bilder`) kommt hinter `text` – dann lernt der Auslöser nur, was alle Bilder
+    teilen, statt Kleidung und Hintergrund mit."""
     arbeit = _trainieren_krea if motor_ziel(motor) == KREA_ZIEL else _trainieren
+    extra = ({"fortschritt": fortschritt, "vorschau": vorschau, "ausloeser": ausloeser, "texte": texte}
+             if arbeit is _trainieren_krea else {})
     if not _LAEUFT.acquire(blocking=False):
         raise RuntimeError("Es läuft schon ein LoRA-Training")
     meldung = None
     try:
-        return arbeit(name, bilder, schritte, rang, lr, modell, ziel, text, on_status, abbruch)
+        return arbeit(name, bilder, schritte, rang, lr, modell, ziel, text, on_status, abbruch, **extra)
     except Exception as e:
         # Nur den Text behalten: der Traceback hielte DiT, LoRA-Schichten, Optimierer und Latents
         # (mehrere GB VRAM) fest, bis irgendwann die Speicherbereinigung läuft.
@@ -189,7 +221,8 @@ def _fortsetzen(stand: Path, schichten: dict, opt, info: dict, on_status) -> int
         return 0
     alt, meta = L.laden(stand)
     gleich = all(meta.get(k) == str(info[k]) for k in ("modell", "rang", "schritte", "bilder_kennung", "lr",
-                                                        "beschreibung"))
+                                                        "beschreibung") + (("texte_kennung",) if "texte_kennung"
+                                                                           in info else ()))
     if gleich and set(alt) == set(schichten):
         L.uebernehmen(schichten, alt)
         L.optimierer_laden(stand, schichten, opt)
@@ -209,7 +242,41 @@ def _sparsam(bloecke: list, z, vec, rope):
     return z
 
 
-def _trainieren_krea(name, bilder, schritte, rang, lr, modell, ziel, text, on_status, abbruch) -> Path:
+VORSCHAU_SCHRITTE = 8                                  # Testbild während des Trainings: wenige Schritte genügen
+
+
+def _vorschau_malen(dit, txt, t, device, dtype, mean, std, W: int, H: int, seed: int, ziel: Path) -> Path:
+    """Ein Testbild mit dem LoRA-Stand mitten im Training (gleicher Seed jedes Mal: man sieht sie lernen).
+    Die VAE kommt nur kurz auf die Karte; passt sie nicht mehr daneben, dekodiert die CPU."""
+    import torch
+    import krea as K
+    from PIL import Image
+    with torch.no_grad():
+        rauschen = torch.randn((1, 16, H // 8, W // 8), generator=torch.Generator().manual_seed(seed)).to(device)
+        sig = K._sigmas(VORSCHAU_SCHRITTE, K.DEFAULTS["shift"]).to(device)
+        lat = K._sample(dit, rauschen * sig[0], txt, sig, "euler", seed)
+        del rauschen, sig
+        z = (lat * std + mean)
+        try:
+            vae = K._VAEDecoder(t["vae"], device, dtype)
+            bild = vae(z)
+        except torch.cuda.OutOfMemoryError:
+            vae = None
+            K._frei()
+            vae = K._VAEDecoder(t["vae"], torch.device("cpu"), torch.float32)
+            bild = vae(z.float().cpu())
+        del vae, lat, z
+    arr = ((bild[0].permute(1, 2, 0).float().cpu().numpy() + 1.0) * 127.5).round().clip(0, 255).astype("uint8")
+    del bild
+    K._frei()
+    ziel.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(arr).save(ziel)
+    return ziel
+
+
+def _trainieren_krea(name, bilder, schritte, rang, lr, modell, ziel, text, on_status, abbruch,
+                     fortschritt=None, vorschau: dict | None = None, ausloeser: str = "",
+                     texte: list[str] | None = None) -> Path:
     import torch
     import torch.nn.functional as F
     import krea as K
@@ -222,6 +289,9 @@ def _trainieren_krea(name, bilder, schritte, rang, lr, modell, ziel, text, on_st
     bilder = list(bilder) if bilder is not None else bilder_auswaehlen(name)
     if len(bilder) < 4:
         raise RuntimeError(f"Zu wenige Bilder für eine LoRA ({len(bilder)}, mindestens 4)")
+    texte = [str(t or "") for t in texte] if texte else None
+    if texte is not None and len(texte) != len(bilder):
+        raise RuntimeError(f"{len(texte)} Bildtexte für {len(bilder)} Bilder")
     if (grund := K.missing_reason()):
         raise RuntimeError(grund)
     modelle = K.discover()
@@ -245,29 +315,38 @@ def _trainieren_krea(name, bilder, schritte, rang, lr, modell, ziel, text, on_st
             for i, p in enumerate(bilder):
                 if on_status:
                     on_status(f"LoRA: Bilder einpacken {i + 1}/{len(bilder)}")
-                latents.append(((enc(_bild_tensor(p, W, H).to(device)[None]) - mean) / std).cpu())
+                bw, bh = krea_format(p)
+                latents.append(((enc(_bild_tensor(p, bw, bh).to(device)[None]) - mean) / std).cpu())
         del enc
         K._frei()
         if on_status:
             on_status("LoRA: Beschreibung lesen (Qwen3-VL) …")
+        saetze = [lernsatz(text, b) for b in texte] if texte else [text]
         te = K._Qwen3Text(t["text"], device, dtype)
         with torch.no_grad():
-            ctx = K._encode(text, te, device)
+            ctxs = [K._encode(s, te, device) for s in saetze]
+            ctx_v = K._encode(str(vorschau.get("text") or text), te, device) if vorschau else None
         del te
         K._frei()
         if on_status:
             on_status("LoRA: Modell laden …")
         dit = K._DiT(pfad, device, dtype, on_status)
         with torch.no_grad():
-            txt = dit.text(ctx)
-        del ctx
+            txts = [dit.text(c) for c in ctxs]
+            txt_v = dit.text(ctx_v) if ctx_v is not None else None
+        del ctxs, ctx_v
         schichten = K.lora_anbringen(dit, rang, rang, device, torch.float32)
         dit.bloecke = lambda z, vec, rope: _sparsam(dit.blocks, z, vec, rope)
         opt = torch.optim.AdamW(L.parameter(schichten), lr=lr, weight_decay=0.0)
         info = {"ziel": KREA_ZIEL, "modell": ref, "familie": "krea2", "rang": rang, "schritte": schritte,
                 "bilder": len(bilder), "bilder_kennung": _bilder_kennung(bilder), "lr": lr, "beschreibung": text,
-                "groesse": f"{W}x{H}"}
+                "groesse": " ".join(sorted({"x".join(map(str, krea_format(p))) for p in bilder}))}
+        if ausloeser:
+            info["ausloeser"] = ausloeser
+        if texte:
+            info["texte_kennung"] = _texte_kennung(texte)
         start = _fortsetzen(stand, schichten, opt, info, on_status)
+        alle_v = int(vorschau.get("alle") or 0) if vorschau else 0
         beginn, verluste = time.time(), []
         for schritt in range(start, schritte):
             if abbruch is not None and abbruch():
@@ -275,7 +354,8 @@ def _trainieren_krea(name, bilder, schritte, rang, lr, modell, ziel, text, on_st
                 raise RuntimeError(f"LoRA-Training angehalten bei Schritt {schritt}/{schritte} – geht beim nächsten "
                                    "Mal dort weiter")
             zufall = random.Random(1234 * 1_000_003 + schritt)
-            x0 = latents[zufall.randrange(len(latents))].to(device)
+            nr = zufall.randrange(len(latents))
+            x0, txt = latents[nr].to(device), txts[nr if texte else 0]
             u = min(max(zufall.random(), 1e-3), 1 - 1e-3)
             sigma = math.exp(shift) / (math.exp(shift) + (1.0 / u - 1.0))     # wie die Rauschstärken beim Malen
             gen = torch.Generator(device=x0.device).manual_seed(1234 + schritt)
@@ -287,18 +367,35 @@ def _trainieren_krea(name, bilder, schritte, rang, lr, modell, ziel, text, on_st
             verlust.backward()
             opt.step()
             verluste.append(verlust.item())
+            del x0, x, v, verlust, rauschen
             if (schritt + 1) % VORGABEN["zwischenstand"] == 0:
                 L.speichern(stand, schichten, {**info, "schritt": schritt + 1}, opt)
+            fertig = schritt + 1 - start
+            je = (time.time() - beginn) / fertig
+            mittel = sum(verluste[-50:]) / len(verluste[-50:])
+            rest = je * (schritte - schritt - 1)
             if on_status:
-                fertig = schritt + 1 - start
-                je = (time.time() - beginn) / fertig
-                mittel = sum(verluste[-50:]) / len(verluste[-50:])
-                on_status(f"LoRA: Schritt {schritt + 1}/{schritte} · Verlust {mittel:.3f} · noch etwa "
-                          f"{_uhr(je * (schritte - schritt - 1))}")
+                on_status(f"LoRA: Schritt {schritt + 1}/{schritte} · Verlust {mittel:.3f} · noch etwa {_uhr(rest)}")
+            if fortschritt:
+                fortschritt({"schritt": schritt + 1, "schritte": schritte, "prozent": 100.0 * (schritt + 1) / schritte,
+                             "verlust": round(mittel, 4), "rest_s": round(rest)})
+            if alle_v and txt_v is not None and (schritt + 1) % alle_v == 0 and schritt + 1 < schritte:
+                opt.zero_grad(set_to_none=True)
+                K._frei()
+                try:
+                    bild = _vorschau_malen(dit, txt_v, t, device, dtype, mean, std, W, H,
+                                           int(vorschau.get("seed") or 7),
+                                           Path(vorschau["ordner"]) / f"schritt_{schritt + 1:05d}.png")
+                    if fortschritt:
+                        fortschritt({"vorschau": str(bild), "schritt": schritt + 1, "schritte": schritte})
+                except Exception as e:                   # ein Testbild darf das Training nie aufhalten
+                    if on_status:
+                        on_status(f"LoRA: Testbild übersprungen ({type(e).__name__})")
+                    K._frei()
         L.speichern(ziel, schichten, {**info, "schritt": schritte})
         if stand.is_file():
             stand.unlink()
-        del dit, schichten, opt, txt
+        del dit, schichten, opt, txts, txt_v
         K._frei()
     return ziel
 

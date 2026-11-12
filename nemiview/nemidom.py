@@ -24,6 +24,17 @@ _ATTR_ALS_EIGENSCHAFT = {"id": "id", "className": "class", "type": "type", "name
                          "rows": "rows", "cols": "cols", "maxLength": "maxlength", "pattern": "pattern"}
 
 
+def _nachfahren(wurzeln) -> int:
+    """Anzahl aller Knoten unter den Wurzeln (ohne die Wurzeln selbst)."""
+    n = 0
+    stapel = list(wurzeln)
+    while stapel:
+        kinder = getattr(stapel.pop(), "kinder", ())
+        n += len(kinder)
+        stapel.extend(kinder)
+    return n
+
+
 class Knoten(Wirt):
     def __init__(self, dok):
         self.dok = dok
@@ -90,6 +101,7 @@ class Element(Knoten):
         self.kinder: list[Knoten] = []
         self.stil_js: dict[str, str] = {}
         self.hoerer: dict[str, list] = {}
+        self.eigen_hoerer: dict = {}          # on…-Eigenschaft je Typ (höchstens einer, steht auch in hoerer)
         self.wert: str = self.attrs.get("value", "") if self.tag != "textarea" else ""
         self.checked = "checked" in self.attrs
         self.box = None                       # vom Layout: (x, y, breite, höhe) im Dokument
@@ -106,7 +118,7 @@ class Element(Knoten):
             self.kinder.insert(self.kinder.index(vor), k)
         else:
             self.kinder.append(k)
-        self.dok.zaehlen()
+        self.dok.zaehlen(1 + _nachfahren([k]))            # eingehängte Teilbäume (cloneNode, Fragment) mitzählen
         self.dok.aendern()
 
     def enthaelt(self, k) -> bool:
@@ -160,6 +172,15 @@ class Element(Knoten):
 
     def nicht_mehr_hoeren(self, typ, fn):
         self.hoerer[typ] = [(f, e) for f, e in self.hoerer.get(typ, []) if f is not fn]
+
+    def eigen_setzen(self, typ, fn):
+        """el.on<typ> = fn: ersetzt den bisherigen Eigenschafts-Hörer; nicht aufrufbar → nur entfernen."""
+        alt = self.eigen_hoerer.pop(typ, None)
+        if alt is not None:
+            self.nicht_mehr_hoeren(typ, alt)
+        if ist_aufrufbar(fn):
+            self.eigen_hoerer[typ] = fn
+            self.hoeren(typ, fn)
 
     # -- JavaScript ----------------------------------------------------------------
     def js_get(self, key, js):
@@ -238,8 +259,7 @@ class Element(Knoten):
         if key == "ownerDocument":
             return d
         if key.startswith("on") and key[2:] in self.hoerer:
-            eigen = [f for f, _ in self.hoerer[key[2:]] if getattr(f, "_eigenschaft", False)]
-            return eigen[0] if eigen else None
+            return self.eigen_hoerer.get(key[2:])
         methoden = _ELEMENT_METHODEN.get(key)
         if methoden is not None:
             return js.nativ(lambda js_, t, a, m=methoden: m(self, js_, a), key)
@@ -297,11 +317,7 @@ class Element(Knoten):
                     o.attrs.pop("selected", None)
             d.aendern()
         elif key.startswith("on") and len(key) > 2:
-            typ = key[2:]
-            self.hoerer[typ] = [(f, e) for f, e in self.hoerer.get(typ, []) if not getattr(f, "_eigenschaft", False)]
-            if ist_aufrufbar(wert):
-                wert.props["_eigenschaft"] = True
-                self.hoeren(typ, wert)
+            self.eigen_setzen(key[2:], wert)
         else:
             raise JSFehler(js.fehler("TypeError", f"Eigenschaft „{key}“ von <{self.tag}> lässt sich nicht setzen"))
 
@@ -655,6 +671,7 @@ class Dokument(Element):
         self.einstieg = "index.html"
         self.geaendert = True
         self.knoten_zahl = 0
+        self.bruchstueck: Element | None = None   # Halter des gerade gelesenen HTML-Bruchstücks (innerHTML …)
         self.titel = ""
         self.fokus = None
         self.ueber = None                     # Element unter der Maus (:hover)
@@ -670,11 +687,19 @@ class Dokument(Element):
         if self.on_geaendert:
             self.on_geaendert()
 
-    def zaehlen(self):
-        self.knoten_zahl += 1
+    def zaehlen(self, n: int = 1):
+        self.knoten_zahl += n
         if self.knoten_zahl > MAX_KNOTEN:
-            from .nemijs import Grenze
-            raise Grenze("Zu viele Elemente im Dokument")
+            # Der Zähler steigt bei jedem Anlegen und Einhängen und fällt beim Entfernen nicht:
+            # an der Grenze die echte Zahl nachzählen, erst dann abbrechen.
+            self.knoten_zahl = self.echte_knoten_zahl()
+            if self.knoten_zahl > MAX_KNOTEN:
+                from .nemijs import Grenze
+                raise Grenze("Zu viele Elemente im Dokument")
+
+    def echte_knoten_zahl(self) -> int:
+        """Knoten im Dokumentbaum plus im gerade gelesenen Bruchstück."""
+        return _nachfahren([self] + ([self.bruchstueck] if self.bruchstueck is not None else []))
 
     def zustand(self, el, pseudo) -> bool:
         if pseudo == "hover":
@@ -973,7 +998,7 @@ def laden(js: NemiJS, quelle: str, ordner: Path | None = None, einstieg: str = "
     for el in dok.alle():                                 # on…-Attribute aus der Datei → Hörer
         for name, code in list(el.attrs.items()):
             if name.startswith("on") and len(name) > 2 and code.strip():
-                el.hoeren(name[2:], _attr_hoerer(js, code, f"{el.tag}.{name}"))
+                el.eigen_setzen(name[2:], _attr_hoerer(js, code, f"{el.tag}.{name}"))
     dok.titel = dok.titel.strip()
     dok.geaendert = True
     return dok
@@ -992,8 +1017,12 @@ def _attr_hoerer(js: NemiJS, code: str, name: str):
 def fragment(dok: Dokument, quelle: str) -> list[Knoten]:
     halter = Element(dok, "#fragment")
     leser = _Leser(dok, halter, True)
-    leser.feed(quelle)
-    leser.close()
+    vorher, dok.bruchstueck = dok.bruchstueck, halter
+    try:
+        leser.feed(quelle)
+        leser.close()
+    finally:
+        dok.bruchstueck = vorher
     kinder = list(halter.kinder)
     for k in kinder:
         k.eltern = None

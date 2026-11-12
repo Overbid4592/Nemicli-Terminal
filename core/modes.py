@@ -55,7 +55,7 @@ _auto_until: float | None = None     # monotonic-Zeit, zu der der Zünder auslö
 
 # Werkzeuge, die auch im Chat-Modus frei bleiben (schreiben nur nach learned/).
 MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen",
-                "gedaechtnis_aufraeumen"}
+                "gedaechtnis_aufraeumen", "gedaechtnis_einlesen", "bild_bewerten"}
 
 # Reine LESE-Werkzeuge: NUR diese dürfen im Modus „lesen" laufen. Alles andere
 # blockt dort – ausdrücklich als Allowlist, damit ein neues oder unbekanntes
@@ -69,7 +69,7 @@ READ_TOOLS = {
     "api_nachschlagen", "code_pruefen", "paket_info", "seite_ansehen", "doku_suchen", "app_liste", "app_pruefen",
     "dateien_suchen", "inhalt_suchen",
     "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
-    "gedaechtnis_suchen", "gedaechtnis_lesen", "skill_laden", "bilder_suchen",
+    "gedaechtnis_suchen", "gedaechtnis_lesen", "gedaechtnis_status", "skill_laden", "bilder_suchen",
     # feste Systemabfragen (systemabfrage.py) + Zeitplan ansehen
     "abfragen", "zeitplan_anzeigen",
     # nachsehen, welche Programme ein Update haben (winget, nichts wird installiert)
@@ -80,6 +80,8 @@ READ_TOOLS = {
     "backup_liste",
     # Entwicklung: den laufenden Debugbericht lesen, sich selbst prüfen
     "debugbericht", "selbstdiagnose",
+    # llama.cpp-Reserve: Stand ansehen
+    "llamacpp_stand",
     # Hintergrund-Aufgaben nachsehen
     "aufgaben",
     # bewährten Code aus früheren Projekten nachschlagen
@@ -256,6 +258,8 @@ def decide(action: dict, needs_confirm: bool) -> str:
     # in jedem Modus, auch Auto – so driftet die KI nicht unbemerkt ab. Fragen
     # statt sperren, weil die KI den Assistenten selbst einschaltet.
     draussen = _ausserhalb_projekt(action) is not None
+    if not draussen and _shell_frei(action):
+        return "run"
     if mode == "lesen":
         # Nur echte Lese-Werkzeuge laufen – ausdrücklich per Allowlist. Alles,
         # was irgendwo schreibt (auch confirm=False wie bild_malen, merken,
@@ -307,6 +311,18 @@ def decide(action: dict, needs_confirm: bool) -> str:
             pass
         return "run"
     return "ask" if needs_confirm else "run"             # normal
+
+
+def _shell_frei(action: dict) -> bool:
+    """`befehl` von der offenen Liste (shellfrei.py) und ohne Inhalt aus dem Netz im Gespräch?"""
+    if action.get("tool") != "befehl":
+        return False
+    try:
+        import actions
+        import shellfrei
+        return actions.fremd_grund(action) is None and shellfrei.frei(actions._befehl_text(action))
+    except ImportError:
+        return False
 
 
 def _nach_netz_inhalt(action: dict) -> bool:
@@ -366,13 +382,14 @@ def block_message(action: dict) -> str:
 
 _PROMPT_HINTS = {
     "chat": ("Modus 💬 Chatten: Gespräch, Recherche, Planen. Jede Aktion – auch Lesen – wird "
-             "dem Nutzer erst zur Freigabe vorgelegt; setz sie nur ein, wenn sie wirklich "
+             "dem Nutzer erst zur Freigabe vorgelegt (außer `befehl` von der offenen Liste reiner "
+             "Abfragen); setz sie nur ein, wenn sie wirklich "
              "gebraucht wird. Merken (merken/skill_merken) ist frei und ausdrücklich erwünscht: "
              "was ihr beim Reden herausfindet und entscheidet, halte fest, damit ihr später "
              "gemeinsam darauf bauen könnt."),
     "lesen": ("Modus 👁 Nur Lesen: Du darfst alles lesen, suchen und ansehen, aber NICHTS "
               "verändern – schreibende Werkzeuge und Befehle sind gesperrt und werden gar nicht "
-              "erst gefragt. Willst du etwas ändern, beschreib es als Vorschlag; der Nutzer "
+              "erst gefragt; nur `befehl` von der offenen Liste reiner Abfragen läuft. Willst du etwas ändern, beschreib es als Vorschlag; der Nutzer "
               "schaltet dann um."),
     "normal": ("Modus ⚙ Normal: Lesen läuft sofort, verändernde Aktionen fragen den Nutzer "
                "vorher (F8)."),

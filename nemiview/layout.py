@@ -247,8 +247,9 @@ class Layout:
         return w
 
     # -- Block ------------------------------------------------------------------------
-    def _block(self, k: Kasten, x, y, cb_w, cb_h, wurzel=False, fest_w=None):
-        """Kasten k als Block an (x, y) im Bezugsblock der Breite cb_w legen."""
+    def _block(self, k: Kasten, x, y, cb_w, cb_h, wurzel=False, fest_w=None, fest_h=None):
+        """Kasten k als Block an (x, y) im Bezugsblock der Breite cb_w legen. fest_w/fest_h: Inhaltsmaße vorgegeben
+        (Flex-Hauptachse)."""
         k.texte, k.marker = [], None          # neu legen: nichts vom letzten Messen behalten
         self._abstaende(k, cb_w)
         s = k.stil
@@ -272,8 +273,8 @@ class Layout:
         k.w = w + rp
         innen_x = k.x + k.rand[3] + k.polster[3]
         innen_y = k.y + k.rand[0] + k.polster[0]
-        h_vorgabe = laenge(s.get("height"), cb_h, k.schrift["size"], self.ctx)
-        if h_vorgabe is not None and s.get("box-sizing") == "border-box":
+        h_vorgabe = laenge(s.get("height"), cb_h, k.schrift["size"], self.ctx) if fest_h is None else fest_h
+        if fest_h is None and h_vorgabe is not None and s.get("box-sizing") == "border-box":
             h_vorgabe = max(0.0, h_vorgabe - k.polster[0] - k.polster[2] - k.rand[0] - k.rand[2])
         if wurzel and h_vorgabe is None:
             h_vorgabe = None
@@ -299,9 +300,13 @@ class Layout:
             return
         fs = k.schrift["size"]
         dx = laenge(k.stil.get("left"), cb_w, fs, self.ctx) or -(laenge(k.stil.get("right"), cb_w, fs, self.ctx) or 0)
-        dy = laenge(k.stil.get("top"), cb_h, fs, self.ctx) or -(laenge(k.stil.get("bottom"), cb_h, fs, self.ctx) or 0)
+        dy = self._relativ_dy(k, cb_h)
         if dx or dy:
             self._verschieben(k, dx, dy)
+
+    def _relativ_dy(self, k, cb_h):
+        fs = k.schrift["size"]
+        return laenge(k.stil.get("top"), cb_h, fs, self.ctx) or -(laenge(k.stil.get("bottom"), cb_h, fs, self.ctx) or 0)
 
     def _verschieben(self, k, dx, dy):
         k.x += dx
@@ -372,9 +377,8 @@ class Layout:
                 einzug = 0.0
             self._block(kind, x, cy + einzug, w, None)
             cy = kind.y + kind.h + kind.aussen[2] - (kind.pos == "relative" and 0)
-            if kind.pos == "relative":
-                cy = kind.y + kind.h + kind.aussen[2] - (laenge(kind.stil.get("top"), None, kind.schrift["size"],
-                                                                self.ctx) or 0)
+            if kind.pos == "relative":                     # Verschiebung zählt nicht für den Fluss
+                cy = kind.y + kind.h + kind.aussen[2] - self._relativ_dy(kind, None)
             vorige_unten = kind.aussen[2]
             erster = False
         zeilen_abschliessen()
@@ -407,7 +411,7 @@ class Layout:
                 if not teil:
                     continue
                 if teil.isspace():
-                    stuecke.append(("raum", " ", schrift, farbe, besitzer, False))
+                    stuecke.append(("raum", " ", schrift, farbe, besitzer, ws_ == "nowrap"))
                 else:
                     stuecke.append(("wort", teil, schrift, farbe, besitzer, ws_ == "nowrap"))
 
@@ -461,7 +465,9 @@ class Layout:
                 bw = self.messer.breite(st[1], st[2]) + st[2].get("spacing", 0)
                 if art == "raum" and not zeilen[-1]:
                     continue
-            if breiten[-1] + bw > w + 0.5 and zeilen[-1] and art != "raum" and not (art == "wort" and st[5] and False):
+            vorher = zeilen[-1][-1][0] if zeilen[-1] else None
+            kein_umbruch = art == "wort" and st[5] and vorher is not None and vorher[0] in ("wort", "raum") and vorher[5]
+            if breiten[-1] + bw > w + 0.5 and zeilen[-1] and art != "raum" and not kein_umbruch:
                 while zeilen[-1] and zeilen[-1][-1][0][0] == "raum":
                     breiten[-1] -= zeilen[-1][-1][1]
                     zeilen[-1].pop()
@@ -471,12 +477,12 @@ class Layout:
             breiten[-1] += bw
         ausricht = k.stil.get("text-align", "left")
         cy = y
-        for zeile, zb in zip(zeilen, breiten):
+        for nr, (zeile, zb) in enumerate(zip(zeilen, breiten)):
             while zeile and zeile[-1][0][0] == "raum":
                 zb -= zeile[-1][1]
                 zeile.pop()
             if not zeile:
-                cy += k.schrift["line"] if not stuecke or zeilen.index(zeile) < len(zeilen) - 1 else 0
+                cy += k.schrift["line"] if not stuecke or nr < len(zeilen) - 1 else 0
                 continue
             zh = k.schrift["line"]
             for st, _b in zeile:
@@ -550,13 +556,19 @@ class Layout:
                 zeile += st[1]
             elif st[0] == "kasten":
                 c = st[1]
+                if c.pos in ("absolute", "fixed"):
+                    continue
+                if c.anzeige not in INLINE and c.el.tag not in ERSETZT:     # Block-Kind: eigene Zeile, Maximum unten
+                    breite, zeile = max(breite, zeile), 0.0
+                    continue
                 self._abstaende(c, cb_w)
                 cw = self._breite_vorgabe(c, cb_w)
                 if cw is None:
                     cw = self._inhalt_breite(c, cb_w)
                 zeile += cw + c.polster[1] + c.polster[3] + c.rand[1] + c.rand[3] + c.aussen[1] + c.aussen[3]
         for c in k.kinder:                       # Block-Kinder (z. B. in einem inline-block)
-            if isinstance(c, Kasten) and c.anzeige not in INLINE and c.el.tag not in ERSETZT and c.pos == "static":
+            if isinstance(c, Kasten) and c.anzeige not in INLINE and c.el.tag not in ERSETZT and \
+                    c.pos not in ("absolute", "fixed"):
                 self._abstaende(c, cb_w)
                 cw = self._breite_vorgabe(c, cb_w)
                 if cw is None:
@@ -589,7 +601,8 @@ class Layout:
         if tag in ("svg", "canvas"):
             return laenge(k.el.attrs.get("height"), None, fs, self.ctx) or (150.0 if tag == "canvas" else 24.0)
         if tag == "textarea":
-            return fs * 1.3 * int(k.el.attrs.get("rows", "3") or 3)
+            zeilen = _zahl(k.el.attrs.get("rows"), 3)
+            return fs * 1.3 * (int(zeilen) if math.isfinite(zeilen) and zeilen >= 1 else 3)
         if tag == "input" and k.el.attrs.get("type") in ("checkbox", "radio"):
             return 16.0
         if tag == "input" and k.el.attrs.get("type") == "range":
@@ -610,12 +623,13 @@ class Layout:
         gap_h = laenge(s.get("column-gap"), w, fs, self.ctx) or 0.0
         gap_v = laenge(s.get("row-gap"), h, fs, self.ctx) or 0.0
         kinder = [c for c in k.kinder if not (isinstance(c, Kasten) and c.pos in ("absolute", "fixed"))]
-        posten = []
+        posten, anonyme = [], []
         for c in kinder:
             if isinstance(c, Text):
                 if not c.text.strip():
                     continue
                 c = self._anonym(k, c)
+                anonyme.append(c)
             posten.append(c)
         posten.sort(key=lambda c: _zahl(c.stil.get("order"), 0))
         if richtung.endswith("reverse"):
@@ -630,6 +644,7 @@ class Layout:
                 (c.polster[0] + c.polster[2] + c.rand[0] + c.rand[2] + c.aussen[0] + c.aussen[2])
             basis = c.stil.get("flex-basis", "auto")
             b = laenge(basis, haupt, c.schrift["size"], self.ctx) if basis not in ("auto", "content") else None
+            aus_basis = b is not None
             if b is None:
                 if zeile:
                     b = self._breite_vorgabe(c, w)
@@ -637,10 +652,20 @@ class Layout:
                         b = self._inhalt_breite(c, w)
                 else:
                     b = laenge(c.stil.get("height"), h, c.schrift["size"], self.ctx)
+                    if b is not None and c.stil.get("box-sizing") == "border-box":
+                        b = max(0.0, b - c.polster[0] - c.polster[2] - c.rand[0] - c.rand[2])
                     if b is None:
                         self._block(c, 0, 0, w, None)
                         b = c.h - c.polster[0] - c.polster[2] - c.rand[0] - c.rand[2]
-            maße.append([c, b, rp_h, _zahl(c.stil.get("flex-grow"), 0), _zahl(c.stil.get("flex-shrink"), 1)])
+            untere = b                                     # Spalte: Mindesthöhe (Inhalt, außer bei overflow)
+            if not zeile and aus_basis:
+                untere = 0.0
+                if not c.clip:
+                    self._block(c, 0, 0, w, None)
+                    untere = c.h - c.polster[0] - c.polster[2] - c.rand[0] - c.rand[2]
+            # [Kasten, Größe, Rand+Polster, grow, shrink, Mindesthöhe (Spalte), aus flex-basis]
+            maße.append([c, b, rp_h, _zahl(c.stil.get("flex-grow"), 0), _zahl(c.stil.get("flex-shrink"), 1), untere,
+                         aus_basis])
         # Zeilen bilden
         reihen, aktuell, summe = [], [], 0.0
         for m in maße:
@@ -682,7 +707,18 @@ class Layout:
                     self._block(c, 0, 0, w, h, fest_w=self._begrenzen(c, m[1], w))
                     quer = max(quer, c.h + c.aussen[0] + c.aussen[2])
                 else:
-                    self._block(c, 0, 0, w, None)
+                    # Hauptachse senkrecht: Höhe aus basis/grow anwenden, nicht unter die Mindesthöhe;
+                    # ohne stretch nur die Inhaltsbreite
+                    fest_h = max(m[1], m[5]) if m[6] or m[1] > m[5] + 0.5 else None
+                    selbst = c.stil.get("align-self", "auto")
+                    a = align if selbst == "auto" else selbst
+                    fest_w = None
+                    if a not in ("stretch", "normal") and c.stil.get("width") in (None, "auto") and \
+                            c.el.tag not in ERSETZT:
+                        rp_w = c.polster[1] + c.polster[3] + c.rand[1] + c.rand[3]
+                        fest_w = max(0.0, min(self._inhalt_breite(c, w), w - rp_w - c.aussen[1] - c.aussen[3]))
+                    m.append(fest_h)
+                    self._block(c, 0, 0, w, None, fest_w=fest_w, fest_h=fest_h)
                     quer = max(quer, c.w + c.aussen[1] + c.aussen[3])
             reihen_lagen.append((reihe, frei, quer))
         if zeile and h is not None and len(reihen_lagen) == 1:
@@ -723,7 +759,7 @@ class Layout:
                     cw = c.w + c.aussen[1] + c.aussen[3]
                     if a == "stretch" and c.stil.get("width") in (None, "auto"):
                         self._block(c, 0, 0, w, None, fest_w=max(0.0, w - c.aussen[1] - c.aussen[3] - c.polster[1] -
-                                                                  c.polster[3] - c.rand[1] - c.rand[3]))
+                                                                  c.polster[3] - c.rand[1] - c.rand[3]), fest_h=m[7])
                         cw = c.w + c.aussen[1] + c.aussen[3]
                     ox = (w - cw) / 2 if a == "center" else (w - cw) if a in ("flex-end", "end") else 0.0
                     self._verschieben(c, x + ox + c.aussen[3] - c.x, y + pos + c.aussen[0] - c.y)
@@ -732,6 +768,8 @@ class Layout:
                 cy += quer + gap_v
             else:
                 cy = pos - gap_v - zwischen if reihe else 0.0
+        for a in anonyme:                                  # Text direkt im Flex-Kasten: Stücke beim Eltern zeichnen
+            k.texte.extend(a.texte)
         if zeile:
             hoehe = cy - gap_v
             return max(hoehe, h or 0.0) if s.get("height") in (None, "auto") else hoehe
@@ -751,8 +789,13 @@ class Layout:
         fs = k.schrift["size"]
         gap_h = laenge(s.get("column-gap"), w, fs, self.ctx) or 0.0
         gap_v = laenge(s.get("row-gap"), h, fs, self.ctx) or 0.0
-        posten = [c for c in k.kinder if isinstance(c, Kasten) and c.pos not in ("absolute", "fixed")]
-        posten += [self._anonym(k, c) for c in k.kinder if isinstance(c, Text) and c.text.strip()]
+        posten, anonyme = [], []
+        for c in k.kinder:                                 # Reihenfolge wie im Dokument
+            if isinstance(c, Kasten) and c.pos not in ("absolute", "fixed"):
+                posten.append(c)
+            elif isinstance(c, Text) and c.text.strip():
+                anonyme.append(self._anonym(k, c))
+                posten.append(anonyme[-1])
         spalten = self._spalten(s.get("grid-template-columns", "none"), w, gap_h, fs)
         n = max(1, len(spalten))
         ji = s.get("justify-items", "stretch")
@@ -797,6 +840,8 @@ class Layout:
                 self._verschieben(c, cx + ox + c.aussen[3] - c.x, cy + oy + c.aussen[0] - c.y)
                 cx += sw + gap_h
             cy += rh + gap_v
+        for a in anonyme:                                  # Text direkt im Grid: Stücke beim Eltern zeichnen
+            k.texte.extend(a.texte)
         return max(summe, h or 0.0)
 
     def _spalten(self, vorlage: str, w, gap, fs) -> list[float]:

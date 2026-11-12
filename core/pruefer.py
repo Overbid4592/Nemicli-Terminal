@@ -22,7 +22,7 @@ _TATEN = (r"gespeichert|geschrieben|angelegt|erstellt|gelöscht|entfernt|install
 _ERFOLG = re.compile(rf"(?i)\b(erledigt|fertig|geschafft|hat geklappt|klappt jetzt|funktioniert jetzt|{_TATEN})\b|✅")
 _MISSERFOLG = re.compile(
     rf"(?i)fehlgeschlagen|gescheitert|scheiterte|misslungen|nicht geklappt|ging nicht|hat nicht funktioniert|"
-    rf"konnte\b[^.!?\n]{{0,30}}\bnicht|\bnicht\b[^.!?\n]{{0,30}}\b({_TATEN})\b|leider|abgelehnt|"
+    rf"konnte\b[^.!?\n]{{0,30}}\bnicht|\b(nichts?|nie|niemals|kein\w*)\b[^.!?\n]{{0,30}}\b({_TATEN})\b|leider|abgelehnt|"
     rf"fehlermeldung|\b(ein|einen|einem|mit)\s+fehler\b|fehler\w*\s+(aufgetreten|gemeldet|kam)|"
     rf"nicht ausgeführt|nicht erlaubt|gesperrt|nicht gefunden|❌|⚠")
 _ICH_TAT = re.compile(rf"(?i)\bich\s+(habe|hab)\b[^.!?\n]{{0,80}}?\b({_TATEN})\b")

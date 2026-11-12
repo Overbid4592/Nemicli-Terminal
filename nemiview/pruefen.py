@@ -49,7 +49,7 @@ def pruefen(ordner: Path) -> tuple[bool, str]:
     try:
         lz = AppLaufzeit(ordner, 900, 650, virtuelle_zeit=True)
         lz.laden()
-        lz.js.zeitgeber_laufen(3000)
+        lz.zeitgeber_laufen(3000)
         Layout(lz.dok, lz.kaskade, 900, 650).rechnen()
         for f in lz.fehler:
             funde.append(f)

@@ -243,8 +243,13 @@ def _trainieren(modell, schritte, rang, lr, on_status, abbruch, gguf, beispiele,
         _protokoll(f"{titel} für {Path(gguf).name}: {schritte} Schritte, Rang {rang}, "
                    f"{len(daten)} Beispiele, Verlust {mittel:.3f}")
         return ziel
+    except BaseException as e:
+        # Lokale Variablen der inneren Frames im Traceback halten sonst Modell und Graph im VRAM
+        import traceback
+        traceback.clear_frames(e.__traceback__)
+        raise
     finally:
-        del lern, model
+        lern = model = opt = verlust = None
         gc.collect()
         try:
             gg.close()

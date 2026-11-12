@@ -127,7 +127,7 @@ class _KDA:
 
     def _falten(self, j: int, x: torch.Tensor) -> torch.Tensor:
         full = torch.cat([self.zust[j], x], dim=0)
-        self.zust[j].copy_(full[-(self.K - 1):])
+        self.zust[j].copy_(full[full.shape[0] - (self.K - 1):])
         return F.silu(F.conv1d(full.t().unsqueeze(0), self.conv[j], groups=self.conv[j].shape[0])[0].t())
 
     def __call__(self, x: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:

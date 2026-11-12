@@ -1,5 +1,6 @@
 """
-videomotoren - Video-Modelle neben Wan 2.2 5B, je Bauart ein eigener Motor (zuerst LTX-2.5 mit Ton).
+videomotoren - Video-Modelle neben Wan 2.2 5B, je Bauart ein eigener Motor: LTX-2.5 (mit Ton) und
+SD-Video (Stable Diffusion 1.5 oder SDXL mit Zeit-Schichten, ohne Ton).
 
 Ordner `Models/Videomodelle/` (Daten- und Programmordner): je Modell ein Unterordner mit dem Transformer
 (.safetensors oder .gguf), Zubehör geteilt in `text_encoders/` und `vae/` oder im Modellordner.
@@ -16,16 +17,16 @@ from pathlib import Path
 
 from bildmotoren.gewichte import ist_folgeteil, namen, ohne_praefix
 
-from . import ltx2
+from . import ltx2, sdvideo
 
 try:
     from paths import INSTALL as _INSTALL, ROOT as _ROOT
 except Exception:
     _ROOT = _INSTALL = Path(__file__).resolve().parents[2]
 
-BAUARTEN = {"ltx2": ltx2}
+BAUARTEN = {"ltx2": ltx2, "sdvideo": sdvideo}
 ORDNER = [_ROOT / "Models" / "Videomodelle", _INSTALL / "Models" / "Videomodelle"]
-GETEILT = ("text_encoders", "vae")
+GETEILT = ("text_encoders", "vae", "bewegung", "tokenizer_clip")
 BACKEND = "motor"
 MAX_SEKUNDEN = 20
 
@@ -42,6 +43,7 @@ EINSTELLUNGEN = {                        # Schlüssel -> (Vorgabe, erlaubte Wert
     "schritte": (0, None),               # 0: Vorgabe des Modells
     "cfg": (0.0, None),                  # 0: Vorgabe des Modells
     "ton": (True, (True, False)),
+    "startbild": ("auto", ("auto", "aus")),   # auto: ohne Startbild malt der Bild-Motor zuerst eines (SD-Video)
     "kacheln": ("auto", ("auto", "klein", "mittel", "gross", "aus")),
     "speicher": ("auto", ("auto", "schnell", "sparsam")),
 }
@@ -117,6 +119,9 @@ def teile(name: str | None = None) -> dict:
     if m is None:
         return {}
     modul = BAUARTEN[m["bauart"]]
+    if hasattr(modul, "teile"):                          # Bauart mit eigenem Zubehör (SD-Video)
+        return {"name": m["name"], "bauart": m["bauart"], "dit": m["dit"],
+                **modul.teile(m, [o for o in ORDNER if o.is_dir()])}
     return {"name": m["name"], "bauart": m["bauart"], "dit": m["dit"],
             "text": _suche(m, ("text_encoders",), modul.text_passt),
             "vae": _suche(m, ("vae",), modul.vae_passt),
@@ -139,6 +144,24 @@ def gewaehlt() -> str | None:
     g = _config().get("video_motor_modell") or None
     alle = modelle()
     return g if g in alle else next(iter(alle), None)
+
+
+def _modul(name: str | None = None):
+    m = modelle().get(name or gewaehlt() or "")
+    return BAUARTEN[m["bauart"]] if m else None
+
+
+def merkmal(name: str | None = None) -> str:
+    """Kurzbeschreibung der Bauart eines Modells für Menüs („Video mit Ton“)."""
+    return getattr(_modul(name), "MERKMAL", "")
+
+
+def hat_ton(name: str | None = None) -> bool:
+    return bool(getattr(_modul(name), "TON", True))
+
+
+def nimmt_startbild(name: str | None = None) -> bool:
+    return bool(getattr(_modul(name), "STARTBILD", False))
 
 
 def aktiv() -> bool:
@@ -220,8 +243,9 @@ def _gilt(schluessel: str, extra: dict | None):
     return einstellung(schluessel)
 
 
-def plan(size: tuple[int, int] | None = None, extra: dict | None = None) -> dict:
-    """Die wirksamen Einstellungen (AUTO aufgelöst) für das nächste Video; `extra` überstimmt einzelne."""
+def plan(size: tuple[int, int] | None = None, extra: dict | None = None, name: str | None = None) -> dict:
+    """Die wirksamen Einstellungen (AUTO aufgelöst) für das nächste Video; `extra` überstimmt einzelne.
+    Größe, Takt und Ton richten sich nach der Bauart des Modells (`name`, sonst das gewählte)."""
     stufe = _gilt("aufloesung", extra)
     stufe = auto_aufloesung() if stufe == "auto" else stufe
     B, H = size or AUFLOESUNG[stufe][_gilt("format", extra)]
@@ -236,9 +260,17 @@ def plan(size: tuple[int, int] | None = None, extra: dict | None = None) -> dict
             platz = int(frei_bytes(torch.device("cuda")) * 0.5) if torch.cuda.is_available() else None
         except Exception:
             platz = None
-    return {"aufloesung": stufe, "breite": (int(B) // 32) * 32, "hoehe": (int(H) // 32) * 32,
-            "fps": _gilt("fps", extra), "schritte": einstellung("schritte") or None, "cfg": einstellung("cfg") or None,
-            "ton": _gilt("ton", extra), "kacheln": KACHELN[k], "kacheln_name": k, "speicher": speicher, "platz": platz}
+    p = {"aufloesung": stufe, "format": _gilt("format", extra),
+         "breite": (int(B) // 32) * 32, "hoehe": (int(H) // 32) * 32,
+         "fps": _gilt("fps", extra), "schritte": einstellung("schritte") or None, "cfg": einstellung("cfg") or None,
+         "ton": _gilt("ton", extra), "kacheln": KACHELN[k], "kacheln_name": k, "speicher": speicher, "platz": platz}
+    modul = _modul(name)
+    if modul is not None:                                # Bauart mit eigener Größe, eigenem Takt, ohne Ton
+        if hasattr(modul, "groesse") and not size:
+            p["breite"], p["hoehe"] = modul.groesse(None, p["format"])
+        p["fps"] = getattr(modul, "FPS", None) or p["fps"]
+        p["ton"] = p["ton"] and bool(getattr(modul, "TON", True))
+    return p
 
 
 # ===========================================================================
@@ -255,7 +287,10 @@ def missing_reason(name: str | None = None) -> str | None:
     t = teile(name)
     if not t:
         return f"Video-Modell '{name}' nicht gefunden."
-    z = BAUARTEN[t["bauart"]].ZUBEHOER
+    modul = BAUARTEN[t["bauart"]]
+    if hasattr(modul, "fehlt"):
+        return modul.fehlt(t, ordner())
+    z = modul.ZUBEHOER
     for art, wo in (("text", "text_encoders"), ("vae", "vae"), ("ton", "vae")):
         if t[art] is None:
             return f"Es fehlt: {z[art]} – nach {ordner() / wo}"
@@ -279,9 +314,12 @@ def generate(prompt: str, *, sekunden: float = 5.0, size: tuple[int, int] | None
         raise RuntimeError(grund)
     t = teile(name)
     modul = BAUARTEN[t["bauart"]]
-    p = plan(size, extra)
+    p = plan(size, extra, name)
     if steps:
         p["schritte"] = int(steps)
+    for schluessel in ("start", "start_staerke", "negativ"):
+        if extra and extra.get(schluessel):
+            p[schluessel] = extra[schluessel]
     sekunden = min(max(float(sekunden), 1.0), MAX_SEKUNDEN)
     seed = int(time.time() * 1000) & 0x7FFFFFFF if seed is None else int(seed)
     beginn = time.time()
@@ -331,6 +369,17 @@ LTX-2.5 (Lightricks, Video mit Ton):
 
 Quellen: huggingface.co/Lightricks/LTX-2.5 (Anmeldung und Lizenz nötig), huggingface.co/unsloth/LTX-2.5-GGUF.
 Die Lizenz „LTX-2.x Community License“ gilt für die Modelldateien.
+
+SD-Video (Stable Diffusion 1.5 oder SDXL als Video, 8 Bilder je Sekunde, ohne Ton):
+  MeinModell/<checkpoint>.safetensors          ein ganzer Bild-Checkpoint (SD 1.5 oder SDXL, mit CLIP und VAE)
+  bewegung/<bewegungs-modul>                   Zeit-Schichten, passend zur Bauart (auch im Modellordner):
+     SD 1.5:  animatediff_lightning_4step_comfyui.safetensors   huggingface.co/ByteDance/AnimateDiff-Lightning
+              v3_sd15_mm.ckpt                                   huggingface.co/guoyww/animatediff
+     SDXL:    hsxl_temporal_layers.f16.safetensors              huggingface.co/hotshotco/Hotshot-XL
+              mm_sdxl_v10_beta.ckpt                             huggingface.co/guoyww/animatediff
+  tokenizer_clip/vocab.json + merges.txt       huggingface.co/openai/clip-vit-large-patch14
+Die offiziellen Bewegungs-Module werden vor dem ersten Laden per SHA-256 geprüft; .ckpt-Dateien nur dann
+gelesen und einmal nach .safetensors umgeschrieben. Ein Startbild hält die Figur: /video … --start bild.png
 
 Wenig Grafikspeicher? Eine GGUF nehmen; AUTO wählt Auflösung und VAE-Kacheln passend zur Karte.
 Danach: /video -> Modell wählen.

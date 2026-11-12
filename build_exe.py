@@ -103,6 +103,7 @@ def signieren(liste: list[Path] | None = None) -> str:
     Mit Zeitstempel, damit die Signatur das Ablaufen des Zertifikats überdauert."""
     dateien = ",".join("'" + str(f).replace("'", "''") + "'" for f in (liste or _eigene_exe()))
     skript = "\n".join([
+        "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false",   # sonst OEM-Codepage
         "$ErrorActionPreference='Stop'",
         r"$z = Get-ChildItem Cert:\CurrentUser\My -CodeSigningCert | "
         f"Where-Object {{ $_.Subject -eq '{ZERTIFIKAT}' -and $_.NotAfter -gt (Get-Date) }} | "
@@ -218,6 +219,7 @@ def setup_bauen() -> Path | None:
 
 
 SETUPS_BEHALTEN = 3
+SETUPS_STABIL = {"NemiCLI-Setup-9.46.880.exe"}   # sichere Stände: bleiben immer und zählen nicht mit
 
 
 def _setup_version(p: Path) -> tuple[int, ...]:
@@ -226,8 +228,9 @@ def _setup_version(p: Path) -> tuple[int, ...]:
 
 
 def alte_setups_weg(ordner: Path, behalten: int = SETUPS_BEHALTEN) -> list[str]:
-    """Nur die neuesten Setup-Dateien (nach Versionsnummer) samt .sha256 behalten – ältere sind Ballast."""
-    setups = sorted((p for p in ordner.glob("NemiCLI-Setup-*.exe") if _setup_version(p)), key=_setup_version)
+    """Nur die neuesten Setup-Dateien (nach Versionsnummer) samt .sha256 behalten, dazu immer die aus SETUPS_STABIL."""
+    setups = sorted((p for p in ordner.glob("NemiCLI-Setup-*.exe") if _setup_version(p) and p.name not in SETUPS_STABIL),
+                    key=_setup_version)
     weg = []
     for p in setups[:-behalten] if behalten > 0 else []:
         for f in (p, p.with_name(p.name + ".sha256")):

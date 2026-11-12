@@ -113,7 +113,8 @@ function einsetzen(text, senden) {
     const start = el.selectionStart ?? el.value.length;
     const ende = el.selectionEnd ?? el.value.length;
     el.value = el.value.slice(0, start) + text + el.value.slice(ende);
-    el.selectionStart = el.selectionEnd = start + text.length;
+    try { el.selectionStart = el.selectionEnd = start + text.length; }
+    catch (_) { /* email u. a.: ohne Auswahl-API, das Setzen wirft */ }
   }
   el.dispatchEvent(new Event("input", { bubbles: true }));
   el.dispatchEvent(new Event("change", { bubbles: true }));

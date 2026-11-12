@@ -70,8 +70,8 @@ _QWEN_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
 
 
 def tokenizer_da(ordner: Path) -> bool:
-    return (ordner / "tokenizer.json").exists() or ((ordner / "vocab.json").exists()
-                                                    and (ordner / "merges.txt").exists())
+    return (ordner / "tokenizer.json").exists() or all(
+        (ordner / d).exists() for d in ("vocab.json", "merges.txt", "tokenizer_config.json"))
 
 
 def qwen_tokenizer(ordner: Path):
@@ -89,10 +89,11 @@ def qwen_tokenizer(ordner: Path):
             pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
         tok.decoder = decoders.ByteLevel()
         cfg = ordner / "tokenizer_config.json"
-        if cfg.exists():
-            dec = json.loads(cfg.read_text(encoding="utf-8")).get("added_tokens_decoder", {})
-            tok.add_special_tokens([AddedToken(v["content"], special=True, normalized=False)
-                                    for _, v in sorted(dec.items(), key=lambda kv: int(kv[0]))])
+        if not cfg.exists():                     # ohne sie würden <|im_start|> & Co. als Text zerlegt
+            raise FileNotFoundError(f"Tokenizer unvollständig: {cfg.name} fehlt in {ordner}")
+        dec = json.loads(cfg.read_text(encoding="utf-8")).get("added_tokens_decoder", {})
+        tok.add_special_tokens([AddedToken(v["content"], special=True, normalized=False)
+                                for _, v in sorted(dec.items(), key=lambda kv: int(kv[0]))])
     return lambda text: tok.encode(text, add_special_tokens=False).ids
 
 
