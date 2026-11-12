@@ -183,7 +183,7 @@ Neue Abhängigkeiten: keine.
 | W12 | `with os.scandir()` + `islice(MAX_ENTRIES)`, `is_dir(follow_symlinks=False)`, atomares Schreiben, beschädigte Beispieldatei vor dem Überschreiben als `.kaputt` sichern, Einträge prüfen | lassen (kein Sicherheitsbauteil) | keine |
 
 Tests (Phase 5) je Punkt: simulierte harmlose und verdächtige Ereignisse wie in den
-Nachweis-Skripten, als Unit-Tests (Testsuite, nicht im Repository); danach die bestehenden Wache-Tests und auf Zuruf
+Nachweis-Skripten, als Unit-Tests (Testsuite in `tests/`); danach die bestehenden Wache-Tests und auf Zuruf
 die volle Reihe.
 
 ### Offene Frage an den Nutzer

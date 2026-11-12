@@ -138,9 +138,10 @@ def host() -> str:
     """WebUI-Adresse aus der Konfig (Standard 127.0.0.1:7860)."""
     try:
         import config
+        import netzadresse
         h = str(config.load().get(_CONFIG_KEY_HOST) or "").strip()
         if h:
-            return h.rstrip("/")
+            return netzadresse.sicher(h.rstrip("/"))
     except Exception:
         pass
     return DEFAULT_HOST

@@ -594,7 +594,7 @@ function md(src){
   h = h.replace(/`([^`]+)`/g,(m,c)=>'<code>'+c+'</code>');
   h = h.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
   h = h.replace(/(^|[^*])\*([^*]+)\*/g,'$1<em>$2</em>');
-  h = h.replace(/\[([^\]]+)\]\((https?:[^)]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  h = h.replace(/\[([^\]]+)\]\((https:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
   h = h.replace(/^### (.*)$/gm,'<h4>$1</h4>').replace(/^## (.*)$/gm,'<h3>$1</h3>').replace(/^# (.*)$/gm,'<h3>$1</h3>');
   h = h.replace(/^[-*] (.*)$/gm,'<li>$1</li>');
   h = h.replace(/(<li>[\s\S]*?<\/li>)/g, m=>'<ul>'+m+'</ul>');

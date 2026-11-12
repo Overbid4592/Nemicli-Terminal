@@ -97,7 +97,7 @@ Ziel: wissen, ob sich Streaming lohnt, **ohne** eine Zeile Streaming-Code.
   – wie im gehärteten Leser – vor dem Lesen gegen die Dateilänge und die Limits geprüft.
 - Kein Hintergrund-Thread darf ungeprüfte Zahlen aus der Datei benutzen.
 - Streaming ist **abschaltbar** (`stream = aus` → Verhalten wie heute).
-- Jede Phase bekommt eigene Tests (Testsuite, nicht im Repository): Cache-Treffer, Rauswurf,
+- Jede Phase bekommt eigene Tests (Testsuite in `tests/`): Cache-Treffer, Rauswurf,
   Budget wird nie überschritten, Ergebnis identisch zur Variante ohne Streaming (Phase 1–2).
 - Messwerte kommen ins Debug-Log und in `Modelltests.md`.
 

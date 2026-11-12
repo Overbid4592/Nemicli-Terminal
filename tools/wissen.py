@@ -60,7 +60,7 @@ def name(p: Path, basis: Path | None = None) -> str:
 def stempel(liste: list[Path], basis: Path | None = None) -> str:
     """Fingerabdruck des Ordners: ändert sich, sobald eine Datei dazukommt, wegfällt oder sich ändert."""
     basis = basis or ordner()
-    h = hashlib.sha1(VERFAHREN.encode())
+    h = hashlib.sha1(VERFAHREN.encode(), usedforsecurity=False)
     for p in liste:
         st = p.stat()
         h.update(f"{name(p, basis)}\0{st.st_mtime_ns}\0{st.st_size}\n".encode("utf-8"))

@@ -19,6 +19,7 @@ import time
 
 import cloudprovider as CP
 import httpx
+import netzadresse
 from cloudprovider import (
     _KEIN_CHAT,
     CLOUD,
@@ -119,11 +120,16 @@ def _norm_host(raw: str) -> str:
     name = teile.hostname or "127.0.0.1"
     if name in ("0.0.0.0", "::", "[::]"):               # Lausch-Adresse, als Ziel unter Windows nicht erreichbar
         name = "127.0.0.1"
+    schema = teile.scheme
+    if schema == "http" and not netzadresse.lokal(name):   # unverschlüsselt nur zum eigenen Rechner
+        schema = "https"
     if teile.port is not None:
         port = f":{teile.port}"
     else:                                              # ohne Port: Ollama-Vorgabe – außer bei https (Vermittler)
         port = "" if teile.scheme == "https" else ":11434"
-    return f"{teile.scheme}://{name}{port}{teile.path}".rstrip("/")
+    if ":" in name:                                    # IPv6 in der Adresse wieder einklammern
+        name = f"[{name}]"
+    return f"{schema}://{name}{port}{teile.path}".rstrip("/")
 
 
 OLLAMA_HOST = _norm_host(os.getenv("OLLAMA_HOST", ""))

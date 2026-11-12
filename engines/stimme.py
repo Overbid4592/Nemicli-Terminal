@@ -293,7 +293,7 @@ def stimme_festlegen(beschreibung: str, seed: int, sprache: str = "german", name
 # Text vorbereiten
 # ---------------------------------------------------------------------------
 
-_EMOJI = re.compile("[\U0001F000-\U0001FAFF☀-➿️‍]")
+_EMOJI = re.compile(r"[\U0001f000-\U0001faff\u2600-\u27bf\ufe0f\u200d]")
 
 
 def sprechtext(text: str) -> str:

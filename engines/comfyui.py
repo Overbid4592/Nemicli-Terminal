@@ -96,7 +96,8 @@ def host() -> str:
     except Exception:
         h = ""
     if h:
-        return h if h.startswith("http") else f"http://{h}"
+        import netzadresse
+        return netzadresse.sicher(h)
     return DEFAULT_HOST
 
 
