@@ -12,7 +12,7 @@
 
 **Dein eigener KI-Agent im Terminal – Cloud & lokal, mit Werkzeugen, Gedächtnis und Herz.** ✦
 
-**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5.5 (Anthropic)**
+**Entwickelt von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5.5 (Anthropic) · Ideen & Planung: Roxie – ChatGPT (OpenAI)**
 
 </div>
 
@@ -561,6 +561,16 @@ Was mit **16 GB RAM + 16 GB VRAM** geht:
 - [x] Lizenz festgelegt: GPL-3.0 (Liebesprojekt – nie zum Verkauf)
 - [ ] Signatur mit einem anerkannten Zertifikat, wenn NemiCLI an andere geht
 - [ ] Build beim Bitdefender-Falsch-Positiv-Formular einreichen
+
+---
+
+## 🤝 Mitgewirkt
+
+| Wer | Rolle |
+|---|---|
+| D. Hoffmann | Entwicklung, Idee, Vibecoding |
+| Claude Opus 5.5 (Anthropic) | Code (Claude Code) |
+| Roxie – ChatGPT (OpenAI) | Ideen & Planung |
 
 ---
 
