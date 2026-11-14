@@ -36,6 +36,22 @@ class NGramTests(unittest.TestCase):
             e.zufuegen(t)
             self.assertEqual(e.vorschlag(8), NGramEntwurf(folge[:i]).vorschlag(8))
 
+    def test_fenster_bleibt_begrenzt(self):
+        """Rolling N-gram index must agree with a freshly built index for the last window."""
+        import random
+
+        from ggufengine.spekulativ import NGramEntwurf
+        fenster = 24
+        rnd = random.Random(42)
+        folge = [rnd.randrange(7) for _ in range(600)]
+        e = NGramEntwurf(folge[:10], fenster=fenster)
+        for i, tid in enumerate(folge[10:], 11):
+            e.zufuegen(tid)
+            ref = NGramEntwurf(folge[:i], fenster=fenster)
+            self.assertEqual(e.vorschlag(8), ref.vorschlag(8))
+            self.assertLessEqual(len(e._toks), fenster + min(1024, fenster))
+            self.assertLessEqual(len(e._index), fenster + min(1024, fenster))
+
     def test_nutzen(self):
         from ggufengine.spekulativ import Nutzen
         P = Nutzen.PRUEFUNGEN
@@ -74,6 +90,23 @@ class NGramTests(unittest.TestCase):
         self.assertEqual(pausen, [Nutzen.PAUSE, 2 * Nutzen.PAUSE, 4 * Nutzen.PAUSE])
         runde(n, {8: 0.015, 4: 0.015, 3: 0.015, 2: 0.015, 1: 0.015}, 3)   # lohnt wieder: Pause von vorn
         self.assertEqual(runde(n, {8: 0.030, 4: 0.030, 3: 0.030, 2: 0.030, 1: 0.030}), [Nutzen.PAUSE])
+
+    def test_nutzen_trennt_angenommene_von_nachberechneten_tokens(self):
+        """A rejected proposal can require one extra model token, but is still a miss."""
+        from ggufengine.spekulativ import Nutzen
+
+        n = Nutzen()
+        n.einzeln(0.010)
+        n.start(1)
+        n.pruefung(0.012, 1)     # original sampled token
+        n.pruefung(0.020, 1)     # replacement sampled after a rejected proposal
+        n.pause(angenommen=0)
+        self.assertEqual(n._je[1][2], 0.0)
+
+        n.start(3)
+        n.pruefung(0.014, 4)     # one original, two accepted, one replacement
+        n.pause(angenommen=2)
+        self.assertAlmostEqual(n._je[3][2], 2 / 3)
 
     def test_nutzen_waehlt_die_schnellste_laenge(self):
         """MTP schlägt 2 Token vor: probiert werden 2 und 1, genommen wird die schnellere."""
@@ -152,7 +185,7 @@ def _ohne_zeitmessung():
         def erlaubt(self, laenge=0):
             return 8
 
-        def pause(self):
+        def pause(self, angenommen=None):
             return 0
     return OhneZeitmessung()
 
