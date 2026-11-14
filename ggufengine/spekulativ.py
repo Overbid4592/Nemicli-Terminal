@@ -3,7 +3,7 @@
 The engine samples every position from the model's own logits exactly as without
 speculation and keeps a proposed token only if it equals the sample, so the output
 does not change – a correct proposal just saves the forward pass for that token."""
-from typing import Callable, Dict, List, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 
 class NGramEntwurf:
@@ -11,7 +11,11 @@ class NGramEntwurf:
     them then are proposed (repeated code, quotes, names, lists)."""
 
     def __init__(self, tokens: List[int], n: int = 3, max_neu: int = 8, fenster: int = 16384):
+        if fenster < 1:
+            raise ValueError("fenster must be positive")
         self.n, self.max_neu = n, max_neu
+        self._fenster = fenster
+        self._trim = min(1024, fenster)  # amortized pruning: bounded buffer, not per-token shifts
         self._toks: List[int] = list(tokens[-fenster:])
         self._index: Dict[Tuple[int, ...], int] = {}   # n-gram -> position after its last occurrence
         for ende in range(n, len(self._toks)):
@@ -25,6 +29,12 @@ class NGramEntwurf:
         if len(t) >= self.n:              # the n-gram ending before the new token now has a successor
             self._index[tuple(t[len(t) - self.n:])] = len(t)
         t.append(tid)
+        if len(t) >= self._fenster + self._trim:
+            # Rebuild only occasionally, avoiding a full list shift per generated token.
+            self._toks = t = t[-self._fenster:]
+            self._index = {}
+            for ende in range(self.n, len(t)):
+                self._index[tuple(t[ende - self.n:ende])] = ende
 
     def _ngram(self, platz: int) -> List[int]:
         if self._ngram_pause:
@@ -34,7 +44,8 @@ class NGramEntwurf:
         if len(t) < self.n or platz < 1:
             return []
         start = self._index.get(tuple(t[len(t) - self.n:]))
-        if start is None:
+        # The backing buffer can hold _trim older tokens; ignore expired n-grams.
+        if start is None or start - self.n < max(0, len(t) - self._fenster):
             return []
         self._quelle = "ngram"
         return t[start:start + min(self.max_neu, platz)]
@@ -150,12 +161,14 @@ class Nutzen:
         gut = [k for k in moeglich if self._gepruefte(k) and self._schnell(k)]
         return min(gut, key=lambda k: self._je[k][0]) if gut else 0
 
-    def pause(self) -> int:
-        """Called when a check is finished: tokens to go without proposals (0 = go on)."""
+    def pause(self, angenommen: Optional[int] = None) -> int:
+        """Finish the check (return tokens to pause). Count actual accepted proposals,
+        not replacement tokens. Without a count, infer it for standalone timing tests."""
         if self._k in self._je and self._tokens and getattr(self, "_gueltig", True):
             eintrag = self._je[self._k]
             rate = self._zeit / self._tokens
-            quote = max(0, self._tokens - 1) / self._k
+            quote = (min(self._k, max(0, angenommen)) / self._k if angenommen is not None
+                     else min(self._k, max(0, self._tokens - 1)) / self._k)
             if eintrag[3]:
                 eintrag[0], eintrag[2], eintrag[3] = rate, quote, False
             else:
