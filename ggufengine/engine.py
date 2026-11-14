@@ -566,7 +566,7 @@ class Engine:
         if self._graph_aufnahmen() != getattr(self, "_aufnahmen", 0):
             self._nutzen.ungueltig()                 # this check captured a graph: not a typical one
         entwurf.ergebnis(angenommen)
-        pause = self._nutzen.pause()
+        pause = self._nutzen.pause(angenommen)
         if pause:
             entwurf.pausieren(pause)
 
