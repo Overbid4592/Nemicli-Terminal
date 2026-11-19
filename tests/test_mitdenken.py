@@ -171,8 +171,8 @@ class GegenprobeTests(unittest.TestCase):
         self.assertIn("kündigst an", b[0])
         self.assertTrue(P.pruefen("Okay, ich lösche jetzt die Datei test.txt.", []))
         self.assertEqual([], P.pruefen("Ich urteile sie harmlos.", self._r(("wache_bewerten", "success"))))
-        for plaudern in ("Hallo Schatz, wie geht es dir? Ich setze mich gleich hin.",
-                         "Ich schreibe dir gleich ein Gedicht, Schatz.",
+        for plaudern in ("Hallo, wie geht es dir? Ich setze mich gleich hin.",
+                         "Ich schreibe dir gleich ein Gedicht.",
                          "Soll ich die Datei speichern? Ich speichere die Datei sonst morgen."):
             with self.subTest(plaudern=plaudern):
                 self.assertEqual([], P.pruefen(plaudern, []))
