@@ -186,6 +186,131 @@ def pflege_planen(ctx: "Ctx") -> None:
     aufgabe.add_done_callback(_LERN_AUFGABEN.discard)
 
 
+# Selbstentwurf im Takt (lernschleife): je Fenster eine Runde im Leerlauf, dazu bei /reflektieren.
+SE_PRUEF_S = 60.0            # so oft schaut der Takt nach
+SE_RUHE_S = 120.0            # so lange ohne Eingabe, dann gilt das Terminal als frei
+
+
+def _selbstentwurf_darf(ref) -> tuple[bool, str]:
+    try:
+        import modellgroesse as MG
+        return MG.darf_selbst_umschreiben(ref)
+    except Exception as e:
+        return False, f"Modellgröße nicht prüfbar ({type(e).__name__})"
+
+
+async def selbstentwurf_runde(backend) -> tuple[bool, str]:
+    """Die aktive Persönlichkeit sieht ihren Selbstentwurf an und ändert ihn ggf. – nur mit dem Werkzeug
+    selbstentwurf, ohne den Hauptverlauf. Rückgabe: (geändert, Grund)."""
+    import json
+    import lernschleife as LS
+    import selbstentwurf as SE
+    vorher = SE.stand_zeilen()
+    prompt = LS.selbstentwurf_prompt(SE.reflexions_auftrag(), _rueckblick(backend))
+    system = LS.SE_SYSTEM.format(name=PS.active().name)
+    grund = ""
+    for _ in range(LS.SE_SCHRITTE):
+        acts, _rest = actions.parse_actions(await backend.ask_once(prompt, system) or "")
+        acts = [a for a in acts if a.get("tool") == "selbstentwurf"][:1]
+        if not acts:
+            break
+        res = await actions.run(acts[0])
+        if res.ok and acts[0].get("felder"):
+            grund = " ".join(str(acts[0].get("grund") or "").split())[:200]
+            break
+        prompt += (f"\n\nDein Block: {json.dumps(acts[0], ensure_ascii=False)[:800]}\n"
+                   f"Ergebnis: {str(res.text)[:1500]}\n\nDein Werkzeug-Block oder KEINE:")
+    return SE.stand_zeilen() != vorher, grund
+
+
+def _selbstentwurf_melden(name: str, wer: str, grund: str) -> None:
+    import lernschleife as LS
+    ui.info(f"🪞 {name} hat den Selbstentwurf angepasst" + (f": {grund}" if grund else "."))
+    LS.melden("Du hast deinen Selbstentwurf angepasst" + (f": {grund}" if grund else "") + ".", wer)
+
+
+def _terminal_frei(tui) -> bool:
+    """Keine Antwort läuft, kein Fenster offen, nichts getippt und SE_RUHE_S ohne Eingabe."""
+    if TURN_LOCK.locked():
+        return False
+    if tui is None:
+        return True
+    if getattr(tui, "busy", False) or getattr(tui, "_modal", None) is not None:
+        return False
+    if str(getattr(getattr(tui, "_input", None), "text", "") or "").strip():
+        return False
+    return time.monotonic() - float(getattr(tui, "_last_input", 0.0) or 0.0) >= SE_RUHE_S
+
+
+async def selbstentwurf_takt_lauf(ctx: "Ctx") -> bool:
+    """Die fällige Runde des laufenden Fensters: nur im Gespräch im Vordergrund, mit erlaubtem Modell,
+    unter TURN_LOCK. True = gelaufen."""
+    import lernschleife as LS
+    backend, ref = ctx.backend, ctx.model
+    if backend is None or not LS.selbstentwurf_an() or sicherheit.vordergrund_grund():
+        return False
+    p = PS.active()
+    if not LS.selbstentwurf_faellig(p.name) or not _selbstentwurf_darf(ref)[0]:
+        return False
+    async with TURN_LOCK:
+        if ctx.backend is not backend or PS.active().key != p.key or not LS.selbstentwurf_faellig(p.name):
+            return False
+        LS.selbstentwurf_erledigt(p.name)
+        try:
+            angepasst, grund = await selbstentwurf_runde(backend)
+        except Exception as e:
+            try:
+                import debugbericht
+                debugbericht.ereignis(f"Selbstentwurf-Runde fehlgeschlagen: {type(e).__name__}: {e}")
+            except Exception:
+                pass
+            return True
+    if angepasst:
+        _selbstentwurf_melden(p.name, p.key, grund)
+    return True
+
+
+async def selbstentwurf_takt(ctx: "Ctx") -> None:
+    """Läuft neben der Sitzung im Vollbild: je SE_PRUEF_S nachsehen, ob eine Runde fällig und das Terminal
+    frei ist."""
+    while True:
+        await asyncio.sleep(SE_PRUEF_S)
+        try:
+            if ui.TUI is not None and _terminal_frei(ui.TUI):
+                await selbstentwurf_takt_lauf(ctx)
+        except Exception:
+            pass
+
+
+def selbstentwurf_planen(ctx: "Ctx") -> None:
+    """Klassik-Oberfläche (dort kein Leerlauf-Takt): die fällige Runde nach der Runde im Hintergrund."""
+    if ui.TUI is not None:
+        return
+    aufgabe = asyncio.get_running_loop().create_task(selbstentwurf_takt_lauf(ctx))
+    _LERN_AUFGABEN.add(aufgabe)
+    aufgabe.add_done_callback(_LERN_AUFGABEN.discard)
+
+
+async def selbstentwurf_jetzt(ctx: "Ctx") -> None:
+    """/reflektieren: nach der Reflexion die Selbstentwurf-Runde – zusätzlich, die drei Runden am Tag bleiben.
+    Ohne TURN_LOCK – /reflektieren kann aus dem Menü der KI kommen, deren Zug ihn hält."""
+    darf, warum = _selbstentwurf_darf(ctx.model)
+    if not darf:
+        ui.info(f"🪞 Selbstentwurf nicht angesehen: {warum or 'dieses Modell darf ihn nicht umschreiben'}.")
+        return
+    p = PS.active()
+    with ui.thinking("sieht den Selbstentwurf an"):
+        try:
+            angepasst, grund = await selbstentwurf_runde(ctx.backend)
+        except Exception as e:
+            ui.error(f"Selbstentwurf fehlgeschlagen: {e}")
+            return
+    if angepasst:
+        _selbstentwurf_melden(p.name, p.key, grund)
+    else:
+        ui.info(f"🪞 {p.name} hat den Selbstentwurf angesehen – passt so.")
+
+
 def _kugel_stand() -> dict | None:
     """Kugel-Bild wie die Kugel es wählt (Stimmung, sonst neutral; „kugel“ = ohne Bild),
     dazu das Denk-Bild. stand ändert sich, wenn ein Bild neu gemalt wurde."""
@@ -317,9 +442,7 @@ async def start_webui(ctx: "Ctx") -> "webui.WebBridge":
                 await web_converse(ctx.backend, txt, imgs,
                                    bridge.broadcast, bridge.ask)
                 ctx.current_prompts.append(txt)
-                await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
-                                        list(ctx.current_prompts), ctx.model or "—",
-                                        stand=getattr(ctx.backend, "stand", None))
+                await _chat_speichern(ctx)
                 learn.capture_from_answer(txt, ctx.backend.messages, ctx.current_chat)
                 await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
                 memory.release_encoder()
@@ -530,9 +653,11 @@ async def name_befehl(arg: str) -> None:
                                   ("Über dich", alt["ueber"] or "–")])
 
 
-async def kern_befehl(arg: str) -> None:
+async def kern_befehl(arg: str, ctx: "Ctx | None" = None) -> None:
     """/kern – das feste Aussehen und die Sprechweise der aktiven Persönlichkeit ansehen, ändern, sperren,
-    zurückholen. Nur der Nutzer (MENUE_GESPERRT): eine KI ändert Gesperrtes nur nach seinem Ja."""
+    zurückholen. Nur der Nutzer (MENUE_GESPERRT): eine KI ändert Gesperrtes nur nach seinem Ja.
+    Ändern geschieht im Kern-Fenster (ganzer Stand als JSON, ohne KI dazwischen), neue Gesichter im Kopf-Fenster."""
+    global KERN_BRUECKE, KOPF_BRUECKE  # noqa: PLW0603
     import charakter
     name = PS.active().name
     sub = arg.strip().lower()
@@ -543,7 +668,8 @@ async def kern_befehl(arg: str) -> None:
                      "nach deinem Ja." if stand["gesperrt"] else "🔓 offen – sperren mit /kern sperren."))
     if not sub:
         sub = await ask_confirm("Was möchtest du?", [
-            ("aendern", "✏️  Kern ändern"),
+            ("aendern", "✏️  Kern ändern (Fenster)"),
+            ("kopf", "🙂 Gesicht finden (Fenster)"),
             ("sprechweise", "🗣 Sprechweise ändern"),
             ("sperre", f"🔒 Gesperrt {'✔️' if stand['gesperrt'] else '🛑'}"),
             ("zurueck", "⏪ Alten Stand zurückholen" + (f"  ({len(stand['vorher'])} gemerkt)" if stand["vorher"] else "")),
@@ -557,18 +683,23 @@ async def kern_befehl(arg: str) -> None:
             return
         ui.success("🔒 Kern gesperrt – Selbstbilder beginnen immer damit." if an else "🔓 Kern wieder offen.")
     elif sub in ("aendern", "ändern"):
-        ui.info("🧬 Der Kern ist das Grundskelett: Gesicht, Augen, Haarfarbe und -länge, Haut, Körperbau, Bleibendes "
-                "wie Tattoos – englisch, ein Satz. Keine Kleidung und keine Frisur (die bleiben je Bild frei).")
-        text = (await ask_text("Neuer Kern (leer = abbrechen):")).strip()
-        if not text:
-            ui.info("Nichts geändert.")
-            return
-        if (kleidung := charakter.kleidung_im_kern(text)) and await ask_confirm(
-                f"Kleidung im Kern erkannt ({', '.join(kleidung)}) – die gehört eigentlich in die Outfits. Trotzdem?",
-                [("nein", "Nein, nochmal"), ("ja", "Ja, so speichern")]) != "ja":
-            return
-        charakter.kern_setzen(text, name, grund="kern_nutzer")
-        ui.success("🧬 Kern gespeichert (der alte ist gemerkt: /kern zurueck).")
+        if KERN_BRUECKE is None:
+            KERN_BRUECKE = await start_kern()
+        if KERN_BRUECKE.verbunden():
+            KERN_BRUECKE.senden({"t": "vorne", "name": name})
+            ui.info("🧬 Das Kern-Fenster ist schon offen.")
+        else:
+            gui_oeffnen(KERN_BRUECKE, "--kern")
+            ui.success("🧬 Das Kern-Fenster öffnet sich: alles direkt bearbeiten, dann „Speichern“.")
+    elif sub == "kopf":
+        if KOPF_BRUECKE is None:
+            KOPF_BRUECKE = await start_kopf(ctx)
+        if KOPF_BRUECKE.verbunden():
+            KOPF_BRUECKE.senden({"t": "vorne", "name": name})
+            ui.info("🙂 Das Kopf-Fenster ist schon offen.")
+        else:
+            gui_oeffnen(KOPF_BRUECKE, "--kopf")
+            ui.success("🙂 Das Kopf-Fenster öffnet sich: Wünsche eintippen, Gesichter erschaffen, eins anklicken.")
     elif sub == "sprechweise":
         ui.info("🗣 Wie redet die Persönlichkeit? Zum Beispiel: frech, duzt, kurze Sätze, gern mit Emojis. "
                 "Sie geht mit jeder Nachricht an die KI.")
@@ -585,6 +716,182 @@ async def kern_befehl(arg: str) -> None:
             ui.warn(f"🧬 {e}")
             return
         ui.success(f"⏪ Früherer Kern ist wieder da: „{frueher}“")
+
+
+async def start_kopf(ctx: "Ctx | None"):
+    """Brücke zum Kopf-Fenster: die KI schreibt Gesichts-Varianten des Kerns (tools/gesichtfinder.py), der Bild-Motor
+    malt sie als Nahaufnahmen; übernommen wird nur eine Variante dieser Runde, für die Persönlichkeit der Runde."""
+    import shutil
+    import gesichtfinder as G
+    import gui_bruecke
+    loop = asyncio.get_running_loop()
+    bruecke = None
+    malen_lock = asyncio.Lock()
+    runde = {"nr": 0, "name": "", "varianten": [], "titel": []}
+
+    def senden(art: str, **felder) -> None:
+        bruecke.senden({"t": art, **felder})
+
+    def malen_grund() -> str:
+        try:
+            import imagegen
+            if (grund := imagegen.missing_reason_aktiv()):
+                return grund
+            import hintergrund
+            if (e := hintergrund.gpu_belegt()):
+                return f"Die Grafikkarte ist gerade belegt (Aufgabe #{e['nr']}: {e['titel']}) – danach noch einmal."
+        except Exception as e:
+            return str(e)
+        return ""
+
+    def start(_a: dict) -> None:
+        import charakter
+        name = PS.active().name
+        d = charakter.roh(name)
+        try:
+            import krea
+            korrektur = krea.gesicht_an()
+        except Exception:
+            korrektur = False
+        senden("start", name=name, kern=charakter.kern(name), korrektur=korrektur,
+               malen=(f"🎨 Malen geht gerade nicht: {g}" if (g := malen_grund()) else ""),
+               lora=("🧬 Eine Bild-LoRA ist gebunden – sie hält beim Malen weiter das bisherige Gesicht."
+                     if d.get("lora_bild") else ""))
+
+    async def erschaffen(a: dict) -> None:
+        import charakter
+        import imagegen
+        runde["nr"] += 1
+        nr = runde["nr"]
+        name = PS.active().name
+        kern = charakter.kern(name)
+        if not kern:
+            senden("fehler", text="Es gibt noch keinen Kern – erst einen eintragen (/kern → Kern ändern).")
+            return
+        if ctx is None or ctx.backend is None or not hasattr(ctx.backend, "ask_once"):
+            senden("fehler", text="Kein Modell aktiv – im Terminal mit /model eins wählen.")
+            return
+        if (grund := malen_grund()):
+            senden("fehler", text=grund)
+            return
+        if name != runde["name"]:
+            runde["titel"] = []
+        try:
+            antwort = await ctx.backend.ask_once(G.auftrag(kern, str(a.get("wunsch") or ""), G.ANZAHL, runde["titel"]),
+                                                 G.SYSTEM)
+            varianten = G.lesen(antwort, kern, G.ANZAHL)
+        except Exception as e:
+            senden("fehler", text=str(e))
+            return
+        if nr != runde["nr"]:
+            return
+        stil = str(charakter.roh(name).get("stil") or "")
+        runde.update(name=name, varianten=varianten, titel=runde["titel"] + [v["titel"] for v in varianten])
+        senden("varianten", nr=nr, liste=varianten)
+        await asyncio.to_thread(G.aufraeumen, name)
+        ziel = G.ordner(name)
+        korrektur = bool(a.get("korrektur"))
+        for i, v in enumerate(varianten):
+            if nr != runde["nr"]:
+                return                               # eine neue Runde hat begonnen
+            senden("status", text=f"🎨 male Gesicht {i + 1} von {len(varianten)} …", laeuft=True)
+            senden("malt", nr=nr, i=i)
+            try:
+                async with malen_lock:
+                    pfad = await asyncio.to_thread(imagegen.paint, G.portraet_prompt(v["kern"], stil), seed=v["seed"])
+                ziel.mkdir(parents=True, exist_ok=True)
+                datei = ziel / f"gesicht_{nr}_{i}.png"
+                await asyncio.to_thread(shutil.move, pfad, datei)
+            except Exception as e:
+                senden("fehler", text=f"Gesicht {i + 1}: {e}")
+                return
+            besser = ""
+            if korrektur and nr == runde["nr"]:
+                senden("status", text=f"✨ bessere Gesicht {i + 1} von {len(varianten)} nach …", laeuft=True)
+                try:
+                    async with malen_lock:
+                        besser = await asyncio.to_thread(imagegen.gesicht_nachbessern, str(datei), immer=True) or ""
+                except Exception as e:
+                    senden("hinweis", text=f"Gesichts-Korrektur übersprungen: {e}")
+            senden("bild", nr=nr, i=i, pfad=str(datei), besser=str(besser))
+        if nr == runde["nr"]:
+            senden("status", text="✅ Fertig – klick das Gesicht an, das dir gefällt, oder erschaffe neue.",
+                   laeuft=False)
+
+    def uebernehmen(a: dict) -> None:
+        i, nr = a.get("i"), a.get("nr")
+        if (nr != runde["nr"] or not isinstance(i, int) or not 0 <= i < len(runde["varianten"])
+                or runde["name"] != PS.active().name):
+            senden("fehler", text="Diese Gesichter gehören zu einer älteren Runde – bitte neu erschaffen.")
+            return
+        v = runde["varianten"][i]
+        try:
+            erg = G.uebernehmen(v, runde["name"])
+        except Exception as e:
+            senden("fehler", text=f"Nicht übernommen: {e}")
+            return
+        ui.success(f"🙂 Neues Gesicht für {runde['name']}: „{v['titel']}“ · Seed {erg['seed']} "
+                   "(der alte Kern ist gemerkt: /kern zurueck).")
+        senden("uebernommen", titel=v["titel"], kern=erg["kern"], seed=erg["seed"])
+
+    plane = lambda coro: asyncio.run_coroutine_threadsafe(coro, loop)
+    handlers = {
+        "start": lambda a: loop.call_soon_threadsafe(start, a),
+        "erschaffen": lambda a: plane(erschaffen(a)),
+        "uebernehmen": lambda a: loop.call_soon_threadsafe(uebernehmen, a),
+    }
+    bruecke = gui_bruecke.GuiBruecke(loop, handlers)
+    return bruecke
+
+
+async def start_kern():
+    """Brücke zum Kern-Fenster: Stand laden und den bearbeiteten Stand speichern – nur für die Persönlichkeit,
+    die beim Laden aktiv war, und nur über charakter.kern_json_setzen (Prüfung, Sicherung, Verlauf)."""
+    import charakter
+    import gui_bruecke
+    loop = asyncio.get_running_loop()
+    bruecke = None
+    geladen = [""]                               # Name der Persönlichkeit, deren Kern im Fenster steht
+
+    def stand_senden(art: str, name: str) -> None:
+        geladen[0] = name
+        bruecke.senden({"t": art, "name": name, "json": charakter.kern_json(name),
+                        "basis": charakter.kern_stand(name)})
+
+    def laden(_a: dict) -> None:
+        try:
+            stand_senden("stand", PS.active().name)
+        except Exception as e:
+            bruecke.senden({"t": "fehler", "text": f"Kern nicht lesbar: {e}"})
+
+    def speichern(a: dict) -> None:
+        name = geladen[0]
+        if not name or str(a.get("name") or "") != name:
+            bruecke.senden({"t": "fehler", "text": "Erst neu laden – das Fenster zeigt einen anderen Stand."})
+            return
+        text = str(a.get("json") or "")
+        try:
+            neu = charakter.kern_json_lesen(text)
+            if not a.get("trotzdem") and (kleidung := charakter.kleidung_im_kern(neu["kern"])):
+                bruecke.senden({"t": "kleidung", "woerter": kleidung})
+                return
+            basis = a.get("basis") if isinstance(a.get("basis"), dict) else {}
+            charakter.kern_json_setzen(text, name, basis=basis, grund="kern_fenster")
+        except ValueError as e:
+            bruecke.senden({"t": "fehler", "text": str(e)})
+            return
+        except Exception as e:
+            bruecke.senden({"t": "fehler", "text": f"Nicht gespeichert: {type(e).__name__}: {e}"})
+            return
+        ui.success(f"🧬 Kern von {name} im Kern-Fenster gespeichert (der alte ist gemerkt: /kern zurueck).")
+        stand_senden("gespeichert", name)
+
+    handlers = {
+        "laden": lambda a: loop.call_soon_threadsafe(laden, a),
+        "speichern": lambda a: loop.call_soon_threadsafe(speichern, a),
+    }
+    bruecke = gui_bruecke.GuiBruecke(loop, handlers)
+    return bruecke
 
 
 def _gui_zustand(ctx: "Ctx") -> dict:
@@ -696,10 +1003,7 @@ async def _fenster_zug(ctx: "Ctx", text: str, senden, fragen, *, erlaubt, quelle
             if fertig["text"]:
                 ui.console.print(ui.assistant_panel(fertig["text"]))
             ctx.current_prompts.append(txt)
-            # im Faden: JSON aller Nachrichten + SHA-256 jedes Bildes brauchen bei langen Chats spürbar Zeit
-            await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
-                                    list(ctx.current_prompts), ctx.model or "—",
-                                    stand=getattr(ctx.backend, "stand", None))
+            await _chat_speichern(ctx)
             learn.capture_from_answer(eigen, ctx.backend.messages, ctx.current_chat)
             await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
             memory.release_encoder()
@@ -1003,6 +1307,8 @@ async def start_gui(ctx: "Ctx"):
 
 
 _STEUER_NR = 0
+# Beim Laden aus der Umgebung nehmen: Kindprozesse (Befehle der KI) erben ihn sonst und könnten das Fenster steuern.
+_STEUER_KEY = os.environ.pop("NEMICLI_STEUER_KEY", "")
 _STEUER_ABSTAND_S = 0.08        # die Pseudokonsole reicht je Bild nur den zuletzt gesetzten Titel weiter
 _STEUER_SCHLANGE = None
 
@@ -1025,7 +1331,7 @@ def _fenster_steuern(befehl: str) -> None:
 
 def _steuer_senden(schlange) -> None:
     global _STEUER_NR  # noqa: PLW0603
-    schluessel = os.environ.get("NEMICLI_STEUER_KEY", "")
+    schluessel = _STEUER_KEY or os.environ.get("NEMICLI_STEUER_KEY", "")
     while True:
         befehl = schlange.get()
         _STEUER_NR += 1
@@ -1241,7 +1547,7 @@ async def start_lora(ctx: "Ctx"):
             with malsperre.halten(melden, "LoRA-Training"):
                 texte = lorabild.bildtexte(name, daten, melden)
                 if texte is None:
-                    melden("Kein Seh-Modell unter Vision/ – alle Bilder lernen mit dem Auslöser allein")
+                    melden("Kein Sehmodell unter KI-Modelle/KI-Vision/Sehmodell/ – alle Bilder lernen mit dem Auslöser allein")
                 pfad = imagegen._gpu_fuer_bild(LT.trainieren)(
                     None, bilder=daten, schritte=int(a.get("schritte") or 0) or None, motor="bild",
                     ziel=lorabild.datei(name), text=lorabild.ausloeser(name), on_status=melden,
@@ -1704,13 +2010,6 @@ async def make_backend(ref: str, carry: list | None, strength: str = M.DEFAULT_S
             raise RuntimeError(f"Kein lokales Modell '{model_id}' in {gguflokal.ORDNER}.")
         backend = gguflokal.GgufChat(model_id)
         backend.strength = strength                  # Denk-Budget (/staerke)
-    elif provider == "funke":
-        if not funke_da():
-            raise RuntimeError(FUNKE_FEHLT)
-        from einrichtungshelfer import funkechat
-        if model_id != funkechat.MODELL or not funkechat.verfuegbar():
-            raise RuntimeError(f"Kein lokales Modell '{model_id}' – Funke Groß ist nicht mitgeliefert.")
-        backend = funkechat.FunkeChat(ref)
     else:
         backend = await cloud_backend(ref, strength)
 
@@ -2126,6 +2425,60 @@ async def bibliothekar(chat_id: int | None = None, alles: bool = False, erzwinge
     return res["n"]
 
 
+async def _eigenes_befehl(arg: str) -> None:
+    """/eigenes [oeffnen · freigeben]: der eigene Bereich der aktiven Persönlichkeit – Stand, Ordner ohne
+    gültiges Siegel, freigeben (nur der Nutzer)."""
+    import eigenbereich
+    from rich.markup import escape
+    was = arg.strip().lower()
+    try:
+        s = await asyncio.to_thread(eigenbereich.status)
+    except Exception as e:
+        ui.error(f"Der eigene Bereich lässt sich nicht lesen: {escape(str(e))}")
+        return
+    if was == "oeffnen":
+        if not s["da"]:
+            ui.info("🗝️ Den eigenen Bereich gibt es noch nicht – er entsteht, sobald die KI dort etwas ablegt.")
+            return
+        try:
+            os.startfile(str(s["pfad"]))
+        except Exception as e:
+            ui.warn(f"Öffnen fehlgeschlagen: {escape(str(e))}")
+        return
+    zeilen = [f"Ort: {s['pfad']}"]
+    if not s["da"]:
+        zeilen.append("Noch leer – er entsteht, sobald die KI dort etwas ablegt.")
+    else:
+        zeilen.append(("✔️ Gültig versiegelt" if s["gueltig"] else "⚠️ Das Wurzel-Siegel fehlt oder passt nicht")
+                      + f" · {s['ordner']} Ordner · {s['bytes'] / 2 ** 20:.1f} MB")
+        if s["offen"]:
+            zeilen.append("🔒 Ohne gültiges Siegel (für die KI gesperrt):")
+            zeilen += [f"  - {p}" for p in s["offen"][:20]]
+    ui.text_panel("🗝️ Eigener Bereich", escape("\n".join(zeilen)))
+    if was != "freigeben" or not s["da"]:
+        return
+    if s["gueltig"] and not s["offen"]:
+        ui.info("Alles ist versiegelt – nichts freizugeben.")
+        return
+    wahl = await ask_confirm(
+        "Erst selbst nachsehen, was darin liegt. Danach darf die KI es öffnen und ihm vertrauen. Freigeben?",
+        [("ja", "Ja – ich habe es geprüft, versiegeln"), ("__cancel__", "Nein – gesperrt lassen")])
+    if wahl != "ja":
+        ui.info("Bleibt gesperrt.")
+        return
+    try:
+        if s["gueltig"]:
+            n = 0
+            for p in s["offen"]:
+                n += await asyncio.to_thread(eigenbereich.freigeben, p)
+        else:                                     # neues Wurzel-Siegel: der ganze Bereich
+            n = await asyncio.to_thread(eigenbereich.freigeben, None)
+    except Exception as e:
+        ui.error(f"Freigeben fehlgeschlagen: {escape(str(e))}")
+        return
+    ui.success(f"🗝️ {n} Ordner versiegelt.")
+
+
 async def _backup_befehl(arg: str) -> None:
     """/backup [teil | voll | voll modelle] [ganz] | pruefen [name] | auspacken <name> | ordner."""
     import backup
@@ -2297,9 +2650,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         return
     if sub == "vorne":
         if rest.lower() in ("an", "aus"):
-            _c = config.load()
-            _c["kugel_vorne"] = rest.lower() == "an"
-            config.save(_c)
+            config.update(kugel_vorne=rest.lower() == "an")
         an = bool(config.load().get("kugel_vorne", True))
         ui.info(f"📌 Immer vorne: {'an' if an else 'aus'} – "
                 + ("die Kugel bleibt über allen Fenstern; verdeckt sie etwas, holt NemiCLI sie zurück. Im "
@@ -2308,9 +2659,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         return
     if sub == "impuls":
         if rest.lower() in ("an", "aus"):
-            _c = config.load()
-            _c["kugel_impuls"] = rest.lower() == "an"
-            config.save(_c)
+            config.update(kugel_impuls=rest.lower() == "an")
         an = bool(config.load().get("kugel_impuls", False))
         ui.info(f"🌈 Freier Moment: {'an' if an else 'aus'} – "
                 + (f"alle 1–3 Stunden entscheidet {name} selbst: etwas sagen, malen, Bild wechseln oder nichts. "
@@ -2319,9 +2668,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         return
     if sub == "ankommen":
         if rest.lower() in ("an", "aus"):
-            _c = config.load()
-            _c["kugel_ankommen"] = rest.lower() == "an"
-            config.save(_c)
+            config.update(kugel_ankommen=rest.lower() == "an")
         an = bool(config.load().get("kugel_ankommen", True))
         ui.info(f"👋 Ankommen: {'an' if an else 'aus'} – "
                 + (f"kommst du nach mindestens 3 Stunden zurück (auch nach Standby oder Ausschalten), "
@@ -2331,9 +2678,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
     if sub in ("leben", "musik"):
         schluessel = f"kugel_{sub}"
         if rest.lower() in ("an", "aus"):
-            _c = config.load()
-            _c[schluessel] = rest.lower() == "an"
-            config.save(_c)
+            config.update(**{schluessel: rest.lower() == "an"})
         an = bool(config.load().get(schluessel, True))
         if sub == "leben":
             ui.info(f"🐾 Desktop-Leben: {'an' if an else 'aus'} – "
@@ -2349,9 +2694,7 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
         return
     if sub == "zuschauen":
         if rest.lower() in ("an", "aus"):
-            _c = config.load()
-            _c["kugel_zuschauen"] = rest.lower() == "an"
-            config.save(_c)
+            config.update(kugel_zuschauen=rest.lower() == "an")
         an = bool(config.load().get("kugel_zuschauen", False))
         taste = str(config.load().get("kugel_frage_taste", "strg+alt+n") or "aus")
         ui.info(f"🎮 Beim Spielen zuschauen: {'an' if an else 'aus'} – "
@@ -2386,6 +2729,9 @@ async def _kugel_befehl(ctx: "Ctx", arg: str) -> None:
             ui.info(f"  {i:>2}. {titel:<32} {da:>3}/{len(liste)}   ({key})")
         if not KB.figur(name):
             ui.info("Noch keine Figur: zuerst /kugel malen (Grundbilder) – die Motive zeigen dieselbe Figur.")
+        return
+    if sub == "malen" and rest.lower() == "figur":
+        await _kugel_figur_malen(name)
         return
     if sub == "malen" and rest and (rest.lower() == "alle" or KM.bereich_finden(rest)):
         await _kugel_motive_malen(name, rest)
@@ -2548,6 +2894,60 @@ async def _kugel_motive_malen(name: str, auswahl: str) -> None:
         _bild_vorschau(str(b))
 
 
+async def _kugel_figur_malen(name: str) -> None:
+    """/kugel malen figur: die 10 Posen der Figur im Terminal-Fenster – ganz und sitzend, dieselbe Figur wie
+    Kugel und Motive. Fertige Posen bleiben, gemalt wird nur, was fehlt."""
+    import figur as FG
+    import imagegen
+    import kugelbilder as KB
+    if not KB.figur(name):
+        ui.warn(f"{name} hat noch keine Figur – zuerst /kugel malen (Grundbilder), dann zeigt die Figur im "
+                "Terminal dieselbe Person.")
+        return
+    if KB.veraltet(name):
+        ui.warn(f"Das Aussehen in {name}s Charakter-Datei hat sich geändert – zuerst /kugel malen "
+                "(neue Grundbilder), dann passt die Figur wieder.")
+        return
+    grund = imagegen.missing_reason_aktiv()
+    if grund:
+        ui.warn("Der Bild-Motor kann gerade nicht malen.")
+        ui.info(grund)
+        return
+    offen = KB.figur_fehlend(name)
+    if not offen:
+        ui.success(f"🐾 Alle {len(FG.POSEN)} Posen der Figur sind schon gemalt.")
+        FG.melden(name)
+        return
+    ui.info(f"🐾 {name} malt sich ganz und sitzend: {len(offen)} von {len(FG.POSEN)} Posen – "
+            f"{imagegen.active_label()}, {KB.SCHRITTE} Schritte je Bild.")
+    halt = {"an": False}
+
+    def _halt() -> bool:
+        try:
+            if ui.TUI.consume_abort() if ui.TUI is not None else _esc_pressed():
+                halt["an"] = True
+        except Exception:
+            pass
+        return halt["an"]
+
+    try:
+        bilder = await _run_with_status(
+            f"🐾 {name} malt die Figur · Esc stoppt nach dem laufenden Bild",
+            lambda on_status: KB.figur_malen(name, on_status=on_status, abbruch=_halt))
+    except asyncio.CancelledError:
+        halt["an"] = True
+        raise
+    except Exception as e:
+        ui.error(f"Malen fehlgeschlagen: {e}")
+        return
+    ui.success(f"🐾 {len(bilder)} Posen gemalt → {FG.ordner(name)}")
+    if halt["an"] and len(bilder) < len(offen):
+        ui.info(f"Gestoppt – {len(offen) - len(bilder)} fehlen noch. Weiter mit: /kugel malen figur")
+    FG.melden(name)                           # das Fenster nimmt die ganze Figur statt der Büste
+    for b in bilder[:2]:
+        _bild_vorschau(str(b))
+
+
 async def run_reich(erststart: bool = False) -> None:
     """/start (und einmalig beim ersten Start): Ort des Daten-Ordners wählen (core/reich.py). Kein Vorschlag,
     vor dem Kopieren Inhalt und Größe zeigen, nichts löschen."""
@@ -2580,8 +2980,8 @@ async def run_reich(erststart: bool = False) -> None:
         gesamt = sum(g for _n, g in posten)
         ui.info(f"Das liegt gerade in {paths.DATEN} und käme mit:")
         for name, g in posten:
-            ui.console.print(f"   [dim]{reich.lesbare_groesse(g):>12}[/dim]  {name}")
-        ui.console.print(f"   [dim]{'─' * 12}[/dim]  "
+            ui.console.print(f"   [muted]{reich.lesbare_groesse(g):>12}[/muted]  {name}")
+        ui.console.print(f"   [muted]{'─' * 12}[/muted]  "
                          f"zusammen {reich.lesbare_groesse(gesamt)}")
         wahl2 = await ask_confirm(
             f"Nach {ziel} kopieren?  (Das Original bleibt liegen – es wird nichts gelöscht.)",
@@ -2615,53 +3015,23 @@ async def run_reich(erststart: bool = False) -> None:
     await neu_starten_anbieten("Der neue Ordner gilt überall erst nach einem Neustart.")
 
 
-_FUNKE = None                    # einmal geladen, bleibt Funke für die Sitzung
-FUNKE_FEHLT = "Funke (Einrichtungs-Helfer) ist in dieser Fassung nicht enthalten."
-
-
-def funke_da() -> bool:
-    """Ist das Paket einrichtungshelfer/ in dieser Fassung enthalten? (Ob die Gewichte da sind, sagt verfuegbar().)"""
-    try:
-        import einrichtungshelfer  # noqa: F401
-    except ImportError:
-        return False
-    return True
-
-
-async def _funke_holen():
-    """Funke laden (einmal je Sitzung). None, wenn sie nicht mitgeliefert ist oder nicht lädt."""
-    global _FUNKE  # noqa: PLW0603
-    if _FUNKE is None:
-        try:
-            from einrichtungshelfer import gespraech as G
-        except ImportError:
-            return None
-        if not G.verfuegbar():
-            return None
-        try:
-            _FUNKE = await asyncio.to_thread(G.Funke)
-        except Exception:
-            return None
-    return _FUNKE
-
-
-def _funke_profil(funke) -> dict:
-    """Anrede, Ersatzname und Persönlichkeiten aus dem Nutzerprofil an Funke geben."""
+def _helfer_profil(helfer) -> dict:
+    """Anrede, Ersatzname und Persönlichkeiten aus dem Nutzerprofil an den Helfer geben."""
     import nutzerprofil as NP
     profil = NP.laden()
-    funke.name = profil["anrede"].split(",")[0].strip()
-    funke.ersatzname = profil["name"] or PS.nutzername()
-    funke.personen = [p.name for p in PS.list_all().values()]
-    funke.standard = PS.active().name
+    helfer.name = profil["anrede"].split(",")[0].strip()
+    helfer.ersatzname = profil["name"] or PS.nutzername()
+    helfer.personen = [p.name for p in PS.list_all().values()]
+    helfer.standard = PS.active().name
     return profil
 
 
-async def _funke_runde(funke, schritt: str, nutzer: str = "", **felder):
-    """Eine Runde mit Funke: rechnet im Thread, die Antwort erscheint Wort für Wort."""
+async def _helfer_runde(helfer, schritt: str, nutzer: str = "", **felder):
+    """Eine Runde mit dem Helfer: rechnet im Thread, die Antwort erscheint Wort für Wort."""
     from einrichtungshelfer import gespraech as G
     stand = {"text": ""}
     aufgabe = asyncio.ensure_future(asyncio.to_thread(
-        funke.sagen, schritt, nutzer, beim_text=lambda t: stand.__setitem__("text", t), **felder))
+        helfer.sagen, schritt, nutzer, beim_text=lambda t: stand.__setitem__("text", t), **felder))
     with ui.live_view(ui.helfer_zeile(G.NAME, "…")) as live:
         while not aufgabe.done():
             live.update(ui.helfer_zeile(G.NAME, stand["text"] or "…"))
@@ -2680,39 +3050,39 @@ def _einrichtung_melden(text: str) -> None:
         pass
 
 
-async def _funke_ohne_folgen(funke, schritt: str, text: str, **felder):
-    """Funke antworten lassen, ohne dass sich Anrede oder Persönlichkeit ändern (die setzt das Menü).
-    None, wenn Funke stolpert."""
+async def _helfer_ohne_folgen(helfer, schritt: str, text: str, **felder):
+    """Helfer antworten lassen, ohne dass sich Anrede oder Persönlichkeit ändern (die setzt das Menü).
+    None, wenn der Helfer stolpert."""
     from einrichtungshelfer import gespraech as G
-    name, pers = funke.name, funke.pers
+    name, pers = helfer.name, helfer.pers
     try:
         with ui.live_view(ui.helfer_zeile(G.NAME, "…")):
-            return await asyncio.to_thread(funke.sagen, schritt, text, **felder)
+            return await asyncio.to_thread(helfer.sagen, schritt, text, **felder)
     except Exception:
         return None
     finally:
-        funke.name, funke.pers = name, pers
+        helfer.name, helfer.pers = name, pers
 
 
-def _funke_wahl(funke, schritt: str) -> list[tuple[str, str]]:
+def _helfer_wahl(helfer, schritt: str) -> list[tuple[str, str]]:
     """Feste Antworten eines Schritts als (Wert, Anzeige) – leer: freie Eingabe (Anrede)."""
     if schritt == "pers":
-        return ([(p, p) for p in funke.personen]
-                + [("neu", "Eine eigene anlegen"), ("egal", f"Egal – {funke.standard or 'die Standard-Persönlichkeit'}")])
+        return ([(p, p) for p in helfer.personen]
+                + [("neu", "Eine eigene anlegen"), ("egal", f"Egal – {helfer.standard or 'die Standard-Persönlichkeit'}")])
     return {"modell": [("cloud", "☁ Cloud-Modell (mit Schlüssel)"), ("lokal", "💻 Lokal auf meinem PC"),
                        ("spaeter", "Später")],
             "pruefung": [("ja", "Ja, bitte installieren"), ("nein", "Nein, später")],
             "torch": [("ja", "Ja, Fenster öffnen"), ("nein", "Nein, später")]}.get(schritt, [])
 
 
-async def _funke_frage(funke, schritt: str, esc_hinweis: str = "Abgebrochen – /einrichten führt dich jederzeit "
-                       "wieder hierher.", **felder):
-    """Frage stellen und Antwort holen. Feste Antworten über ein Menü (Funke kann sie nicht missverstehen),
+async def _helfer_frage(helfer, schritt: str, esc_hinweis: str = "Abgebrochen – /einrichten führt dich jederzeit "
+                        "wieder hierher.", **felder):
+    """Frage stellen und Antwort holen. Feste Antworten über ein Menü (der Helfer kann sie nicht missverstehen),
     die Anrede als Text, bis eine Aktion feststeht. None: nach mehreren Versuchen weiter."""
     from einrichtungshelfer import gespraech as G
     from einrichtungshelfer.schema import SCHRITTE
-    await _funke_runde(funke, schritt, **felder)
-    if wahl := _funke_wahl(funke, schritt):
+    await _helfer_runde(helfer, schritt, **felder)
+    if wahl := _helfer_wahl(helfer, schritt):
         while True:
             wert = await ask_confirm("Deine Antwort", wahl + [("__frage__", "❓ Frage stellen"),
                                                              ("__abbruch__", "Abbrechen")])
@@ -2722,7 +3092,7 @@ async def _funke_frage(funke, schritt: str, esc_hinweis: str = "Abgebrochen – 
             if not frage:
                 continue
             ui.nutzer_sagt(frage)
-            antwort = await _funke_ohne_folgen(funke, schritt, frage, **felder)
+            antwort = await _helfer_ohne_folgen(helfer, schritt, frage, **felder)
             if antwort is not None and antwort.art == "-":
                 ui.helfer_sagt(G.NAME, antwort.text)
             else:                                         # als Antwort verstanden: gilt nicht, gewählt wird im Menü
@@ -2737,12 +3107,12 @@ async def _funke_frage(funke, schritt: str, esc_hinweis: str = "Abgebrochen – 
         art = SCHRITTE[schritt][0]
         if schritt != "pers":
             _einrichtung_melden(f"{schritt} = {wert}")
-        antwort = await _funke_ohne_folgen(funke, schritt, {"spaeter": "später", "neu": "eine eigene"}.get(wert, wert),
-                                           **felder)
+        antwort = await _helfer_ohne_folgen(helfer, schritt, {"spaeter": "später", "neu": "eine eigene"}.get(wert, wert),
+                                            **felder)
         if art == "pers":
-            funke.pers = funke.standard if wert in ("neu", "egal") else wert
+            helfer.pers = helfer.standard if wert in ("neu", "egal") else wert
         if antwort is not None and antwort.art == art and antwort.wert.lower() == wert.lower():
-            ui.helfer_sagt(G.NAME, antwort.text)          # Funkes Reaktion – nur, wenn sie zur Wahl passt
+            ui.helfer_sagt(G.NAME, antwort.text)          # Reaktion des Helfers – nur, wenn sie zur Wahl passt
         return G.Antwort(art, wert, "")
     versuche = fragen = 0
     while versuche < G.MAX_VERSUCHE:
@@ -2754,7 +3124,7 @@ async def _funke_frage(funke, schritt: str, esc_hinweis: str = "Abgebrochen – 
         ui.nutzer_sagt(eingabe)
         if "?" in eingabe and fragen < G.MAX_VERSUCHE:    # eine Frage ist keine Antwort: beantworten, nichts setzen
             fragen += 1
-            antwort = await _funke_ohne_folgen(funke, schritt, eingabe, **felder)
+            antwort = await _helfer_ohne_folgen(helfer, schritt, eingabe, **felder)
             if antwort is not None and antwort.art == "-":
                 ui.helfer_sagt(G.NAME, antwort.text)
             else:
@@ -2762,29 +3132,29 @@ async def _funke_frage(funke, schritt: str, esc_hinweis: str = "Abgebrochen – 
             _einrichtung_melden(f"{schritt}: Frage gestellt")
             continue
         versuche += 1
-        antwort = await _funke_runde(funke, schritt, eingabe, **felder)
+        antwort = await _helfer_runde(helfer, schritt, eingabe, **felder)
         if antwort.art != "-":
             return antwort
     return None
 
 
-async def _funke_einrichten(funke) -> list[str]:
-    """/einrichten im Gespräch mit Funke. Rückgabe: Befehle, die danach laufen sollen."""
+async def _helfer_einrichten(helfer) -> list[str]:
+    """/einrichten im Gespräch mit dem Helfer. Rückgabe: Befehle, die danach laufen sollen."""
     import nutzerprofil as NP
     import wizard as W
     danach: list[str] = []
-    profil = _funke_profil(funke)
+    profil = _helfer_profil(helfer)
     neu = NP.leer(profil)
     modell = "spaeter"
 
-    if neu or not funke.name:
-        a = await _funke_frage(funke, "anrede")
+    if neu or not helfer.name:
+        a = await _helfer_frage(helfer, "anrede")
         if a and a.art == "abbruch":
             return danach
         if a and a.wert != "-":
             NP.speichern(name=profil["name"], anrede=a.wert, ueber=profil["ueber"])
-    if neu and funke.personen:
-        a = await _funke_frage(funke, "pers")
+    if neu and helfer.personen:
+        a = await _helfer_frage(helfer, "pers")
         if a and a.art == "abbruch":
             return danach
         if a and a.wert == "neu":
@@ -2794,7 +3164,7 @@ async def _funke_einrichten(funke) -> list[str]:
                 PS.set_active(p.key)
                 _neuer_chat_nach_wechsel()        # sonst landete der laufende Verlauf in ihrer Chat-Datenbank
     if neu:
-        a = await _funke_frage(funke, "modell")
+        a = await _helfer_frage(helfer, "modell")
         if a and a.art == "abbruch":
             return danach
         modell = a.wert if a else "spaeter"
@@ -2809,7 +3179,7 @@ async def _funke_einrichten(funke) -> list[str]:
     _einrichtung_melden(f"Stand – offen: {', '.join(felder['offen']) or '–'} · fehlt: {', '.join(fehlt) or '–'}")
     installiert = False
     if offen:
-        a = await _funke_frage(funke, "pruefung", **felder)
+        a = await _helfer_frage(helfer, "pruefung", **felder)
         if a and a.art == "abbruch":
             return danach
         if a and a.wert == "ja":
@@ -2823,10 +3193,10 @@ async def _funke_einrichten(funke) -> list[str]:
                     ui.error(f"Hat nicht geklappt: {e}")
                     _einrichtung_melden(f"{s['id']} fehlgeschlagen: {type(e).__name__}")
     else:
-        await _funke_runde(funke, "pruefung", **felder)
+        await _helfer_runde(helfer, "pruefung", **felder)
 
     if "torch" in fehlt and W._venv_python():
-        a = await _funke_frage(funke, "torch")
+        a = await _helfer_frage(helfer, "torch")
         if a and a.art == "abbruch":
             return danach
         if a and a.wert == "ja":
@@ -2836,46 +3206,13 @@ async def _funke_einrichten(funke) -> list[str]:
                 ui.error(f"Fenster ließ sich nicht öffnen: {e}")
 
     await _modelle_anbieten()
-    await _funke_runde(funke, "ende", modell=modell, fehlt=fehlt)
+    await _helfer_runde(helfer, "ende", modell=modell, fehlt=fehlt)
     if installiert and getattr(sys, "frozen", False):
         await neu_starten_anbieten("Erst nach einem Neustart nutzen Gedächtnis, Krea und Wache das neue venv "
                                    "neben der exe.")
     if modell in ("cloud", "lokal"):
         danach.insert(0, "/model")
     return danach
-
-
-async def funke_notfall(ctx: "Ctx", exc: BaseException) -> None:
-    """Das große Modell ist ausgefallen: Funke erklärt die Fehler-Art und öffnet auf Wunsch das passende Menü.
-    Funke bekommt nur die Art des Fehlers, nie dessen Text (der kann Schlüssel oder Pfade enthalten)."""
-    funke = await _funke_holen()
-    if funke is None:
-        return
-    from einrichtungshelfer import fehlerart as FA      # erst hier: ohne das Paket ist funke None
-    anbieter = getattr(ctx.backend, "provider_id", "") or (ctx.model or "").split(":")[0]
-    fehler = FA.einordnen(exc, anbieter)
-    try:
-        _funke_profil(funke)
-        antwort = await _funke_frage(funke, "notfall", esc_hinweis="", fehler=fehler)
-    except Exception:
-        return
-    if antwort is not None and antwort.art == "oeffnen" and antwort.wert == "ja":
-        await handle_line(ctx, FA.menue(fehler))
-
-
-async def funke_plaudern(ctx: "Ctx", text: str) -> bool:
-    """Ohne Sprach-Modell antwortet Funke. False, wenn sie nicht da ist (dann gilt der bisherige Hinweis)."""
-    funke = await _funke_holen()
-    if funke is None:
-        return False
-    try:
-        _funke_profil(funke)
-        antwort = await _funke_runde(funke, "plaudern", text, fehler="kein_modell")
-    except Exception:
-        return False
-    if antwort.art == "oeffnen" and antwort.wert == "ja":
-        await handle_line(ctx, "/model")
-    return True
 
 
 async def modelle_einrichten() -> None:
@@ -2945,51 +3282,52 @@ async def _modell_teil_laden(t) -> bool:
 
 async def _modelle_anbieten() -> None:
     """Am Ende der Einrichtung: die freiwilligen Modelle anbieten."""
-    wahl = await ask_confirm("Modelle für Gedächtnis, Bilder, Stimme, Musik, Video … jetzt ansehen? Alles freiwillig.",
+    wahl = await ask_confirm("Modelle für Gedächtnis, Bilder, Stimme, Musik, Porträt … jetzt ansehen? Alles freiwillig.",
                              [("ja", "Ja, Liste zeigen"), ("spaeter", "Später  ·  /einrichten modelle")])
     if wahl == "ja":
         await modelle_einrichten()
 
 
-_HELFER_TEXT = {"funke": "✨ Funke – klein, läuft auf jedem PC, auch ohne Grafikkarte",
-                "gemma4-e2b": "Gemma 4 E2B – versteht freie Sätze besser · für kleinere Grafikkarten",
+_HELFER_TEXT = {"gemma4-e2b": "Gemma 4 E2B – versteht freie Sätze · für kleinere Grafikkarten",
                 "gemma4-e4b": "Gemma 4 E4B – versteht am meisten · ab etwa 8 GB Grafikspeicher"}
 
 
 async def _helfer_waehlen() -> str | None:
-    """Wer führt durch die Einrichtung? Funke immer; Gemma nur mit ausgeliefertem LoRA und torch. Fehlt das
-    Grundmodell, wird es auf Wunsch geladen (unsloth Q4_K_M). None: abgebrochen."""
-    try:
-        from einrichtungshelfer import gemmahelfer as GH
-    except ImportError:                           # ältere Fassung des Helfers: nur Funke
-        return "funke"
+    """Wer führt durch die Einrichtung? Gemma nur mit ausgeliefertem LoRA und torch; fehlt das Grundmodell,
+    wird es auf Wunsch geladen (unsloth Q4_K_M). "": klassischer Ablauf ohne KI-Helfer. None: abgebrochen."""
+    from einrichtungshelfer import gemmahelfer as GH
     import hfladen as H
     import modellkatalog as K
     angebot = GH.angeboten()
-    if len(angebot) == 1:
-        return "funke"
+    if not angebot:
+        return ""
     optionen = []
     for w in angebot:
         t = K.HELFER.get(w)
         zusatz = "" if t is None else ("  ·  ✅ da" if GH.grundmodell(w) else f"  ·  {H.gb(t.groesse)} laden")
         optionen.append((w, _HELFER_TEXT.get(w, w) + zusatz))
-    wahl = await ask_confirm("Wer soll dich durch die Einrichtung führen?", optionen + [("__abbruch__", "Abbrechen")])
+    wahl = await ask_confirm("Wer soll dich durch die Einrichtung führen?",
+                             optionen + [("__ohne__", "Ohne KI-Helfer – Schritt für Schritt"),
+                                         ("__abbruch__", "Abbrechen")])
     if wahl == "__abbruch__":
         ui.info("Abgebrochen – /einrichten führt dich jederzeit wieder hierher.")
         return None
-    if wahl != "funke":
-        import extlibs
-        if not await asyncio.to_thread(lambda: bool(extlibs.enable().get("aktiv"))):
-            ui.info("Gemma braucht torch, das fehlt noch – Funke richtet es mit dir ein, danach kannst du wechseln.")
-            return "funke"
-        if GH.grundmodell(wahl) is None:
-            t = K.HELFER[wahl]
-            ui.info(f"📜 {t.titel}: Lizenz {t.lizenz} – {t.lizenz_link}")
-            ui.info(f"   {t.dateien[0].name}  ·  {H.gb(t.groesse)}  ·  {K.quelle(t.dateien[0])}")
-            los = await ask_confirm(f"{H.gb(t.groesse)} herunterladen?",
-                                    [("ja", "⬇  Ja, Lizenz gelesen – herunterladen"), ("nein", "Nein – Funke nehmen")])
-            if los != "ja" or not await _modell_teil_laden(t):
-                return "funke"
+    if wahl == "__ohne__":
+        return ""
+    import extlibs
+    if not await asyncio.to_thread(lambda: bool(extlibs.enable().get("aktiv"))):
+        ui.info("Gemma braucht torch, das fehlt noch – die Einrichtung geht ohne KI-Helfer weiter und richtet es "
+                "mit dir ein, danach kannst du wechseln.")
+        return ""
+    if GH.grundmodell(wahl) is None:
+        t = K.HELFER[wahl]
+        ui.info(f"📜 {t.titel}: Lizenz {t.lizenz} – {t.lizenz_link}")
+        ui.info(f"   {t.dateien[0].name}  ·  {H.gb(t.groesse)}  ·  {K.quelle(t.dateien[0])}")
+        los = await ask_confirm(f"{H.gb(t.groesse)} herunterladen?",
+                                [("ja", "⬇  Ja, Lizenz gelesen – herunterladen"),
+                                 ("nein", "Nein – ohne KI-Helfer weiter")])
+        if los != "ja" or not await _modell_teil_laden(t):
+            return ""
     import config
     config.update(einrichtungs_helfer=wahl)
     _einrichtung_melden(f"Helfer = {wahl}")
@@ -2999,35 +3337,27 @@ async def _helfer_waehlen() -> str | None:
 async def run_wizard(nur_offene: bool = False) -> list[str]:
     """Einrichtungs-Assistent (/einrichten): prüft, fragt, installiert. Rückgabe: Befehle, die danach laufen sollen.
 
-    Ist der Einrichtungs-Helfer Funke mitgeliefert, führt er durch das Gespräch; sonst (oder wenn er nicht
-    lädt) der klassische Ablauf. Am Ende werden die Modelle der Motoren angeboten (freiwillig)."""
+    Ist ein Gemma-Helfer (mit LoRA) angeboten und gewählt, führt er durch das Gespräch; sonst (oder wenn er
+    nicht lädt) der klassische Ablauf. Am Ende werden die Modelle der Motoren angeboten (freiwillig)."""
     import wizard as W
 
-    if not nur_offene and not funke_da():
-        ui.info(f"{FUNKE_FEHLT} Die Einrichtung läuft klassisch.")
-    elif not nur_offene:
-        from einrichtungshelfer import gespraech as G
-        if G.verfuegbar():
-            try:
-                from einrichtungshelfer import gemmahelfer as GH
-                bauen = GH.funke_bauen
-            except ImportError:                   # ältere Fassung des Helfers ohne Gemma: Funke allein
-                def bauen(_wahl):
-                    return G.Funke(), "funke"
+    if not nur_offene:
+        from einrichtungshelfer import gemmahelfer as GH
+        if GH.angeboten():
+            from einrichtungshelfer import gespraech as G
             wahl = await _helfer_waehlen()
             if wahl is None:
                 return []
-            try:
-                funke, ist = await _run_with_status(f"✨ {G.NAME} wacht auf", lambda _s: bauen(wahl))
-            except Exception as e:
-                ui.warn(f"{G.NAME} ließ sich nicht laden ({e}) – es geht ohne ihn weiter.")
-            else:
-                if ist != wahl:
-                    ui.warn("Gemma ließ sich nicht laden – Funke hilft dir weiter.")
+            if wahl:
                 try:
-                    return await _funke_einrichten(funke)
+                    helfer = await _run_with_status(f"✨ {G.NAME} wacht auf", lambda _s: GH.helfer_bauen(wahl))
                 except Exception as e:
-                    ui.warn(f"{G.NAME} ist gestolpert ({e}) – es geht ohne ihn weiter.")
+                    ui.warn(f"{G.NAME} ließ sich nicht laden ({e}) – es geht ohne KI-Helfer weiter.")
+                else:
+                    try:
+                        return await _helfer_einrichten(helfer)
+                    except Exception as e:
+                        ui.warn(f"{G.NAME} ist gestolpert ({e}) – es geht ohne KI-Helfer weiter.")
 
     ui.info("🧰 Ich schaue nach, was auf diesem PC schon da ist …")
     schritte = await asyncio.to_thread(W.check_all)
@@ -3117,6 +3447,16 @@ async def code_befehl(ctx: "Ctx | None" = None, arg: str = "") -> None:
     unter = arg.strip()
     if unter.lower() in ("end", "ende", "aus", "stop", "off"):
         _coding_beenden()
+        return
+    if unter.lower() in ("frei", "vorsicht"):              # eigener Schalter, nur der Nutzer setzt ihn
+        import coding as _coding
+        import config as _config
+        _config.update(**{_coding.FREIGABE_SCHALTER: unter.lower()})
+        if unter.lower() == "frei":
+            ui.success("🚀 Coding frei: im Projekt arbeitet sie ohne Rückfrage durch – nur die Rote Liste fragt "
+                       "(außerhalb des Projekts, Ordner löschen, git push, Downloads, Zeitpläne).")
+        else:
+            ui.success("🛡 Coding vorsicht: Änderungen und Befehle fragen wie im Arbeitsmodus.")
         return
     if unter.lower() in ("status", "?", ""):
         if not coding.aktiv():

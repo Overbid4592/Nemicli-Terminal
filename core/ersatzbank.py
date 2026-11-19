@@ -19,7 +19,7 @@ import config
 MAX_ERSATZ = 2
 SCHWELLE = 5
 FENSTER_S = 30 * 60
-LOKAL = ("gguf", "ollama", "funke")
+LOKAL = ("gguf", "ollama")
 SPERR_ANFAENGE = ("Fehler: 🛡️ Geschützt", "Fehler: 🔒 Komplett gesperrt", "Fehler: 🛡️ Tabu")
 MELDUNG = ("Lieber Nutzer, die KI hat mehrfach versucht, die Sperre zu durchdringen, und musste "
            "deshalb herausgefiltert werden. Bitte suche dir mit /model eine neue aus.")

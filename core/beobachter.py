@@ -23,6 +23,7 @@ MAX_DATEIEN = 40                  # so viele Dateien und Ordner merkt er sich je
 MAX_INHALT = 120_000              # bis zu dieser Größe (Bytes) wird der Inhalt für den Unterschied gemerkt
 MAX_DIFF_ZEILEN = 14              # so viele geänderte Zeilen zeigt ein Hinweis höchstens
 MAX_MELDUNGEN = 6                 # so viele Dateien/Ordner nennt ein Rundenhinweis höchstens
+MAX_DIFF_EINGABE = 4000           # mehr Zeilen je Seite: kein Zeilenvergleich, nur Größe und Zeilenzahl
 PAUSE_S = 30 * 60                 # ab dieser Pause zwischen zwei Runden: Hinweis mit der neuen Uhrzeit
 UMGEBUNG_NAMEN = {"modell": "Modell", "persoenlichkeit": "Persönlichkeit", "modus": "Modus",
                   "arbeitsordner": "Arbeitsordner"}
@@ -95,6 +96,8 @@ def _uhrzeit(zeit: float) -> str:
 def unterschied(alt: str, neu: str, name: str = "") -> str:
     """Kurzer Unterschied (+ neue, − entfernte Zeilen mit Zeilennummer), als Fremdinhalt gerahmt."""
     a, b = alt.splitlines(), neu.splitlines()
+    if max(len(a), len(b)) > MAX_DIFF_EINGABE:            # difflib wüchse quadratisch
+        return ""
     zeilen, plus, minus = [], 0, 0
     for tag, i1, i2, j1, j2 in difflib.SequenceMatcher(None, a, b, autojunk=False).get_opcodes():
         if tag == "equal":
@@ -125,6 +128,10 @@ def _aenderung(alt: dict, neu: dict | None, name: str) -> str:
         diff = unterschied(alt["text"], neu["text"], name)
         if diff:
             return diff
+        n_alt, n_neu = len(alt["text"].splitlines()), len(neu["text"].splitlines())
+        if max(n_alt, n_neu) > MAX_DIFF_EINGABE:
+            return (f"Größe {alt['groesse']:,} → {neu['groesse']:,} Bytes, "
+                    f"{n_alt:,} → {n_neu:,} Zeilen").replace(",", ".")
     return f"Größe {alt['groesse']:,} → {neu['groesse']:,} Bytes".replace(",", ".")
 
 
@@ -237,6 +244,7 @@ def runde_hinweis(umgebung: dict | None = None, jetzt: float | None = None) -> s
         dateien = list(_dateien.items())
         ordner = list(_ordner.items())
     geaendert = []
+    weitere = 0                                        # über MAX_MELDUNGEN: nur gezählt, ohne Unterschied
     for s, alt in reversed(dateien):                   # zuletzt gesehene zuerst
         try:
             st = os.stat(s)
@@ -250,8 +258,11 @@ def runde_hinweis(umgebung: dict | None = None, jetzt: float | None = None) -> s
             with _lock:
                 _merken(_dateien, s, {**neu, "zeit": alt["zeit"]})
             continue
-        geaendert.append(f"- Datei {s} ({'gelesen ' + _vor(jetzt - alt['zeit'])}): "
-                         f"{_aenderung(alt, neu, Path(s).name)}")
+        if len(geaendert) < MAX_MELDUNGEN:
+            geaendert.append(f"- Datei {s} ({'gelesen ' + _vor(jetzt - alt['zeit'])}): "
+                             f"{_aenderung(alt, neu, Path(s).name)}")
+        else:
+            weitere += 1
         kurz.append(f"{Path(s).name} {'weg' if neu is None else 'geändert'}")
         with _lock:
             if neu is None:
@@ -273,8 +284,10 @@ def runde_hinweis(umgebung: dict | None = None, jetzt: float | None = None) -> s
             with _lock:
                 if s in _ordner:
                     _ordner[s]["mtime"] = mtime
-    if len(geaendert) > MAX_MELDUNGEN:
-        geaendert = geaendert[:MAX_MELDUNGEN] + [f"- … und {len(geaendert) - MAX_MELDUNGEN} weitere"]
+    weitere += max(0, len(geaendert) - MAX_MELDUNGEN)
+    geaendert = geaendert[:MAX_MELDUNGEN]
+    if weitere:
+        geaendert.append(f"- … und {weitere} weitere")
     punkte += geaendert
     letzter_kurz = kurz
     if not punkte:

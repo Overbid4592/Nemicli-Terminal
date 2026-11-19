@@ -37,16 +37,13 @@ HIDDEN += ["loramotor"] + ["loramotor." + f.stem for f in sorted((ROOT / "loramo
 # TensorRT-Zusatz (trtmotor); tensorrt_rtx kommt wie torch aus dem venv, das SDK legt der Nutzer ab
 HIDDEN += ["trtmotor"] + ["trtmotor." + f.stem for f in sorted((ROOT / "trtmotor").glob("*.py"))
                           if f.stem != "__init__"]
-# Einrichtungs-Helfer: nur die Laufzeit (reines Python); Training/Lernstoff bleiben in der Werkstatt.
-# Ohne den Ordner (öffentliche Fassung) baut NemiCLI ohne Funke.
-if (ROOT / "einrichtungshelfer").is_dir():
-    HIDDEN += ["einrichtungshelfer"] + ["einrichtungshelfer." + m for m in (
-        "schema", "wortschatz", "laufzeit", "gespraech", "fehlerart", "funkechat", "torchmodell", "gemmahelfer")
-        if (ROOT / "einrichtungshelfer" / f"{m}.py").is_file()]
-EXCLUDES_HELFER = ["einrichtungshelfer." + m for m in ("training", "daten", "daten_notfall", "daten_gross", "pruefen",
-                                                       "plaudern", "gemmalernstoff")]
+# Einrichtungs-Helfer: Gespräch und Gemma-Anbindung; Lernstoff/Training bleiben in der Werkstatt
+HIDDEN += ["einrichtungshelfer"] + ["einrichtungshelfer." + m for m in ("schema", "gespraech", "gemmahelfer")]
+EXCLUDES_HELFER = ["einrichtungshelfer." + m for m in ("daten", "daten_notfall", "gemmalernstoff")]
 # NemiView: eigener App-Viewer (JavaScript-Interpreter, HTML/CSS, Fenster) – reines Python
 HIDDEN += ["nemiview"] + ["nemiview." + f.stem for f in sorted((ROOT / "nemiview").glob("*.py")) if f.stem != "__init__"]
+# Wache: alle Module, auch die erst mitten im Code geladenen (termin, kimodell …)
+HIDDEN += ["wache"] + ["wache." + f.stem for f in sorted((ROOT / "tools" / "wache").glob("*.py")) if f.stem != "__init__"]
 # main.py ist auf vier Dateien verteilt; die Teile lädt main._teil_laden (kein import)
 HIDDEN += ["main_dienste", "main_befehle", "main_start"]
 # Porträt-Motor (LivePortrait-Nachbau) – Paket unter engines/
@@ -102,24 +99,47 @@ for _pkg in _STDLIB:
 HIDDEN = sorted(set(HIDDEN))
 
 # Mitgelieferte Dateien (Daten, kein Code).
-DATAS = [(str(ROOT / "allowlist.json"), ".")]
+DATAS = [(str(ROOT / "allowlist.json"), "."),
+         (str(ROOT / "core" / "netzzwang.py"), ".")]      # Quelle für den Netz-Zwang in Python-Kindprozessen
+# Momentaufnahme der Schutzliste (build_exe.py lädt sie vor dem Bau; nur Kürzel, keine Adressen)
+for _moment in ("schutzliste_moment.bin", "schutzliste_moment.json"):
+    if (ROOT / "build" / _moment).is_file() and (ROOT / "build" / _moment).stat().st_size:
+        DATAS.append((str(ROOT / "build" / _moment), "."))
 for extra in ("README.md", "CHANGELOG.md", "LICENSE", ".env.example", "requirements.txt", "nemicli.ico"):
     if (ROOT / extra).exists():
         DATAS.append((str(ROOT / extra), "."))
 DATAS.append((str(ROOT / "engines" / "liveportrait" / "LIZENZ.txt"), "liveportrait"))   # MIT-Hinweis des Originals
 DATAS.append((str(ROOT / "engines" / "musik" / "LIZENZ.txt"), "musik"))                 # MIT-Hinweise der Vorbilder
+# Unpackt als rohe .py: tools/entpacken.py lädt sie nur mit passender SHA-256; dazu die MIT-Lizenz
+DATAS.append((str(ROOT / "tools" / "unpackt.py"), "tools"))
+DATAS.append((str(ROOT / "tools" / "unpackt_LICENSE.txt"), "tools"))
 for _vorlage in sorted((ROOT / "appstore_vorlagen").rglob("*")):                         # Beispiel-Apps des Appstores
     if _vorlage.is_file() and "__pycache__" not in _vorlage.parts:
         DATAS.append((str(_vorlage), str(_vorlage.parent.relative_to(ROOT)).replace("\\", "/")))
 for _db in sorted((ROOT / "ggufengine" / "daten").glob("*.json")):      # Modell-Datenbank
     DATAS.append((str(_db), "ggufengine/daten"))
-for _ordner in ("modell", "modell_gross"):           # Funke (gespraech.ordner) und Funke Groß (funkechat.ordner)
-    for _helfer in ("helfer.bin", "wortschatz.json"):
-        if (ROOT / "einrichtungshelfer" / _ordner / _helfer).exists():
-            DATAS.append((str(ROOT / "einrichtungshelfer" / _ordner / _helfer), f"einrichtungshelfer/{_ordner}"))
-for _zusatz in sorted((ROOT / "einrichtungshelfer" / "lora").glob("*")):   # LoRA des Gemma-Helfers + LIZENZ.txt
-    if _zusatz.suffix in (".safetensors", ".txt") and not _zusatz.stem.endswith("_stand"):
-        DATAS.append((str(_zusatz), "einrichtungshelfer/lora"))
+# LoRA des Gemma-Helfers + LIZENZ.txt: feste Liste statt Glob – eine dort abgelegte fremde oder aus Nutzerdaten
+# trainierte LoRA kommt so nie ins Paket.
+for _zusatz in ("LIZENZ.txt", "gemma-4-E2B-it-Q4_K_M.safetensors", "gemma-4-E4B-it-Q4_K_M.safetensors"):
+    if (ROOT / "einrichtungshelfer" / "lora" / _zusatz).is_file():
+        DATAS.append((str(ROOT / "einrichtungshelfer" / "lora" / _zusatz), "einrichtungshelfer/lora"))
+
+# Bewegung der Figur (engines/bewegung.py): SprongMotion-Modell und -Laufzeit mit Lizenz, Apache-2.0. Die exe legt sie
+# beim ersten Start in den Bewegungs-Modellordner der Installation (nur mit passender SHA-256).
+_MOTION = ROOT / "KI-Modelle" / "KI-Bewegung" / "Bewegungsmodell" / "SprongMotion-14M"
+if not (_MOTION / "SprongMotion-14M-v1.0-Q8_0.gguf").is_file():
+    _MOTION = ROOT / "Models" / "Motion"                  # früherer Ort
+_sys.path.insert(0, str(ROOT / "engines"))
+import bewegung as _bewegung                              # feste SHA-256 von Modell und DLL
+for _pfad, _soll in ((_MOTION / _bewegung.MODELL, _bewegung.MODELL_SHA),
+                     (_MOTION / f"sprongmotion-{_bewegung.VERSION}" / _bewegung.DLL, _bewegung.DLL_SHA)):
+    if _pfad.is_file() and _bewegung.sha256(_pfad) != _soll:
+        raise SystemExit(f"SHA-256 stimmt nicht, wird nicht eingepackt: {_pfad}")
+if (_MOTION / _bewegung.MODELL).is_file():
+    DATAS.append((str(_MOTION / _bewegung.MODELL), "Motion"))
+for _datei in (_bewegung.DLL, "LICENSE", "NOTICE"):
+    if (_MOTION / f"sprongmotion-{_bewegung.VERSION}" / _datei).is_file():
+        DATAS.append((str(_MOTION / f"sprongmotion-{_bewegung.VERSION}" / _datei), f"Motion/sprongmotion-{_bewegung.VERSION}"))
 
 # Build-Nummer in die exe: dort gibt es kein Git, das die Commits zählt.
 _sys.path.insert(0, str(ROOT / "core"))
@@ -156,8 +176,8 @@ pyz = PYZ(a.pure)
 
 # exe + Ordner NemiCLIT2 statt einer einzigen Datei: Eine exe, die sich bei
 # jedem Start in den Temp-Ordner entpackt und von dort Code ausführt, ist ein
-# Schädlingsmuster – Bitdefender (Advanced Threat Defense) hat sie deshalb
-# samt der zuletzt geschriebenen Quelldateien in Quarantäne genommen.
+# Schädlingsmuster – der Virenschutz nimmt sie deshalb samt der zuletzt
+# geschriebenen Quelldateien in Quarantäne.
 # Python, Bibliotheken und Code liegen in NemiCLIT2 (sys._MEIPASS), Daten nie.
 exe = EXE(
     pyz,

@@ -23,10 +23,17 @@ ZERTIFIKAT = "CN=NemiCLI"
 JAHRE = 5
 
 
+def _powershell() -> str:
+    """Voller Pfad: ein bloßer Name würde zuerst im aktuellen Ordner gesucht."""
+    import os
+    exe = Path(os.environ.get("SystemRoot") or r"C:\Windows") / "System32" / "WindowsPowerShell" / "v1.0" / "powershell.exe"
+    return str(exe) if exe.is_file() else "powershell"
+
+
 def _ps(skript: str) -> subprocess.CompletedProcess:
     # Windows PowerShell gibt umgeleitet in der OEM-Codepage aus; UTF-8 ohne BOM erzwingen.
     skript = "[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding $false\n" + skript
-    return subprocess.run(["powershell", "-NoProfile", "-Command", skript],
+    return subprocess.run([_powershell(), "-NoProfile", "-Command", skript],
                           capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
@@ -43,6 +50,8 @@ def anlegen() -> int:
         "$ErrorActionPreference='Stop'",
         f"$z = New-SelfSignedCertificate -Type CodeSigningCert -Subject '{ZERTIFIKAT}' "
         r"-CertStoreLocation Cert:\CurrentUser\My -KeyAlgorithm RSA -KeyLength 3072 "
+        # Der Schlüssel verlässt den Speicher nie; ca=false: das vertraute Zertifikat beglaubigt keine anderen.
+        "-KeyExportPolicy NonExportable -TextExtension @('2.5.29.19={text}ca=false') "
         f"-HashAlgorithm SHA256 -NotAfter (Get-Date).AddYears({JAHRE})",
         "try {",
         f"  Export-Certificate -Cert $z -FilePath '{cer}' | Out-Null",

@@ -7,14 +7,14 @@ Aufruf:   python build_exe.py              exe bauen + Setup-Datei
           python build_exe.py --nur-msi    nur die MSI aus dem vorhandenen dist/NemiCLI
 Ergebnis: dist/NemiCLI/NemiCLI.exe  +  dist/NemiCLI/NemiCLIT2/  (Python, Bibliotheken, Code)
           dist/NemiCLI/SHA256SUMS.txt    (Prüfsummen der exe-Dateien)
-          dist/NemiCLI-Setup-<Build>.exe (eine Datei: installiert oder aktualisiert .ncli2)
+          dist/NemiCLI-Setup-<Build>.exe (eine Datei: installiert oder aktualisiert .nemicli im Benutzerordner)
 
 Liegt ein Code-Signatur-Zertifikat "CN=NemiCLI" im Zertifikatsspeicher des
 Nutzers (anlegen: python zertifikat.py), werden die exe-Dateien signiert.
 
 Die exe startet direkt aus NemiCLIT2 – sie entpackt nichts in den Temp-Ordner.
 Das ist Absicht: eine exe, die sich bei jedem Start selbst entpackt und von
-dort Code ausführt, hält Bitdefender für Schadsoftware.
+dort Code ausführt, hält der Virenschutz für Schadsoftware.
 
 Beim Start legt NemiCLI selbst an, was es braucht (paths.ensure_layout), und
 fragt beim ersten Mal, wo der Daten-Ordner liegen soll. Auf dem Zielrechner
@@ -25,6 +25,7 @@ Die großen Modelle kommen NICHT mit – jeder sucht sich selbst aus, welche.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import shutil
 import subprocess
@@ -37,6 +38,7 @@ DIST = ROOT / "dist"
 ZIEL = DIST / "NemiCLI"
 EXE = ZIEL / "NemiCLI.exe"
 ZERTIFIKAT = "CN=NemiCLI"
+# Set-AuthenticodeSignature akzeptiert nur http. Die Antwort ist von der Zeitstempelstelle signiert.
 ZEITSTEMPEL = "http://timestamp.digicert.com"
 
 
@@ -61,7 +63,32 @@ def check() -> bool:
     if not (ROOT / "NemiCLI.spec").exists():
         print("FEHLT: NemiCLI.spec")
         ok = False
+    for fehler in motion_fehlt():
+        print(f"FEHLT: {fehler}")
+        ok = False
     return ok
+
+
+def motion_fehlt() -> list[str]:
+    """Jede exe bringt die Bewegung der Figur mit (NemiCLI.spec): Modell und Laufzeit im Bewegungs-Modellordner,
+    mit der festen SHA-256 aus engines/bewegung.py. Gibt zurück, was fehlt oder nicht stimmt."""
+    sys.path.insert(0, str(ROOT / "engines"))
+    import bewegung
+    ordner = ROOT / "KI-Modelle" / "KI-Bewegung" / "Bewegungsmodell" / "SprongMotion-14M"   # wie NemiCLI.spec
+    if not (ordner / bewegung.MODELL).is_file() and (ROOT / "Models" / "Motion" / bewegung.MODELL).is_file():
+        ordner = ROOT / "Models" / "Motion"                                            # früherer Ort
+    noetig = [(ordner / bewegung.MODELL, bewegung.MODELL_SHA),
+              (ordner / f"sprongmotion-{bewegung.VERSION}" / bewegung.DLL, bewegung.DLL_SHA)]
+    fehlt = []
+    for pfad, soll in noetig:
+        if not pfad.is_file():
+            fehlt.append(f"{pfad.relative_to(ROOT)}  ->  /bewegung holen bzw. einrichten (Entwicklungsordner)")
+        elif bewegung.sha256(pfad) != soll:
+            fehlt.append(f"{pfad.relative_to(ROOT)}: SHA-256 stimmt nicht")
+    for name in ("LICENSE", "NOTICE"):
+        if not (ordner / f"sprongmotion-{bewegung.VERSION}" / name).is_file():
+            fehlt.append(f"{(ordner / f'sprongmotion-{bewegung.VERSION}' / name).relative_to(ROOT)} (gehört zur DLL)")
+    return fehlt
 
 
 def eigene_daten_im_ziel() -> list[str]:
@@ -74,14 +101,34 @@ def eigene_daten_im_ziel() -> list[str]:
     if not ZIEL.is_dir():
         return []
     gefunden = [n for n in ("nemicli.config.json", ".env") if (ZIEL / n).exists()]
-    von_selbst = {"folder_model.json"}           # legt NemiCLI beim Start ohne Zutun an
-    for n in ("chats", "Gespraeche", "learned", "Wache", "Persoenlichkeiten", "Bilder",
-              "Agenten", "Berichte", "Models"):
+    von_selbst = {"folder_model.json", "Anleitung.txt"}     # legt NemiCLI beim Start ohne Zutun an
+    sys.path.insert(0, str(ROOT / "core"))
+    import paths                                            # alles, was zum Daten-Ordner gehört
+    for n in dict.fromkeys(list(paths.DATEN_INHALT) + ["KI-Modelle", "Backup", "Cache", "ModelGGUF", "Vision"]):
         d = ZIEL / n
-        if d.is_dir() and any(f.name not in von_selbst and not f.name.startswith("LIES-MICH")
-                              for f in d.rglob("*") if f.is_file()):
+        if d.is_file():
+            gefunden.append(n)
+        elif d.is_dir() and any(f.name not in von_selbst and not f.name.startswith("LIES-MICH")
+                                for f in d.rglob("*") if f.is_file()):
             gefunden.append(n)
     return gefunden
+
+
+MOMENT_ORDNER = ROOT / "build"          # NemiCLI.spec packt die Momentaufnahme der Schutzliste von hier ein
+
+
+def schutzliste_moment() -> str:
+    """Schutzliste laden und als Momentaufnahme ins Bündel legen: jede exe ist ab dem ersten Start geschützt.
+    Ohne Netz bleibt der bisherige Stand (einmal gesperrt, immer gesperrt)."""
+    for sub in ("core", "tools"):
+        if str(ROOT / sub) not in sys.path:
+            sys.path.insert(0, str(ROOT / sub))
+    import schutzliste
+    MOMENT_ORDNER.mkdir(parents=True, exist_ok=True)
+    stand = schutzliste.momentaufnahme(MOMENT_ORDNER)
+    fehler = [f"{q.get('anzeige')}: {q['fehler']}" for q in stand.get("quellen", {}).values() if q.get("fehler")]
+    return (f"{stand.get('eintraege', 0):,} Adressen".replace(",", ".")
+            + (f" (nicht aktualisiert: {', '.join(fehler)})" if fehler else ""))
 
 
 def build() -> bool:
@@ -113,10 +160,13 @@ def signieren(liste: list[Path] | None = None) -> str:
         "  try { $s = Set-AuthenticodeSignature -FilePath $f -Certificate $z -HashAlgorithm SHA256 "
         f"-TimestampServer '{ZEITSTEMPEL}' }}",
         "  catch { $s = Set-AuthenticodeSignature -FilePath $f -Certificate $z -HashAlgorithm SHA256 }",
-        '  "$($s.Status)  $(Split-Path $f -Leaf)"',
+        "  $ts = if ((Get-AuthenticodeSignature $f).TimeStamperCertificate) { '' } else { '  (OHNE Zeitstempel)' }",
+        '  "$($s.Status)  $(Split-Path $f -Leaf)$ts"',
         "}",
     ])
-    r = subprocess.run(["powershell", "-NoProfile", "-Command", skript],
+    # PSModulePath aus PowerShell 7 lässt Windows PowerShell fremde Module laden (-CodeSigningCert fehlt dann).
+    umgebung = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    r = subprocess.run(["powershell", "-NoProfile", "-Command", skript], env=umgebung,
                        capture_output=True, text=True, encoding="utf-8", errors="replace")
     return "\n".join(x.strip() for x in (r.stdout, r.stderr) if x and x.strip())
 
@@ -172,7 +222,7 @@ def msi_bauen() -> Path | None:
 
 def setup_bauen() -> Path | None:
     """dist/NemiCLI-Setup-<Build>.exe: eine Datei, die dist/NemiCLI als ZIP trägt und es in eine
-    vorhandene Installation (.ncli2) aufspielt oder neu installiert (installer/nemicli_setup.py).
+    vorhandene Installation (.nemicli im Benutzerordner) aufspielt oder neu installiert (installer/nemicli_setup.py).
     Sie packt sich nur zum Installieren aus, NemiCLI selbst startet weiter aus seinem Ordner."""
     import zipfile
     _step("Setup-Datei")
@@ -188,7 +238,7 @@ def setup_bauen() -> Path | None:
     arbeit.mkdir(parents=True, exist_ok=True)
     paket = arbeit / "nutzlast.zip"
     sys.path.insert(0, str(ROOT / "installer"))
-    from aufspielen import PROGRAMMTEILE           # das Setup nimmt nur diese an (z. B. kein ModelGGUF/, Vision/)
+    from aufspielen import PROGRAMMTEILE           # das Setup nimmt nur diese an (z. B. kein KI-Modelle/)
     with zipfile.ZipFile(paket, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as z:
         for f in sorted(ZIEL.rglob("*")):
             if f.is_file() and f.relative_to(ZIEL).parts[0] in PROGRAMMTEILE:
@@ -197,7 +247,7 @@ def setup_bauen() -> Path | None:
     icon = ROOT / "nemicli.ico"
     befehl = [sys.executable, "-m", "PyInstaller", str(ROOT / "installer" / "nemicli_setup.py"),
               "--onefile", "--windowed", "--noconfirm", "--name", name,
-              "--paths", str(ROOT / "installer"),
+              "--paths", str(ROOT / "installer"), "--paths", str(ROOT / "core"),
               "--add-data", f"{paket};.", "--add-data", f"{icon};.", "--icon", str(icon),
               "--distpath", str(DIST), "--workpath", str(arbeit / "werk"), "--specpath", str(arbeit)]
     for weg in ("torch", "numpy", "PIL", "tkinter", "matplotlib"):
@@ -215,11 +265,19 @@ def setup_bauen() -> Path | None:
     print(f"  SHA-256: {h}")
     for weg in alte_setups_weg(DIST):
         print(f"  alte Setup-Datei entfernt: {weg}")
+    zwischenstand_weg(arbeit)
     return datei
 
 
+def zwischenstand_weg(arbeit: Path) -> None:
+    """Arbeitsordner und Rezepte der Setup-Bauten (je Bau einige 100 MB) – entstehen bei jedem Bau neu."""
+    shutil.rmtree(arbeit / "werk", ignore_errors=True)
+    for spec in arbeit.glob("NemiCLI-Setup-*.spec"):
+        spec.unlink(missing_ok=True)
+
+
 SETUPS_BEHALTEN = 3
-SETUPS_STABIL = {"NemiCLI-Setup-9.46.880.exe"}   # sichere Stände: bleiben immer und zählen nicht mit
+SETUPS_STABIL = {"NemiCLI-Setup-9.80.1048.exe"}   # sichere Stände: bleiben immer und zählen nicht mit
 
 
 def _setup_version(p: Path) -> tuple[int, ...]:
@@ -259,6 +317,11 @@ def main() -> int:
         alt.unlink()
         print(f"  alte Ein-Datei-exe entfernt: {alt}")
     print("alles da.")
+    _step("Schutzliste (Momentaufnahme)")
+    try:
+        print("  " + schutzliste_moment())
+    except Exception as e:                     # kein Abbruch: die exe lädt die Listen dann beim ersten Start
+        print(f"  nicht geladen ({type(e).__name__}: {e}) – die exe lädt die Listen beim ersten Start")
     if not build():
         print("\nBau fehlgeschlagen – Meldung oben lesen.")
         return 1

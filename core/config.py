@@ -18,8 +18,11 @@ from pathlib import Path
 import keyvault
 
 try:                 # Config und .env gehoeren zum PROGRAMM, nicht zu den Daten.
-    from paths import INSTALL as _ROOT     # (sonst dreht es sich im Kreis:
-except Exception:                          #  paths liest die Config, um DATEN zu finden)
+    import paths as _paths                 # (sonst dreht es sich im Kreis:
+    _ROOT = _paths.INSTALL                 #  paths liest die Config, um DATEN zu finden)
+    if _paths._testlauf():                 # Test-Suite: echte Einstellungen und Schlüssel bleiben unberührt
+        _ROOT = _paths.TESTDATEN
+except Exception:
     _ROOT = Path(__file__).resolve().parent.parent            # Projekt-Wurzel
 _FILE = _ROOT / "nemicli.config.json"
 _ENV = _ROOT / ".env"
@@ -82,11 +85,12 @@ def load() -> dict:
     return {}
 
 
-def _melden(text: str) -> None:
-    """Einmal je Fehlerart sichtbar machen – nicht still schlucken."""
-    if text in _gemeldet:
+def _melden(text: str, art: str | None = None) -> None:
+    """Einmal je Fehlerart sichtbar machen – nicht still schlucken. `art`: woran Gleiches erkannt wird (sonst
+    der Text; Zwischendateien tragen wechselnde Namen)."""
+    if (art or text) in _gemeldet:
         return
-    _gemeldet.add(text)
+    _gemeldet.add(art or text)
     try:
         import ui
         ui.warn(f"⚙ Einstellungen nicht gespeichert: {text} ({_FILE})")
@@ -94,38 +98,57 @@ def _melden(text: str) -> None:
         pass
 
 
+def _hinweis(text: str) -> None:
+    """Wie _melden, für Fälle, in denen trotzdem gespeichert wird."""
+    if text in _gemeldet:
+        return
+    _gemeldet.add(text)
+    try:
+        import ui
+        ui.warn(f"⚙ Einstellungen: {text} ({_FILE})")
+    except Exception:
+        pass
+
+
+def _direkt_schreiben(pfad: Path, text: str) -> None:
+    """Rückfall, wenn kein Tausch geht (die Datei ist von einem anderen Prozess ohne Löschrecht offen): an Ort und
+    Stelle schreiben, bis auf die Platte. Die .bak daneben ist dann schon der alte, vollständige Stand."""
+    with open(pfad, "w", encoding="utf-8") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+
+
 def save(data: dict) -> bool:
-    """Sicher speichern: Zwischendatei, dann tauschen; die bisherige Fassung bleibt als .bak.
-    Ist die Datei gerade von einem anderen Prozess offen (die Wache liest sie oft), wird der
-    Tausch kurz wiederholt und zuletzt direkt geschrieben. False + Hinweis, wenn nichts ging."""
+    """Sicher speichern: Zwischendatei bis auf die Platte, dann tauschen (core/atomar.py); die bisherige Fassung
+    bleibt als .bak. Ist die Datei gerade von einem anderen Prozess offen (die Wache liest sie oft), wird der Tausch
+    nach einer Pause noch einmal versucht und zuletzt direkt geschrieben. False + Hinweis, wenn nichts ging."""
     global letzter_fehler, _GELESEN
+    import atomar
     # Gleich große Fassung im selben Zeittakt hätte dieselbe Kennung: der eigene Stand gilt sofort.
     _GELESEN = None
-    tmp = _FILE.with_name(f"{_FILE.name}.{os.getpid()}.tmp")       # je Prozess eigene (Hauptprogramm, Wache)
+    text = json.dumps(data, indent=2, ensure_ascii=False)
     try:
-        tmp.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
         if _lesen(_FILE) is not None:
-            shutil.copyfile(_FILE, _FILE.with_name(_FILE.name + ".bak"))
-        for versuch in range(6):
+            bak = _FILE.with_name(_FILE.name + ".bak")
             try:
-                os.replace(tmp, _FILE)
-                break
+                atomar.text_schreiben(bak, _FILE.read_text(encoding="utf-8"))
             except PermissionError:
-                if versuch == 5:
-                    _FILE.write_text(tmp.read_text(encoding="utf-8"), encoding="utf-8")
-                    tmp.unlink(missing_ok=True)
-                    break
-                time.sleep(0.05)
+                shutil.copyfile(_FILE, bak)
+        try:
+            atomar.text_schreiben(_FILE, text)
+        except PermissionError:
+            time.sleep(0.2)
+            try:
+                atomar.text_schreiben(_FILE, text)
+            except PermissionError:
+                _direkt_schreiben(_FILE, text)
         _GELESEN = None
         letzter_fehler = ""
         return True
     except Exception as e:
         letzter_fehler = f"{type(e).__name__}: {e}"
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        _melden(letzter_fehler)
+        _melden(letzter_fehler, f"{type(e).__name__} {getattr(e, 'errno', '')}")
         return False
 
 
@@ -140,12 +163,26 @@ class _Dateisperre:
         self.pfad = _FILE.with_name(_FILE.name + ".lock")
         self.fd = None
 
+    WARTEN_S = (3.0, 2.0)          # erster Versuch, nach einer Meldung ein zweiter
+
     def __enter__(self):
-        ende = time.time() + 3.0
+        for nr, warten in enumerate(self.WARTEN_S):
+            ergebnis = self._versuchen(warten)
+            if ergebnis != "belegt":
+                return self
+            if nr == 0:
+                _hinweis("Sperrdatei belegt – zweiter Versuch")
+        # Weiter ohne Sperre (sonst ginge die Änderung ganz verloren) – aber nicht still
+        _hinweis("Sperrdatei weiter belegt – gespeichert ohne Sperre")
+        return self
+
+    def _versuchen(self, warten: float) -> str:
+        """"frei" (Sperre gehalten), "ohne" (Ordner nicht beschreibbar) oder "belegt" (Zeit um)."""
+        ende = time.time() + warten
         while time.time() < ende:
             try:
                 self.fd = os.open(self.pfad, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-                return self
+                return "frei"
             except FileExistsError:
                 try:
                     if time.time() - self.pfad.stat().st_mtime > 10:
@@ -155,8 +192,8 @@ class _Dateisperre:
                     pass
                 time.sleep(0.02)
             except OSError:
-                break                                      # Ordner nicht beschreibbar: ohne Sperre weiter
-        return self
+                return "ohne"                              # Ordner nicht beschreibbar: ohne Sperre weiter
+        return "belegt"
 
     def __exit__(self, *_):
         if self.fd is not None:

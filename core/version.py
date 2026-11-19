@@ -8,7 +8,7 @@ Aufbau wie bei Windows („Version 24H2, Build 26100"):
     STAND     Datum des Codes (Jahr.Monat.Tag)
     GEBURTSTAG  Projektbeginn; daraus das Alter in /version und im Systemprompt
 
-Im Git-Repo kommt die Build-Nummer aus `git rev-list --count HEAD`, dazu der
+Im Git-Repo kommt die Build-Nummer aus BUILD_START + `git rev-list --count HEAD`, dazu der
 kurze Commit-Hash. Die gepackte exe hat kein Git; dort liest sie `build.txt`,
 das NemiCLI.spec beim Bauen mit in die exe packt.
 """
@@ -21,8 +21,8 @@ import subprocess
 import sys
 from pathlib import Path
 
-VERSION = "9.66 Alpha"
-STAND = "2026.11.12"
+VERSION = "10.00 Alpha"
+STAND = "2026.11.19"
 GEBURTSTAG = _dt.date(2026, 6, 19)
 AUTHOR = "D. Hoffmann (Vibecoder)"
 BUILT_WITH = "Claude Opus 5.5 · Anthropic"
@@ -61,6 +61,9 @@ def git_info() -> dict:
 
 
 _BUILD_CACHE: str | None = None
+# Version 10.00 beginnt mit Build 000 beim 100. Commit dieses Repositorys; die Build-Nummer zählt von dort weiter
+# (vorher 9.73.1017 … 9.103.1116).
+BUILD_START = -100
 
 
 def _haupt_neben() -> str:
@@ -76,6 +79,7 @@ def build_nummer() -> str:
         n = ""
         if not _FROZEN and (_INSTALL / ".git").exists():
             n = _git("rev-list", "--count", "HEAD")
+            n = f"{BUILD_START + int(n):03d}" if n.isdigit() else ""
         for ort in (_INSTALL, _ASSETS):          # neben der exe, sonst in der exe
             if n:
                 break

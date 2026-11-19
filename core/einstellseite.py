@@ -44,6 +44,11 @@ def _rechtsklick() -> str:
     return "an" if st.get("bildschirm") and st.get("bild") else "aus"
 
 
+def _tempo() -> str:
+    wert = str(config.load().get("terminal_fps") or "")
+    return "tempo " + (wert if wert in ("30", "60") else "30")
+
+
 AN_AUS = (("an", "An"), ("aus", "Aus"))
 
 # /schriftgröße je Rolle (ui/design.py): Wert „<rolle> <px>“
@@ -71,7 +76,15 @@ def _kugel_auto() -> str:
 EINTRAEGE: list[tuple] = [
     (EINFACH, "/voice", "🔊 Stimme", "Wann die Persönlichkeit vorliest.",
      (("an", "Jede Antwort"), ("knopf", "Nur auf Anfrage"), ("aus", "Aus")), _stimme, None),
-    (EINFACH, "/modus", "🧭 Arbeitsweise", "Was die KI ohne Rückfrage tun darf.", None, None, None),
+    (EINFACH, "/modus", "🧭 Arbeitsweise", "Was die KI ohne Rückfrage tun darf.", None, None,
+     ("chat", "lesen", "normal", "auto", "autoan")),
+    (EINFACH, "/modus", "🟦 Coding: Freigabe", "Im Coding-Projekt durcharbeiten oder fragen (Shift+Tab im Coding).",
+     (("coding frei", "Frei durcharbeiten"), ("coding vorsicht", "Vorsicht")),
+     lambda: "coding " + ("vorsicht" if str(config.load().get("coding_freigabe") or "") == "vorsicht" else "frei"),
+     None),
+    (EINFACH, "/modus", "🎨 Bilder: Freigabe", "Ob die Persönlichkeit ohne Rückfrage malen darf.",
+     (("bild frei", "Ohne Rückfrage"), ("bild fragen", "Vor jedem Bild fragen")),
+     lambda: "bild " + ("fragen" if str(config.load().get("bild_freigabe") or "") == "fragen" else "frei"), None),
     (EINFACH, "/denken", "🧭 Nachdenken", "Ob die Persönlichkeit vor dem Antworten nachdenkt.", None, None,
      ("auto", "an", "aus")),
     (EINFACH, "/staerke", "🧠 Denkstufe", "Wie gründlich das Modell nachdenkt.", None, None, None),
@@ -90,9 +103,13 @@ EINTRAEGE: list[tuple] = [
      lambda: "geteilt " + _schalter("terminal_geteilt", False), None),
     (PROFI, "/terminal", "🌊 Terminal: weiches Rollen", "Weiches Rollen und gleitender Cursor.",
      (("weich an", "An"), ("weich aus", "Aus")), lambda: "weich " + _schalter("terminal_weich", True), None),
+    (PROFI, "/terminal", "🎞 Terminal: Bildrate", "Bilder je Sekunde der Oberfläche – ab dem nächsten Start.",
+     (("tempo 30", "30 (sparsam)"), ("tempo 60", "60 (flüssig)")), _tempo, None),
     (PROFI, "/terminal", "🎨 Terminal: Farben", "Farben des Terminal-Fensters – ab dem nächsten Start.",
      (("thema auto", "Wie /theme"), ("thema breeze", "Breeze"), ("thema mint", "Mint")),
      lambda: "thema " + str(config.load().get("terminal_thema") or "auto").lower(), None),
+    (EINFACH, "/kompass", "🧭 Kompass bei /", "Beim Tippen von / ein Fenster mit allen Befehlen neben dem Terminal.",
+     AN_AUS, lambda: _schalter("kompass", False), None),
     (EINFACH, "/emoji", "😊 Emojis", "Wie viele Emojis die Persönlichkeit nimmt.", None, None,
      ("low", "middle", "strong", "frei")),
     (PROFI, "/kontext", "📏 Kontext (lokales Modell)", "Wie viel vom Gespräch das Modell im Blick hat.",

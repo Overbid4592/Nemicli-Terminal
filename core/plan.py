@@ -5,6 +5,8 @@ Hat eine Nutzer-Runde mehr als einen Arbeitsschritt, schreibt die KI mit dem
 Werkzeug `plan` vorher die Schritte auf. Ohne Liste läuft je Runde nur EIN Arbeitsschritt;
 Nachsehen (Lese-Werkzeuge) und Begleiten (Gedächtnis, Kugel, Stimme) zählen nicht mit –
 Plaudern soll keine Liste erzeugen.
+Bilder und Videos brauchen nie eine Liste, zusammen aber höchstens MAX_MEDIEN Stück je Nachricht; ohne Liste
+malt die KI nach einem geklappten Bild höchstens NEU_MALEN-mal von sich aus neu.
 Ausnahme: der Coding-Assistent, der seine eigene Todo-Liste führt (coding.py).
 
 Die Liste gilt, bis alle Punkte erledigt oder gestrichen sind – auch über mehrere Nutzer-Runden
@@ -35,28 +37,46 @@ FREI = {"plan", "coding_start", "todo", "anleitung_lesen", "menue_oeffnen"}
 BEGLEITEN = {"merken", "kugel", "erinnern", "vorlesen", "stimme_schalter", "modell_schalter", "emoji_stufe", "aufgaben", "lora", "coding_lora",
              "denkweise", "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen", "wache_bewerten"}
 EINZELN = 1                   # so viele Arbeitsschritte je Nachricht laufen ohne Liste
+# Bilder und Videos: nie eine Liste, aber je Nachricht zusammen höchstens MAX_MEDIEN Stück (Grafikkarte).
+MEDIEN = {"bild_malen", "bild_serie", "comic_malen", "portraet_bewegen", "video_erstellen"}
+MAX_MEDIEN = 10
+NEU_MALEN = 1                 # so oft malt die KI je Nachricht von sich aus neu (ohne Liste): Strom und Rechenzeit
 
 SPERR_TEXT = (
     "Nicht ausgeführt: {tools}. Regel: Pro Nachricht des Nutzers ist ein Arbeitsschritt ohne Todo-Liste frei – "
-    "diesmal war das schon: {schon}. Frei bleiben Nachsehen, Begleiten (z. B. merken, kugel, wache_bewerten) und "
-    "ein neuer Versuch eines Werkzeugs, das gerade fehlgeschlagen ist. Für weitere Schritte schreib zuerst auf, "
+    "diesmal war das schon: {schon}. Frei bleiben Nachsehen, Begleiten (z. B. merken, kugel, wache_bewerten), "
+    "Bilder und Videos und ein neuer Versuch eines Werkzeugs, das gerade fehlgeschlagen ist. Für weitere Schritte schreib zuerst auf, "
     "was du vorhast, z. B. {{\"tool\": \"plan\", \"punkte\": [\"Ordner ansehen\", \"Datei anlegen\"]}} – im selben "
     "Zug darfst du direkt danach die Aktion schicken. Hake Punkte mit {{\"tool\": \"plan\", \"erledigt\": 1}} ab.")
+
+MEDIEN_TEXT = (
+    "Nicht ausgeführt: {tools}. Regel: Je Nachricht des Nutzers höchstens {max} Bilder oder Videos zusammen "
+    "(jedes Bild einer Serie und jedes Comic-Feld zählt einzeln) – diesmal schon {schon}. Weitere erst nach der "
+    "nächsten Nachricht des Nutzers.")
+
+NEU_TEXT = (
+    "Nicht ausgeführt: {tools}. Regel: Je Nachricht des Nutzers malst du von dir aus höchstens {neu}× neu – "
+    "das ist schon passiert. Ein Bild, das dir nicht gefällt, ist kein Fehler: Es bleibt liegen, und der Nutzer "
+    "entscheidet. Zeig ihm, was du hast, und frag, ob er ein neues möchte. Mehrere Bilder auf einmal gehören in "
+    "EINEN Zug (oder bild_serie); für eine lange Reihe leg vorher eine Todo-Liste mit plan an.")
 
 _liste: dict | None = None
 _gezeigt: tuple | None = None
 _ohne_liste = 0               # Arbeitsschritte dieser Nachricht ohne Liste
 _erster: str = ""             # der freie Arbeitsschritt dieser Nachricht (für die Sperr-Meldung)
 _fehlgeschlagen: set[str] = set()   # Werkzeuge, die in dieser Nachricht fehlschlugen: ein neuer Versuch ist frei
+_medien = 0                   # Bilder/Videos dieser Nachricht
+_malzuege = 0                 # Züge dieser Nachricht, in denen ein Bild/Video geklappt hat
+_gemalt = False               # im laufenden Zug hat ein Bild/Video geklappt
+_grund = ""                   # warum medien_begrenzen zuletzt etwas zurückhielt: "zahl" | "neu"
 
 
 def runde_neu() -> bool:
     """Neue Nutzer-Runde. Eine Liste mit offenen Punkten bleibt (lange Arbeit über mehrere Runden),
     eine fertige weicht. True = eine offene Liste läuft weiter."""
-    global _liste, _gezeigt, _ohne_liste, _erster
+    global _liste, _gezeigt
     _gezeigt = None
-    _ohne_liste, _erster = 0, ""
-    _fehlgeschlagen.clear()
+    _zaehler_leeren()
     if _liste is not None and aktuell() is not None:
         return True
     _liste = None
@@ -65,18 +85,29 @@ def runde_neu() -> bool:
 
 def verwerfen() -> None:
     """Neuer Chat: keine Liste mitnehmen."""
-    global _liste, _gezeigt, _ohne_liste, _erster
-    _ohne_liste, _erster = 0, ""
-    _fehlgeschlagen.clear()
+    global _liste, _gezeigt
+    _zaehler_leeren()
     _liste = None
     _gezeigt = None
 
 
+def _zaehler_leeren() -> None:
+    global _ohne_liste, _erster, _medien, _malzuege, _gemalt, _grund
+    _ohne_liste, _erster, _medien, _malzuege, _gemalt, _grund = 0, "", 0, 0, False, ""
+    _fehlgeschlagen.clear()
+
+
 def abhaken_nach(act: dict, ok) -> bool:
     """Nach jeder Aktion. Fehlgeschlagen: ein neuer Versuch desselben Werkzeugs ist frei. Feld `abhaken`:
-    Punkt(e) sofort abhaken, wenn sie geklappt hat. True, wenn sich die Liste geändert hat."""
+    Punkt(e) sofort abhaken, wenn sie geklappt hat. True, wenn sich die Liste geändert hat.
+    Ein fehlgeschlagenes Bild oder Video zählt nicht zu den Grenzen je Nachricht."""
+    global _medien, _gemalt
     if ok is False and act.get("tool"):
         _fehlgeschlagen.add(str(act["tool"]))
+        if act["tool"] in MEDIEN:
+            _medien = max(0, _medien - medien_zahl(act))
+    if ok is True and act.get("tool") in MEDIEN:
+        _gemalt = True
     if ok is not True or _liste is None or act.get("tool") == "plan" or act.get("abhaken") in (None, ""):
         return False
     nrn = _nummern(act.get("abhaken"))
@@ -245,7 +276,7 @@ def zurueckweisen(acts: list[dict], frei: bool = False) -> tuple[list[dict], lis
         tool = act.get("tool")
         if tool == "plan" and _texte(act.get("punkte")):
             liste_da = True
-        if tool in FREI or tool in BEGLEITEN or tool in modes.READ_TOOLS or liste_da:
+        if tool in FREI or tool in BEGLEITEN or tool in MEDIEN or tool in modes.READ_TOOLS or liste_da:
             laufen.append(act)
         elif tool in _fehlgeschlagen:
             _fehlgeschlagen.discard(tool)
@@ -262,3 +293,52 @@ def zurueckweisen(acts: list[dict], frei: bool = False) -> tuple[list[dict], lis
 def sperr_text(gesperrt: list[dict]) -> str:
     tools = ", ".join(dict.fromkeys(str(a.get("tool", "?")) for a in gesperrt))
     return SPERR_TEXT.format(tools=tools, schon=_erster or "ein anderer Schritt im selben Zug")
+
+
+def medien_zahl(act: dict) -> int:
+    """Wie viele Bilder/Videos eine Aktion erzeugt: je Serienbild und Comic-Feld eins."""
+    tool = act.get("tool")
+    if tool == "bild_serie":
+        teile = act.get("varianten") or act.get("bilder")
+    elif tool == "comic_malen":
+        teile = act.get("panels") or act.get("felder")
+    else:
+        return 1
+    return len(teile) if isinstance(teile, list) and teile else 1
+
+
+def medien_begrenzen(acts: list[dict]) -> tuple[list[dict], list[dict]]:
+    """Einmal je Zug: teilt die Aktionen in (laufen, zurück). Bilder und Videos zusammen höchstens MAX_MEDIEN je
+    Nachricht (auch mit Liste oder Coding-Assistent). Ohne Liste malt die KI nach einem geklappten Mal-Zug höchstens
+    NEU_MALEN weitere Züge lang von sich aus neu."""
+    global _medien, _malzuege, _gemalt, _grund
+    if _gemalt:                                   # der vorige Zug hat gemalt
+        _malzuege, _gemalt = _malzuege + 1, False
+    liste = _liste is not None or any(a.get("tool") == "plan" and _texte(a.get("punkte")) for a in acts)
+    neu_zu = not liste and _malzuege > NEU_MALEN
+    laufen, zurueck = [], []
+    _grund = ""
+    for act in acts:
+        if act.get("tool") in MEDIEN:
+            n = medien_zahl(act)
+            if neu_zu or _medien + n > MAX_MEDIEN:
+                zurueck.append(act)
+                _grund = _grund or ("neu" if neu_zu else "zahl")
+                continue
+            _medien += n
+        laufen.append(act)
+    return laufen, zurueck
+
+
+def medien_hinweis() -> str:
+    """Kurzzeile für den Nutzer zur letzten Zurückhaltung."""
+    if _grund == "neu":
+        return f"🟨 Schon {NEU_MALEN}× neu gemalt – die KI fragt dich, bevor sie weitermalt."
+    return f"🟨 Höchstens {MAX_MEDIEN} Bilder oder Videos je Nachricht."
+
+
+def medien_text(zurueck: list[dict]) -> str:
+    tools = ", ".join(dict.fromkeys(str(a.get("tool", "?")) for a in zurueck))
+    if _grund == "neu":
+        return NEU_TEXT.format(tools=tools, neu=NEU_MALEN)
+    return MEDIEN_TEXT.format(tools=tools, max=MAX_MEDIEN, schon=_medien)

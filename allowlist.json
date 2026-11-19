@@ -512,10 +512,106 @@
       "note": "OpenRouter Modelle/Doku"
     },
     {
-      "domain": "platform.openai.com",
+      "domain": "openai.com",
       "tier": 1,
-      "category": "ml_docs",
-      "note": "OpenAI API-Doku"
+      "category": "ai_vendor",
+      "note": "OpenAI: Neuigkeiten, Release Notes, Doku (developers.openai.com)"
+    },
+    {
+      "domain": "anthropic.com",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Anthropic: Neuigkeiten, Doku"
+    },
+    {
+      "domain": "claude.com",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Anthropic: Claude-Doku (platform.claude.com)"
+    },
+    {
+      "domain": "blog.google",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Google-Blog (Gemini-Ankündigungen)"
+    },
+    {
+      "domain": "deepmind.google",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Google DeepMind: Modelle, Forschung"
+    },
+    {
+      "domain": "mistral.ai",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Mistral: Neuigkeiten, Modelle"
+    },
+    {
+      "domain": "x.ai",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "xAI: Neuigkeiten, Doku"
+    },
+    {
+      "domain": "ai.meta.com",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Meta AI: Llama, Blog"
+    },
+    {
+      "domain": "qwen.ai",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Qwen (Alibaba): Blog, Modelle"
+    },
+    {
+      "domain": "qwenlm.github.io",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Qwen-Blog der Organisation QwenLM (nur diese Subdomain)"
+    },
+    {
+      "domain": "deepseek.com",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "DeepSeek: Neuigkeiten, API-Doku"
+    },
+    {
+      "domain": "lmstudio.ai",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "LM Studio: Blog, Release Notes"
+    },
+    {
+      "domain": "vllm.ai",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "vLLM: Doku, Blog"
+    },
+    {
+      "domain": "comfy.org",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "ComfyUI: Blog, Doku"
+    },
+    {
+      "domain": "nvidianews.nvidia.com",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "NVIDIA-Pressemeldungen"
+    },
+    {
+      "domain": "rocm.docs.amd.com",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "AMD ROCm Doku"
+    },
+    {
+      "domain": "devblogs.microsoft.com",
+      "tier": 1,
+      "category": "ai_vendor",
+      "note": "Microsoft-Entwicklerblogs (WSL, DirectML, Windows)"
     },
     {
       "domain": "pytorch.org",
@@ -579,9 +675,9 @@
     },
     {
       "domain": "archive.org",
-      "tier": 1,
+      "tier": 2,
       "category": "reference",
-      "note": "Internet Archive / Wayback"
+      "note": "Internet Archive / Wayback: Uploads beliebiger Konten und Kopien beliebiger Seiten; /save gesperrt, eingebettete Adressen werden mitgeprueft"
     },
     {
       "domain": "britannica.com",
@@ -762,6 +858,18 @@
       "tier": 1,
       "category": "security",
       "note": "NVD CVE-Datenbank"
+    },
+    {
+      "domain": "cveawg.mitre.org",
+      "tier": 1,
+      "category": "security",
+      "note": "CVE Services API (offizielle CVE-Datensaetze, JSON 5)"
+    },
+    {
+      "domain": "osv.dev",
+      "tier": 1,
+      "category": "security",
+      "note": "OSV-Schwachstellendatenbank (inkl. api.osv.dev)"
     },
     {
       "domain": "owasp.org",

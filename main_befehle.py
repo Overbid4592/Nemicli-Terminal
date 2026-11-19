@@ -160,6 +160,17 @@ async def _update_ablauf(ctx, gruende: list[str]) -> str | None:
         ui.info("⬇ Programm: " + ("exe – neue Versionen kommen als neuer Ordner." if getattr(sys, "frozen", False)
                                  else "kein Git-Remote, übersprungen."))
 
+    import llamareserve
+    import luecken
+    if llamareserve.eingerichtet():                      # nur, wenn die llama.cpp-Reserve eingerichtet ist
+        try:
+            with ui.thinking("prüfe den llama.cpp-Build auf bekannte Lücken (OSV.dev)"):
+                erg = await asyncio.to_thread(luecken.llamacpp_pruefen)
+            zeilen = luecken.llamacpp_zeilen(erg)
+            (ui.warn if erg.get("luecken") else ui.info)("\n".join(zeilen))
+        except OSError as e:
+            ui.warn(f"🛡 llama.cpp nicht geprüft: {e}")
+
     if V.site_packages() is None:
         import uvsetup
         if uvsetup.VENV_DIR.exists() and not uvsetup.venv_passt():
@@ -172,11 +183,14 @@ async def _update_ablauf(ctx, gruende: list[str]) -> str | None:
         liste = await asyncio.to_thread(V.pruefen)
     if V.STAND["luecken"]:
         ui.warn(f"🛡 {V.STAND['luecken']} – Lücken diesmal nicht geprüft.")
+    if V.STAND["torch"]:
+        ui.warn(f"🔥 PyTorch-Index nicht geprüft: {V.STAND['torch']}")
     if not liste:
         ui.success("📦 venv ist aktuell, keine bekannten Lücken – nichts zu tun.")
         return None
     ui.update_tabelle(liste)
-    machbar = [e for e in liste if e.machbar]
+    torch_neu = [e for e in liste if e.grund == "torch-update"]       # eigener Punkt, nie in „alles“
+    machbar = [e for e in liste if e.machbar and e.grund != "torch-update"]
     noetig = [e for e in machbar if e.noetig]
     updates = [e for e in machbar if not e.noetig]
     mit_luecken = [e for e in liste if e.luecken]
@@ -188,9 +202,14 @@ async def _update_ablauf(ctx, gruende: list[str]) -> str | None:
         opts.append(("noetig", f"🔧  Reparieren ({len(noetig)})"))
     elif updates:
         opts.append(("alles", f"⬆  {len(updates)} Update(s) installieren"))
+    if torch_neu:
+        t = torch_neu[0]
+        opts.append(("torch", f"🔥  Nur PyTorch: {t.installiert} → {t.neu} (rund 3 GB)"))
+        if machbar:
+            opts.append(("alles_torch", "⬆  Alles oben + PyTorch"))
     erklaeren = bool(mit_luecken) and _cloud_modell(ctx)
     offen = [e for e in liste if not e.machbar]
-    if not machbar and not erklaeren:
+    if not machbar and not torch_neu and not erklaeren:
         ui.info("🛡 Offen (nicht automatisch behebbar): "
                 + ", ".join(f"{e.name} – {e.hinweis or 'selbst im venv-Fenster (/venv)'}" for e in offen))
         return None
@@ -202,7 +221,7 @@ async def _update_ablauf(ctx, gruende: list[str]) -> str | None:
         return _luecken_frage(mit_luecken)
     if wahl == "__cancel__":
         return None
-    auswahl = noetig if wahl == "noetig" else machbar
+    auswahl = {"noetig": noetig, "torch": torch_neu, "alles_torch": machbar + torch_neu}.get(wahl, machbar)
     try:
         res = await _run_with_status("📦 venv aktualisieren", lambda on_status: V.einspielen(auswahl, on_status))
     except Exception as e:
@@ -223,6 +242,13 @@ async def _update_ablauf(ctx, gruende: list[str]) -> str | None:
         gruende.append(f"{', '.join(res['neustart'])} ist geladen – nach dem Neustart gleich /update tippen.")
     for name, grund in res["abgelehnt"]:
         ui.warn(f"⏭ {name} übersprungen, nichts verändert: {grund}")
+    t = res.get("torch") or {}
+    if t.get("text"):
+        (ui.success if t.get("jetzt") or t.get("start") else ui.warn)(f"🔥 {t['text']}")
+        if t.get("jetzt"):
+            gruende.append("Ein Neustart nimmt die neue PyTorch-Fassung.")
+        elif t.get("start"):
+            gruende.append("Beim Neustart wird PyTorch eingespielt (dauert ein paar Minuten).")
     if offen:
         ui.info("🛡 Offen (nicht automatisch behebbar): "
                 + ", ".join(f"{e.name} – {e.hinweis or 'selbst im venv-Fenster (/venv)'}" for e in offen))
@@ -393,15 +419,9 @@ async def pick_model(current: str | None) -> str | None:
                        f"☁  Cloud-Anbieter hinzufügen  ·  Key eintragen ({len(keyless)})"))
     import gguflokal
     lokale = gguflokal.modelle()
-    if lokale:                              # eigener GGUF-Motor: Modelle aus ModelGGUF/
+    if lokale:                              # eigener GGUF-Motor: Modelle aus KI-Modelle/KI-Chat/Chatmodell/
         stufe1.insert(0, ("gguf", f"🧠  Lokal (eigener Motor)  ·  {len(lokale)} Modell(e)  ·  "
                                   "ohne Server, kein Key"))
-    funke_ref = None
-    if funke_da():                          # Funke Groß: NemiCLIs eigenes kleines Modell, wenn mitgeliefert
-        from einrichtungshelfer import funkechat
-        if funkechat.verfuegbar():
-            funke_ref = funkechat.REF
-            stufe1.append((funke_ref, f"{funkechat.beschreibung()}  ·  kein Key"))
     P.lokale_vorpruefen()
     for pid, p in P.PROVIDERS.items():      # weitere lokale Server (LM Studio, Jan, llama.cpp, vLLM), wenn sie laufen
         if p.keyless and pid != "ollama" and p.available():
@@ -427,9 +447,6 @@ async def pick_model(current: str | None) -> str | None:
     wahl = await ask_suche(frage, stufe1)
     if wahl == "__cancel__":
         return None
-    if funke_ref and wahl == funke_ref:
-        await _funke_vorgaben_waehlen()
-        return wahl
 
     # --- Einrichtungs-Zweige (laden/installieren, dann zurück ins /model) ---
     if wahl == "hf":
@@ -475,7 +492,7 @@ async def pick_model(current: str | None) -> str | None:
             opts.append((M.make_ref("gguf", name), gguflokal.beschreibung(name)))
             if reserve:                      # dasselbe Modell über die festgenagelte llama.cpp-Reserve
                 opts.append((_RESERVE_MARKE + M.make_ref("gguf", name),
-                             f"🦙 {name}  ·  über llama.cpp {llamareserve.BUILD} (Reserve"
+                             f"🦙 {name}  ·  über llama.cpp {llamareserve.aktiv()} (Reserve"
                              + (", 👁 sieht Bilder)" if gguflokal.sieht(name) else ")")))
         opts.append(("__cancel__", "Zurück / Abbrechen"))
         n = gguflokal.kontext() if gguflokal.kontext_einstellung() > 0 else 0
@@ -538,22 +555,6 @@ def _video_opts(text: str) -> dict:
     return opts
 
 
-async def _funke_vorgaben_waehlen() -> None:
-    """Vorgaben für Funke Groß (du/Sie, Länge, Emojis) – per Auswahl, gespeichert als funke_vorgaben."""
-    jetzt = {"anrede": "du", "laenge": "normal", "emoji": "ja"} | (config.load().get("funke_vorgaben") or {})
-    kurz = f"{'du' if jetzt['anrede'] == 'du' else 'Sie'} · {jetzt['laenge']} · Emojis {jetzt['emoji']}"
-    if await ask_confirm("Wie soll Funke sprechen?", [("so", f"So lassen  ({kurz})"),
-                                                      ("anpassen", "Anpassen: du/Sie · Länge · Emojis")]) != "anpassen":
-        return
-    neu = dict(jetzt)
-    neu["anrede"] = await ask_confirm("Anrede?", [("du", "du"), ("sie", "Sie")])
-    neu["laenge"] = await ask_confirm("Wie ausführlich?", [("kurz", "kurz (ein Satz)"), ("normal", "normal"),
-                                                           ("lang", "ausführlich")])
-    neu["emoji"] = await ask_confirm("Emojis?", [("ja", "ja 😊"), ("nein", "nein")])
-    config.update(funke_vorgaben=neu)
-    ui.success("✨ Gemerkt – gilt ab der nächsten Antwort.")
-
-
 async def ersatzbank_waehlen(ctx) -> None:
     """/model ersatz: bis zu zwei Cloud-Modelle, die einspringen, wenn das aktive herausgefiltert wird."""
     bank = ersatzbank.liste()
@@ -605,14 +606,18 @@ async def _rauswurf_uebernehmen(ctx) -> None:
     ui.warn("Kein Ersatz auf der Bank. Wähle ein neues Modell mit /model.")
 
 
-async def _llamacpp_holen_mit_balken(art: str, namen: list[str]) -> None:
-    """llamareserve.holen im Thread, mit Ladebalken je Paket; Esc bricht ab (fortsetzbar)."""
+async def _llamacpp_holen_mit_balken(art: str, namen: list[str], aufgabe=None) -> None:
+    """llamareserve.holen (oder `aufgabe(fortschritt, stopp)`) im Thread, mit Ladebalken je Paket;
+    Esc bricht ab (fortsetzbar)."""
     import threading
     import llamareserve
     stopp = threading.Event()
-    st = {"name": namen[0] if namen else "", "erledigt": 0, "gesamt": 1, "tempo": 0.0, "letzt": None}
+    namen = list(namen)
+    st = {"name": namen[0] if namen else "llama.cpp", "erledigt": 0, "gesamt": 1, "tempo": 0.0, "letzt": None}
 
     def fortschritt(name: str, erledigt: int, gesamt: int) -> None:
+        if name not in namen:
+            namen.append(name)
         jetzt = time.monotonic()
         if name != st["name"] or st["letzt"] is None:
             st["letzt"], st["tempo"] = (jetzt, erledigt), 0.0
@@ -624,9 +629,13 @@ async def _llamacpp_holen_mit_balken(art: str, namen: list[str]) -> None:
 
     def panel():
         nr = namen.index(st["name"]) + 1 if st["name"] in namen else 1
-        return ui.hf_fortschritt(st["name"], "lade", st["erledigt"], st["gesamt"], st["tempo"], nr, len(namen))
+        return ui.hf_fortschritt(st["name"], "lade", st["erledigt"], st["gesamt"], st["tempo"], nr,
+                                 max(len(namen), 1))
 
-    task = asyncio.create_task(asyncio.to_thread(llamareserve.holen, art, fortschritt, stopp))
+    if aufgabe is None:
+        task = asyncio.create_task(asyncio.to_thread(llamareserve.holen, art, fortschritt, stopp))
+    else:
+        task = asyncio.create_task(asyncio.to_thread(aufgabe, fortschritt, stopp))
     try:
         with ui.live_view(panel()) as live:
             while not task.done():
@@ -641,15 +650,65 @@ async def _llamacpp_holen_mit_balken(art: str, namen: list[str]) -> None:
     ok, zeilen = task.result()
     for z in zeilen:
         ui.info(z)
-    if ok:
+    if ok and aufgabe is None:
         ui.success("🦙 Im /model-Menü steht jedes lokale Modell jetzt auch mit 🦙 (über llama.cpp).")
 
 
+async def bewegung_befehl(arg: str) -> None:
+    """/bewegung: Strichmännchen-Figur mit SprongMotion – Stand · holen · einrichten [pfad] · an · aus · probe <text>."""
+    import bewegung
+    import figur
+    teile = arg.strip().split(maxsplit=1)
+    was = teile[0].lower() if teile else ""
+    rest = teile[1].strip() if len(teile) > 1 else ""
+    if was in ("holen", "laden"):
+        with ui.thinking(f"lade SprongMotion {bewegung.VERSION} von GitHub und prüfe die SHA-256"):
+            ok, zeilen = await asyncio.to_thread(bewegung.holen)
+    elif was == "einrichten":
+        with ui.thinking("prüfe die Modelldatei (SHA-256)"):
+            ok, zeilen = await asyncio.to_thread(bewegung.modell_einrichten, Path(rest) if rest else None)
+    elif was in ("an", "aus"):
+        config.update(figur_strich=was == "an")
+        ok, zeilen = True, ["🕺 Strichmännchen " + ("an" if was == "an" else "aus – die Figur zeigt wieder Bilder")]
+    elif was == "probe":
+        try:
+            ok, zeilen = True, [figur.bewegen(rest or "waves with both hands", "froh")]
+        except Exception as exc:
+            ok, zeilen = False, [str(exc)]
+    else:
+        ok, zeilen = True, bewegung.stand()["zeilen"] + [
+            "   /bewegung holen · einrichten [pfad] · an · aus · probe <englischer Satz>"]
+    for z in zeilen:
+        (ui.info if ok else ui.warn)(z)
+    if was in ("holen", "laden", "einrichten", "an", "aus") and ok:
+        figur._STAND["posen"] = None              # neu melden: Strichmännchen oder Bilder-Figur
+        figur.melden()
+        if bewegung.stand()["bereit"] and config.load().get("figur_strich", True):
+            ui.success("🕺 Alles da – im eigenen Terminal-Fenster steht jetzt das Strichmännchen. Sag ihr z. B. "
+                       "„dreh dich mal“.")
+
+
 async def llamacpp_befehl(ctx, arg: str) -> None:
-    """/llamacpp: Stand der Reserve · einrichten (Pakete prüfen und entpacken) · vergleich [frage]."""
+    """/llamacpp: Stand der Reserve · holen · einrichten · aktualisieren · wechseln <build> · vergleich [frage]."""
     import llamareserve
     teile = arg.strip().split(maxsplit=1)
     was = teile[0].lower() if teile else ""
+    if was in ("aktualisieren", "update", "updaten"):
+        ui.info("🦙 Frage GitHub nach dem neuesten llama.cpp-Build · Esc bricht das Laden ab, ein neuer Aufruf "
+                "setzt fort.")
+        await _llamacpp_holen_mit_balken("auto", [], aufgabe=llamareserve.aktualisieren)
+        return
+    if was in ("wechseln", "nutzen"):
+        build = teile[1].strip().lower() if len(teile) > 1 else ""
+        if not build:
+            ui.info(f"🦙 Aktiv: {llamareserve.aktiv()} · eingerichtet: "
+                    f"{', '.join(llamareserve.installiert()) or 'keiner'} – /llamacpp wechseln <build>")
+            return
+        try:
+            ui.success(await asyncio.to_thread(llamareserve.aktivieren, build))
+        except (ValueError, OSError) as exc:
+            ui.error(f"Wechsel nicht möglich: {exc}")
+        return
     if was in ("holen", "laden"):
         art = teile[1].strip().lower() if len(teile) > 1 else "auto"
         try:
@@ -657,7 +716,8 @@ async def llamacpp_befehl(ctx, arg: str) -> None:
         except ValueError as exc:
             ui.error(str(exc))
             return
-        mb = sum(llamareserve.GROESSE[n] for n in namen) / 2**20
+        kat = llamareserve.katalog()
+        mb = sum(kat[n][1] for n in namen) / 2**20
         ui.info(f"🦙 Für diesen Rechner: {', '.join(namen)} ({grund}) · {mb:.0f} MB von GitHub · Esc bricht ab, "
                 "ein neuer Aufruf setzt fort.")
         await _llamacpp_holen_mit_balken(art, namen)
@@ -695,6 +755,178 @@ async def llamacpp_befehl(ctx, arg: str) -> None:
         ui.info("📦 Pakete liegen bereit – /llamacpp einrichten prüft und entpackt sie.")
 
 
+_ZIP_TEXT = {"an": "an – NemiCLI fragt „Entpacken?“", "auto": "auto – Archive im Profilordner sofort entpacken",
+             "aus": "aus – nichts wird entpackt, die KI kann es nicht"}
+
+
+async def zip_befehl(arg: str) -> None:
+    """/zip: Stand · an · auto · aus · <pfad> (der Nutzer entpackt selbst nach DATEN/Entpackt)."""
+    import entpacken
+    roh = arg.strip()
+    was = roh.lower()
+    if was in entpacken.MODI:
+        entpacken.modus_setzen(was)
+        ui.info(f"📦 /zip {_ZIP_TEXT[was]} (gespeichert)")
+        return
+    if not roh:
+        ui.info(f"📦 /zip {_ZIP_TEXT[entpacken.modus()]}  ·  /zip an · auto · aus · <pfad>")
+        ui.info(f"   Ziel für /zip <pfad> und die KI: {Path(paths.DATEN) / 'Entpackt'}")
+        import profilordner
+        ui.info(f"   Archive im Profilordner ({PS.active().name}): nach "
+                f"Profile/{profilordner.ordnername(PS.active().name)}/Entpackt")
+        return
+    quelle = Path(os.path.expandvars(roh.strip('"').strip("'"))).expanduser()
+    if not quelle.is_file():
+        ui.warn(f"📦 Keine Datei: {quelle}  ·  /zip an · auto · aus · <pfad>")
+        return
+    if not entpacken.ist_archiv(quelle):
+        ui.warn(f"📦 {quelle.name} ist kein bekanntes Archiv.")
+        return
+    ziel = entpacken.ziel_fuer_chat(quelle)
+    ui.info("📦 Entpacke im eigenen Fenster – dort siehst du den Fortschritt und kannst abbrechen.")
+    ergebnis = await asyncio.to_thread(entpacken.fenster_starten, quelle, ziel, profil=None, einlesen=False)
+    ui.info("📦 " + actions.entpacken_ergebnis_text(ergebnis))
+
+
+_CVE_NUTZUNG = "/cve · /cve laden <ordner> [voll] · /cve stopp · /cve suchen <text|CVE-ID|produkt version>"
+
+
+async def cve_befehl(arg: str) -> None:
+    """/cve: Stand · laden <ordner> [voll] · stopp · suchen … – Gefahrenwissen aus der CVE-Liste (tools/gefahren.py).
+    Laden startet nur der Nutzer; der Import läuft im eigenen Prozess."""
+    import gefahren
+    teile = arg.strip().split(None, 1)
+    was = teile[0].lower() if teile else ""
+    rest = teile[1].strip() if len(teile) > 1 else ""
+    if was in ("", "status", "stand"):
+        _cve_status(gefahren)
+    elif was in ("laden", "import", "importieren"):
+        voll = rest.lower().endswith(" voll")
+        ordner = (rest[:-5] if voll else rest).strip().strip('"').strip("'")
+        if not ordner:
+            ui.warn("Welcher Ordner? /cve laden <ordner> – der entpackte cvelistV5-Ordner (mit Unterordner cves).")
+            return
+        try:
+            ui.info(await asyncio.to_thread(gefahren.starten, ordner, voll))
+        except ValueError as e:
+            ui.warn(f"⚠ {e}")
+    elif was in ("stopp", "stop", "abbrechen"):
+        ui.info(gefahren.stoppen())
+    elif was in ("suchen", "suche", "finde"):
+        if not rest:
+            ui.warn("Was suchen? /cve suchen <text|CVE-ID|produkt version>")
+            return
+        erg = await asyncio.to_thread(_cve_suche_nutzer, gefahren, rest)
+        if not erg["geladen"]:
+            ui.info("Die CVE-Liste ist noch nicht geladen – /cve laden <ordner>.")
+        elif not erg["treffer"]:
+            ui.info("Keine Treffer in der CVE-Liste." + (f" ({erg['hinweis']})" if erg.get("hinweis") else ""))
+        else:
+            kopf = [gefahren.KOPF, f"{erg['gesamt']} Treffer, gezeigt {len(erg['treffer'])} (höchste CVSS zuerst)"
+                    + (f" · {erg['hinweis']}" if erg.get("hinweis") else "")]
+            ui.text_panel("⚠ CVE-Liste", "\n".join(kopf + gefahren.treffer_zeilen(erg, 400)))
+    else:
+        ui.warn(f"Unbekannt. {_CVE_NUTZUNG}")
+
+
+def _cve_suche_nutzer(gefahren, text: str) -> dict:
+    """CVE-ID exakt; „produkt version“ mit Versionsfilter; sonst Produkt, dann Volltext."""
+    worte = text.split()
+    if len(worte) == 1 and gefahren.cve_id_norm(text) == text.strip().upper():
+        return gefahren.suchen(cve_id=text, limit=20)
+    if len(worte) >= 2 and gefahren.version_lesen(worte[-1]) is not None:
+        erg = gefahren.suchen(produkt=" ".join(worte[:-1]), version=worte[-1], limit=20)
+        if erg["treffer"] or not erg["geladen"]:
+            return erg
+    erg = gefahren.suchen(produkt=text, limit=20)
+    if erg["treffer"] or not erg["geladen"]:
+        return erg
+    return gefahren.suchen(text=text, limit=20)
+
+
+def _cve_status(gefahren) -> None:
+    st = gefahren.status()
+    lauf = gefahren.stand_lesen()
+    if st["geladen"]:
+        zeilen = [("Einträge", f"{st['anzahl']} ({st['hoch']} mit CVSS ≥ 7)"),
+                  ("Stand der Liste", (st.get("quelle_stand") or "?")[:19].replace("T", " ")),
+                  ("Letzter Import", st.get("letzter_import") or "?"),
+                  ("Datenbank", f"learned/gefahren.db · {st['groesse_mb']} MB")]
+    else:
+        zeilen = [("Liste", "noch nicht geladen – /cve laden <ordner>")]
+    if lauf:
+        zahl = (f"{lauf.get('dateien', 0)} / {lauf.get('gesamt', 0)} Dateien · neu {lauf.get('neu', 0)} · "
+                f"aktualisiert {lauf.get('aktualisiert', 0)} · unverändert {lauf.get('unveraendert', 0)} · "
+                f"REJECTED {lauf.get('abgelehnt', 0)} · zu groß {lauf.get('zu_gross', 0)} · "
+                f"kaputt {lauf.get('kaputt', 0)} · fremd {lauf.get('fremd', 0)} · Links {lauf.get('links', 0)}")
+        phase = lauf.get("phase") or "?"
+        if gefahren.laeuft():
+            zeilen.append(("Import", f"läuft ({phase}) – {zahl}"))
+        elif phase == "fehler":
+            zeilen.append(("Letzter Import", f"Fehler: {lauf.get('fehler', '?')}"))
+        elif phase in ("fertig", "abgebrochen"):
+            ende = "abgebrochen" if phase == "abgebrochen" else "fertig"
+            zeilen.append(("Letzter Lauf", f"{ende} ({lauf.get('art', '')}, {lauf.get('sekunden', 0)} s) – {zahl}"))
+            w = lauf.get("wache") or {}
+            if w.get("fehler"):
+                zeilen.append(("Wache CVE-001", f"Abgleich fehlgeschlagen: {w['fehler']}"))
+            elif not w.get("fehlt") and "treffer" in w:
+                zeilen.append(("Wache CVE-001", f"{w['treffer']} Programm(e) betroffen, {w.get('alarme', 0)} neue "
+                                                f"Alarme ({w.get('geprueft', 0)} geprüft)"))
+    try:
+        from wache import zugang as _WZ
+        betroffen = _WZ.speicher().gefahr_liste()
+    except Exception:
+        betroffen = []
+    if betroffen:
+        zeilen.append(("Betroffen laut Wache", "; ".join(
+            f"{g['name']} {g['version']} – {g['anzahl']}× bis CVSS {g['max_cvss']:.1f}" for g in betroffen[:5])
+            + (f" (+{len(betroffen) - 5})" if len(betroffen) > 5 else "")))
+    zeilen.append(("Befehle", _CVE_NUTZUNG))
+    ui.kv_panel("⚠ CVE-Liste (Gefahrenwissen)", zeilen)
+
+
+async def profil_zips_pruefen() -> None:
+    """Archive direkt im Profilordner der aktiven Persönlichkeit: je nach /zip fragen, sofort entpacken
+    (sichtbares Fenster, danach ins Gedächtnis) oder nichts. Nur im Vordergrund."""
+    if sicherheit.vordergrund_grund():
+        return
+    try:
+        import entpacken
+        modus = entpacken.modus()
+        if modus == "aus":
+            return
+        profil = PS.active().name
+        funde = await asyncio.to_thread(entpacken.neue_zips, profil)
+    except Exception:
+        return
+    for quelle in funde:
+        if modus != "auto":
+            wahl = await ask_confirm(f"📦 Neues Archiv im Profilordner von {profil}: {quelle.name} – entpacken?",
+                                     [("ja", "Ja, entpacken (Fenster mit Fortschritt, danach ins Gedächtnis)"),
+                                      ("nein", "Nein, nicht entpacken")])
+            if wahl != "ja":
+                _zip_erledigt(entpacken, profil, quelle, "abgelehnt")
+                ui.info("📦 Nicht entpackt – NemiCLI fragt bei diesem Archiv nicht mehr.")
+                continue
+        ziel = entpacken.ziel_fuer_profil(profil, quelle)
+        ui.info(f"📦 Entpacke {quelle.name} im eigenen Fenster …")
+        ergebnis = await asyncio.to_thread(entpacken.fenster_starten, quelle, ziel, profil=profil, einlesen=True)
+        code = ergebnis.get("code") if isinstance(ergebnis, dict) else 2
+        _zip_erledigt(entpacken, profil, quelle, "entpackt" if code in entpacken.CODES_FERTIG else
+                      "abgelehnt" if code == 3 else "fehler")
+        ui.info("📦 " + actions.entpacken_ergebnis_text(ergebnis if isinstance(ergebnis, dict) else {"code": 2}))
+        if code in entpacken.CODES_FERTIG:
+            ui.info("📦 Das Einlesen ins Gedächtnis läuft im Fenster weiter – dort siehst du jede Datei.")
+
+
+def _zip_erledigt(entpacken, profil: str, quelle: Path, wie: str) -> None:
+    try:
+        entpacken.als_erledigt(profil, quelle, wie)
+    except (OSError, ValueError) as exc:
+        ui.warn(f"📦 Konnte nicht vermerken, dass {quelle.name} behandelt ist: {exc}")
+
+
 async def switch_model(ref: str, backend, model, strength):
     """Wechselt das aktive Modell. Gibt (backend, model) zurück (alt bei Fehler)."""
     carry = backend.messages if backend else None
@@ -716,11 +948,9 @@ async def switch_model(ref: str, backend, model, strength):
         import gguflokal
         if gguflokal.motor_wahl(M.split_ref(ref)[1]) == gguflokal.LLAMACPP:
             import llamareserve
-            where = f"lokal über die Reserve llama.cpp {llamareserve.BUILD}"
+            where = f"lokal über die Reserve llama.cpp {llamareserve.aktiv()}"
         else:
             where = "lokal im eigenen Motor – das erste Laden dauert ein paar Sekunden"
-    elif M.split_ref(ref)[0] == "funke":
-        where = "NemiCLIs eigenes kleines Modell auf diesem PC – ohne Werkzeuge und Bilder"
     else:
         where = "in der Cloud"
     ui.success(f"Modell aktiv: {ref}  ({where})")
@@ -876,6 +1106,7 @@ async def _ps_profil(p: "PS.Persoenlichkeit") -> None:
         _sprueche_im_hintergrund()
         if wechsel:
             _neuer_chat_nach_wechsel()
+            await profil_zips_pruefen()
     elif wahl == "edit":
         await _ps_bearbeiten(p)
     elif wahl == "copy":
@@ -889,8 +1120,10 @@ async def _ps_profil(p: "PS.Persoenlichkeit") -> None:
         sicher = await ask_confirm(f"{p.name} wirklich löschen? (Datei {p.path.name})",
                                    [("ja", "Ja, löschen"), ("nein", "Nein")])
         if sicher == "ja":
-            PS.delete(p)
+            beiseite = PS.delete(p)
             ui.success(f"🎭 {p.name} gelöscht." + ("  Nemi übernimmt." if aktiv else ""))
+            if beiseite is not None:
+                ui.info(f"📁 Chats, Bilder und Eigenes liegen weiter unter {beiseite}.")
 
 
 async def persoenlichkeiten_menu(arg: str) -> None:
@@ -911,6 +1144,7 @@ async def persoenlichkeiten_menu(arg: str) -> None:
         _sprueche_im_hintergrund()
         if wechsel:
             _neuer_chat_nach_wechsel()
+            await profil_zips_pruefen()
         return
 
     while True:
@@ -964,6 +1198,27 @@ async def _einlesen_starten(ctx: "Ctx") -> None:
     await bibliothekar(ctx.current_chat, alles=True)
 
 
+CTX_FRIST_S = 2.0                # Kontextgröße (Statusleiste): so lange gilt die gemerkte
+CTX_FRIST_EIGEN_S = 30.0         # … beim eigenen Motor; Modell, Einstellung und geladener Motor gelten sofort
+
+
+def _ctx_schluessel(model) -> tuple:
+    """Wovon die Kontextgröße abhängt: Modell und gemessener Wert, beim eigenen Motor (gguf) dazu `gguf_kontext`,
+    `gguf_motor` und das geladene Modell."""
+    try:
+        art = M.split_ref(model or "")[0]
+    except Exception:
+        art = ""
+    gemessen = getattr(pricing, "_GEMESSEN", {}).get(model or "")
+    if art != "gguf":
+        return (art, model, gemessen)
+    import gguflokal
+    c = config.load()
+    motor = getattr(gguflokal, "_motor", None)
+    geladen = (str(motor[0]), str(motor[1]), id(motor[2])) if motor else None
+    return (art, model, gemessen, repr(c.get("gguf_kontext")), repr(c.get("gguf_motor")), geladen)
+
+
 class Ctx:
     """Veränderlicher Sitzungs-Status, den sich Klassik-Loop und TUI teilen."""
 
@@ -983,13 +1238,16 @@ class Ctx:
         import persona
         persona.chat_gewechselt(self.current_chat)          # Kern-Gedächtnis: neue Momentaufnahme je Chat
         # Die Oberfläche ruft das 5× je Sekunde; beim eigenen Motor kostet die Kontextgröße einen Ordnerscan.
+        # Neu gefragt wird, wenn sich etwas ändert, wovon sie abhängt – sonst erst nach einer Frist.
         jetzt = time.monotonic()
         merk = getattr(self, "_ctx_merk", None)
-        if merk is not None and merk[0] == self.model and jetzt - merk[1] < 2.0:
+        schluessel = _ctx_schluessel(self.model)
+        frist = CTX_FRIST_EIGEN_S if schluessel[0] == "gguf" else CTX_FRIST_S
+        if merk is not None and merk[0] == schluessel and jetzt - merk[1] < frist:
             ctx_max = merk[2]
         else:
             ctx_max = pricing.context_window(self.model)
-            self._ctx_merk = (self.model, jetzt, ctx_max)
+            self._ctx_merk = (schluessel, jetzt, ctx_max)
         try:
             import actions
             actions.KONTEXT_TOKEN = int(ctx_max or 0)           # datei_lesen liest so viel, wie passt
@@ -1017,7 +1275,15 @@ def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None
     if cmd in C.UNTERMENUES:
         return C.UNTERMENUES[cmd]
     if cmd == "/modus":
-        return [(k, f"{haken(k == modes.current())}{sym} {name}", None) for k, sym, name in modes.MODES]
+        import coding as _coding
+        import config as _config
+        frei_c = str(_config.load().get(_coding.FREIGABE_SCHALTER) or "") != "vorsicht"
+        frei_b = modes.bild_stufe() == "frei"
+        return ([(k, f"{haken(k == modes.current())}{sym} {name}", None) for k, sym, name in modes.MODES]
+                + [("coding frei", f"{haken(frei_c)}🟦 Coding frei – im Projekt durcharbeiten", None),
+                   ("coding vorsicht", f"{haken(not frei_c)}🟦 Coding vorsicht – fragt wie der Modus", None),
+                   ("bild frei", f"{haken(frei_b)}🎨 Bilder frei – malen ohne Rückfrage", None),
+                   ("bild fragen", f"{haken(not frei_b)}🎨 Bilder fragen – vor jedem Bild", None)])
     if cmd == "/emoji":
         import emojistufe
         jetzt = emojistufe.stufe()
@@ -1190,7 +1456,7 @@ def _kontext_anzeige(ctx: "Ctx") -> None:
             if a < b:
                 z.stylize(span.style, a - pos, b - pos)
         pos += 40
-    fmt = lambda n: f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+    fmt = ui.fmt_tokens
     pct = lambda n: f"{n / fenster * 100:.1f} %"
     ui.info(f"📊 Kontext · {ctx.model or 'kein Modell'} · {fmt(belegt)} von {fmt(fenster)} Token ({pct(belegt)})"
             + ("" if genau else "  ·  geschätzt"))
@@ -1229,8 +1495,10 @@ def _embedding_art(ordner) -> str:
 # /terminal: Schalter -> (Config-Schlüssel, Vorgabe, Name)
 TERMINAL_SCHALTER = {"leuchten": ("terminal_leuchten", True, "✨ Leuchten im Hintergrund"),
                      "weich": ("terminal_weich", True, "🌊 Weiches Rollen"),
-                     "geteilt": ("terminal_geteilt", False, "🪟 Reiter „KI“ neben dem Chat")}
+                     "geteilt": ("terminal_geteilt", False, "🪟 Reiter „KI“ neben dem Chat"),
+                     "figur": ("terminal_figur", True, "🐾 Figur der Persönlichkeit rechts")}
 TERMINAL_THEMEN = ("auto", "breeze", "mint")
+TERMINAL_TEMPO = ("30", "60")          # Bildrate der Oberfläche (terminal_fps), die erste ist die Vorgabe
 
 
 def terminal_befehl(arg: str) -> None:
@@ -1247,15 +1515,40 @@ def terminal_befehl(arg: str) -> None:
             ui.TUI._weich = an                       # das Blättern im Verlauf gleich mit
         ui.success(f"{name}  {'✔️' if an else '🛑'}"
                    + ("" if eigenes else "  ·  gilt im eigenen Terminal-Fenster (NemiCLI.exe)"))
+        if teile[0] == "figur" and an:
+            _figur_hinweis()
     elif len(teile) == 2 and teile[0] == "thema" and teile[1] in TERMINAL_THEMEN:
         config.update(terminal_thema=teile[1])
         ui.success(f"🎨 Farben des Terminal-Fensters: {teile[1]} – ab dem nächsten Start.")
+    elif len(teile) == 2 and teile[0] == "tempo" and teile[1] in TERMINAL_TEMPO:
+        config.update(terminal_fps=int(teile[1]))
+        ui.success(f"🎞 Bildrate der Oberfläche: {teile[1]} Bilder je Sekunde – ab dem nächsten Start (/restart).")
     else:
         c = config.load()
         stand = "  ·  ".join(f"{name} {'✔️' if c.get(schluessel, vorgabe) else '🛑'}"
                              for schluessel, vorgabe, name in TERMINAL_SCHALTER.values())
-        ui.info(f"🖥 {stand}  ·  🎨 {c.get('terminal_thema') or 'auto'}")
-        ui.info("   /terminal leuchten|weich|geteilt an|aus  ·  /terminal thema auto|breeze|mint")
+        tempo = str(c.get("terminal_fps") or "")
+        tempo = tempo if tempo in TERMINAL_TEMPO else TERMINAL_TEMPO[0]
+        ui.info(f"🖥 {stand}  ·  🎨 {c.get('terminal_thema') or 'auto'}  ·  🎞 {tempo}")
+        ui.info("   /terminal leuchten|weich|geteilt|figur an|aus  ·  /terminal thema auto|breeze|mint"
+                "  ·  /terminal tempo 30|60")
+
+
+def _figur_hinweis() -> None:
+    """Woher die Figur ihre Bilder hat – und wie sie ganz und sitzend wird."""
+    try:
+        import figur
+        import persoenlichkeiten as PS
+        name = PS.active().name
+        art, _bilder = figur.bilder(name)
+    except Exception:
+        return
+    if art == "figur":
+        ui.info(f"🐾 {name} sitzt ganz rechts auf der Eingabe – mit allen Posen.")
+    elif art == "buste":
+        ui.info(f"🐾 {name} zeigt sich mit ihren Kugel-Bildern. Ganz und sitzend: /kugel malen figur")
+    else:
+        ui.info(f"🐾 Für die Figur braucht {name} Bilder: erst /kugel malen, dann /kugel malen figur.")
 
 
 def _schalter_an(cmd: str, basis: str) -> bool | None:
@@ -1270,6 +1563,9 @@ def _schalter_an(cmd: str, basis: str) -> bool | None:
         if (cmd, basis) == ("/reflektieren", "auto"):
             import lernschleife
             return lernschleife.an()
+        if (cmd, basis) == ("/reflektieren", "selbst"):
+            import lernschleife
+            return lernschleife.selbstentwurf_an()
         if (cmd, basis) == ("/skills", "selbst"):
             import skills
             return skills.selbst()
@@ -1281,6 +1577,12 @@ def _schalter_an(cmd: str, basis: str) -> bool | None:
             return bool(config.load().get("uebung", True))
         if (cmd, basis) == ("/auto", ""):
             return bool(config.load().get("auto_stark"))
+        if (cmd, basis) == ("/bild", "gesicht"):
+            import krea
+            return krea.gesicht_an()
+        if (cmd, basis) == ("/web", "schutz"):
+            import schutzliste
+            return schutzliste.an()
         if cmd == "/terminal" and basis in TERMINAL_SCHALTER:
             schluessel, vorgabe, _name = TERMINAL_SCHALTER[basis]
             return bool(config.load().get(schluessel, vorgabe))
@@ -1293,11 +1595,14 @@ _SCHALTER_NAME = {("/kugel", "auto"): "✨ AUTO", ("/kugel", "vorne"): "📌 Imm
                   ("/debug", ""): "🐞 Debugbericht – die KI kann hineinsehen (Cloud)",
                   ("/debug", "motor"): "⚙ Motor-Log – jeder Prompt des lokalen Motors (groß, privat)",
                   ("/reflektieren", "auto"): "🔁 Automatisch reflektieren (nach Korrekturen, Fehlern, größeren Aufgaben)",
+                  ("/reflektieren", "selbst"): "🍽 Selbstentwurf 3× am Tag ansehen (morgens, mittags, abends)",
                   ("/skills", "selbst"): "🧩 Selbst anlegen/ändern ohne Rückfrage",
                   ("/kontextmenue", ""): "🖱 Im Rechtsklick-Menü", ("/uebung", ""): "🎓 Übungsmodus",
-                  ("/auto", ""): "🧠 Auto-Stark",
+                  ("/auto", ""): "🧠 Auto-Stark", ("/bild", "gesicht"): "✨ Gesichts-Korrektur",
+                  ("/web", "schutz"): "⛔ Schutzliste (Schad- und Phishing-Adressen)",
                   ("/terminal", "leuchten"): "✨ Leuchten im Hintergrund",
-                  ("/terminal", "weich"): "🌊 Weiches Rollen", ("/terminal", "geteilt"): "🪟 Reiter „KI“ neben dem Chat"}
+                  ("/terminal", "weich"): "🌊 Weiches Rollen", ("/terminal", "geteilt"): "🪟 Reiter „KI“ neben dem Chat",
+                  ("/terminal", "figur"): "🐾 Figur der Persönlichkeit rechts"}
 _SCHALTER_ZEICHEN = {}   # sonst ✔️ / 🛑
 
 
@@ -1307,6 +1612,9 @@ def _wahl_stand(cmd: str) -> str | None:
         if cmd == "/voice":
             import stimme
             return stimme.modus()
+        if cmd == "/zip":
+            import entpacken
+            return entpacken.modus()
         if cmd == "/subagenten":
             import subagents
             stufe = subagents.stufe()
@@ -1507,10 +1815,10 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
     # --- Normaler Chat ----------------------------------------------------
     if not text.strip():
         return None
+    await profil_zips_pruefen()          # Archiv im Profilordner: vor der Antwort fragen bzw. entpacken
     await _rauswurf_uebernehmen(ctx)
     if ctx.backend is None:
-        if not await funke_plaudern(ctx, text):
-            ui.warn("Kein Modell aktiv. Wähle eins mit /model (z.B. /model gemma-12b).")
+        ui.warn("Kein Modell aktiv. Wähle eins mit /model (z.B. /model gemma-12b).")
         return None
 
     text = emoji.expand(text)   # =)  <3  :feuer:  ->  echte Emojis
@@ -1545,15 +1853,13 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
                 await _rauswurf_uebernehmen(ctx)
             aus_dem_netz = actions.web_tainted()
             ctx.current_prompts.append(text)
-            # im Faden: JSON aller Nachrichten + SHA-256 jedes Bildes brauchen bei langen Chats spürbar Zeit
-            await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
-                                    list(ctx.current_prompts), ctx.model or "—",
-                                    stand=getattr(ctx.backend, "stand", None))
+            await _chat_speichern(ctx)
             n_code = learn.capture_from_answer(text, ctx.backend.messages, ctx.current_chat)
             await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
             memory.release_encoder()
         lernen_planen(ctx, getippt, records, aus_dem_netz, pricing.weggefallen_holen(ctx.backend))
         pflege_planen(ctx)
+        selbstentwurf_planen(ctx)
         if n_code:
             ui.info(f"🐍 {n_code} Code-Snippet(s) in den Wissensspeicher gelernt.")
         # Terminal-Antwort auch im offenen Browser spiegeln (Status & Hinweis)
@@ -1565,12 +1871,74 @@ async def handle_line(ctx: Ctx, text: str) -> str | None:
         mascot.maybe()
     except Exception as e:
         ui.error(f"Fehler bei der Antwort: {e}")
-        await funke_notfall(ctx, e)
     finally:                         # auch nach Esc (CancelledError) oder Fehler
         if GUI_BRUECKE is not None:
             GUI_BRUECKE.senden({"t": "busy", "on": False})
             _gui_spiegeln(ctx)
     return None
+
+
+async def _chat_speichern(ctx: "Ctx") -> None:
+    """Verlauf speichern – im Faden: JSON aller Nachrichten + SHA-256 jedes Bildes brauchen bei langen Chats
+    spürbar Zeit. Hat ein anderes Fenster denselben Chat weitergeschrieben, geht es als neuer Chat weiter."""
+    nr = await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
+                                 list(ctx.current_prompts), ctx.model or "—",
+                                 stand=getattr(ctx.backend, "stand", None))
+    if nr != ctx.current_chat:
+        ui.info(f"📒 Chat {ctx.current_chat} wurde in einem anderen Fenster weitergeschrieben – "
+                f"dieses Gespräch geht als Chat {nr} weiter.")
+        ctx.current_chat = nr
+        ctx.sync_session()
+
+
+async def reflektieren_befehl(ctx: "Ctx", arg: str) -> None:
+    """/reflektieren [auto an|aus · selbst [verlauf|zurueck|an|aus]] – ohne Zusatz: Reflexion, danach die
+    Selbstentwurf-Runde."""
+    import lernschleife as LS
+    was, wahl = (arg.lower().split() + ["", ""])[:2]
+    if was == "auto":
+        if wahl in ("an", "aus"):
+            LS.setzen(wahl == "an")
+        ui.info("🪞 Automatisch reflektieren: " + (
+            "AN – nach Korrekturen, Fehlern und größeren Aufgaben (nie nach Web-Inhalt)"
+            if LS.an() else "AUS – nur noch mit /reflektieren"))
+        return
+    if was == "selbst":
+        import selbstentwurf as SE
+        if wahl in ("an", "aus"):
+            LS.selbstentwurf_setzen(wahl == "an")
+            ui.info("🪞 Selbstentwurf im Takt: " + (
+                "AN – morgens, mittags und abends einmal ansehen (nur mit erlaubtem Modell)"
+                if LS.selbstentwurf_an() else "AUS – nur noch mit /reflektieren"))
+        elif wahl == "verlauf":
+            staende = SE.verlauf()
+            if not staende:
+                ui.info("🪞 Noch keine früheren Stände.")
+            for e in staende:
+                ui.console.print(f"  {e.get('nr')}. {e.get('zeit') or '?'} – {e.get('grund') or '–'}: "
+                                 f"{e.get('felder') or ''}", markup=False, highlight=False)
+        elif wahl in ("zurueck", "zurück"):
+            try:
+                ui.success(SE.zurueck())
+            except ValueError as e:
+                ui.warn(f"🪞 Nicht zurückgesetzt: {e}.")
+        else:
+            for zeile in SE.stand_zeilen():
+                ui.console.print(zeile, markup=False, highlight=False)
+            ui.info("🪞 Im Takt (3× am Tag): " + ("an" if LS.selbstentwurf_an() else "aus")
+                    + " · /reflektieren selbst verlauf · /reflektieren selbst zurueck")
+        return
+    if ctx.backend is None:
+        ui.warn("Kein Modell aktiv – mit /model eins wählen.")
+        return
+    saved = await do_reflect(ctx)
+    if saved:
+        ui.success(f"🪞 {len(saved)} Lehre(n) gemerkt:")
+        for art, t in saved:
+            ui.console.print(f"  [muted]{art}[/muted]  {t}")
+    else:
+        ui.info("🪞 Nichts Bleibendes zum Lernen gefunden – alles gut.")
+    await selbstentwurf_jetzt(ctx)
 
 
 async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
@@ -1618,7 +1986,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             else:
                 ui.info(f"🗄 Archiv – die {len(archiv)} jüngsten (ersetzt, vergessen, zusammengelegt):")
                 for a in archiv:
-                    ui.console.print(f"  [dim]#{a.get('id')} · {a.get('archiviert', '?')} · {a.get('grund', '')}[/dim]"
+                    ui.console.print(f"  [muted]#{a.get('id')} · {a.get('archiviert', '?')} · {a.get('grund', '')}[/muted]"
                                      f"  {a.get('text', '')}")
                 ui.info("Zurückholen: /gedaechtnis zurueck <nummer>")
         elif sub.split()[:1] in (["zurueck"], ["zurück"], ["wiederherstellen"]):
@@ -1649,8 +2017,8 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                         "oder NemiCLI merkt sich Wichtiges von selbst.")
             else:
                 for e in entries:
-                    ui.console.print(f"  [dim]#{e['id']} · {e['ts']} · {e['kind']}[/dim]  {e['text']}"
-                                     + (f"  [dim]📎 {e['detail']}[/dim]" if e.get("detail") else ""))
+                    ui.console.print(f"  [muted]#{e['id']} · {e['ts']} · {e['kind']}[/muted]  {e['text']}"
+                                     + (f"  [muted]📎 {e['detail']}[/muted]" if e.get("detail") else ""))
                 ui.info("Löschen: /gedaechtnis vergiss <nummer>  ·  alles: /gedaechtnis leeren  ·  "
                         "Archiv: /gedaechtnis archiv")
             try:
@@ -1675,10 +2043,10 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                 await bibliothekar(sofort=True)
             ui.info("🗜 " + GP.bericht_text(erg))
             for z in erg.get("zusammen") or []:
-                ui.console.print(f"  [dim]#{z['behalten']} + {', '.join('#' + str(w) for w in z['weg'])}[/dim]  "
+                ui.console.print(f"  [muted]#{z['behalten']} + {', '.join('#' + str(w) for w in z['weg'])}[/muted]  "
                                  f"{z['text']}")
             for v in erg.get("veraltet") or []:
-                ui.console.print(f"  [dim]#{v['nr']} archiviert[/dim]  {v['grund']}")
+                ui.console.print(f"  [muted]#{v['nr']} archiviert[/muted]  {v['grund']}")
         else:
             with ui.thinking("räume das Gedächtnis auf"):
                 r = await asyncio.to_thread(memory.consolidate)
@@ -1689,25 +2057,8 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                            f"({r['before']} → {r['after']}). Zurückholen: /gedaechtnis archiv")
             else:
                 ui.info(f"Alles schon ordentlich – nichts zu verschmelzen ({n} Notizen).")
-    elif cmd == "/reflektieren" and arg.split()[:1] == ["auto"]:
-        import lernschleife as LS
-        wahl = (arg.split() + [""])[1].lower()
-        if wahl in ("an", "aus"):
-            LS.setzen(wahl == "an")
-        ui.info("🪞 Automatisch reflektieren: " + (
-            "AN – nach Korrekturen, Fehlern und größeren Aufgaben (nie nach Web-Inhalt)"
-            if LS.an() else "AUS – nur noch mit /reflektieren"))
     elif cmd == "/reflektieren":
-        if ctx.backend is None:
-            ui.warn("Kein Modell aktiv – mit /model eins wählen.")
-        else:
-            saved = await do_reflect(ctx)
-            if saved:
-                ui.success(f"🪞 {len(saved)} Lehre(n) gemerkt:")
-                for art, t in saved:
-                    ui.console.print(f"  [dim]{art}[/dim]  {t}")
-            else:
-                ui.info("🪞 Nichts Bleibendes zum Lernen gefunden – alles gut.")
+        await reflektieren_befehl(ctx, arg)
     elif cmd == "/start":
         await run_reich()
     elif cmd == "/einrichten" and arg.strip().lower() in ("modelle", "models", "modell"):
@@ -1771,6 +2122,10 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             await _einlesen_starten(ctx)
     elif cmd == "/llamacpp":
         await llamacpp_befehl(ctx, arg)
+    elif cmd == "/zip":
+        await zip_befehl(arg)
+    elif cmd == "/bewegung":
+        await bewegung_befehl(arg)
     elif cmd == "/name":
         await name_befehl(arg)
     elif cmd == "/skills":
@@ -1814,7 +2169,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             gui_oeffnen(MUSIK_BRUECKE, "--musik")
             ui.success("🎵 Das Musik-Fenster öffnet sich: Wunsch eintippen, ausarbeiten lassen, komponieren.")
     elif cmd == "/kern":
-        await kern_befehl(arg)
+        await kern_befehl(arg, ctx)
     elif cmd == "/lora":
         global LORA_BRUECKE  # noqa: PLW0603
         if LORA_BRUECKE is None:
@@ -1860,11 +2215,43 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                 "aus": "gesperrt"}[modus]
                 + ("" if webfetch.search_available() else "  ·  ⚠ ohne Ollama-Schlüssel (/web key) aus")
                 + "  ·  /web fremdseiten frei|fragen|aus")
+        elif arg.strip().lower().split()[:1] == ["lokal"]:
+            import netzzwang
+            teile = arg.strip().lower().split()[1:]
+            weg = bool(teile) and teile[0] in ("weg", "entfernen", "aus")
+            zahl = teile[1] if weg and len(teile) > 1 else (teile[0] if teile and not weg else "")
+            eigene = [p for p in (config.load().get(netzzwang.EINSTELLUNG) or []) if isinstance(p, int)]
+            if zahl:
+                if not zahl.isdigit() or not 0 < int(zahl) < 65536:
+                    ui.warn(f"'{zahl}' ist kein Port (1–65535).")
+                    return None
+                port = int(zahl)
+                eigene = [p for p in eigene if p != port] if weg else sorted(set(eigene) | {port})
+                config.update(**{netzzwang.EINSTELLUNG: eigene})
+                if weg and port in netzzwang.STANDARD:
+                    ui.warn(f"Port {port} ({netzzwang.STANDARD[port]}) ist ein bekannter Dienst und bleibt frei.")
+            ui.info("🔒 Netz-Zwang: ins Netz nur https://, unverschlüsselt nur zu 127.0.0.1 auf diesen Ports – "
+                    f"{netzzwang.ports_text()}\n   Die KI schreibt dafür lokal:PORT.  "
+                    "/web lokal <port> gibt frei · /web lokal weg <port> nimmt zurück")
+        elif arg.strip().lower().split()[:1] == ["schutz"]:
+            import schutzliste
+            wert = (arg.strip().lower().split() + [""])[1]
+            if wert in ("an", "aus"):
+                config.update(**{schutzliste.SCHALTER: wert == "an"})
+            elif wert in ("aktualisieren", "neu", "update"):
+                ui.info("⛔ Lade die Schutzlisten neu …")
+                try:
+                    await asyncio.to_thread(schutzliste.aktualisieren)
+                except Exception as e:
+                    ui.error(f"Schutzliste nicht aktualisiert: {e}")
+            ui.info(schutzliste.status_text())
         else:
             status = ("🔎 Web-Suche (Ollama): aktiv" if webfetch.search_available()
                       else "🔎 Web-Suche (Ollama): aus – mit  /web key  einrichten")
             status += (f"  ·  ◐ Fremdseiten über Ollama: {webfetch.fremdseiten_modus()}"
                        if webfetch.fremdseiten_an() else "  ·  ◐ Fremdseiten: aus")
+            import schutzliste
+            status += "  ·  ⛔ Schutzliste: " + ("an" if schutzliste.an() else "aus") + " (/web schutz)"
             ui.info(status)
             eintraege = webfetch.entries()
             filt = arg.strip().lower()
@@ -1949,7 +2336,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
         if sub in ("an", "on", "ein", "knopf", "button"):
             if not stimme.verfuegbar():
                 ui.warn("Kein Stimm-Modell gefunden – Qwen3-TTS-Talker und 12-Hz-Tokenizer (GGUF) "
-                        "in einen Ordner unter Vision/ legen.")
+                        "in einen Ordner unter KI-Modelle/KI-Stimme/Stimmmodell/ legen.")
             elif sub in ("knopf", "button"):
                 stimme.modus_setzen("knopf")
                 ui.success("🔊 Stimme auf Knopf – spricht nur auf Anfrage (/voice jetzt, Vorlese-Werkzeug, "
@@ -2157,9 +2544,7 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             else:
                 if ergebnis:
                     ui.success(ergebnis)
-                    await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
-                                            list(ctx.current_prompts), ctx.model or "—",
-                                            stand=getattr(ctx.backend, "stand", None))
+                    await _chat_speichern(ctx)
                     _kontext_neu_zaehlen(ctx, vorbereiten=False)
                 else:
                     ui.info("📌 Noch nichts zusammenzufassen – das Gespräch ist kurz genug.")
@@ -2171,7 +2556,8 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                 labels = kontextmenue.installieren()
                 ui.success("🖱 Eingetragen: " + "  ·  ".join(labels))
                 ui.info("Windows 11 zeigt sie unter „Weitere Optionen anzeigen“ (Shift+F10). "
-                        "Ein Klick öffnet NemiCLI und schickt „Schau dir dieses Bild an“ gleich ab.")
+                        "Ein Klick öffnet NemiCLI und schickt „Schau dir dieses Bild an“ gleich ab. "
+                        "„🛡 Wächter-Scan“ prüft markierte Dateien, Ordner oder Laufwerke mit Ampel.")
             elif sub in ("aus", "off"):
                 n = kontextmenue.entfernen()
                 ui.info(f"🖱 Rechtsklick-Einträge entfernt ({n} Schlüssel)." if n
@@ -2181,6 +2567,8 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
                 an = st["bildschirm"] and st["bild"]
                 ui.info(f"🖱 Rechtsklick-Menü ist {'an' if an else 'aus'}.  "
                         "/kontextmenue an · aus")
+                if an and not st.get("waechterscan"):
+                    ui.info("🛡 „Wächter-Scan“ fehlt noch im Menü – /kontextmenue an trägt ihn dazu ein.")
         except Exception as e:
             ui.warn(f"Rechtsklick-Menü: {e}")
     elif cmd == "/subagenten":
@@ -2230,15 +2618,34 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
     elif cmd in PERSONA_CMDS:
         await persoenlichkeiten_menu(arg)
     elif cmd == "/modus":
+        import coding as _coding
+        import config as _config
         sub = arg.strip().lower()
         if not sub:
-            zeilen = [(f"{sym} {n}" + ("  ✔️" if k == modes.current() else ""),
-                       {"chat": "Gespräch & Planen – jede Aktion fragt, Merken frei",
-                        "lesen": "alles lesen, nichts anrühren – Ändern gesperrt",
-                        "normal": "Lesen sofort, Ändern mit Rückfrage (F8)",
-                        "auto": f"ohne Rückfragen im aktuellen Ordner · Zünder {modes.AUTO_FUSE_S // 60} min"}[k])
+            beschreibung = {"chat": "Gespräch & Planen – jede Aktion fragt, Merken frei",
+                            "lesen": "alles lesen, nichts anrühren – Ändern gesperrt",
+                            "normal": "Lesen sofort, Ändern mit Rückfrage (F8)",
+                            "auto": f"ohne Rückfragen im aktuellen Ordner · Zünder {modes.AUTO_FUSE_S // 60} min",
+                            "autoan": "ohne Rückfragen im aktuellen Ordner, ohne Zünder"}
+            zeilen = [(f"{sym} {n}" + ("  ✔️" if k == modes.current() else ""), beschreibung.get(k, ""))
                       for k, sym, n in modes.MODES]
-            ui.kv_panel(f"Arbeitsmodus: {modes.label()}   ·   Shift+Tab schaltet weiter", zeilen)
+            coding_stufe = ("vorsicht" if str(_config.load().get(_coding.FREIGABE_SCHALTER) or "") == "vorsicht"
+                            else "frei")
+            zeilen += [("🟦 Coding: " + coding_stufe,
+                        "eigene Stufe im Coding-Assistenten (Shift+Tab im Coding) – /modus coding frei|vorsicht"),
+                       ("🎨 Bilder: " + modes.bild_stufe(), "eigene Stufe fürs Malen – /modus bild frei|fragen")]
+            ui.kv_panel(f"Arbeitsmodus: {modes.anzeige()}   ·   Shift+Tab schaltet weiter", zeilen)
+            return None
+        teile = sub.split()
+        if teile[0] == "bild" and len(teile) == 2:
+            stufe = modes.bild_stufe_setzen(teile[1])
+            ui.success("🎨 Bilder: " + ("malen ohne Rückfrage, in jedem Bereich" if stufe == "frei"
+                                        else "vor jedem Bild wird gefragt"))
+            return None
+        if teile[0] == "coding" and len(teile) == 2 and teile[1] in ("frei", "vorsicht"):
+            _config.update(**{_coding.FREIGABE_SCHALTER: teile[1]})
+            ui.success("🟦 Coding: " + ("frei – arbeitet im Projekt durch" if teile[1] == "frei"
+                                         else "vorsicht – fragt wie der Arbeitsmodus"))
             return None
         key = modes.resolve(sub)
         if key is None:
@@ -2269,8 +2676,31 @@ async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
             ui.info(f"Datei: {protokoll.PFAD}")
     elif cmd == "/wache":
         await _wache_befehl(ctx, arg.strip())
+        wache_karte_auffrischen()
+    elif cmd == "/kompass":
+        import kompass
+        wahl = arg.strip().lower()
+        if wahl in ("an", "ein", "on"):
+            kompass.setzen(True)
+            ui.success("🧭 Kompass an – tipp / und schau neben das Terminal.")
+        elif wahl in ("aus", "off"):
+            kompass.setzen(False)
+            ui.info("🧭 Kompass aus.")
+        else:
+            ui.info(f"🧭 Kompass ist {'an' if kompass.an() else 'aus'} – /kompass an|aus.")
+    elif cmd == "/zeitplan":
+        import zeitplan
+        if arg.strip().lower() in ("liste", "list", "status"):
+            ui.info(zeitplan.liste())
+        else:
+            zeitplan.fenster_oeffnen()
+            ui.info("📅 Das Zeitplan-Fenster geht auf.")
     elif cmd == "/backup":
         await _backup_befehl(arg.strip())
+    elif cmd == "/cve":
+        await cve_befehl(arg)
+    elif cmd == "/eigenes":
+        await _eigenes_befehl(arg)
     elif cmd == "/doku":
         import doku
         teile = arg.lower().split()

@@ -17,11 +17,43 @@ UNTERORDNER = ("Chats", "Bilder", "Videos", "Skills", "Erinnerungen", "LoRA")
 _UMLAUTE = str.maketrans({"ä": "ae", "ö": "oe", "ü": "ue", "Ä": "Ae", "Ö": "Oe", "Ü": "Ue", "ß": "ss"})
 
 
+# Gerätenamen: Windows legt dafür keinen Ordner an.
+RESERVIERT = frozenset({"CON", "PRN", "AUX", "NUL", *(f"COM{i}" for i in range(1, 10)),
+                        *(f"LPT{i}" for i in range(1, 10))})
+
+
 def ordnername(name: str) -> str:
     """Anzeigename → Ordnername ohne Sonderzeichen."""
     t = str(name or "").translate(_UMLAUTE)
     t = re.sub(r"[^A-Za-z0-9_]+", "_", t).strip("_")
-    return re.sub(r"_+", "_", t)[:60].strip("_") or "Profil"
+    t = re.sub(r"_+", "_", t)[:60].strip("_") or "Profil"
+    return f"{t}_" if t.upper() in RESERVIERT else t
+
+
+def belegt() -> set[str]:
+    """Vorhandene Profil-Ordner (klein geschrieben – Windows unterscheidet nicht)."""
+    try:
+        return {p.name.lower() for p in wurzel().iterdir() if p.is_dir()}
+    except OSError:
+        return set()
+
+
+def beiseitelegen(name: str) -> Path | None:
+    """Profile/<Name>/ als _geloescht_<Name>_<Zeit> umbenennen statt löschen: Chats, Bilder und
+    Eigenes bleiben erhalten, eine spätere gleichnamige Persönlichkeit erbt nichts davon.
+    Rückgabe: der neue Ort, None wenn es keinen Ordner gab oder er gerade nicht umzubenennen ist."""
+    alt = wurzel() / ordnername(name)
+    if not alt.is_dir():
+        return None
+    basis = f"_geloescht_{alt.name}_{time.strftime('%Y-%m-%d_%H-%M-%S')}"
+    ziel, n = alt.with_name(basis), 2
+    while ziel.exists():
+        ziel, n = alt.with_name(f"{basis}_{n}"), n + 1
+    try:
+        alt.rename(ziel)
+    except OSError:                         # Datei noch offen: Ordner bleibt (neue Namen weichen ihm aus)
+        return None
+    return ziel
 
 
 def aktiv() -> str:

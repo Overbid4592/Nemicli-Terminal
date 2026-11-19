@@ -546,7 +546,7 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
   Vergisst die KI `figur`, nimmt NemiCLI die Figur von selbst dazu, wenn der Prompt sie meint – ihr Name,
   „me/myself/selfie“ oder mehrere Merkmale ihres Aussehens zusammen mit einer Person; Landschaften, Tiere
   oder andere Menschen bleiben ohne. `figur: false` schaltet es aus. Im Ergebnis steht „🧍 Figur automatisch dazu“.
-  `bild_serie` malt bis zu 30 Varianten in einem Auftrag mit gleichem Seed. Die KI pflegt die Datei
+  `bild_serie` malt bis zu 10 Varianten in einem Auftrag mit gleichem Seed. Die KI pflegt die Datei
   mit `charakter_aendern` (du bestätigst), von Hand per `/charakter oeffnen`.
 - **Gesichter nachmalen (Krea 2):** Nach `/bild` und `bild_malen` sucht das **Seh-Modell** aus
   `Vision/` (der Bildbeschreiber) die Gesichter und nennt sie als Kästen; jeder Kasten muss plausibel sein
@@ -668,6 +668,29 @@ zeigt die [README](../README.md); wie es technisch gebaut ist, steht in
 - **🎨 Themes für alles** (`/theme nachtglas · pastell · neon`): 🌌 Nachtglas (tiefes Blau, Cyan → Lila), 🌸 Pastell-Nacht
   (Mint und Rosé), ⚡ Neon-Klar (Schwarz mit kräftigem Cyan und Pink) färben Terminal **und** Fenster; die übrigen
   Terminal-Themes lassen die Fenster bei „Klassik“. Fenster übernehmen es beim nächsten Öffnen, die Kugel nach /restart.
+- **🧍 Echtes Aussehen** (9.70, Hülle seit 9.72, `/kugel malen figur`): Körper in T-Haltung von vorn und hinten gemalt, alle
+  22 Gelenke aus dem Umriss aufgelegt. Skelett, Hülle, Aussehen getrennt (`tools/figurrig.py`): um jeden Knochen eine Röhre
+  – das Stück Bild, das zu ihm gehört, 2 px breiter –, an den Gelenken runde Kappen wie Knorpel; im Fenster liegt jedes
+  Stück auf seinem Knochen – starr in der Mitte, weich überblendet am Gelenk (kein Gummi, kein Scharnier), Kappen
+  darunter füllen die Lücke beim Beugen. Feste Größe (14 Zeilen,
+  kleiner nur, wenn das Fenster zu niedrig ist), steht oben auf dem Rahmen der Eingabe über dem Inhalt (volle Breite für
+  NemiCLI). Arme in jedem Winkel zwischen waagerecht und schräg werden erkannt.
+- **😉 Gesichter der Figur** (9.73): aus dem Vorderbild des Körpers rechnet der Porträt-Motor (LivePortrait,
+  `tools/figurgesicht.py`) acht Köpfe – froh, lacht, grinst, zwinkert, staunt, ernst, verliebt, schläft –, ohne neu zu
+  malen; figurrig schneidet sie wie die Kopf-Röhre zu, das Fenster tauscht nur den Kopf. Beim Dösen sind die Augen zu.
+- **🎚️ Figur-Justierer** (9.72): Rechtsklick auf die Figur → „Figur anpassen …“: Regler für Größe (8–24 Zeilen), Kopf,
+  Rumpf, Arme, Beine, Füße (70–130 %), Platz links ↔ rechts und hoch ↕ runter; sie bewegt sich live mit. Je Persönlichkeit
+  in `Figur/justierung.json` (`ui/figurmass.py`), die KI stellt es mit `figur_justieren` („mach deine Arme etwas länger“).
+- **🕺 Bewegung nach Text** (9.69, `/bewegung`): Mit SprongMotion wird die Figur ein Strichmännchen mit dem Gesicht der
+  Persönlichkeit (22 Gelenke, 20 Bilder je Sekunde, leicht schräg gesehen). Die KI bewegt es mit `figur_bewegen`
+  (englischer Satz + Gesicht); jede Pose ist eine echte Bewegung (`engines/bewegung.py`, `ui/figur.py`).
+- **🐾 Figur im Terminal** (9.68, `/terminal figur an|aus`): Die aktive Persönlichkeit sitzt rechts auf der Kopfzeile
+  der Eingabe und zeigt mit zehn Posen, was passiert (sitzt · winkt · denkt nach · prüft · arbeitet · freut sich · Herz ·
+  grinst · Kopf schief · döst). Bilder: Kugel-Motive als Büste, ganz und sitzend nach `/kugel malen figur`. Das Fenster
+  hält rechts Spalten frei, damit nichts verdeckt wird (`ui/figur.py`, `ui/terminal_fenster.py`).
+- **🐯 tigra** (`/theme tigra`, 9.67): Violett und Cyan, dazu Rosé und Gold, färbt Terminal und Fenster, ♥ neben der
+  Version. Seit 9.67 hat Text in **jedem** Theme mindestens 4,5 : 1 Kontrast (`ui/kontrast.py`), auch wenn der Hintergrund
+  des Terminal-Fensters durchscheint; Rahmen bleiben leiser. Neben dem Bild steht, was die KI tut (denkt · prüft · arbeitet).
 - **Neues Aussehen:** Glas-Flächen (oben heller, feiner Rand, Lichtstreif), Verlauf-Ring um den Avatar, schwebende
   Eingabe mit Schatten, sanftes Leuchten oben im Fenster; Kugel-Panel mit weichem Leuchtrand, runden Blasen und einem
   Senden-Knopf im Verlauf; im Terminal Überschriften und Rahmen-Titel im Farbverlauf des Themes und Kacheln in den

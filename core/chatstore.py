@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 import sqlite3
 import time
@@ -317,25 +318,71 @@ def _stand_schluessel(chat_id: int) -> str:
     return f"gespraech:{int(chat_id)}"
 
 
-def save(chat_id: int, messages: list, prompts: list[str], model: str, stand: str | None = None) -> None:
+# Zuletzt von diesem Prozess gelesener oder geschriebener Stand je Chat: (Datenbank, Nr) → Zeilen.
+# Weicht die Datenbank davon ab, hat ein anderes Fenster denselben Chat weitergeschrieben.
+_EIGEN: dict[tuple[str, int], list[str]] = {}
+
+
+def _eigen_schluessel(ort: Path, chat_id: int) -> tuple[str, int]:
+    return str(db_pfad(ort)), int(chat_id)
+
+
+def save(chat_id: int, messages: list, prompts: list[str], model: str, stand: str | None = None) -> int:
     """Speichert den Verlauf. Hat der Kontext aufgeräumt, bleibt der ausgelagerte Anfang in der
     Datenbank (und damit im Suchindex). `stand`: Stand des Gesprächs (Zusammenfassung des
-    ausgelagerten Teils) – leer lässt den gespeicherten stehen."""
+    ausgelagerten Teils) – leer lässt den gespeicherten stehen.
+    Rückgabe: die Nummer, unter der gespeichert wurde. Hat ein anderes Fenster den Chat seit dem
+    eigenen letzten Stand weitergeschrieben und gingen dessen Nachrichten sonst verloren, wird
+    der Verlauf als neuer Chat abgezweigt."""
     if not prompts:
-        return  # leere Chats nicht anlegen
-    c = _verbinden(_ordner_fuer(chat_id))
+        return chat_id  # leere Chats nicht anlegen
+    ort = _ordner_fuer(chat_id)
+    c = _verbinden(ort)
     try:
         zeilen, bilder = _als_zeilen(list(messages))
-        alt = _gespeichert(c, chat_id)
-        zeilen = zusammenfuehren(alt, _bilder_behalten(alt, zeilen))       # gleiche Nachricht = gleiche Zeile
-        _schreiben(c, chat_id, [], prompts, model, datetime.now().strftime("%Y-%m-%d %H:%M"),
-                   zeilen=zeilen, bilder=bilder)
-        if stand:
-            c.execute("INSERT OR REPLACE INTO stand(schluessel, wert) VALUES (?, ?)",
-                      (_stand_schluessel(chat_id), stand))
-        c.commit()
+        if c.in_transaction:
+            c.commit()
+        # Prüfen und Schreiben in einer Schreib-Transaktion: ein zweites Fenster kann dazwischen nichts anhängen,
+        # das der Abgleich nicht gesehen hat.
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            alt = _gespeichert(c, chat_id)
+            eigen = _EIGEN.get(_eigen_schluessel(ort, chat_id))
+            ergebnis = zusammenfuehren(alt, _bilder_behalten(alt, zeilen))     # gleiche Nachricht = gleiche Zeile
+            if alt and alt != eigen and ergebnis[:len(alt)] != alt:
+                basis = eigen or []                 # eigener Stand: ausgelagerter Anfang bleibt dabei
+                ergebnis = zusammenfuehren(basis, _bilder_behalten(basis, zeilen))
+                chat_id = _naechste_id(c, ort)      # gleiche Datenbank: Bild-Verweise bleiben gültig
+            _schreiben(c, chat_id, [], prompts, model, datetime.now().strftime("%Y-%m-%d %H:%M"),
+                       zeilen=ergebnis, bilder=bilder)
+            if stand:
+                c.execute("INSERT OR REPLACE INTO stand(schluessel, wert) VALUES (?, ?)",
+                          (_stand_schluessel(chat_id), stand))
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
+        _EIGEN[_eigen_schluessel(ort, chat_id)] = list(ergebnis)
     finally:
         c.close()
+    return chat_id
+
+
+def _naechste_id(c: sqlite3.Connection, ort: Path) -> int:
+    """Wie next_id, aber die eigene Datenbank über die offene Verbindung `c` (sie hält die Schreibsperre)."""
+    hoechste = int(c.execute("SELECT COALESCE(MAX(id), 0) FROM chats").fetchone()[0])
+    eigen = db_pfad(ort)
+    for o in _alle_orte():
+        if db_pfad(o) == eigen:
+            continue
+        andere = _verbinden(o, anlegen=False)
+        if andere is None:
+            continue
+        try:
+            hoechste = max(hoechste, andere.execute("SELECT COALESCE(MAX(id), 0) FROM chats").fetchone()[0])
+        finally:
+            andere.close()
+    return hoechste + 1
 
 
 def _bild(c: sqlite3.Connection, h: str) -> str | None:
@@ -348,7 +395,8 @@ def md_path(chat_id: int) -> Path:
     return _ordner_fuer(chat_id) / f"{chat_id:03d}.md"
 
 
-def load(chat_id: int) -> dict | None:
+def load(chat_id: int, merken: bool = False) -> dict | None:
+    """`merken`: der Chat wird hier fortgesetzt – sein Stand gilt als eigener (siehe save)."""
     ort = _ort_von(chat_id)
     if ort is None:
         return None
@@ -358,8 +406,10 @@ def load(chat_id: int) -> dict | None:
                          (int(chat_id),)).fetchone()
         if kopf is None:
             return None
-        nachrichten = [_bilder_rein(json.loads(r[0]), lambda h: _bild(c, h)) for r in
-                       c.execute("SELECT inhalt FROM nachrichten WHERE chat=? ORDER BY nr", (int(chat_id),))]
+        zeilen = _gespeichert(c, int(chat_id))
+        nachrichten = [_bilder_rein(json.loads(z), lambda h: _bild(c, h)) for z in zeilen]
+        if merken:
+            _EIGEN[_eigen_schluessel(ort, chat_id)] = zeilen
         stand = c.execute("SELECT wert FROM stand WHERE schluessel=?", (_stand_schluessel(chat_id),)).fetchone()
         return {"id": int(chat_id), "title": kopf[0] or "", "model": kopf[1] or "", "updated": kopf[2] or "",
                 "prompts": json.loads(kopf[3] or "[]"), "messages": nachrichten, "stand": (stand or [""])[0] or ""}
@@ -425,6 +475,10 @@ def sichern(ort: Path | None = None) -> Path:
     if pruefen(ort) != "ok":
         raise RuntimeError(f"Die Chat-Datenbank ist nicht in Ordnung ({pruefen(ort)}) – keine Sicherung "
                            "über die letzte gute.")
+    try:
+        bilder_aufraeumen(ort)
+    except sqlite3.Error:
+        pass                                    # gesperrt o. Ä.: beim nächsten Sichern
     ziel = backup_pfad(ort)
     tmp = ziel.with_suffix(".tmp")
     quelle = sqlite3.connect(str(db_pfad(ort)), timeout=10)
@@ -444,6 +498,37 @@ def sichern(ort: Path | None = None) -> Path:
         quelle.close()
     tmp.replace(ziel)
     return ziel
+
+
+_VERWEIS = re.compile(re.escape(_BILD_VERWEIS) + r"([0-9a-f]{64})")
+
+
+def bilder_aufraeumen(ort: Path | None = None) -> int:
+    """Bilder, auf die keine Nachricht, kein Prompt und kein Gesprächsstand mehr verweist, aus der Tabelle
+    `bilder` löschen (Chat gelöscht, Verlauf zurückgenommen). In einer Schreib-Transaktion: kein anderes
+    Fenster kann zwischen Zählen und Löschen ein Bild neu verwenden. Rückgabe: gelöschte Bilder."""
+    ort = ort or ordner()
+    if not db_pfad(ort).exists():
+        return 0
+    c = sqlite3.connect(str(db_pfad(ort)), timeout=10)
+    try:
+        c.execute("BEGIN IMMEDIATE")
+        try:
+            benutzt: set[str] = set()
+            for sql in ("SELECT inhalt FROM nachrichten", "SELECT prompts FROM chats", "SELECT wert FROM stand"):
+                for (text,) in c.execute(sql):
+                    if text and _BILD_VERWEIS in text:
+                        benutzt.update(_VERWEIS.findall(text))
+            alle = [h for (h,) in c.execute("SELECT hash FROM bilder")]
+            weg = [(h,) for h in alle if h not in benutzt]
+            c.executemany("DELETE FROM bilder WHERE hash=?", weg)
+            c.commit()
+        except BaseException:
+            c.rollback()
+            raise
+    finally:
+        c.close()
+    return len(weg)
 
 
 def zuletzt_gesichert(ort: Path | None = None) -> float | None:

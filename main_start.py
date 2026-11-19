@@ -15,7 +15,7 @@ def _gespraech_fortsetzen(ctx: "Ctx") -> dict | None:
     if ctx.backend is None:
         return None
     zuletzt = chatstore.letzter()
-    data = chatstore.load(zuletzt["id"]) if zuletzt else None
+    data = chatstore.load(zuletzt["id"], merken=True) if zuletzt else None
     if not data:
         return None
     ctx.backend.messages = pricing.gespraechsende(data.get("messages", []))
@@ -57,8 +57,7 @@ def _start_gruss(ctx: "Ctx") -> None:
                 if ui.BANNER_KOMPAKT:
                     return
                 system = PS.render_text(PS.active())
-                # Funke Groß versteht keine lange Anweisung, deshalb begrüßt er auf ein einfaches Hallo
-                frage = "hallo" if getattr(ctx.backend, "provider_id", "") == "funke" else startseite.gruss_prompt()
+                frage = startseite.gruss_prompt()
                 text = await asyncio.wait_for(ctx.backend.ask_once(frage, system), 90)
             text = startseite.gruss_bereinigen(text)
             if text:
@@ -370,7 +369,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
             fenster = design.palette_name()
             ui.info(f"🎨 Die Fenster (Desktop-Fenster, Kugel, Charakter, Musik, Store) nehmen „{fenster}“ – "
                     "beim nächsten Öffnen; die Kugel nach /restart." if fenster != "klassik" else
-                    "🎨 Die Fenster bleiben bei „Klassik“ – nachtglas, pastell und neon färben auch sie.")
+                    "🎨 Die Fenster bleiben bei „Klassik“ – nachtglas, pastell, neon und tigra färben auch sie.")
         else:
             ui.warn(f"Theme '{arg}' gibt es nicht. Verfügbar: {', '.join(ui.THEMES)}")
     elif cmd == "/model":
@@ -439,6 +438,13 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
         ui.success(f"🟣 Krea 2 malt jetzt mit {neu} Schritten – dauerhaft gespeichert.")
         if int(zahl) != neu:
             ui.info(f"Erlaubt sind {krea.SCHRITTE_MIN} bis {krea.SCHRITTE_MAX} Schritte.")
+    elif cmd == "/bild" and re.fullmatch(r"(?i)gesicht(\s+(an|aus))?", arg.strip()):
+        import krea
+        teile = arg.lower().split()
+        an = (teile[1] == "an") if len(teile) > 1 else not krea.gesicht_an()
+        krea.set_gesicht(an)
+        ui.success("✨ Gesichts-Korrektur an – Gesichter werden nach dem Malen vergrößert nachgemalt." if an else
+                   "✨ Gesichts-Korrektur aus – die Bilder bleiben, wie Krea sie malt.")
     elif cmd == "/bild":
         import imagegen
         reason = imagegen.missing_reason_aktiv()
@@ -459,6 +465,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
                 ui.info(f"🟣 Krea 2 – kein Negativ-Prompt, CFG 1, {krea.schritte()} Schritte "
                         f"(/bild schritte ändert das). Modelle in {krea.krea_dir()}. "
                         "/bildmodel wechselt das Modell.")
+                ui.info(f"✨ Gesichts-Korrektur {'✔️' if krea.gesicht_an() else '🛑'}  (/bild gesicht schaltet um)")
             elif akt_backend == "motor":
                 import bildmotoren
                 ui.info(f"{bildmotoren.titel()} – kein Negativ-Prompt, {bildmotoren.schritte()} Schritte. "
@@ -874,7 +881,7 @@ async def _befehl_ausfuehren_2(ctx: "Ctx", cmd: str, arg: str, text: str):
     else:
         # Unbekannt: ähnliche Befehle zeigen; ohne Treffer fragt die KI in der Befehlsliste nach.
         import commands as C
-        treffer = [n for n, _ in C.find_commands(cmd)[:5]]
+        treffer = [n.strip() for n, _ in C.vorschlaege(f"{cmd} {arg}".strip())[:5]]
         if treffer:
             ui.info(f"{cmd} gibt es nicht. Meintest du: " + " · ".join(treffer))
         elif ctx.backend is None:
@@ -998,6 +1005,15 @@ async def auftrag_lauf(name: str) -> int:
 # Bericht in Berichte/Wache_….md.
 # ---------------------------------------------------------------------------
 
+def _vorpruefer_kurz() -> str:
+    try:
+        from wache import vorpruefer as VP
+        ok, grund = VP.bereit()
+        return "bereit – sieht Alarme vor dem Weckruf (/wache vorpruefer)" if ok else f"nicht aktiv – {grund}"
+    except Exception as exc:
+        return f"nicht aktiv – {exc}"
+
+
 async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
     from wache import zugang as Z, justierung as J, werkzeuge as W
     teile = arg.split(None, 1)
@@ -1031,11 +1047,13 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
              "warnt (ML-002/DL-002)" if e.get("netz_alarm") else "Schattenmodus – nur Protokoll (/wache netz)"),
             ("Folgen-Netz", "aus" if not e.get("dl", True) else
              "warnt (DL-001)" if e.get("dl_alarm") else "Schattenmodus – nur Protokoll (/wache dl)"),
+            ("Vorprüfer", _vorpruefer_kurz()),
             ("Daten", str(Z.DB_PFAD)),
         ])
-        ui.info("/wache alarme · ereignisse · regeln · justierungen · inventar · training · fullscan · "
+        ui.info("/wache alarme · ereignisse · regeln · justierungen · inventar · training · fullscan · termin · "
                 "schwelle <x> · trigger <stufe|5–20> · stumm <R00x> · laut <R00x> · start · stop · "
-                "an · aus · autostart an|aus · kugel an|aus · dl · netz [adresse] · ml zurueck · erledigt <id> · reset · "
+                "an · aus · autostart an|aus · kugel an|aus · vorpruefer an|aus · dl · netz [adresse] · ml zurueck · "
+                "erledigt <id> · reset · "
                 "rueckgaengig")
     elif sub == "start":
         ui.info(Z.starten(paths.INSTALL))
@@ -1075,6 +1093,36 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
                 ("Klick", "kleines Chatfenster: reden · 📸 Screenshot · Bilder · Alles ok?"),
                 ("Ändern", "/wache kugel an|aus"),
             ])
+    elif sub in ("vorpruefer", "vorprüfer"):
+        from wache import vorpruefer as VP, vorpruefer_lernen as VPL
+        if rest.lower() == "lernen":
+            if VP.modell_ordner() is None:
+                ui.warn("Erst das Grundmodell laden: /einrichten modelle → Wache-Vorprüfer.")
+                return
+            wahl = await ask_confirm(
+                "Der Vorprüfer lernt aus den Urteilen zu Alarmen auf DIESEM PC (Programmnamen, Befehlszeilen, "
+                "Begründungen). Die LoRA bleibt im Datenordner (Wache/vorpruefer/) und wird nie weitergegeben. "
+                f"Etwa eine Stunde, höchstens {VPL.VRAM_GRENZE_GB:g} GB Grafikspeicher. Eingeschaltet wird sie nur, "
+                "wenn sie in der Prüfung keinen Alarm schließt, der nicht harmlos ist. Jetzt lernen?",
+                [("ja", "Ja, auf diesem PC lernen"), ("nein", "Nein")])
+            if wahl == "ja":
+                ui.info(VPL.starten())
+            return
+        if rest.lower() == "vergessen":
+            wahl = await ask_confirm("Die gelernte LoRA des Vorprüfers löschen? Er ist dann aus, bis er neu lernt.",
+                                     [("ja", "Ja, löschen"), ("nein", "Nein")])
+            if wahl == "ja":
+                ui.info("Gelöscht – der Vorprüfer ist aus." if VPL.vergessen() else "Es gab keine gelernte LoRA.")
+            return
+        if rest.lower() in ("an", "aus", "on", "off"):
+            an = rest.lower() in ("an", "on")
+            if J.speichern({"vorpruefer": an}):
+                ui.success(f"Vorprüfer {'an' if an else 'aus'} – gilt ab dem nächsten Weckruf.")
+            else:
+                ui.warn("Nicht gespeichert – der Vorprüfer bleibt, wie er war.")
+        else:
+            ui.kv_panel("🛡 Vorprüfer der Wache", VP.stand() + [("Ändern", "/wache vorpruefer an|aus · lernen · "
+                                                                     "vergessen")])
     elif sub == "erledigt":
         if not rest:
             ui.warn("Welcher Alarm? /wache erledigt <id> – die Nummer steht bei /wache alarme.")
@@ -1086,6 +1134,43 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
                       else W.alarme({"id": rest}))
     elif sub == "ereignisse":
         ui.text_panel("🛡 Ereignisse", W.ereignisse({"anzahl": 40, "prozess": rest}))
+    elif sub == "ki" and rest.strip().lower() in ("ml warnen", "ml scharf", "ml schatten", "ml an", "ml aus"):
+        # KI-Modell (ML-003) schaltet nur der Nutzer
+        from wache import justierung as J
+        wahl = rest.strip().lower().split()[1]
+        neu = {"warnen": {"ki_ml": True, "ki_ml_alarm": True}, "scharf": {"ki_ml": True, "ki_ml_alarm": True},
+               "schatten": {"ki_ml": True, "ki_ml_alarm": False}, "an": {"ki_ml": True}, "aus": {"ki_ml": False}}[wahl]
+        if J.speichern(neu):
+            protokoll.schreibe("wache_justieren", f"KI-Modell: {neu}", "success", veraendernd=True, wer="Nutzer")
+            ui.success({"warnen": "KI-Modell warnt: ungewöhnliche Taten einer KI werden Alarme ML-003.",
+                        "scharf": "KI-Modell warnt: ungewöhnliche Taten einer KI werden Alarme ML-003.",
+                        "schatten": "KI-Modell im Schattenmodus: Funde nur ins Protokoll.",
+                        "an": "KI-Modell an.", "aus": "KI-Modell aus: lernt nicht, bewertet nicht."}[wahl]
+                       + " Die laufende Wache übernimmt das in etwa 10 Sekunden.")
+        else:
+            ui.warn("Nicht gespeichert – das KI-Modell bleibt, wie es war.")
+    elif sub == "ki" and rest.strip().lower() in ("warnen", "scharf", "schatten", "an", "aus"):
+        # Gegencheck (R024) und den ganzen Tracker schaltet nur der Nutzer
+        from wache import justierung as J
+        wahl = rest.strip().lower()
+        neu = {"warnen": {"ki": True, "ki_alarm": True}, "scharf": {"ki": True, "ki_alarm": True},
+               "schatten": {"ki": True, "ki_alarm": False}, "an": {"ki": True}, "aus": {"ki": False}}[wahl]
+        if J.speichern(neu):
+            protokoll.schreibe("wache_justieren", f"KI-Tracker: {neu}", "success", veraendernd=True, wer="Nutzer")
+            ui.success({"warnen": "Gegencheck warnt: ungemeldete Starts einer KI werden Alarme R024.",
+                        "scharf": "Gegencheck warnt: ungemeldete Starts einer KI werden Alarme R024.",
+                        "schatten": "Gegencheck im Schattenmodus: Funde nur ins Protokoll.",
+                        "an": "KI-Tracker an.",
+                        "aus": "KI-Tracker aus: keine Erkennung, keine Zeitleiste, keine R019–R024."}[wahl]
+                       + " Die laufende Wache übernimmt den Gegencheck in etwa 10 Sekunden; an/aus gilt nach "
+                       "einem Neustart der Wache.")
+        else:
+            ui.warn("Nicht gespeichert – der KI-Tracker bleibt, wie er war.")
+    elif sub == "ki":
+        # /wache ki [name] [stunden] – KI-Tracker: wer war aktiv, Zeitleiste, Alarme R019–R024
+        worte = rest.split()
+        std = next((w for w in worte if w.replace(".", "", 1).isdigit()), "24")
+        ui.text_panel("🛡 KI-Tracker", W.ki({"ki": " ".join(w for w in worte if w != std), "stunden": std}))
     elif sub == "inventar":
         ui.text_panel("🛡 Inventar", W.inventar({"art": rest}))
     elif sub == "regeln":
@@ -1123,6 +1208,14 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
                                   speicher=Z.speicher(), motor=Z.motor, nutzer=True))
         except J.Grenzverletzung as exc:
             ui.warn(str(exc))
+    elif sub == "anleitung" and rest.lower() in ("ok", "bestaetigen", "bestätigen"):
+        from wache import wecker as WK
+        namen = WK.anleitungen_bestaetigen(Z.speicher())
+        ui.success("✅ Als dein Stand übernommen: " + ", ".join(namen) + " – der Weckruf warnt dazu nicht mehr.")
+        protokoll.schreibe("wache", "Anleitungen bestätigt (Nutzer)", "success", veraendernd=True, wer="Nutzer")
+    elif sub == "anleitung":
+        ui.info("/wache anleitung ok – eine selbst geänderte wache_alarm.md bzw. Agenten/systemwache.md als deinen "
+                "Stand übernehmen. Bis dahin zeigt der Weckruf sie mit Warnung als fremde Daten.")
     elif sub == "ml" and rest.lower() in ("zurueck", "zurück"):
         if Z.motor is not None:
             ui.info(Z.motor.ml_zurueckdrehen())
@@ -1157,6 +1250,14 @@ async def _wache_befehl(ctx: "Ctx", arg: str) -> None:
         _folgen_befehl(rest.lower(), e)
     elif sub in ("fullscan", "vollscan"):
         await _vollscan_befehl(rest.lower())
+    elif sub in ("termin", "autoscan", "zeitplan"):
+        # Zeitplan des Auto-Vollscans: nur im Fenster, nur der Nutzer
+        from wache import termin as TE
+        if rest.strip().lower() == "status":
+            ui.info(TE.status_text())
+        else:
+            _termin_fenster()
+            ui.info("📅 Das Termin-Fenster geht auf. " + TE.status_text())
     elif sub == "selbsttest":
         from wache import selbsttest as ST
         ui.text_panel("🛡 Selbsttest", ST.laufen())
@@ -1279,11 +1380,31 @@ def _folgen_befehl(rest: str, e: dict) -> None:
         ui.warn("Unbekannt. /wache dl zeigt die Möglichkeiten.")
 
 
+def _termin_fenster() -> None:
+    """Termin-Fenster (--termin) als eigenen Prozess öffnen."""
+    import subprocess
+    if getattr(sys, "frozen", False):
+        befehl = [str(paths.exe_ohne_fenster()), "--termin"]
+    else:
+        py = Path(sys.executable)
+        fensterlos = py.with_name("pythonw.exe")
+        befehl = [str(fensterlos if fensterlos.is_file() else py), str(Path(paths.INSTALL) / "main.py"), "--termin"]
+    subprocess.Popen(befehl, cwd=str(paths.INSTALL))
+
+
 async def _vollscan_befehl(rest: str) -> None:
-    """/wache fullscan [status|stop]: alle Laufwerke als Baseline der Wache."""
+    """/wache fullscan [status|stop|termin [status]]: alle Laufwerke als Baseline der Wache."""
+    from wache import termin as TE
     from wache import vollscan as VS
     if rest == "stop":
         ui.info(VS.stoppen())
+        return
+    if rest.split()[:1] == ["termin"]:                 # Zeitplan des Auto-Vollscans, wie /wache termin
+        if rest.split()[1:] == ["status"]:
+            ui.info(TE.status_text())
+        else:
+            _termin_fenster()
+            ui.info("📅 Das Termin-Fenster geht auf. " + TE.status_text())
         return
     if rest != "status" and not VS.laeuft():
         letzter = VS.stand_lesen()
@@ -1292,11 +1413,9 @@ async def _vollscan_befehl(rest: str) -> None:
                  "kann eine Stunde oder länger dauern.")
         if letzter.get("phase") == "abgebrochen":
             frage = "Der letzte Vollscan wurde angehalten – dort weitermachen?"
-        elif not VS.woche_frei()[0]:
-            ui.warn(VS.sperre_text())
-            return
         if await ask_confirm(frage, [("ja", "Ja, starten"), ("nein", "Nein")]) != "ja":
             return
+        # Von Hand startet immer – unabhängig vom Zeitplan (/wache termin)
         ui.info(await asyncio.to_thread(VS.starten, paths.INSTALL))
         gestartet = True
     else:
@@ -1304,12 +1423,15 @@ async def _vollscan_befehl(rest: str) -> None:
     z = VS.stand_lesen()
     if not z:
         ui.info("Noch kein Vollscan. /wache fullscan startet einen.")
+        ui.info("📅 " + TE.status_text())
         return
     if not gestartet:                     # Momentaufnahme; der laufende Stand steht unten in der Statuszeile
         titel = "🛡 Vollscan" + (f" · Stand {time.strftime('%H:%M')}" if VS.laeuft() else "")
         ui.console.print(ui.progress_panel(titel, VS.anzeige(z), live=False))
     if z.get("fehlertext"):
         ui.warn(f"Fehler: {z['fehlertext']}")
+    if not gestartet:
+        ui.info("📅 " + TE.status_text() + " · /wache fullscan termin ändert ihn")
     if VS.laeuft():
         ui.info("Fortschritt live unten in der Statuszeile · /wache fullscan status = Stand · "
                 "/wache fullscan stop = anhalten (später weiter)")
@@ -1366,6 +1488,46 @@ def vollscan_beobachten() -> None:
             _VOLLSCAN["task"] = asyncio.create_task(_vollscan_melden())
     except Exception:
         pass
+
+
+WACHE_KARTE_TAKT_S = 60          # so oft zählt die Wache-Karte der Startseite neu (Urteile schließen Alarme laufend)
+_WACHE_KARTE: dict = {"task": None}
+
+
+def wache_karte_text() -> str:
+    """Text der Wache-Karte nach dem aktuellen Stand – dieselben Zahlen wie der Tray (Speicher.lage)."""
+    import startseite
+    from wache import zugang as Z
+    return startseite.wache_text(True, Z.speicher().lage()) if Z.laeuft() else startseite.wache_text(False, {})
+
+
+def wache_karte_setzen(text: str) -> None:
+    import startseite
+    if text != startseite.STAND.get("wache"):
+        startseite.setzen(wache=text)
+
+
+def wache_karte_auffrischen() -> None:
+    """Wache-Karte sofort neu zählen (nach /wache-Befehlen); Fehler lassen die alte Anzeige stehen."""
+    try:
+        wache_karte_setzen(wache_karte_text())
+    except Exception:
+        pass
+
+
+async def _wache_karte_takt() -> None:
+    while True:
+        await asyncio.sleep(WACHE_KARTE_TAKT_S)
+        try:
+            wache_karte_setzen(await asyncio.to_thread(wache_karte_text))
+        except Exception:
+            pass
+
+
+def wache_karte_beobachten() -> None:
+    """Startet das Nachzählen der Wache-Karte (nur mit Startseite, einmal je Sitzung)."""
+    if _WACHE_KARTE["task"] is None or _WACHE_KARTE["task"].done():
+        _WACHE_KARTE["task"] = asyncio.create_task(_wache_karte_takt())
 
 
 KUGEL_MODELL_HALTEN_S = 300      # lokales Modell nach dem letzten Kugel-Gespräch so lange halten
@@ -1563,7 +1725,7 @@ def wache_lauf() -> int:
         ref = _migrate_ref(config.load().get("model"))
         anbieter = M.split_ref(ref or "")[0]
         prov = P.get(anbieter) if anbieter else None
-        lokal = anbieter in ("", "gguf", "ollama", "funke") or bool(getattr(prov, "keyless", False))
+        lokal = anbieter in ("", "gguf", "ollama") or bool(getattr(prov, "keyless", False))
         frei = vonsichaus.vram_frei_mb()
         platz = frei is not None and frei >= vonsichaus.BILD_AB_MB
         if _modell_sieht(ref) and (platz or not lokal):
@@ -1738,6 +1900,13 @@ async def main():
     except Exception:
         pass
 
+    # Programmordner ausweisen: das Setup findet ihn so auch nach einem Umbenennen (nur als exe).
+    if paths.FROZEN:
+        with start.schritt("Ordnerkennung"):
+            import ordnerkennung
+            import version
+            ordnerkennung.pflegen(paths.INSTALL, version.build_nummer())
+
     # Noch im Klartext liegende API-Keys in den Windows-Umschlag packen (einmalig).
     secured_keys = 0
     with start.schritt("API-Keys schützen"):
@@ -1788,15 +1957,7 @@ async def main():
                 model = gemerkt
             except Exception as e:
                 ui.error(f"Gemerktes Modell '{gemerkt}' ließ sich nicht laden: {e}")
-
-    # 2) Sonst: mit Cloud-Sonnet starten, wenn ein Anthropic-Key da ist
-    if backend is None and os.getenv("ANTHROPIC_API_KEY"):
-        try:
-            from chat import Chat
-            model = M.make_ref("anthropic", "claude-sonnet-4-6")
-            backend = Chat(model="claude-sonnet-4-6", strength=strength)
-        except Exception as e:
-            ui.error(f"Cloud-Start fehlgeschlagen: {e}")
+    # Sonst kein Modell: der Nutzer wählt mit /model (kein festes, womöglich kostenpflichtiges Modell).
 
     ctx = Ctx(backend=backend, model=model, strength=strength,
               current_chat=chatstore.next_id(), current_prompts=[])
@@ -1853,7 +2014,7 @@ async def main():
         if not _WZ.laeuft() and _we.get("aktiv", True):
             ui.info(_WZ.starten(paths.INSTALL))
         _wi = _WZ.laeuft()
-        _st = _WZ.speicher().alarm_statistik()
+        _st = _WZ.speicher().lage()
         if _wi:
             _lage = f"{_st.get('offen', 0)} offen"
             if _st.get("echt"):
@@ -1864,6 +2025,7 @@ async def main():
                 ui.info(f"🛡 Wache läuft (PID {_wi['pid']}) · Alarme: {_lage} · /wache zeigt mehr")
             else:
                 startseite.setzen(wache=startseite.wache_text(True, _st))
+                wache_karte_beobachten()
         elif not _we.get("aktiv", True):
             if tui is None:
                 ui.info("🛡 Wache ist aus (/wache start · /wache an schaltet den Autostart wieder ein)")
@@ -1920,9 +2082,8 @@ async def main():
     try:
         import wizard as _W
         if _W.erster_start():
-            ui.info("👋 Zum ersten Mal hier? Tippe  /einrichten  – " +
-                    ("Funke ✨, der kleine Einrichtungs-Helfer, führt dich" if funke_da() else "der Assistent führt dich")
-                    + " durch alles Nötige.")
+            ui.info("👋 Zum ersten Mal hier? Tippe  /einrichten  – der Einrichtungs-Assistent führt dich "
+                    "durch alles Nötige.")
     except Exception:
         pass
 
@@ -1936,6 +2097,7 @@ async def main():
     global AKTIVER_CTX
     AKTIVER_CTX = ctx
     asyncio.get_running_loop().create_task(von_sich_aus_abholen())   # Nachrichten aus dem freien Moment
+    asyncio.get_running_loop().create_task(selbstentwurf_takt(ctx))  # Selbstentwurf: dreimal am Tag im Leerlauf
     with start.schritt("Sprüche"):
         _sprueche_im_hintergrund(ctx)
     with start.schritt("Such-Index"):
@@ -2008,8 +2170,8 @@ def selftest(out=print) -> int:
         except Exception as e:
             fehler += 1
             print(f"  FEHLT {mod}: {e}")
-    for rel in ("Models", "Bilder", "chats", "learned"):
-        d = paths.ROOT / rel
+    import modellorte as _MO
+    for rel, d in [(rel, paths.ROOT / rel) for rel in ("Bilder", "chats", "learned")] + [(_MO.WURZEL_NAME, _MO.WURZEL)]:
         print(f"  {'ok  ' if d.exists() else 'FEHLT'} Ordner {rel}")
         fehler += 0 if d.exists() else 1
     import json as _json                              # Modell-Datenbank (ohne torch lesbar)
@@ -2028,33 +2190,13 @@ def selftest(out=print) -> int:
     except Exception as e:
         fehler += 1
         print(f"  FEHLT Allowlist: {e}")
-    if not funke_da():                     # Fassung ohne einrichtungshelfer/: kein Fehler
-        print(f"  info {FUNKE_FEHLT} /einrichten läuft klassisch")
-    else:
-        try:                               # Einrichtungs-Helfer: lädt er und antwortet er (reines Python)?
-            from einrichtungshelfer import gespraech as G
-            if G.verfuegbar():
-                t0 = time.perf_counter()
-                probe = G.Funke().sagen("modell", "lokal bitte")
-                ok = probe.art == "modell" and probe.wert == "lokal"
-                fehler += 0 if ok else 1
-                print(f"  {'ok  ' if ok else 'FEHLT'} {G.NAME} antwortet ({probe.art}={probe.wert}, "
-                      f"{time.perf_counter() - t0:.1f} s)")
-            else:
-                print(f"  info {G.NAME} ist nicht mitgeliefert – /einrichten läuft klassisch")
-        except Exception as e:
-            fehler += 1
-            print(f"  FEHLT Einrichtungs-Helfer: {e}")
-        try:                               # Funke Groß (/model): Datei vollständig? Antworten wäre ohne torch zu langsam
-            from einrichtungshelfer import funkechat as FC
-            if FC.verfuegbar():
-                k = FC.kopf()
-                print(f"  ok   Funke Groß in /model ({k['parameter'] / 1e6:.1f} Mio. Parameter, {k['typ']})")
-            else:
-                print("  info Funke Groß ist nicht mitgeliefert")
-        except Exception as e:
-            fehler += 1
-            print(f"  FEHLT Funke Groß: {e}")
+    try:                                   # Einrichtungs-Helfer: Gemma nur mit ausgeliefertem LoRA
+        from einrichtungshelfer import gemmahelfer as GH
+        angebot = GH.angeboten()
+        print(f"  info Einrichtungs-Helfer: {', '.join(angebot) if angebot else 'keiner – /einrichten läuft klassisch'}")
+    except Exception as e:
+        fehler += 1
+        print(f"  FEHLT Einrichtungs-Helfer: {e}")
     import imagegen
     grund = imagegen.missing_reason_aktiv()
     motor = imagegen.active_label()
@@ -2106,7 +2248,7 @@ def selftest(out=print) -> int:
     except Exception as e:
         fehler += 1
         print(f"  FEHLER Assistent: {e}")
-    print("\nErgebnis:", "alles gut ✅" if not fehler else f"{fehler} Problem(e) ❌")
+    print("\nErgebnis: " + ("alles gut ✅" if not fehler else f"{fehler} Problem(e) ❌"))
     return 0 if not fehler else 1
 
 
@@ -2115,6 +2257,8 @@ if __name__ == "__main__":
         for k, v in VER.report():
             print(f"{k:<14} {v}")
         raise SystemExit(0)
+    import netzzwang                     # vor jeder Verbindung: nur https, Klartext nur zu freigegebenen lokalen Ports
+    netzzwang.installieren()
     try:                                 # eigene Namensauflösungen mitschreiben (Netz-Auskunft der Wache)
         from wache import netzspur as _NS
         _NS.installieren()
@@ -2122,14 +2266,22 @@ if __name__ == "__main__":
         pass
     # Eigenes Terminal-Fenster: mit --fenster, oder NemiCLI.exe (Fenster-App) ohne Hintergrund-Auftrag.
     # Das Fenster startet NemiCLI selbst in einer Pseudokonsole – ohne Windows Terminal.
-    _HINTERGRUND = ("--wache", "--vollscan", "--auftrag", "--sag", "--selftest", "--bild",
-                    "--systemcheck", "--kontext", "--malkind", "--bibliothekar")
+    from fensterstart import HINTERGRUND as _HINTERGRUND
+    if "--vorpruefer-lernen" in sys.argv:    # LoRA des Wache-Vorprüfers lernen (eigener Prozess, nur auf Wunsch)
+        from wache import vorpruefer_lernen as _VPL
+        raise SystemExit(_VPL.hauptprogramm(sys.argv[sys.argv.index("--vorpruefer-lernen") + 1:]))
     if "--malkind" in sys.argv:          # Bilder der Wache in einem kurzen eigenen Prozess (engines/malkind.py)
         import malkind
         raise SystemExit(malkind.hauptprogramm(sys.argv[sys.argv.index("--malkind") + 1:]))
     if "--bibliothekar" in sys.argv:     # Gedächtnis einbetten in einem eigenen Prozess (tools/bibkind.py)
         import bibkind
         raise SystemExit(bibkind.hauptprogramm(sys.argv[sys.argv.index("--bibliothekar") + 1:]))
+    if "--gefahren" in sys.argv:         # CVE-Liste einlesen in einem eigenen Prozess (tools/gefahren.py, /cve laden)
+        import gefahren
+        raise SystemExit(gefahren.hauptprogramm(sys.argv[sys.argv.index("--gefahren") + 1:]))
+    if "--entpacken" in sys.argv:       # Archiv sichtbar entpacken in einem eigenen Fenster (tools/entpacken.py)
+        import entpacken_fenster
+        raise SystemExit(entpacken_fenster.hauptprogramm(sys.argv[sys.argv.index("--entpacken") + 1:]))
     if "--kontext" in sys.argv:          # Rechtsklick-Menü: Screenshot / Bild / Antwort an NemiCLI
         import kontextmenue
         raise SystemExit(kontextmenue.main(sys.argv[sys.argv.index("--kontext") + 1:]))
@@ -2151,6 +2303,21 @@ if __name__ == "__main__":
     if "--charaktere" in sys.argv:       # Charakter-Galerie (/charaktere, verbindet sich mit einer laufenden Sitzung)
         import charakter_fenster
         raise SystemExit(charakter_fenster.starten())
+    if "--termin" in sys.argv:           # Zeitplan des Auto-Vollscans (/wache termin)
+        import termin_fenster
+        raise SystemExit(termin_fenster.starten())
+    if "--zeitplan" in sys.argv:         # Zeitplan-Aufträge (/zeitplan, Vorschläge der KI)
+        import zeitplan_fenster
+        raise SystemExit(zeitplan_fenster.starten())
+    if "--kompass" in sys.argv:          # Kompass: Befehle neben dem Terminal (/kompass an, verbindet sich mit der Sitzung)
+        import kompass_fenster
+        raise SystemExit(kompass_fenster.starten())
+    if "--kern" in sys.argv:             # Kern-Fenster (/kern → ändern, verbindet sich mit einer laufenden Sitzung)
+        import kern_fenster
+        raise SystemExit(kern_fenster.starten())
+    if "--kopf" in sys.argv:             # Kopf-Fenster (/kern kopf, verbindet sich mit einer laufenden Sitzung)
+        import kopf_fenster
+        raise SystemExit(kopf_fenster.starten())
     if "--vorschau" in sys.argv:         # kleines Fenster mit bewegtem Porträt (portraet_bewegen)
         import vorschau_fenster
         _i = sys.argv.index("--vorschau")
@@ -2158,11 +2325,9 @@ if __name__ == "__main__":
     if "--fenster" in sys.argv or (getattr(sys, "frozen", False) and sys.stdout is None
                                    and not any(a in sys.argv for a in _HINTERGRUND)):
         import terminal_fenster as _TF
-        _rest = [a for a in sys.argv[1:] if a != "--fenster"]
-        if getattr(sys, "frozen", False):
-            _kind = [str(paths.exe_mit_fenster()), *_rest]
-        else:
-            _kind = [sys.executable, str(Path(__file__).resolve()), *_rest]
+        import fensterstart as _FS
+        _TF.schutz_starten()                 # Fehler-Haken und faulthandler (Debugbericht „fenster“)
+        _kind = _FS.kind_befehl(sys.argv, bool(getattr(sys, "frozen", False)), Path(__file__).resolve())
         raise SystemExit(_TF.starten(_kind, ordner=os.getcwd()))
     if "--selftest" in sys.argv:
         raise SystemExit(selftest())

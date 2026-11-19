@@ -54,6 +54,10 @@ if getattr(sys, "frozen", False):
     except Exception:
         pass
 
+# Reine Fenster-Prozesse (Terminal-Fenster, GUI, Charakter-Galerie) brauchen die App nicht: gleich verzweigen
+import fensterstart  # noqa: E402
+fensterstart.frueh(__name__, Path(__file__).resolve())
+
 import ki_terminal  # noqa: E402,F401  – nimmt die Leitung zum Terminal-Fenster aus der Umgebung, bevor Programme starten
 
 from dotenv import load_dotenv
@@ -113,7 +117,7 @@ async def ask_suche(frage: str, optionen: list[tuple[str, str]], **k) -> str:
     return await _ask_suche(frage, optionen, frage_fn=ask_confirm, text_fn=ask_text, **k)
 
 
-load_dotenv(paths.INSTALL / ".env")  # gehoert zum Programm, nicht zu den Daten
+load_dotenv(config._ENV)    # gehoert zum Programm, nicht zu den Daten (Test-Suite: TESTDATEN)
 config.decrypt_env()        # verschlüsselte API-Keys (Windows-Umschlag) nutzbar machen
 PS.ensure_dir()             # Persoenlichkeiten/ + LIES-MICH anlegen
 
@@ -132,8 +136,6 @@ def _modell_sieht(model: str | None) -> bool:
     if prov == "gguf":                               # eigener Motor: mmproj im Modell-Ordner
         import gguflokal
         return gguflokal.sieht(mid)
-    if prov == "funke":                              # Funke Groß: nur Text
-        return False
     if prov in ("openai", "google", "anthropic", "openrouter"):
         return True
     if prov == "ollama_cloud":                       # ollama.com meldet die Fähigkeit wie lokales Ollama
@@ -222,7 +224,7 @@ async def _bilder_fuer_chat(model: str | None, text: str,
             pass
     return text, None, ("Das aktive Modell sieht keine Bilder. Nimm mit /model ein "
                         "Vision-Modell (Cloud oder ein Ollama-Modell mit 👁) – oder leg ein "
-                        "Seh-Modell (.gguf + mmproj) in einen Ordner unter Vision/ (/vision).")
+                        "Seh-Modell (.gguf + mmproj) in einen Ordner unter KI-Modelle/KI-Vision/Sehmodell/ (/vision).")
 MAX_STEPS = 12                  # Bremse für Aktions-Ketten pro Nutzer-Nachricht (keine Endlosschleife)
 # Runden nur mit Lese-Werkzeugen (READ_TOOLS) brauchen mehr Schritte (Anleitung in Stücken, mehrere
 # Abfragen); sobald etwas geändert wurde, gilt wieder MAX_STEPS.
@@ -233,7 +235,16 @@ CODING_MAX_STEPS = 80
 # Mit offener Todo-Liste (lange Serien, z. B. 20 Bilder) gilt diese Gesamtgrenze; die Bremse ohne
 # Fortschritt (MAX_STEPS ohne neuen Haken) bleibt, damit nichts endlos läuft.
 SERIE_MAX_STEPS = 120
-_FRAGE_HALT_NOTE = ("\n\n[System] 🟠 Eine Frage ist offen. Stell sie dem Nutzer jetzt, kurz und "
+# Coding-Freigabe „frei“ (coding.frei): keine Bremse je Punkt, nur diese Gesamtgrenze – angehalten wird sonst nur,
+# wenn sich die KI im Kreis dreht (gleiche Aktion mit gleichem Ergebnis KREIS_GLEICH-mal, KREIS_FEHLER Fehler am Stück).
+CODING_FREI_MAX_STEPS = 400
+KREIS_GLEICH = 3
+KREIS_FEHLER = 6
+_KREIS_NOTE = ("\n\n[System] 🔁 Du drehst dich im Kreis: dieselbe Aktion bringt immer dasselbe Ergebnis, oder es "
+               "scheitert Schritt um Schritt. Führe jetzt KEINE weitere Aktion aus. Sag kurz, wo es hakt, was du "
+               "versucht hast und welchen anderen Weg du vorschlägst.")
+_KREIS_WARN = "🔁 Sie dreht sich im Kreis – ich halte an. Sag „weiter“ oder gib ihr einen Tipp."
+_FRAGE_HALT_NOTE =("\n\n[System] 🟠 Eine Frage ist offen. Stell sie dem Nutzer jetzt, kurz und "
                     "klar – ohne Aktion. Dann wartest du auf seine Antwort.")
 # Lesende Werkzeuge, die mit identischen Feldern nichts Neues bringen: eine
 # Wiederholung in derselben Runde wird nicht ausgeführt, sondern nur angemerkt.
@@ -241,7 +252,8 @@ _FRAGE_HALT_NOTE = ("\n\n[System] 🟠 Eine Frage ist offen. Stell sie dem Nutze
 _DEDUPE_TOOLS = {"datei_lesen", "ordner_auflisten", "dateien_suchen", "inhalt_suchen",
                  "ordner_erkennen", "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
                  "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar", "wache_netz",
-                 "gedaechtnis_suchen", "gedaechtnis_lesen", "bild_protokoll", "bilder_suchen"}
+                 "gedaechtnis_suchen", "gedaechtnis_lesen", "bild_protokoll", "bilder_suchen", "medien_suchen",
+                 "cve_suchen"}
 _STEP_LIMIT_NOTE = (
     "\n\n[System] ⏸ Du hast in dieser Runde die Obergrenze an Aktionen erreicht "
     f"({MAX_STEPS} mit Änderungen, {MAX_LESE_STEPS} nur lesend). Führe jetzt KEINE weitere Aktion aus. Fasse zusammen, was du "
@@ -257,6 +269,18 @@ _STEP_LIMIT_WARN = ("⏸ Viele Aktionen am Stück – ich halte kurz an, damit n
 
 def _schritt_grenze(nur_gelesen: bool) -> int:
     return MAX_LESE_STEPS if nur_gelesen else MAX_STEPS
+
+
+def _im_kreis(spur: dict, act: dict, res) -> bool:
+    """Zählt (Aktion, Ergebnis) in dieser Runde: True, sobald dieselbe Aktion KREIS_GLEICH-mal denselben Fehler
+    brachte. Erfolge zählen nicht – ein Testlauf, der nach jedem Punkt „OK“ meldet, ist kein Kreis."""
+    if getattr(res, "ok", None) is True:
+        return False
+    import hashlib
+    ergebnis = hashlib.sha256(str(getattr(res, "text", "") or "")[:4000].encode("utf-8", "replace")).hexdigest()
+    schluessel = (_action_key(act), getattr(res, "ok", None), ergebnis)
+    spur[schluessel] = spur.get(schluessel, 0) + 1
+    return spur[schluessel] >= KREIS_GLEICH
 _DUPLICATE_NOTE = ("Diese Aktion hattest du in dieser Runde schon mit genau denselben Angaben "
                    "ausgeführt – das Ergebnis steht oben. Nutze es, statt es erneut abzurufen.")
 
@@ -274,10 +298,12 @@ GUI_BRUECKE = None              # Verbindung zum GUI-Fenster (None = kein /gui g
 MUSIK_BRUECKE = None            # Verbindung zum Musik-Fenster (/musik)
 LORA_BRUECKE = None             # Verbindung zur LoRA-Werkstatt (/lora)
 CHARAKTER_BRUECKE = None        # Verbindung zur Charakter-Galerie (/charaktere)
+KERN_BRUECKE = None             # Verbindung zum Kern-Fenster (/kern → ändern)
+KOPF_BRUECKE = None             # Verbindung zum Kopf-Fenster (/kern kopf)
 # Im GUI-Modus „Chat“ erlaubt: nichts am PC ändern – malen, Bilder ansehen, Gedächtnis, Skills (Prüffenster).
 CHAT_WERKZEUGE = frozenset({"plan", "bild_malen", "bild_serie", "portraet_bewegen", "charakter_zeigen",
                             "charakter_aendern",
-                            "bild_ansehen", "bild_fragen", "bild_protokoll", "bilder_suchen",
+                            "bild_ansehen", "bild_fragen", "bild_protokoll", "bilder_suchen", "medien_suchen",
                             "gedaechtnis_suchen", "gedaechtnis_lesen", "gedaechtnis_aufraeumen", "gedaechtnis_einlesen",
                             "gedaechtnis_status", "merken", "bild_bewerten",
                             "tagebuch", "lieblingsbild",
@@ -320,6 +346,24 @@ def _esc_pressed() -> bool:
     return hit
 
 
+def _taetig(art: str | None) -> None:
+    """Status neben dem Bild der Persönlichkeit: denkt / prueft / arbeitet (ui/startseite.py)."""
+    try:
+        import startseite
+        startseite.taetig(art)
+    except Exception:
+        pass
+
+
+def _figur_antwort(text: str) -> None:
+    """Letzte Antwort an die Figur im eigenen Terminal-Fenster (Rückfrage, freches Zeichen …)."""
+    try:
+        import figur
+        figur.antwort(text)
+    except Exception:
+        pass
+
+
 def _abbruch_taste() -> bool:
     """ESC (oder „STOP“ während der Arbeit) seit der letzten Abfrage?"""
     return ui.TUI.consume_abort() if ui.TUI is not None else _esc_pressed()
@@ -350,7 +394,7 @@ def _render(thinking_txt: str, answer: str, think_secs: float | None = None,
     from rich.text import Text
     teile = []
     if note:
-        teile.append(Text(note, style="italic #7d8590"))
+        teile.append(Text(note, style="italic muted"))
     if thinking_txt:
         expanded = bool(ui.TUI is not None and ui.TUI.thinking_expanded)
         if ui.TUI is not None:
@@ -365,7 +409,7 @@ def _render(thinking_txt: str, answer: str, think_secs: float | None = None,
 
 async def _bilder_aus_ergebnis(res, model: str | None):
     """Werkzeug hat Bilder geliefert (bild_ansehen/bildschirm_ansehen): als Data-URIs
-    fürs Modell – oder, wenn das Modell nicht sieht, vom Bildbeschreiber (`Vision/`)
+    fürs Modell – oder, wenn das Modell nicht sieht, vom Bildbeschreiber (`KI-Modelle/KI-Vision/Sehmodell/`)
     beschreiben lassen (die Beschreibung kommt dann in den Ergebnistext).
     Gibt (uris_oder_None, ergebnis) zurück – ActionResult ist unveränderlich."""
     import dataclasses
@@ -385,7 +429,7 @@ async def _bilder_aus_ergebnis(res, model: str | None):
             "wird dir jetzt als Bild gezeigt", "wurde vom Bildbeschreiber angesehen") + "\n" + "\n\n".join(bloecke))
     return None, dataclasses.replace(res, text=res.text + (
         "(Das aktive Modell sieht keine Bilder – nimm mit /model ein Vision-Modell "
-        "oder leg ein Seh-Modell unter Vision/ (/vision), dann kann ich es ansehen.)"))
+        "oder leg ein Sehmodell unter KI-Modelle/KI-Vision/Sehmodell/ (/vision), dann kann ich es ansehen.)"))
 
 
 _KOPF_IN_AUSGABE = re.compile(r"(?m)^Ergebnis von '")
@@ -426,12 +470,13 @@ def _umgebung() -> dict:
             "arbeitsordner": os.getcwd(), "chat": getattr(AKTIVER_CTX, "current_chat", None)}
 
 
-def _runde_beobachten(melde) -> str:
-    """Zu Beginn einer Runde: Hinweis fürs Modell (hinten an die Nachricht), kurz für den Nutzer."""
+async def _runde_beobachten(melde) -> str:
+    """Zu Beginn einer Runde: Hinweis fürs Modell (hinten an die Nachricht), kurz für den Nutzer. Dateien prüfen
+    und vergleichen läuft neben der Schleife."""
     if not _schalter("beobachter"):
         return ""
     try:
-        text = beobachter.runde_hinweis(_umgebung())
+        text = await asyncio.to_thread(beobachter.runde_hinweis, _umgebung())
     except Exception:
         return ""
     if text and beobachter.letzter_kurz:
@@ -622,6 +667,8 @@ async def _freigabe(act: dict, *, frage, pruefe, zeige_aktion, wer: str,
         return "rejected", None
     if tool == "charakter_aendern":
         act["_kern_ja"] = True                # der Nutzer hat diese Änderung gesehen (auch am gesperrten Kern)
+    if tool == "entpacken":
+        act["_entpacken_ja"] = True           # nur hier gesetzt: das Werkzeug läuft ohne dieses Ja nicht
     if choice == "always":
         AUTO_ALLOW.add(tool)
     return "run", None
@@ -817,7 +864,8 @@ async def _recherche_lauf(act: dict, backend, records: list, melde, plan_zeigen,
                 ticker.cancel()
     record["status"] = "unverified" if stand.pfad else "not_run"
     protokoll.schreibe("recherche", f"Recherche: {frage}", record["status"], veraendernd=False,
-                       wer=PS.active().name, pfad=stand.pfad, ergebnis=stand.abgebrochen or None)
+                       wer=PS.active().name,
+                       ergebnis=stand.abgebrochen or (stand.pfad.name if stand.pfad else None))
     return recherche.ergebnis_fuers_modell(stand)
 
 
@@ -893,7 +941,7 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
     user_text += ("\n\n" + notstopp.STOP_RUNDE) if stop else notstopp.hinweis_abholen()
     user_text += lernschleife.hinweise_abholen(PS.active().key)     # was im Hintergrund geschah
     user_text += _neuigkeiten(PS.active().key)                       # nach einem Update: was neu ist
-    user_text += _runde_beobachten(ui.info)                          # was sich seit dem letzten Blick geändert hat
+    user_text += await _runde_beobachten(ui.info)                    # was sich seit dem letzten Blick geändert hat
     if coding.aktiv() and coding.ist_ende_ansage(user_text):
         _coding_beenden()
     import debugbericht as _DBG
@@ -990,14 +1038,14 @@ async def _antworten_mit_reserve(aus: dict, backend, next_input, imgs):
     try:
         return await aus["antworten"](backend, next_input, imgs)
     except llamareserve.ReserveFrage as frage:
-        wahl = await aus["frage"](frage.frage, [("ja", f"Ja, mit llama.cpp {llamareserve.BUILD}"),
+        wahl = await aus["frage"](frage.frage, [("ja", f"Ja, mit llama.cpp {llamareserve.aktiv()}"),
                                                 ("nein", "Nein")])
         if wahl != "ja":
             aus["warn"](str(frage))
             return None
         import gguflokal
         gguflokal.motor_setzen(frage.name, gguflokal.LLAMACPP)
-        aus["info"](f"🦙 {frage.name} läuft jetzt über llama.cpp {llamareserve.BUILD} "
+        aus["info"](f"🦙 {frage.name} läuft jetzt über llama.cpp {llamareserve.aktiv()} "
                     "(zurück zum eigenen Motor: /model).")
         try:
             return await aus["antworten"](backend, next_input, imgs)
@@ -1025,7 +1073,11 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
     block_nachgefragt = False                # unlesbarer Aktionsblock: höchstens einmal neu anfordern
     gestupst = False                         # angekündigt, aber nichts aufgerufen: höchstens einmal je Runde
     rolle_gestupst = False                   # dritte Person statt Ich-Form: höchstens einmal je Runde
-    gesamt =CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS
+    coding_frei = coding.frei()              # Coding-Freigabe „frei“: durcharbeiten, nur der Kreis bremst
+    gesamt = CODING_FREI_MAX_STEPS if coding_frei else (CODING_MAX_STEPS if coding.aktiv() else MAX_LESE_STEPS)
+    kreis_spur: dict[tuple, int] = {}        # (Aktion, Ergebnis) → wie oft in dieser Runde
+    fehler_am_stueck = 0
+    im_kreis = False
     for schritt in itertools.count():
         if notstopp.ausgeloest():            # Not-Stopp: kein weiterer Schritt
             return
@@ -1033,10 +1085,13 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
             gesamt = max(gesamt, SERIE_MAX_STEPS)
         if schritt > gesamt:
             break
-        letzter = (schritt - basis >= _schritt_grenze(nur_gelesen) or schritt >= gesamt
-                   or frage_halt)            # Extra-Runde: nur noch zusammenfassen / fragen
+        bremse = not coding_frei and schritt - basis >= _schritt_grenze(nur_gelesen)
+        letzter = (bremse or schritt >= gesamt or frage_halt
+                   or im_kreis)              # Extra-Runde: nur noch zusammenfassen / fragen
         if frage_halt:
             next_input = next_input + _FRAGE_HALT_NOTE
+        elif im_kreis:
+            next_input = next_input + _KREIS_NOTE
         elif letzter:
             next_input = next_input + _STEP_LIMIT_NOTE
 
@@ -1108,7 +1163,7 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
             for act in acts:
                 records.append({"tool": act.get("tool", "?"), "status": "not_run"})
             aus["warn"]("🟠 Erst die offene Frage – die Aktion wartet auf deine Antwort."
-                        if frage_halt else _STEP_LIMIT_WARN)
+                        if frage_halt else _KREIS_WARN if im_kreis else _STEP_LIMIT_WARN)
             return
 
         # 3) Aktionen abarbeiten (Bestätigung bei verändernden)
@@ -1129,6 +1184,13 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
                 ergebnisse.append(_CHAT_GESPERRT.format(tool=act.get("tool", "?")) if chat else
                                   _FENSTER_GESPERRT.format(tool=act.get("tool", "?"), liste=", ".join(sorted(erlaubt))))
             acts = [a for a in acts if a.get("tool") in erlaubt]
+        acts, zu_viel = plan.medien_begrenzen(acts)
+        if zu_viel:
+            aus["hinweis"](plan.medien_hinweis() + " Nicht ausgeführt: "
+                           + ", ".join(actions.describe(a).splitlines()[0] for a in zu_viel))
+            for act in zu_viel:
+                records.append({"tool": act.get("tool", "?"), "status": "not_run"})
+            ergebnisse.append(plan.medien_text(zu_viel))
         acts, gesperrt = plan.zurueckweisen(acts, coding.aktiv())
         if gesperrt:
             aus["hinweis"]("🟨 Mehr als ein Schritt – erst die Todo-Liste. Nicht ausgeführt: "
@@ -1215,6 +1277,11 @@ async def _schleife(backend, user_text, images, records, denk, aus: dict) -> Non
             else:
                 res = await aus["ausfuehren"](act, tool, titel)
             _finish_record(record, res)
+            if coding_frei and _im_kreis(kreis_spur, act, res):
+                im_kreis = True
+            fehler_am_stueck = 0 if res.ok is not False else fehler_am_stueck + 1
+            if coding_frei and fehler_am_stueck >= KREIS_FEHLER:
+                im_kreis = True
             if tool not in modes.READ_TOOLS and tool not in ("plan", "todo", "coding_start") and res.ok:
                 notstopp.geaendert_merken(actions.describe(act))
             uris, res = await _bilder_aus_ergebnis(res, SESSION.get("model"))
@@ -1257,6 +1324,7 @@ async def _terminal_antworten(backend, next_input, imgs) -> dict:
     t0 = time.monotonic()
     think = {"start": None, "secs": None}    # wie lange wurde nachgedacht?
     last_paint = 0.0
+    paint_takt = 0.08                # Abstand zwischen zwei Bildern: wächst mit ihrer Dauer (0,08 … 0,4 s)
     ankunft = {"denken": None, "antwort": None, "stuecke": 0}   # ab Absenden, für den Debugbericht
 
     def _tokens() -> int:
@@ -1336,9 +1404,12 @@ async def _terminal_antworten(backend, next_input, imgs) -> dict:
                         ankunft["antwort"] = time.monotonic() - t0
                     answer += ev["text"]
                 now = time.monotonic()
-                if now - last_paint >= 1 / 12:
+                if now - last_paint >= paint_takt:
+                    # Lange Antworten: jedes Bild baut sie ganz neu – dauert das, wird seltener gezeichnet
+                    t_mal = time.perf_counter()
                     live.update(_view())
-                    last_paint = now
+                    paint_takt = min(0.4, max(0.08, (time.perf_counter() - t_mal) * 4))
+                    last_paint = time.monotonic()
         except KeyboardInterrupt:              # Ctrl-C -> ebenfalls abbrechen
             aborted = True
 
@@ -1385,6 +1456,7 @@ def _terminal_ausgabe() -> dict:
         hoeren = bool(cleaned) and not acts and _voice_an()
         if cleaned and not acts:
             _LETZTE_ANTWORT[0] = cleaned
+            _figur_antwort(cleaned)
         ui.console.print(_render(r["denken"], _kurzfassung(cleaned) if hoeren else display,
                                  r["denk_s"], r["note"], done=True))
         # Denktext gibt es NUR hier - in backend.messages steht er nicht.
@@ -1408,6 +1480,7 @@ def _terminal_ausgabe() -> dict:
     zeige_aktion.web_live = True                    # Web-Werkzeuge zeigen hier ihre eigene, lebendige Zeile
 
     async def ausfuehren(act, tool, titel):
+        _taetig("prueft" if tool in modes.READ_TOOLS else "arbeitet")
         if tool in _FORTSCHRITT_WERKZEUGE:
             # Bildmalen und Backup zeigen einen echten Ladebalken (Schritt i/n), genau wie die Befehle.
             # Die Aktion läuft im Thread und meldet ihren Fortschritt über actions.bild_status() zurück.
@@ -1432,6 +1505,7 @@ def _terminal_ausgabe() -> dict:
             return await _warten_mit_stopp(asyncio.create_task(actions.run(act)))
 
     def nach_aktion(act, tool, res, sekunden, vorher, abgehakt, uris) -> None:
+        _taetig("denkt")                            # die KI liest das Ergebnis und macht weiter
         if tool == "plan" and res.ok:
             _plan_zeigen()
         else:
@@ -1680,7 +1754,7 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
     user_text += ("\n\n" + notstopp.STOP_RUNDE) if stop else notstopp.hinweis_abholen()
     user_text += lernschleife.hinweise_abholen(PS.active().key)     # was im Hintergrund geschah
     user_text += _neuigkeiten(PS.active().key)                       # nach einem Update: was neu ist
-    user_text += _runde_beobachten(lambda t: emit({"t": "note", "text": t}))
+    user_text += await _runde_beobachten(lambda t: emit({"t": "note", "text": t}))
     notstopp.runde_aktiv(True)
     try:
         await _schleife(backend, user_text, images, records, denk, _web_ausgabe(emit, confirm, erlaubt))

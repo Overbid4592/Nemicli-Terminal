@@ -1,9 +1,10 @@
 """
 aufspielen.py - Installieren und Aktualisieren aus einer Setup-Datei (ohne Oberfläche).
 
-Die Setup-Datei trägt den fertigen Bau (dist/NemiCLI) als ZIP. Gesucht wird nach
-vorhandenen Installationen im Ordner `.ncli2` im Benutzerordner und an der Wurzel
-jedes lokalen Laufwerks. Beim Aktualisieren werden nur die Programmteile ersetzt
+Die Setup-Datei trägt den fertigen Bau (dist/NemiCLI) als ZIP. Das Programm liegt immer im
+festen Ordner `.nemicli` im Benutzerordner (eine ältere Installation in `.ncli2` dort wird weiter
+aktualisiert); hat der Nutzer den Ordner umbenannt, findet das Setup ihn über die Ordnerkennung
+(core/ordnerkennung.py). Den Daten-Ordner wählt der Nutzer beim ersten Start selbst. Beim Aktualisieren werden nur die Programmteile ersetzt
 (PROGRAMMTEILE und was oben im ZIP liegt); venv, Modelle, Config und Daten im
 Ordner bleiben unberührt. Der Tausch läuft über Umbenennen: Schlägt ein Schritt
 fehl, kommen die alten Programmteile zurück.
@@ -11,7 +12,10 @@ fehl, kommen die alten Programmteile zurück.
 from __future__ import annotations
 
 import ctypes
+import os
 import shutil
+import subprocess
+import sys
 import uuid
 import zipfile
 from ctypes import wintypes
@@ -19,41 +23,30 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Optional
 
-ORDNERNAME = ".ncli2"
+try:
+    import ordnerkennung                         # im Setup gebündelt (--paths core)
+except ImportError:                              # Entwicklung und Tests
+    sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "core"))
+    import ordnerkennung
+
+ORDNERNAME = ".nemicli"
+ALTER_ORDNERNAME = ".ncli2"                    # früherer Name: eine Installation dort wird weiter aktualisiert
 PROGRAMMTEILE = ("NemiCLI.exe", "NemiCLIc.exe", "NemiCLIT2", "chrome-erweiterung", "SHA256SUMS.txt")
 BUILD_DATEI = "NemiCLIT2/build.txt"
 NEU, ALT = ".setup_neu", ".setup_alt"          # Zwischenordner im Ziel, nur während des Tauschs
-_LAUFWERK_WECHSEL, _LAUFWERK_FEST = 2, 3       # GetDriveTypeW
 
 
 @dataclass
 class Installation:
     ordner: Path
-    build: str                                   # "" = Ordner da, aber noch kein Programm darin
+    build: str                                   # "" = noch kein Programm im Ordner
 
 
-# --- Suchen --------------------------------------------------------------------------------------------
+# --- Programmordner ---------------------------------------------------------------------------------------
 
-def laufwerke() -> list[str]:
-    """Buchstaben der lokalen Laufwerke (fest und wechselbar, ohne Netz und CD)."""
-    try:
-        maske = ctypes.windll.kernel32.GetLogicalDrives()
-        typ = ctypes.windll.kernel32.GetDriveTypeW
-    except (AttributeError, OSError):
-        return []
-    return [chr(65 + i) for i in range(26)
-            if maske >> i & 1 and typ(f"{chr(65 + i)}:\\") in (_LAUFWERK_WECHSEL, _LAUFWERK_FEST)]
-
-
-def kandidaten() -> list[Path]:
-    orte = [Path.home() / ORDNERNAME] + [Path(f"{lw}:\\") / ORDNERNAME for lw in laufwerke()]
-    raus, gesehen = [], set()
-    for p in orte:
-        schluessel = str(p).lower()
-        if schluessel not in gesehen:
-            gesehen.add(schluessel)
-            raus.append(p)
-    return raus
+def zielordner() -> Path:
+    """Der feste Programmordner: `.nemicli` im Benutzerordner."""
+    return Path.home() / ORDNERNAME
 
 
 def ist_installation(ordner: Path) -> bool:
@@ -67,18 +60,70 @@ def build_von(ordner: Path) -> str:
         return "?"
 
 
-def finden(orte: Optional[list[Path]] = None) -> list[Installation]:
-    """Installationen (mit Build) und vorhandene `.ncli2`-Ordner ohne Programm (Build "")."""
-    raus = []
-    for p in kandidaten() if orte is None else orte:
-        try:
-            if ist_installation(p):
-                raus.append(Installation(p, build_von(p)))
-            elif p.is_dir():
-                raus.append(Installation(p, ""))
-        except OSError:                              # Laufwerk nicht bereit
-            continue
-    return raus
+def _stand(ordner: Path) -> Installation:
+    try:
+        return Installation(ordner, build_von(ordner) if ist_installation(ordner) else "")
+    except OSError:
+        return Installation(ordner, "")
+
+
+_SIGNATUR_OK = ("Valid", "UnknownError")      # UnknownError: eigenes Zertifikat, dessen Wurzel Windows nicht kennt
+
+
+def _signatur(datei: Path) -> tuple[str, str]:
+    """(Status, Fingerabdruck des Zertifikats) einer Authenticode-Signatur; ("", "") wenn nicht prüfbar."""
+    befehl = ("$s = Get-AuthenticodeSignature -LiteralPath $env:NEMICLI_PRUEFDATEI; "
+              "$s.Status.ToString() + '|' + $s.SignerCertificate.Thumbprint")
+    umgebung = {k: v for k, v in os.environ.items() if k.upper() != "PSMODULEPATH"}
+    umgebung["NEMICLI_PRUEFDATEI"] = str(datei)
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", befehl],
+                           capture_output=True, text=True, timeout=30, env=umgebung,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    except (OSError, subprocess.SubprocessError):
+        return "", ""
+    status, _, abdruck = r.stdout.strip().partition("|")
+    return status, abdruck.strip()
+
+
+def signatur_passt(exe: Path) -> bool:
+    """Ist `exe` mit demselben Zertifikat signiert wie dieses Setup? Ein unsigniertes Setup (Entwicklung)
+    kann nichts vergleichen – dann nein."""
+    if not getattr(sys, "frozen", False) or not exe.is_file():
+        return False
+    eigen_status, eigen = _signatur(Path(sys.executable))
+    ziel_status, ziel = _signatur(exe)
+    return bool(eigen) and eigen == ziel and eigen_status in _SIGNATUR_OK and ziel_status in _SIGNATUR_OK
+
+
+def _gemerkt() -> Optional[Installation]:
+    """Der Ordner aus ordner.json – nur mit Programm, gleicher Kennung und gleichem Zertifikat."""
+    gemerkt = ordnerkennung.gemerkter_ordner()
+    if gemerkt is None:
+        return None
+    ordner, kennung = gemerkt
+    stand = _stand(ordner)
+    eigene = ordnerkennung.lesen(ordner)
+    if not stand.build or eigene is None or eigene["kennung"] != kennung:
+        return None
+    if ordner in (zielordner(), Path.home() / ALTER_ORDNERNAME):
+        return stand                                 # fester Ort: würde ohnehin gewählt
+    return stand if signatur_passt(ordner / "NemiCLI.exe") else None
+
+
+def installation(ordner: Optional[Path] = None) -> Installation:
+    """Stand im Programmordner; Build "" = noch kein Programm darin. Ohne `ordner`: zielordner(), wenn dort
+    ein Programm liegt; sonst der von NemiCLI gemerkte (umbenannte) Ordner, dann das frühere `.ncli2` im
+    Benutzerordner. Der feste Ordner geht vor, damit eine zuletzt gestartete Kopie ihn nicht verdrängt."""
+    if ordner is not None:
+        return _stand(ordner)
+    neu = _stand(zielordner())
+    if neu.build:
+        return neu
+    if (gemerkt := _gemerkt()) is not None:
+        return gemerkt
+    alt = _stand(Path.home() / ALTER_ORDNERNAME)
+    return alt if alt.build else neu
 
 
 def laeuft(ordner: Path) -> list[str]:

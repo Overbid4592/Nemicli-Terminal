@@ -26,7 +26,9 @@ _fertig = False
 
 
 def ist_befehl(text: str) -> bool:
-    return (text or "").strip().lower() in BEFEHLE
+    """/restart oder /neustart als erstes Wort (Zusätze wie „jetzt“ ändern nichts)."""
+    teile = (text or "").split(maxsplit=1)
+    return bool(teile) and teile[0].lower() in BEFEHLE
 
 
 def im_eigenen_fenster() -> bool:
@@ -106,7 +108,7 @@ def beenden() -> None:
         _fertig = True
         if not im_eigenen_fenster():
             try:
-                subprocess.Popen(_neuer_prozess(), cwd=str(Path.home()), close_fds=True,
+                subprocess.Popen(_neuer_prozess(), cwd=os.getcwd(), close_fds=True,     # Arbeitsordner bleibt
                                  creationflags=getattr(subprocess, "CREATE_NEW_CONSOLE", 0))
             except Exception:
                 pass

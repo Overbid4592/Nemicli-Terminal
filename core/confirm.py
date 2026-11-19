@@ -158,7 +158,7 @@ async def ask(question: str, options: list[tuple[str, str]]) -> str:
     style = PTStyle.from_dict({
         "q":   "bold",
         "sel": f"{accent} bold",
-        "opt": "#7d8590",
+        "opt": ui.leise(),
     })
 
     app = Application(

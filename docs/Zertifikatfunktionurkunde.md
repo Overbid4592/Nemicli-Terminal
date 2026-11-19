@@ -114,7 +114,7 @@ Kurz gesagt: **Ein Zuhause für eine KI, die hilft, mitdenkt und aufpasst.**
 | Krea 2 | Eigener Bild-Motor auf der Grafikkarte. Schnell dank FP4 auf RTX 50. |
 | Charakter-Datei | Eine feste Figur, die auf jedem Bild gleich aussieht. |
 | Gesichter nachmalen | Kleine Gesichter werden schärfer und schöner. |
-| Bild-Serien | Bis zu 30 Bilder in einem Rutsch. |
+| Bild-Serien | Bis zu 10 Bilder in einem Rutsch. |
 
 ### 🖥 Oberflächen
 

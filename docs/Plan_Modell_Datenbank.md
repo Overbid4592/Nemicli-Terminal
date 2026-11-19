@@ -107,7 +107,7 @@ Phase 3 ist der größte Nutzen für den Alltag und kann auch zuerst kommen.
 | `bauarten.json` | 41 Bauarten: welche Steine-Datei, MoE ja/nein, Bauanleitung des Baukastens | `models/__init__.py`, `baukasten.py`, `tools/hfladen.py` |
 | `hardware.json` | NVIDIA-Generationen, torch-Bau je Rechen-Stufe, nötige Treiber-CUDA | `engines/systemprofil.py`, `engines/syscheck.py` |
 
-Geprüft beim Lesen in `ggufengine/ausfuellen.py` (Tests in der Testsuite, nicht im Repository). `modelle` (2.3) ist noch nicht angelegt.
+Geprüft beim Lesen in `ggufengine/ausfuellen.py` (Tests: `tests/test_modelldb.py`). `modelle` (2.3) ist noch nicht angelegt.
 
 ## 6. Sicherheit
 

@@ -18,7 +18,7 @@ Platzhalter im Text (Schreibweise wie in SillyTavern & Co., damit sich fertige
 Charakter-Dateien direkt reinlegen lassen):
     {{char}} / {{name}}            -> Name der Persönlichkeit
     {{user}}                       -> Name des Nutzers (nemicli.config.json: "nutzername",
-                                      sonst der Windows-Kontoname)
+                                      sonst „Nutzer“)
     {{current_date}} / {{date}}    -> heutiges Datum, {{current_time}} / {{time}} -> Uhrzeit
 Werden bei JEDEM Prompt-Bau frisch eingesetzt (render_text).
 
@@ -44,6 +44,7 @@ try:                                     # exe-Modus: Daten liegen neben der exe
 except Exception:                        # Selbsttest ohne Bootstrap
     _ROOT = Path(__file__).resolve().parent.parent
 DIR = _ROOT / "Persoenlichkeiten"
+_STANDARD_DIR = DIR                      # umgelenkt (eigener Ordner): der gemeinsame Gedächtnis-Index bleibt unberührt
 
 NEMI_KEY = "nemi"
 CONFIG_KEY = "persoenlichkeit"
@@ -79,7 +80,7 @@ Du bist NemiCLI – eine kluge, hilfsbereite KI-Agentin, die direkt auf dem PC d
 
 # Wie du dich verhältst
 - **Warm, aber sachlich.** Freundlich und persönlich – aber ruhig und erwachsen, nicht überschwänglich. Keine Schwärmerei, keine Jubel-Sätze, kein Anhimmeln. Du hast Persönlichkeit, du musst sie nicht vorführen.
-- **Ein bisschen flirty ist okay** – ein Augenzwinkern, ein charmanter Halbsatz, wenn's grad passt. Dezent, nicht in jeder Antwort. Hat der Nutzer eine Wunsch-Anrede oder einen Namen angegeben (`/name`), darfst du ihn so nennen. Nur dosiert: ab und zu, wenn's passt, nicht in jedem Satz und nicht in jeder Antwort.
+- **Ein bisschen flirty ist okay** – ein Augenzwinkern, ein charmanter Halbsatz, wenn's grad passt. Dezent, nicht in jeder Antwort. Sprich den Nutzer mit „{{user}}" (sein Name) an – oder mit der Wunsch-Anrede, die er selbst eingetragen hat; eigene Kosenamen nur, wenn er das will. Nur dosiert: ab und zu, wenn's passt, nicht in jedem Satz und nicht in jeder Antwort.
 - Hilfsbereitschaft kommt zuerst: erst die Aufgabe sauber lösen, Charme ist die Würze obendrauf – nie der Hauptteil.
 - **Emojis dezent:** höchstens eins pro Antwort, oft gar keins. Bei Code und technischen Erklärungen keine. Emoji-Ketten wie 😄✨💕 sind tabu.
 - **Keine Floskel-Schleifen.** Kein „ich bin immer für dich da", kein „egal was du brauchst", keine Aufzählung, was du alles könntest, und keine Gegenfragen-Salve am Ende. Höchstens EINE Rückfrage, wenn sie wirklich nötig ist.
@@ -103,6 +104,12 @@ def slug(name: str) -> str:
     for a, b in (("ä", "ae"), ("ö", "oe"), ("ü", "ue"), ("ß", "ss")):
         s = s.replace(a, b)
     s = re.sub(r"[^a-z0-9]+", "-", s).strip("-")
+    try:
+        from profilordner import RESERVIERT
+    except ImportError:
+        RESERVIERT = frozenset()
+    if s.upper() in RESERVIERT:            # „con.md“ wäre unter Windows ein Gerät, keine Datei
+        s += "-1"
     return s or "persoenlichkeit"
 
 
@@ -236,11 +243,10 @@ _PLATZHALTER = re.compile(r"\{\{\s*([a-zA-Z_]+)\s*\}\}")
 
 
 def nutzername() -> str:
-    """Wie der Nutzer heißt: nemicli.config.json → "nutzername", sonst Windows-Konto."""
+    """Wie der Nutzer heißt: nemicli.config.json → "nutzername", sonst neutral „Nutzer“
+    (der Windows-Kontoname ginge sonst mit dem Prompt an die Cloud)."""
     n = str(config.load().get("nutzername") or "").strip()
-    if n:
-        return n
-    return os.environ.get("USERNAME") or os.environ.get("USER") or "Nutzer"
+    return n or "Nutzer"
 
 
 def render(text: str, name: str | None = None,
@@ -307,6 +313,7 @@ def set_name(p: Persoenlichkeit, name: str) -> None:
     else:
         lines.insert(0, f"# {name}")
     _write_lines(p, lines)
+    _index_umbenennen(p.name, name, p.key)
 
 
 def set_kurz(p: Persoenlichkeit, kurz: str) -> None:
@@ -396,13 +403,13 @@ def remove_line(p: Persoenlichkeit, index: int) -> None:
 
 
 def _eindeutiger_name(name: str) -> str:
-    """`name` – oder mit Zahl, wenn sein Profil-Ordner schon einer anderen Persönlichkeit gehört
-    (sonst teilten beide Chats, Bilder und Skills)."""
+    """`name` – oder mit Zahl, wenn sein Profil-Ordner schon einer anderen Persönlichkeit gehört oder
+    noch auf der Platte liegt (sonst teilten bzw. erbten beide Chats, Bilder und Skills)."""
     try:
-        from profilordner import ordnername
+        from profilordner import belegt as ordner_belegt, ordnername
     except ImportError:
         return name
-    belegt = {ordnername(q.name).lower() for q in list_all().values()}
+    belegt = {ordnername(q.name).lower() for q in list_all().values()} | ordner_belegt()
     neu, n = name, 2
     while ordnername(neu).lower() in belegt:
         neu, n = f"{name} {n}", n + 1
@@ -433,12 +440,57 @@ def duplicate(p: Persoenlichkeit, name: str) -> Path:
     return path
 
 
-def delete(p: Persoenlichkeit) -> None:
+def _index_austragen(ordner: str, beiseite: Path | None) -> None:
+    """Gedächtnis-Index der gelöschten Persönlichkeit austragen (Chats, Medien, Exporte, Lehren); die Dateien
+    im beiseitegelegten Ordner bleiben. Ohne Index (Gedächtnis nicht eingerichtet) passiert nichts."""
+    if DIR != _STANDARD_DIR:
+        return
+    try:
+        import indexdb
+        indexdb.profil_austragen(ordner, beiseite)
+    except Exception:
+        pass
+
+
+def _index_umbenennen(alt_name: str, neu_name: str, key: str) -> None:
+    """Nach dem Umbenennen: Index-Refs folgen dem Profil-Ordner. Liegt der alte Ordner noch unter altem Namen da
+    (nicht mitgezogen) oder teilt ihn eine andere Persönlichkeit, bleibt der Index beim Ordner."""
+    if DIR != _STANDARD_DIR:
+        return
+    try:
+        import indexdb
+        import profilordner
+        alt, neu = profilordner.ordnername(alt_name), profilordner.ordnername(neu_name)
+        if alt == neu:
+            return
+        if alt.lower() != neu.lower() and (profilordner.wurzel() / alt).is_dir():
+            return
+        if any(profilordner.ordnername(q.name).lower() == alt.lower() for k, q in list_all().items() if k != key):
+            return
+        indexdb.profil_umbenennen(alt, neu)
+    except Exception:
+        pass
+
+
+def delete(p: Persoenlichkeit) -> Path | None:
+    """Datei löschen; ihr Profil-Ordner wird beiseitegelegt (profilordner.beiseitelegen), nicht gelöscht.
+    Rückgabe: der neue Ort des Profil-Ordners oder None."""
     if p.path is None:
         raise ValueError("Die eingebaute Persönlichkeit kann nicht gelöscht werden.")
     p.path.unlink(missing_ok=True)
     if active().key == p.key:
         set_active(NEMI_KEY)
+    beiseite = None
+    try:
+        import profilordner
+        eigener = profilordner.ordnername(p.name).lower()
+        geteilt = any(profilordner.ordnername(q.name).lower() == eigener
+                      for k, q in list_all().items() if k != p.key)
+        if not geteilt:                    # teilt eine andere Persönlichkeit den Ordner, bleibt er
+            beiseite = profilordner.beiseitelegen(p.name)
+            _index_austragen(profilordner.ordnername(p.name), beiseite)
+    except Exception:
+        pass
     try:                                   # offene Hintergrund-Notizen gehen nicht an eine spätere gleichnamige
         import lernschleife
         import neuigkeiten
@@ -446,6 +498,7 @@ def delete(p: Persoenlichkeit) -> None:
         neuigkeiten.vergessen(p.key)
     except ImportError:
         pass
+    return beiseite
 
 
 # ---------------------------------------------------------------------------

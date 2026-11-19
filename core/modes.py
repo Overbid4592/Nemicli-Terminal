@@ -26,6 +26,7 @@ Der Modus gilt nur für die laufende Sitzung; jeder Start beginnt in „normal".
 from __future__ import annotations
 
 import os
+import re
 import time
 from pathlib import Path
 
@@ -54,8 +55,8 @@ _current = DEFAULT
 _auto_until: float | None = None     # monotonic-Zeit, zu der der Zünder auslöst
 
 # Werkzeuge, die auch im Chat-Modus frei bleiben (schreiben nur nach learned/).
-MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbild", "vorschau_schliessen",
-                "gedaechtnis_aufraeumen", "gedaechtnis_einlesen", "bild_bewerten"}
+MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "selbstentwurf", "lieblingsbild", "profilbild",
+                "vorschau_schliessen", "gedaechtnis_aufraeumen", "gedaechtnis_einlesen", "bild_bewerten"}
 
 # Reine LESE-Werkzeuge: NUR diese dürfen im Modus „lesen" laufen. Alles andere
 # blockt dort – ausdrücklich als Allowlist, damit ein neues oder unbekanntes
@@ -65,17 +66,17 @@ MEMORY_TOOLS = {"merken", "skill_merken", "tagebuch", "lieblingsbild", "profilbi
 # skill_merken → learned/, ordner_lernen → learned/); die gehören NICHT hierher.
 READ_TOOLS = {
     "datei_lesen", "bild_ansehen", "bild_fragen", "bild_protokoll", "anleitung_lesen", "ordner_auflisten", "ordner_erkennen",
-    "charakter_zeigen",
+    "charakter_zeigen", "cve_suchen",
     "api_nachschlagen", "code_pruefen", "paket_info", "seite_ansehen", "doku_suchen", "app_liste", "app_pruefen",
     "dateien_suchen", "inhalt_suchen",
     "web_lesen", "web_wiki", "web_suche", "fach_suche", "ml_status",
-    "gedaechtnis_suchen", "gedaechtnis_lesen", "gedaechtnis_status", "skill_laden", "bilder_suchen",
+    "gedaechtnis_suchen", "gedaechtnis_lesen", "gedaechtnis_status", "skill_laden", "bilder_suchen", "medien_suchen",
     # feste Systemabfragen (systemabfrage.py) + Zeitplan ansehen
     "abfragen", "zeitplan_anzeigen",
     # nachsehen, welche Programme ein Update haben (winget, nichts wird installiert)
     "updates_suchen",
     # Systemwache: nachsehen ist lesen
-    "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar", "wache_netz",
+    "wache_status", "wache_alarme", "wache_ereignisse", "wache_inventar", "wache_netz", "wache_ki",
     # Sicherungen ansehen und Prüfsummen nachrechnen
     "backup_liste",
     # Entwicklung: den laufenden Debugbericht lesen, sich selbst prüfen
@@ -99,6 +100,8 @@ WACHE_URTEIL_TOOLS = {"wache_bewerten", "wache_justieren", "wache_programm", "me
 # etwas ausrichten. Im Hintergrund fragt niemand nach – deshalb Sperre statt Rückfrage.
 WACHE_NACH_NETZ_GESPERRT = {"wache_justieren", "wache_programm", "erinnern"}
 _wache_dienst = False
+# Fragen in jedem Modus, auch Auto; „Immer“ gibt es dafür nicht (sicherheit.optionen).
+IMMER_FRAGEN = {"entpacken"}
 
 # Im Kugel-Gespräch gesperrt: Suchläufe ohne Größengrenze lesen ganze Dateibäume in
 # den Speicher des Wache-Prozesses. Der Weckruf ist davon nicht betroffen.
@@ -171,9 +174,57 @@ def set_mode(key: str) -> str:
 
 
 def cycle() -> str:
-    """Nächster Modus (Shift+Tab): chat → lesen → normal → auto → autoan → chat …"""
+    """Shift+Tab schaltet die Stufe des Bereichs, in dem man gerade ist (bereich()):
+    Chat: chat → lesen → normal → auto → autoan → chat …; Coding: frei ↔ vorsicht (eigene Stufe des Assistenten).
+    Gibt den neuen Schlüssel zurück ("coding_frei"/"coding_vorsicht" im Coding)."""
+    if bereich() == "coding":
+        import coding
+        return "coding_" + coding.freigabe_wechseln()
     i = _KEYS.index(_current)
     return set_mode(_KEYS[(i + 1) % len(_KEYS)])
+
+
+# ---------------------------------------------------------------------------
+# Bereiche: jeder mit eigener Stufe, die er sich merkt
+#   💬 Chat    – der Arbeitsmodus (MODES)
+#   🟦 Coding  – coding.frei(): frei | vorsicht, solange der Coding-Assistent an ist
+#   🎨 Bild    – bild_stufe(): frei | fragen, für die Mal-Werkzeuge in jedem Bereich
+# ---------------------------------------------------------------------------
+BILD_WERKZEUGE = {"bild_malen", "bild_serie", "comic_malen", "kugel_anziehen"}
+BILD_SCHALTER = "bild_freigabe"            # nemicli.config.json: "frei" (Vorgabe) | "fragen"
+
+
+def bereich() -> str:
+    """'coding', solange der Coding-Assistent an ist, sonst 'chat'."""
+    try:
+        import coding
+        return "coding" if coding.aktiv() else "chat"
+    except Exception:
+        return "chat"
+
+
+def bild_stufe() -> str:
+    try:
+        import config
+        return "fragen" if str(config.load().get(BILD_SCHALTER) or "frei").lower() == "fragen" else "frei"
+    except Exception:
+        return "frei"
+
+
+def bild_stufe_setzen(stufe: str) -> str:
+    import config
+    stufe = "fragen" if str(stufe).lower().startswith(("frag", "vors")) else "frei"
+    config.update(**{BILD_SCHALTER: stufe})
+    return stufe
+
+
+def anzeige() -> str:
+    """Was Shift+Tab gerade gesetzt hat – für die Meldung und den Modus-Hinweis in Dialogen."""
+    if bereich() == "coding":
+        import coding
+        return ("🚀 Coding frei – arbeitet im Projekt durch" if coding.frei()
+                else "🛡 Coding vorsicht – fragt wie der Arbeitsmodus") + f"  ·  Chat: {label()}"
+    return label()
 
 
 def auto_remaining() -> int | None:
@@ -212,6 +263,8 @@ def _inside_cwd(action: dict) -> bool:
         v = action.get(f)
         if not isinstance(v, str) or not v.strip():
             continue
+        if _netzpfad(v):                   # resolve() auf einer Freigabe schickte die Windows-Anmeldung dorthin
+            return False
         try:
             p = Path(os.path.expandvars(v)).expanduser().resolve()
         except Exception:
@@ -221,13 +274,21 @@ def _inside_cwd(action: dict) -> bool:
     return True
 
 
+def _netzpfad(roh: str) -> bool:
+    try:
+        import actions
+        return actions.pfad_vorpruefen(roh) is not None
+    except ImportError:
+        return roh.strip().strip("\"'").replace("/", "\\").startswith(("\\\\", "\\??\\"))
+
+
 def _ausserhalb_projekt(action: dict) -> str | None:
     """Erstes Pfadfeld außerhalb des Coding-Projekts – sonst None (auch ohne Assistent).
 
     Werkzeuge ohne Pfadfeld (z.B. `befehl`) zählen nicht: sie haben ihren eigenen
     Filter und laufen ohnehin im Projektordner."""
     import coding
-    if coding.projekt() is None:
+    if coding.projekt() is None or action.get("tool") in ("todo", "plan"):   # dort ist „ziel“ der Auftrag, kein Pfad
         return None
     for f in _PATH_FIELDS:
         v = action.get(f)
@@ -247,6 +308,8 @@ def decide(action: dict, needs_confirm: bool) -> str:
     tool = action.get("tool", "")
     if _kugel_runde and tool in KUGEL_NUR_TERMINAL:
         _kugel_abgelehnt = True
+        return "block"
+    if _sperr_grund(action):           # Entpacken nur im Vordergrund; nichts aus Entpackt-Ordnern starten
         return "block"
     if tool == "plan":                 # die Todo-Liste liegt nur im Speicher – in jedem Modus frei
         return "run"
@@ -275,8 +338,8 @@ def decide(action: dict, needs_confirm: bool) -> str:
         # Skills werden später befolgt: Prüffenster in jedem Modus, auch Auto –
         # frei nur mit /skills selbst an (steckt in needs_confirm, samt Netz-Taint).
         return "ask" if needs_confirm else "run"
-    if tool == "einstellung_aendern":
-        return "ask"                    # Prüffenster in jedem Modus, auch Auto
+    if tool == "einstellung_aendern" or tool in IMMER_FRAGEN:
+        return "ask"                    # Prüffenster bzw. Rückfrage in jedem Modus, auch Auto
     try:                                # Wächter: Persönlichkeit, Anleitungen, Zeitplan, Skripte
         import sicherheit
         if sicherheit.steuerdatei_grund(action):
@@ -291,7 +354,16 @@ def decide(action: dict, needs_confirm: bool) -> str:
         cmd = coding.pruefbefehl(action)
         if cmd:
             return decide({"tool": "befehl", "befehl": cmd}, True)
+        if coding.frei() and not _todo_nur_nutzer(action):   # frei: Liste und Kriterien legt die KI selbst fest
+            return "run"
         return "ask" if needs_confirm else "run"
+    if tool in BILD_WERKZEUGE:          # 🎨 eigene Stufe, in jedem Bereich (Nur Lesen sperrt oben weiter)
+        if bild_stufe() == "fragen":
+            return "ask"
+        if not (needs_confirm and _nach_netz_inhalt(action)):
+            return "run"
+    if (frei := _coding_frei(action, needs_confirm)) is not None:
+        return frei
     if mode == "chat":
         if tool in MEMORY_TOOLS:
             return "ask" if needs_confirm else "run"
@@ -313,16 +385,59 @@ def decide(action: dict, needs_confirm: bool) -> str:
     return "ask" if needs_confirm else "run"             # normal
 
 
+def _todo_nur_nutzer(action: dict) -> bool:
+    """`todo pruefen` ohne Prüfbefehl und ohne Seite: Grün gibt dann nur der Nutzer – auch bei Freigabe „frei“."""
+    import coding
+    return str(action.get("aktion") or "").lower() == "pruefen" and not coding.pruefseite(action)
+
+
+def _coding_frei(action: dict, needs_confirm: bool) -> str | None:
+    """Coding-Freigabe „frei“ (coding.frei): im Projekt „run“, nur die Rote Liste (sicherheit.coding_grund) „ask“.
+    None, wenn sie nicht gilt (Assistent aus, Freigabe „vorsicht“) – dann entscheidet der Arbeitsmodus.
+    Inhalt aus dem Netz im Gespräch bremst weiter Merken und Befehle (über sie könnten Daten abfließen);
+    Dateien im Projekt schreibt die KI trotzdem frei."""
+    try:
+        import coding
+        if not coding.frei():
+            return None
+        import sicherheit
+    except ImportError:
+        return None
+    tool = action.get("tool", "")
+    if tool in MEMORY_TOOLS and needs_confirm:
+        return "ask"
+    if needs_confirm and tool == "befehl" and _nach_netz_inhalt(action):
+        return "ask"
+    return "ask" if sicherheit.coding_grund(action) else "run"
+
+
+def _sperr_grund(action: dict) -> str | None:
+    try:
+        import sicherheit
+    except ImportError:
+        return None
+    return sicherheit.sperr_grund(action)
+
+
 def _shell_frei(action: dict) -> bool:
-    """`befehl` von der offenen Liste (shellfrei.py) und ohne Inhalt aus dem Netz im Gespräch?"""
+    """`befehl` von der offenen Liste (shellfrei.py) und ohne Inhalt aus dem Netz im Gespräch? git nicht, wenn der
+    Befehl umgeleitet läuft (Sandbox, Profil): dort liegt, was code_ausfuehren geschrieben hat – auch ein .git, dessen
+    Konfiguration Programme startet. Die übrigen Abfragen hängen nicht vom Ordnerinhalt ab."""
     if action.get("tool") != "befehl":
         return False
     try:
         import actions
         import shellfrei
-        return actions.fremd_grund(action) is None and shellfrei.frei(actions._befehl_text(action))
+        import sicherheit
+        cmd = actions._befehl_text(action)
+        if _GIT.search(cmd) and sicherheit.ausfuehrungsordner() is None:
+            return False
+        return actions.fremd_grund(action) is None and shellfrei.frei(cmd)
     except ImportError:
         return False
+
+
+_GIT = re.compile(r"(?i)(?<![\w.-])git(?:\.exe)?(?![\w.-])")
 
 
 def _nach_netz_inhalt(action: dict) -> bool:
@@ -360,6 +475,8 @@ def _spontan_gesperrt(tool: str) -> bool:
 
 
 def block_message(action: dict) -> str:
+    if (grund := _sperr_grund(action)):
+        return grund
     if _wache_dienst and action.get("tool") in WACHE_URTEIL_TOOLS:
         return (f"Gesperrt: '{action.get('tool')}' – in diesem Gespräch kam Inhalt aus dem Netz, und im "
                 "Hintergrund kann niemand nachfragen. Sag dem Nutzer, was du tun wolltest; er macht es im Terminal.")

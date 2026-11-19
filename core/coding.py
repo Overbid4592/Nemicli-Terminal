@@ -30,6 +30,8 @@ from pathlib import Path
 import config
 
 ABLAGE = ".nemicli"
+WERKSTATT = ("tests", "probe", "cache")    # in der Ablage: Tests, Prüfskripte und Python-Cache der KI
+FREIGABE_SCHALTER = "coding_freigabe"       # nemicli.config.json: "frei" (Vorgabe) | "vorsicht"
 TODO_JSON = "todo.json"
 TODO_MD = "Todo.md"
 AUFTRAG_MD = "Auftrag.md"
@@ -77,6 +79,32 @@ def ablage(p: Path | None = None) -> Path | None:
     return (p / ABLAGE) if p else None
 
 
+def frei() -> bool:
+    """Coding-Freigabe „frei“: Im Projekt arbeitet die KI ohne Rückfrage und ohne feste Schrittgrenze – nur die
+    Rote Liste (sicherheit.coding_grund) fragt. Eigener Schalter, unabhängig vom Arbeitsmodus; das Projekt selbst
+    gibt der Nutzer beim Start frei. „vorsicht“: wie der Arbeitsmodus."""
+    return aktiv() and str(config.load().get(FREIGABE_SCHALTER) or "frei").lower() != "vorsicht"
+
+
+def werkstatt(p: Path | None = None) -> Path | None:
+    """Werkstatt der KI im Projekt (.nemicli/): tests/, probe/ und cache/ – legt sie an, sobald es das Projekt gibt."""
+    a = ablage(p)
+    if a is None or not a.parent.is_dir():
+        return None
+    for name in WERKSTATT:
+        try:
+            (a / name).mkdir(parents=True, exist_ok=True)
+        except OSError:
+            pass
+    return a
+
+
+def befehl_umgebung() -> dict[str, str]:
+    """Zusätze für die Umgebung von `befehl` im Projekt: der Python-Cache liegt in der Werkstatt, nicht im Projekt."""
+    a = werkstatt()
+    return {"PYTHONPYCACHEPREFIX": str(a / "cache")} if a is not None else {}
+
+
 def _sammelordner() -> list[Path]:
     """Desktop, Benutzerprofil & Co.: Sammelbecken, keine Projekte. Ein Ordner darin schon."""
     heim = Path.home()
@@ -93,11 +121,23 @@ def _sammelordner() -> list[Path]:
     return raus
 
 
+def _netzpfad(roh: str) -> bool:
+    """Freigabe eines anderen Rechners oder Gerätepfad (actions.pfad_vorpruefen)? Schon resolve() darauf schickt
+    die Windows-Anmeldung an diesen Rechner."""
+    try:
+        import actions
+        return actions.pfad_vorpruefen(roh) is not None
+    except ImportError:
+        return roh.strip().strip("\"'").replace("/", "\\").startswith(("\\\\", "\\??\\"))
+
+
 def drin(kandidat: str | os.PathLike) -> bool:
     """Liegt der Pfad im Projekt (oder ist er es)? Ohne aktiven Assistenten immer ja."""
     p = projekt()
     if p is None:
         return True
+    if _netzpfad(str(kandidat)):
+        return False
     try:
         k = Path(os.path.expandvars(str(kandidat))).expanduser().resolve()
         p = p.resolve()
@@ -110,6 +150,8 @@ def pruefe_projekt(ziel: str) -> tuple[Path | None, str]:
     """Taugt der Ordner als Projekt? Er muss noch nicht existieren."""
     if not str(ziel or "").strip():
         return None, "Kein Projektordner angegeben (Feld `projekt`)."
+    if _netzpfad(str(ziel)):
+        return None, "Ein Projekt liegt auf diesem Rechner (C:\\…) – keine Freigabe eines anderen Rechners."
     try:
         p = Path(os.path.expandvars(str(ziel))).expanduser().resolve()
     except Exception as e:
@@ -592,15 +634,19 @@ def _todo_markdown(daten: dict) -> str:
 
 _WEG = """\
 ## Der Weg (Schritt für Schritt)
-1. **Verstehen:** Auftrag in eigenen Worten, kurz. Unklar → EINE Frage.
+1. **Verstehen:** Auftrag in eigenen Worten, kurz. Ist etwas offen (Aussehen, Tasten, Technik), nimm eine
+   sinnvolle Vorgabe und nenne sie – der Nutzer kann sie danach ändern. Frag nur, wenn du ohne Antwort
+   wirklich nicht anfangen kannst, und dieselbe Frage nie zweimal.
 2. **Recherche**, wenn das Thema neu ist: web_suche / web_lesen (z.B. GitHub). README und Code
    LESEN, nichts kopieren – Ideen und Aufbau übernehmen, Code selbst schreiben. Lässt du die
    Recherche weg, schreib in `recherche` einen Satz, warum.
 3. **Auftragskarte + Todo-Liste:** todo mit aktion "anlegen". Kleine Punkte. Jeder Punkt braucht
    ein Prüfkriterium; wo es geht einen Prüfbefehl, der bei Erfolg Exitcode 0 liefert (z.B. ein
-   Testlauf). Der Nutzer nickt die Liste ab.
+   Testlauf). Bei Freigabe „vorsicht“ nickt der Nutzer die Liste ab, bei „frei“ geht es gleich los.
 4. **Agentloop:** todo "arbeiten" (nr) → umsetzen → todo "pruefen" (nr) → nächster Punkt.
    Immer nur EIN Punkt in Arbeit. Läuft die Prüfung nicht durch: Ursache suchen, beheben, erneut.
+   Jede Antwort kostet Zeit: pack, was zusammengehört, in EINE Antwort mit mehreren Aktionsblöcken
+   (z. B. todo "arbeiten" + datei_schreiben + todo "pruefen"). Mehrere Dateien lesen: in einer Antwort.
 5. **Abschluss,** wenn alle Punkte 🟢 oder ⚪ sind – in dieser Form:
    ✅ Fertig und geprüft: …
    ❌ Nicht geschafft: …
@@ -616,6 +662,12 @@ _WEG = """\
   requirements an den echten Stand anpassen.
 - Lies eine Datei, bevor du sie änderst.
 - `befehl` läuft im Projektordner. Fürs Projekt immer das Python aus `venv\\Scripts`.
+- **Deine Werkstatt ist `.nemicli\\`** im Projekt: Tests nach `.nemicli\\tests\\`, Prüf- und Probeskripte nach
+  `.nemicli\\probe\\` – nicht zwischen die Dateien des Projekts. Der Python-Cache landet von selbst in
+  `.nemicli\\cache\\`. Ein Prüfbefehl ist am besten ein kleines Skript dort, z. B.
+  `venv\\Scripts\\python.exe .nemicli\\probe\\pruef_3.py` oder
+  `venv\\Scripts\\python.exe -m unittest discover -s .nemicli\\tests -t .` – statt langer `python -c "…"`-Zeilen.
+  Ob ein Text in einer Datei steht, prüfst du am schnellsten mit inhalt_suchen.
 - Bleib im Projektordner. Dateiaktionen außerhalb legt NemiCLI dem Nutzer zur Freigabe vor – in jedem
   Modus, auch Auto. Brauchst du etwas von draußen, sag kurz, warum.
 - Was nur dieses Projekt betrifft (Entscheidungen, Fallstricke): merken mit art "projektnotiz" – landet in
@@ -631,6 +683,9 @@ _WEG = """\
   Projekten (freigegeben und sauber, „geprüft“ = Todo-Punkt wurde grün) – als Vorlage für Stil und Weg.
 - Nach dem Schreiben meldet NemiCLI Syntax- und Strukturfehler sofort. Vor todo "pruefen" eines
   Python-Punktes: code_pruefen (ruff: undefinierte Namen, veralteter Stil, typische Fehler).
+- Fenster-Programme (PySide6, tkinter …): app_ansehen mit datei "gui.py" startet sie, fotografiert nur ihr Fenster
+  und schließt sie wieder – sieh dir das Bild an, bevor du einen Oberflächen-Punkt prüfst. „Lädt ohne Fehler“
+  heißt noch nicht „sieht richtig aus“. Das Foto liegt in `.nemicli\\probe\\`.
 - Web-Punkte (HTML/CSS/JS): seite_ansehen zeigt dir die Seite als Bild – prüf, ob sie aussieht wie verlangt.
   Als Prüfung des Punktes das Feld `seite` (z. B. "chat.html"): todo "pruefen" lädt sie und wird nur grün
   ohne Konsolenfehler und ohne fehlende Dateien. `Test-Path` allein beweist nur, dass die Datei da ist.
@@ -657,10 +712,22 @@ def prompt_hinweis() -> str:
             stand += ("\n\nAlle Punkte sind geprüft → Abschluss-Bericht in der festen Form. Frag danach, "
                       "ob der Coding-Assistent aus soll (/codeend) – ausschalten kann nur der Nutzer.")
     return ("\n\n# 🟦 Coding-Assistent ist AN\n"
-            f"Projekt: {p}  (Ablage: {p / ABLAGE})\n"
+            f"Projekt: {p}  (Ablage und Werkstatt: {p / ABLAGE})\n"
             "Du arbeitest jetzt auf einem festen Weg. Das Programm führt die Todo-Liste und "
-            "prüft; du denkst und baust. Der Modus bleibt an, bis der Nutzer ihn beendet.\n\n"
-            + _WEG + _umgebung_block(p) + "\n## Aktueller Stand\n" + stand + "\n")
+            "prüft; du denkst und baust. Der Modus bleibt an, bis der Nutzer ihn beendet.\n"
+            + _freigabe_text() + "\n" + _WEG + _umgebung_block(p) + "\n## Aktueller Stand\n" + stand + "\n")
+
+
+def _freigabe_text() -> str:
+    if frei():
+        return ("Freigabe: **frei** – im Projekt arbeitest du ohne Rückfrage und ohne feste Schrittgrenze bis zum "
+                "Ende: lesen, schreiben, Tests, Prüfskripte, pip ins venv des Projekts, git (außer push) laufen "
+                "einfach. Nachfragen kommen nur noch bei der Roten Liste (außerhalb des Projekts, ganze Ordner "
+                "löschen, git push oder Verlauf umschreiben, Downloads, Zeitpläne) – dann sagst du kurz, warum. "
+                "Drehst du dich im Kreis (gleiche Aktion, gleicher Fehler), hält NemiCLI an: such dann einen "
+                "anderen Weg, statt dasselbe zu wiederholen.\n")
+    return ("Freigabe: **vorsicht** – Änderungen und Befehle fragen wie im Arbeitsmodus; der Nutzer nickt die "
+            "Todo-Liste ab.\n")
 
 
 def _umgebung_block(p: Path) -> str:
@@ -717,7 +784,7 @@ def status_text() -> str:
     except OSError:
         stand = (str(p), None, None)
     if _STATUS["stand"] == stand:
-        return _STATUS["text"]
+        return _STATUS["text"] + _freigabe_kurz()
     daten = laden(p)
     if daten is None:
         text = f"Coding · {p.name}"
@@ -725,7 +792,18 @@ def status_text() -> str:
         gepr, gesamt = zaehlen(daten)
         text = f"Coding · {p.name} · {gepr}/{gesamt}"
     _STATUS.update(stand=stand, text=text)
-    return text
+    return text + _freigabe_kurz()
+
+
+def _freigabe_kurz() -> str:
+    return " · 🚀 frei" if frei() else " · 🛡 vorsicht"
+
+
+def freigabe_wechseln() -> str:
+    """Shift+Tab im Coding-Bereich: frei ↔ vorsicht. Gibt die neue Stufe zurück."""
+    neu = "vorsicht" if frei() else "frei"
+    config.update(**{FREIGABE_SCHALTER: neu})
+    return neu
 
 
 _STATUS: dict = {"stand": None, "text": ""}

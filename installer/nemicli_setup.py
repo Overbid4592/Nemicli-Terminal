@@ -1,12 +1,12 @@
 """
 nemicli_setup.py - Die Setup-Datei: NemiCLI installieren oder aktualisieren (Fenster mit PySide6).
 
-Zeigt gefundene Installationen (`.ncli2` im Benutzerordner und auf jedem lokalen Laufwerk),
-ersetzt dort nur die Programmteile und legt auf Wunsch eine Desktop-Verknüpfung an. Läuft
-NemiCLI noch aus dem Ordner, wird nichts beendet – das Fenster bittet ums Schließen.
+Installiert immer in den festen Programmordner `.nemicli` im Benutzerordner. Ist NemiCLI dort
+schon drauf, ersetzt es nur die Programmteile; auf Wunsch legt es eine Desktop-Verknüpfung an.
+Läuft NemiCLI noch aus dem Ordner, wird nichts beendet – das Fenster bittet ums Schließen.
 
   --nutzlast <zip>      anderes Paket (Entwicklung; sonst nutzlast.zip im Bündel)
-  --pruefen <datei>     nur prüfen (Paket lesbar, gefundene Ordner) und Bericht schreiben, nichts ändern
+  --pruefen <datei>     nur prüfen (Paket lesbar, Stand im Programmordner) und Bericht schreiben, nichts ändern
 """
 from __future__ import annotations
 
@@ -16,8 +16,6 @@ import zipfile
 from pathlib import Path
 
 import aufspielen as A
-
-ANDERER = "anderer"
 
 
 def _buendel() -> Path:
@@ -43,8 +41,8 @@ def pruefen(bericht: Path) -> int:
         with zipfile.ZipFile(paket) as z:
             kaputt = z.testzip()
             zeilen.append(f"Dateien: {len(z.namelist())}, " + ("alle lesbar" if kaputt is None else f"KAPUTT: {kaputt}"))
-        for i in A.finden():
-            zeilen.append(f"Gefunden: {i.ordner} – " + (f"Build {i.build}" if i.build else "Ordner ohne Programm"))
+        i = A.installation()
+        zeilen.append(f"Programmordner: {i.ordner} – " + (f"Build {i.build}" if i.build else "noch kein Programm"))
         ok = kaputt is None
     except Exception as exc:
         zeilen.append(f"FEHLER: {exc}")
@@ -88,10 +86,15 @@ def fenster() -> int:
             kopf = QtWidgets.QLabel(f"NemiCLI {self.build}")
             kopf.setObjectName("kopf")
             lay.addWidget(kopf)
-            lay.addWidget(QtWidgets.QLabel("Wohin soll NemiCLI? Gefundene Ordner:"))
-            self.liste = QtWidgets.QListWidget()
-            lay.addWidget(self.liste, 1)
-            self._liste_fuellen()
+            self.inst = A.installation()
+            ort = QtWidgets.QLabel(
+                f"Programmordner: {self.inst.ordner}\n"
+                + (f"Dort ist NemiCLI {self.inst.build} drauf – wird aktualisiert." if self.inst.build
+                   else "Dort ist noch kein NemiCLI – wird neu installiert."))
+            ort.setWordWrap(True)
+            ort.setObjectName("ort")
+            lay.addWidget(ort)
+            lay.addStretch(1)
             hinweis = QtWidgets.QLabel("Ersetzt werden nur die Programmteile (NemiCLI.exe, NemiCLIc.exe, NemiCLIT2, "
                                        "chrome-erweiterung). venv, Modelle, Config und Daten im Ordner bleiben.")
             hinweis.setWordWrap(True)
@@ -116,48 +119,14 @@ def fenster() -> int:
             knoepfe.addWidget(self.zu)
             knoepfe.addWidget(self.los)
             lay.addLayout(knoepfe)
-            self.liste.currentRowChanged.connect(self._knopf_text)
-            self._knopf_text()
-
-        def _liste_fuellen(self):
-            gefunden = A.finden()
-            if not any(i.ordner == Path.home() / A.ORDNERNAME for i in gefunden):
-                gefunden.append(A.Installation(Path.home() / A.ORDNERNAME, ""))
-            gefunden.sort(key=lambda i: (not i.build, str(i.ordner).lower()))
-            for i in gefunden:
-                text = (f"{i.ordner}   –   NemiCLI {i.build} (aktualisieren)" if i.build
-                        else f"{i.ordner}   –   noch kein Programm (hier installieren)")
-                eintrag = QtWidgets.QListWidgetItem(text)
-                eintrag.setData(QtCore.Qt.UserRole, i)
-                self.liste.addItem(eintrag)
-            eintrag = QtWidgets.QListWidgetItem("📁  Anderen Ordner wählen …")
-            eintrag.setData(QtCore.Qt.UserRole, ANDERER)
-            self.liste.addItem(eintrag)
-            self.liste.setCurrentRow(0)
-
-        def _gewaehlt(self):
-            eintrag = self.liste.currentItem()
-            return eintrag.data(QtCore.Qt.UserRole) if eintrag else None
-
-        def _knopf_text(self, *_):
-            i = self._gewaehlt()
-            self.los.setText("Aktualisieren" if isinstance(i, A.Installation) and i.build else "Installieren")
+            self.los.setText("Aktualisieren" if self.inst.build else "Installieren")
 
         def _frage(self, text: str) -> bool:
             antwort = QtWidgets.QMessageBox.question(self, "NemiCLI Setup", text)
             return antwort == QtWidgets.QMessageBox.Yes
 
         def _los(self):
-            i = self._gewaehlt()
-            if i == ANDERER:
-                ordner = QtWidgets.QFileDialog.getExistingDirectory(self, "Ordner für NemiCLI wählen",
-                                                                    str(Path.home()))
-                if not ordner:
-                    return
-                ziel = Path(ordner)
-                i = A.Installation(ziel, A.build_von(ziel) if A.ist_installation(ziel) else "")
-            if not isinstance(i, A.Installation):
-                return
+            i = self.inst = A.installation()             # neu lesen: zwischendurch geändert?
             laufend = A.laeuft(i.ordner)
             if laufend:
                 QtWidgets.QMessageBox.information(
@@ -172,7 +141,6 @@ def fenster() -> int:
                     f"In {i.ordner} liegt die neuere Version {i.build}. Wirklich die ältere {self.build} aufspielen?"):
                 return
             self.ziel = i.ordner
-            self.liste.setEnabled(False)
             self.los.setEnabled(False)
             self.zu.setEnabled(False)
             self.balken.setValue(0)
@@ -187,7 +155,6 @@ def fenster() -> int:
             self.zu.setEnabled(True)
             if fehler:
                 self.balken.hide()
-                self.liste.setEnabled(True)
                 self.los.setEnabled(True)
                 self.meldung.setText(f"⚠ Das ging nicht: {fehler}\nDie bisherigen Programmteile sind unverändert.")
                 return
@@ -214,9 +181,7 @@ def fenster() -> int:
         QWidget { background: #0d1117; color: #e6edf3; font-size: 11pt; }
         QLabel#kopf { font-size: 18pt; font-weight: bold; color: #58a6ff; }
         QLabel#leise { color: #8b949e; }
-        QListWidget { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 4px; }
-        QListWidget::item { padding: 8px; }
-        QListWidget::item:selected { background: #1f6feb; color: white; border-radius: 4px; }
+        QLabel#ort { background: #161b22; border: 1px solid #30363d; border-radius: 6px; padding: 12px; }
         QPushButton { background: #21262d; border: 1px solid #30363d; border-radius: 6px; padding: 8px 18px; }
         QPushButton#haupt { background: #238636; border-color: #2ea043; font-weight: bold; }
         QPushButton:disabled { color: #6e7681; }

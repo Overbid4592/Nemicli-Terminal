@@ -127,11 +127,13 @@ def sperre(tool: str) -> str:
 
 
 def prompt_hinweis() -> str:
-    """Block für den System-Prompt, solange eine Aufgabe läuft – damit die KI es vorher weiß."""
+    """Block für den System-Prompt, solange eine Aufgabe läuft – damit die KI es vorher weiß. Mit Startzeit statt
+    Laufzeit: der Block bleibt gleich, solange die Aufgabe läuft (Präfix-Cache lokaler Modelle)."""
     l = laufend()
     if not l:
         return ""
-    was = ", ".join(f"#{e['nr']} {e['titel']} (seit {_dauer(e)})" for e in l)
+    was = ", ".join(f"#{e['nr']} {e['titel']} (seit {time.strftime('%H:%M', time.localtime(e['start']))} Uhr)"
+                    for e in l)
     return (f"\n\n# ⏳ Gerade läuft im Hintergrund: {was}\n"
             "Die Grafikkarte ist belegt. Bis die Aufgabe fertig ist, startest du keine Bilder, Bild-Serien, Videos, "
             "Stimme oder Trainings – du kannst nur normal schreiben, nachsehen und reden.\n")
@@ -172,13 +174,16 @@ def plakette() -> tuple[str, str] | None:
     return _SYMBOL.get(e["tool"], "⏳"), text
 
 
-def uebersicht() -> str:
-    """Für das Werkzeug `aufgaben`: laufende und erledigte Aufgaben."""
-    if not _AUFGABEN:
-        return "Keine Hintergrund-Aufgaben."
-    zeilen = []
+def uebersicht(wer: str | None = None) -> str:
+    """Für das Werkzeug `aufgaben`: laufende und erledigte Aufgaben – mit `wer` nur die dieser Persönlichkeit
+    (fremde zählen nur mit, ohne Titel und Ergebnis)."""
+    eigene = [e for e in _AUFGABEN.values() if wer is None or e.get("wer") == wer]
+    fremd = len(_AUFGABEN) - len(eigene)
+    if not eigene:
+        return "Keine Hintergrund-Aufgaben." + (f" ({fremd} einer anderen Persönlichkeit.)" if fremd else "")
+    zeilen = [f"({fremd} weitere einer anderen Persönlichkeit.)"] if fremd else []
     f = _fortschritt()
-    for e in sorted(_AUFGABEN.values(), key=lambda x: x["nr"]):
+    for e in sorted(eigene, key=lambda x: x["nr"]):
         if e["ende"] is None:
             zeilen.append(f"#{e['nr']} läuft seit {_dauer(e)}: {e['titel']}" + (f" – {f}" if f else ""))
         else:
