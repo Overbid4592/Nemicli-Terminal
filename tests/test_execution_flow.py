@@ -161,9 +161,11 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                        _STEP_LIMIT_WARN="limit",
                        _DUPLICATE_NOTE="dup", _action_key=repr,
                        # Coding-Assistent aus: Bremse und Ablauf wie ohne ihn
-                       coding=NS(aktiv=lambda: False, ist_ende_ansage=lambda text: False,
+                       coding=NS(aktiv=lambda: False, frei=lambda: False, ist_ende_ansage=lambda text: False,
                                  marke=lambda: None, pruefbefehl=lambda act: ""),
                        CODING_MAX_STEPS=80, _FRAGE_HALT_NOTE=" [FRAGE]",
+                       CODING_FREI_MAX_STEPS=400, KREIS_FEHLER=6, _KREIS_NOTE=" [KREIS]", _KREIS_WARN="kreis",
+                       _im_kreis=lambda spur, act, res: False,
                        _todo_zeigen=lambda: None, _coding_beenden=lambda: None,
                        # Todo-Liste aus: jede Aktion läuft (eigene Tests unten mit der echten Liste)
                        notstopp=notstopp, _abbruch_taste=lambda: self.taste(), _stopp_taste=lambda: False,
@@ -174,6 +176,8 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                                verwerfen=lambda: None,
                                abhaken_nach=lambda act, ok: False, text_fuer_modell=lambda: "",
                                zurueckweisen=lambda acts, frei=False: (list(acts), []),
+                               medien_begrenzen=lambda acts: (list(acts), []), medien_text=lambda acts: "",
+                               medien_hinweis=lambda: "",
                                sperr_text=lambda acts: "", kurzstand=lambda: "",
                                neu_seit_anzeige=lambda: False),
                        _plan_zeigen=lambda: None,
@@ -202,7 +206,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.config = {}
         beobachter.zuruecksetzen()
         self.addCleanup(beobachter.zuruecksetzen)
-        extract_functions("main.py", {"_schalter", "_umgebung", "_runde_beobachten", "_werkzeug_beobachten",
+        extract_functions("main.py", {"_schalter", "_umgebung", "_runde_beobachten", "_werkzeug_beobachten", "_taetig", "_figur_antwort",
                                        "_gegenprobe", "_denkwerk_start", "_denkwerk_pruefen"}, self.ns)
         extract_functions("main.py", {"_result_feedback", "_ergebnisse_verbinden", "_finish_record", "_close_records",
                                        "_befehle_vorpruefen", "_freigabe", "_buendel_freigabe", "_immer_erlaubt",
@@ -639,7 +643,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
     def coding_an(self, fortschritt: bool, gesamt: int = 80):
         """Coding-Assistent an; fortschritt=True: jede Runde ändert die Todo-Marke."""
         zaehler = iter(range(10_000))
-        self.ns["coding"] = NS(aktiv=lambda: True, ist_ende_ansage=lambda text: False,
+        self.ns["coding"] = NS(aktiv=lambda: True, frei=lambda: False, ist_ende_ansage=lambda text: False,
                                marke=(lambda: next(zaehler)) if fortschritt else (lambda: ("fest",)),
                                pruefbefehl=lambda act: "")
         self.ns["CODING_MAX_STEPS"] = gesamt

@@ -282,12 +282,49 @@ class Formate(unittest.TestCase):
         self.assertEqual(lin.art, "int8")
         self.assertTrue(torch.allclose(lin(self.x), self.x @ (q.float() * s).t(), atol=1e-4))
 
-    def test_int8_convrot_wird_abgelehnt(self):
+    def test_int8_convrot(self):
+        """Wie ComfyUI: W·Hᵀ je 64er-Gruppe drehen, dann je Zeile int8. Lin dreht beim Rechnen zurück."""
+        from bildmotoren.gewichte import hadamard
+        h = hadamard(64, "cpu", torch.float32)
+        self.assertTrue(torch.allclose(h @ h.t(), torch.eye(64), atol=1e-5))
+        gedreht = (self.w.view(64, 2, 64) @ h.t()).view(64, 128)
+        s = gedreht.abs().amax(1, keepdim=True) / 127.0
+        q = (gedreht / s).round().to(torch.int8)
+        cq = torch.tensor(list(b'{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 64}'),
+                          dtype=torch.uint8)
+        lin = self._lin({"l.weight": q, "l.weight_scale": s, "l.comfy_quant": cq})
+        self.assertEqual((lin.art, lin.gruppe), ("int8", 64))
+        ref = self.x @ self.w.t()
+        self.assertLess(float((lin(self.x) - ref).abs().max()), 0.05 * float(ref.abs().max()))
+
+    def test_mxfp8(self):
+        """MXFP8 wie comfy-kitchen: E4M3 je 32 Werte mit E8M0-Skala, Skalen in cuBLAS-Kacheln."""
+        import krea
+        blk = self.w.view(64, 4, 32)
+        e = torch.ceil(torch.log2(blk.abs().amax(-1) / 448.0)).to(torch.int32) + 127
+        skala = torch.pow(2.0, (e - 127).float())
+        q = (blk / skala.unsqueeze(-1)).view(64, 128).to(torch.float8_e4m3fn)
+        cq = torch.tensor(list(b'{"format": "mxfp8"}'), dtype=torch.uint8)
+        bs = krea._to_blocked(e.to(torch.uint8)).view(torch.float8_e8m0fnu)
+        lin = self._lin({"l.weight": q, "l.weight_scale": bs, "l.comfy_quant": cq})
+        self.assertEqual((lin.art, lin.n_out, lin.n_in), ("mxfp8", 64, 128))
+        ref = self.x @ self.w.t()
+        self.assertLess(float((lin(self.x) - ref).abs().max()), 0.1 * float(ref.abs().max()))
+
+    def test_fremde_quantisierung_wird_abgelehnt(self):
+        """Ein unbekanntes Format (z. B. 4-Bit-ConvRot) gibt eine klare Meldung statt eines falschen Bildes."""
         from bildmotoren.gewichte import FormatFehler
-        cq = torch.tensor(list(b'{"format": "int8_tensorwise", "convrot": true}'), dtype=torch.uint8)
-        with self.assertRaises(FormatFehler):
-            self._lin({"l.weight": torch.zeros(64, 128, dtype=torch.int8), "l.weight_scale": torch.ones(64, 1),
-                       "l.comfy_quant": cq})
+        for fmt in (b"convrot_w4a4", b"asym_w4a8_int8"):
+            cq = torch.tensor(list(b'{"format": "' + fmt + b'"}'), dtype=torch.uint8)
+            with self.assertRaises(FormatFehler) as fehler:
+                self._lin({"l.weight": torch.zeros(64, 64, dtype=torch.int8), "l.weight_scale": torch.ones(64, 1),
+                           "l.comfy_quant": cq})
+            self.assertIn(fmt.decode(), str(fehler.exception))
+        riesig = torch.tensor(list(b'{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 16384}'),
+                              dtype=torch.uint8)
+        with self.assertRaises(FormatFehler):                   # Drehgruppe aus der Datei ist begrenzt
+            self._lin({"l.weight": torch.zeros(4, 16384, dtype=torch.int8), "l.weight_scale": torch.ones(4, 1),
+                       "l.comfy_quant": riesig})
 
     def test_nvfp4_aus_dem_dateikopf(self):
         """NVFP4 wie in den ComfyUI-Dateien: Format steht im Kopf (_quantization_metadata), Skalen gekachelt."""

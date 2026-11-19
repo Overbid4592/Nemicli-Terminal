@@ -29,14 +29,15 @@ class SetupsAufraeumen(unittest.TestCase):
     def test_stabiler_stand_bleibt_und_zaehlt_nicht_mit(self):
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
-            for v in ("9.46.880", "9.47.888", "9.48.891", "9.49.900", "9.50.910"):
-                (d / f"NemiCLI-Setup-{v}.exe").write_bytes(b"x")
-                (d / f"NemiCLI-Setup-{v}.exe.sha256").write_text("h", encoding="utf-8")
+            stabil = next(iter(build_exe.SETUPS_STABIL))
+            for name in (stabil, "NemiCLI-Setup-99.1.1.exe", "NemiCLI-Setup-99.2.2.exe", "NemiCLI-Setup-99.3.3.exe",
+                         "NemiCLI-Setup-99.4.4.exe"):
+                (d / name).write_bytes(b"x")
+                (d / f"{name}.sha256").write_text("h", encoding="utf-8")
             build_exe.alte_setups_weg(d)
-            self.assertEqual({"NemiCLI-Setup-9.46.880.exe", "NemiCLI-Setup-9.48.891.exe",
-                              "NemiCLI-Setup-9.49.900.exe", "NemiCLI-Setup-9.50.910.exe"},
+            self.assertEqual({stabil, "NemiCLI-Setup-99.2.2.exe", "NemiCLI-Setup-99.3.3.exe", "NemiCLI-Setup-99.4.4.exe"},
                              {p.name for p in d.glob("*.exe")})
-            self.assertTrue((d / "NemiCLI-Setup-9.46.880.exe.sha256").is_file())
+            self.assertTrue((d / f"{stabil}.sha256").is_file())
 
 
 if __name__ == "__main__":

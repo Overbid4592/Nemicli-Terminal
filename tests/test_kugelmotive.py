@@ -36,7 +36,9 @@ class MotivlisteTests(unittest.TestCase):
         import commands as C
         zusaetze = [z for z, _, _ in C.UNTERMENUES["/kugel"]]
         self.assertIn("motive {}", zusaetze)                       # leere Antwort bricht ab
-        self.assertEqual(1, sum(z.startswith("malen") for z in zusaetze))
+        self.assertEqual(1, sum(z.startswith("malen {") for z in zusaetze))   # nur ein Freitext malt Grundbilder
+        fest = [z for z in zusaetze if z.startswith("malen") and "{" not in z]
+        self.assertEqual(["malen figur"], fest)                    # Figur-Posen: brauchen fertige Grundbilder
 
     def test_bereich_finden(self):
         self.assertEqual("gaming", KM.bereich_finden("6"))

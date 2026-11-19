@@ -211,6 +211,29 @@ class ChatFormatTests(unittest.TestCase):
         self.assertFalse(f.opens_thinking)
         self.assertIsNone(ChatFormatter(tok(), "mistral-v7-tekken", thinking=True).denk_marken())
 
+    def test_mistral_denk_anleitung_aus_der_vorlage(self):
+        """Reasoning-Vorlage mit Denk-Anleitung im Standard-Systemprompt: bei eingeschaltetem Denken steht sie
+        vor dem eigenen Systemprompt ([THINK]/[/THINK] als Spezial-Tokens), ohne Systemprompt allein; aus: nichts."""
+        vorlage = ("{%- set default_system_message = 'Denke zuerst.\\n\\nVorlage:[THINK]Gedanken[/THINK]Antwort' %}"
+                   "{{- '[SYSTEM_PROMPT]' -}}{{- '[INST]' + message['content'] + '[/INST]' }}")
+        t = tok()
+        t.special.update({"[THINK]": 90, "[/THINK]": 91})
+        f = ChatFormatter(t, "mistral-v7-tekken", thinking=True, template=vorlage)
+        self.assertEqual(f.denk_anleitung, "Denke zuerst.\n\nVorlage:[THINK]Gedanken[/THINK]Antwort")
+        self.assertTrue(f.denken_schaltbar and f.denken_im_system)
+        anleitung = (zerlegen("[SYSTEM_PROMPT]Denke zuerst.\n\nVorlage:") + [90] + zerlegen("Gedanken") + [91]
+                     + zerlegen("Antwort"))
+        erwartet = anleitung + zerlegen("\n\nSei nett.[/SYSTEM_PROMPT][INST]Hallo[/INST]Hi!</s>[INST]Wie geht's?[/INST]")
+        self.assertEqual(f.encode(VERLAUF), erwartet)
+        self.assertEqual(f.encode([Message("user", "Hallo")]), anleitung + zerlegen("[/SYSTEM_PROMPT][INST]Hallo[/INST]"))
+        f.thinking = False
+        self.assertEqual(f.encode(VERLAUF), zerlegen(
+            "[SYSTEM_PROMPT]Sei nett.[/SYSTEM_PROMPT][INST]Hallo[/INST]Hi!</s>[INST]Wie geht's?[/INST]"))
+        self.assertIsNone(ChatFormatter(tok(), "mistral-v7-tekken", thinking=True, template=vorlage).denk_anleitung)
+        ohne = ChatFormatter(t, "mistral-v7-tekken", thinking=True, template="{%- set default_system_message = 'Sei nett.' %}")
+        self.assertIsNone(ohne.denk_anleitung)
+        self.assertFalse(ohne.denken_schaltbar)
+
     def test_smollm3_vorlage(self):
         """SmolLM3: Metadaten-Kopf, ohne Werkzeuge kein <|im_end|> nach dem System; /no_think setzt
         einen leeren Denkblock vor jede Antwort, /think im System schaltet um."""

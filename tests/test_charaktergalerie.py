@@ -582,7 +582,7 @@ class Fenster(unittest.TestCase):
         self.f.frei_senden_k.click()
         auftrag = self.lt.gesendet[-1]
         self.assertEqual(("frei", 1, "Sie hat pinke Locken und ist 24"), (auftrag["op"], auftrag["nr"], auftrag["text"]))
-        self.f._ereignis({"t": "frei", "nr": 1, "antwort": "Wie süß! 💖",
+        self.f._ereignis({"t": "frei", "nr": 1, "antwort": "Wie schön! 💖",
                           "aenderungen": {"geschlecht": "w", "alter": 24, "aussehen": FREI["aussehen"]}})
         self.assertEqual(("w", "24", FREI["aussehen"]), (self.f.frei_geschlecht.currentData(), self.f.frei_alter.text(),
                                                        self.f.frei_felder["aussehen"].toPlainText()))
@@ -745,7 +745,7 @@ class Fenster(unittest.TestCase):
         self.assertIs(self.f.seite_start, self.f.stapel.currentWidget())
 
     def test_eigenen_charakter_bearbeiten(self):
-        self.f._ereignis({"t": "bearbeiten", "name": "Juna", "daten": {"name": "Juna", "kern": "an adult woman",
+        self.f._ereignis({"t": "bearbeiten", "name": "PersonB", "daten": {"name": "PersonB", "kern": "an adult woman",
                                                                         "stil": "dark", "seed": 9}, "bild": ""})
         self.assertIs(self.f.seite_ansehen, self.f.stapel.currentWidget())
         self.assertTrue(self.f.zeilen["name"].isHidden())                       # nur Aussehen und Stil

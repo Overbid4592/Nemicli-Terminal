@@ -266,13 +266,35 @@ class GpuFuerBildTests(unittest.TestCase):
         self.assertEqual(m.log, ["raus", "rein"])
 
     def test_ohne_modell_wirkungslos(self):
-        with patch.object(G, "_motor", None):
+        from unittest.mock import MagicMock
+        speicher = MagicMock()
+        drin = []
+        with patch.object(G, "_motor", None), patch.dict(sys.modules, {"memory": speicher}), \
+                patch.object(G.gpuzustand, "sicherstellen") as sicher:
             with G.gpu_fuer_bild():
-                pass
+                drin.append(G._bild_tiefe)
+        self.assertEqual(drin, [0])                                  # kein Zähler, nichts ausgelagert
+        self.assertEqual(G._bild_tiefe, 0)
+        sicher.assert_called_once()
+        speicher.gpu_freigeben.assert_called_once()                  # Embedding-Modell räumt trotzdem
 
     def test_imagegen_nutzt_die_regel(self):
+        import contextlib
         import imagegen
-        self.assertTrue(hasattr(imagegen.paint, "__wrapped__"))
+        huelle = imagegen._gpu_fuer_bild(lambda: None).__code__
+        for fn in (imagegen.paint, imagegen.gesicht_nachbessern):
+            self.assertIs(fn.__code__, huelle, fn.__name__)              # mit _gpu_fuer_bild umhüllt
+        log = []
+
+        @contextlib.contextmanager
+        def regel():
+            log.append("rein")
+            yield
+            log.append("raus")
+        with patch.dict(sys.modules, {"gguflokal": G}), patch.object(G, "gpu_fuer_bild", regel), \
+                patch.object(imagegen, "_ollama_freigeben"):
+            imagegen._gpu_vorbereitet(lambda: log.append("malen"), (), {})
+        self.assertEqual(log, ["rein", "malen", "raus"])
 
 
 class EntladenTests(unittest.TestCase):

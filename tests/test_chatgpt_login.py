@@ -150,8 +150,8 @@ class Erneuern(Basis):
 class Browser(Basis):
     """Der ganze Ablauf: Anmelde-Adresse prüfen, Rückruf an den echten Empfänger auf 127.0.0.1, Token-Tausch."""
 
-    def _ablauf(self, antwort_fn, token_antwort=None):
-        gesehen = {}
+    def _ablauf(self, antwort_fn, token_antwort=None, warten_s=15, gesehen=None):
+        gesehen = {} if gesehen is None else gesehen
         echter_post = httpx.post
 
         def browser(url):
@@ -160,7 +160,8 @@ class Browser(Basis):
             gesehen["q"] = q
 
             def rueckruf():
-                httpx.get(q["redirect_uri"] + "?" + urllib.parse.urlencode(antwort_fn(q)), timeout=10)
+                r = httpx.get(q["redirect_uri"] + "?" + urllib.parse.urlencode(antwort_fn(q)), timeout=10)
+                gesehen["status"] = r.status_code
             threading.Thread(target=rueckruf, daemon=True).start()
 
         def post(url, data=None, timeout=None):
@@ -170,7 +171,7 @@ class Browser(Basis):
             return echter_post(url, data=data, timeout=timeout)
 
         with mock.patch.object(L.httpx, "post", post):
-            stand = L.anmelden(browser, warten_s=15)
+            stand = L.anmelden(browser, warten_s=warten_s)
         return stand, gesehen
 
     def test_erste_anmeldung(self):
@@ -195,8 +196,14 @@ class Browser(Basis):
         self.assertEqual(L._lesen()["client_id"], CLIENT)
 
     def test_falscher_state(self):
-        with self.assertRaises(L.AnmeldeFehler):
-            self._ablauf(lambda q: {"code": "c", "state": "fremd", "client_id": CLIENT})
+        # fremder Rückruf wird abgewiesen und beendet das Warten nicht – kurze Zeitgrenze im Test
+        gesehen = {}
+        with self.assertRaises(L.AnmeldeFehler) as f:
+            self._ablauf(lambda q: {"code": "c", "state": "fremd", "client_id": CLIENT},
+                         warten_s=2, gesehen=gesehen)
+        self.assertIn("abgelaufen", str(f.exception))
+        self.assertEqual(gesehen.get("status"), 400)
+        self.assertNotIn("token", gesehen)
 
     def test_abgelehnt(self):
         with self.assertRaises(L.AnmeldeFehler) as f:

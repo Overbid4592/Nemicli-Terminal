@@ -9,6 +9,7 @@ import sys
 import tempfile
 import types
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -39,6 +40,8 @@ class KugelbilderTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(); self.addCleanup(self.tmp.cleanup)
         root = Path(self.tmp.name)
+        koerper = mock.patch.object(KB, "_koerper_noetig", lambda: False)   # bewegliche Körper: test_figurrig
+        koerper.start(); self.addCleanup(koerper.stop)
         self._alt = (KB.ORDNER, snapshot.ORDNER, KB._maler, KB._rembg_session)
         KB.ORDNER, snapshot.ORDNER = root / "Persoenlichkeiten", root / "Papierkorb"
         self.roh = root / "roh"; self.roh.mkdir()
@@ -115,11 +118,11 @@ class KugelbilderTests(unittest.TestCase):
     def test_ohne_beschreibung_und_zufallsseed(self):
         with self.assertRaises(RuntimeError):
             KB.malen("Nemi", "   ")
-        KB.malen("Juna", "a small robot", stimmungen=[("", "neutral"), ("froh", "happy")])
+        KB.malen("PersonB", "a small robot", stimmungen=[("", "neutral"), ("froh", "happy")])
         self.assertEqual(2, len(self.aufrufe))
         self.assertEqual(self.aufrufe[0]["seed"], self.aufrufe[1]["seed"])
         self.assertIsInstance(self.aufrufe[0]["seed"], int)
-        self.assertEqual(["froh.png", "neutral.png"], sorted(p.name for p in (KB.ORDNER / "Juna").glob("*.png")))
+        self.assertEqual(["froh.png", "neutral.png"], sorted(p.name for p in (KB.ORDNER / "PersonB").glob("*.png")))
 
     def test_saetze_ohne_negativ(self):
         KB.malen("Nemi", "A small round robot with a matte white shell and cyan eyes.", seed=7)
@@ -209,7 +212,7 @@ class KugelbilderTests(unittest.TestCase):
         self.assertEqual("", KB.kleidung_aus(" - "))
         self.assertEqual("", KB.kleidung_aus(""))
         self.assertEqual("a long green coat", KB.kleidung_aus('\n"a long green coat"\nweiterer Text'))
-        system = KB.kleidung_system("Juna", "a small robot.", "Synthetisches Beispiel.")
+        system = KB.kleidung_system("PersonB", "a small robot.", "Synthetisches Beispiel.")
         self.assertIn("entscheidest du allein", system)
         self.assertIn("a small robot.", system); self.assertIn("Synthetisches Beispiel.", system)
         self.assertNotIn("z. B.", KB.KLEIDUNG_SYSTEM); self.assertNotIn("e.g.", KB.KLEIDUNG_SYSTEM)
@@ -233,9 +236,9 @@ class KugelbilderTests(unittest.TestCase):
         self.assertEqual("x. y. " + KB.RAHMEN_SATZ, KB.prompt_bauen("x.", "y", "unbekannt"))
         self.assertEqual("x. The expression is calm and gentle. " + KB.RAHMEN_SATZ,
                          KB.prompt_bauen("x.", "neutral", ""))
-        sd = KB.selbstbeschreibung_system("Juna")
-        satz = KB.selbstbeschreibung_system("Juna", "# Juna\n## Aussehen\nSynthetisches Beispiel.")
-        self.assertIn("Du bist Juna.", sd)
+        sd = KB.selbstbeschreibung_system("PersonB")
+        satz = KB.selbstbeschreibung_system("PersonB", "# PersonB\n## Aussehen\nSynthetisches Beispiel.")
+        self.assertIn("Du bist PersonB.", sd)
         self.assertIn("Englisch", sd)
         self.assertIn("ganze Sätze", satz)
         self.assertIn("übernimm das genau", satz)

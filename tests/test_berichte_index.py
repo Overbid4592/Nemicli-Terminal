@@ -1,4 +1,4 @@
-"""Berichte → Vektoren, nur die drei neuesten bleiben als Datei.
+"""Berichte → Vektoren, nur die drei neuesten bleiben als Datei .
 
 Alles in einem Temp-Ordner: memory.db, Berichte/, Papierkorb/. Der Encoder wird
 durch eine Zählfunktion ersetzt – mal liefert sie Vektoren, mal nichts (Encoder

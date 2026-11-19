@@ -144,7 +144,8 @@ class VorhinImChatTests(unittest.TestCase):
         bedingung, werte = indexdb._filter_sql(None, "", "", ("chat:52$", "bericht:"))
         self.assertIn("c.ref = ?", bedingung)
         self.assertIn("chat:52", werte)
-        self.assertIn("bericht:%", werte)
+        self.assertIn("substr(c.ref, 1, ?) = ?", bedingung)          # Präfix ohne LIKE-Platzhalter
+        self.assertIn("bericht:", werte)
 
     def test_quelle_aktuell(self):
         with mock.patch.object(chatstore, "aktueller_chat", return_value=52), \

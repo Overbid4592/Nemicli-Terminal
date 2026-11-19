@@ -52,7 +52,7 @@ class Vorsatz(unittest.TestCase):
                 self.assertEqual("task: search result | query: ", e["query_prompt"])
                 self.assertEqual("title: none | text: ", e["dokument_prompt"])
                 self.assertEqual("mean", e["pooling"])
-                self.assertEqual("gemma-embedding2-768-24-262144-mean", E.kennung(tmp))
+                self.assertEqual("gemma-embedding2-768-24-262144-mean-t1", E.kennung(tmp))      # t1: Dokumente mit Titel
 
     def test_aufgabe_waehlt_die_gemma_anweisung(self):
         e = {"query_prompt": "task: search result | query: ", "prompt_eigen": False}

@@ -83,7 +83,7 @@ class BildbeschreiberTests(unittest.TestCase):
             with B._lock:
                 fertig.append(B._engine())
 
-        with patch.object(B, "_helfer", (Path("alt.gguf"), alt)), patch.object(B, "finden", lambda: neu), \
+        with patch.object(B, "_helfer", (Path("alt.gguf"), alt)), patch.object(B, "finden", lambda klein=False: neu), \
                 patch.object(B.gguflokal, "_torch_bereit", lambda: None), \
                 patch.dict(sys.modules, {"ggufengine": types.SimpleNamespace(Engine=_Engine)}):
             t = threading.Thread(target=lauf, daemon=True)

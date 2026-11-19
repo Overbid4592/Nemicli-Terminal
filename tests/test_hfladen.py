@@ -123,8 +123,8 @@ class DateiTests(unittest.TestCase):
 
 
 class _Antwort:
-    def __init__(self, daten: bytes, status: int):
-        self.daten, self.status_code = daten, status
+    def __init__(self, daten: bytes, status: int, headers: dict | None = None):
+        self.daten, self.status_code, self.headers = daten, status, headers or {}
 
     def __enter__(self):
         return self
@@ -149,7 +149,9 @@ class _Netz:
         self.aufrufe.append(dict(headers or {}))
         rng = (headers or {}).get("Range")
         if rng and self.kann_fortsetzen:
-            return _Antwort(self.inhalt[int(rng[6:-1]):], 206)
+            ab = int(rng[6:-1])
+            return _Antwort(self.inhalt[ab:], 206,
+                            {"content-range": f"bytes {ab}-{len(self.inhalt) - 1}/{len(self.inhalt)}"})
         return _Antwort(self.inhalt, 200)
 
 

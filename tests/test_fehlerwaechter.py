@@ -225,7 +225,7 @@ class Absturz(Grundlage):
         self.assertEqual(FW.hinweis_beim_start(), "")      # nur nach echtem Absturz ein Hinweis
 
     def test_herunterfahren_ist_kein_befund(self):
-        # Wache am 22.10. 02:05: PC ausgeschaltet, Qt bekam kein Abmelden mit – Windows' Protokoll zeigt es
+        # PC ausgeschaltet, Qt bekam kein Abmelden mit – das Windows-Protokoll zeigt das Herunterfahren
         self._marke(999_994)
         zeiten = []
         with mock.patch.object(FW, "_pid_lebt", return_value=False), \

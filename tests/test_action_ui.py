@@ -36,6 +36,7 @@ with patch.dict(sys.modules, {
     "models": NS(strength_menu=lambda *args: {}, split_ref=lambda ref: ref.partition(":")),
     "chatstore": NS(),
     "commands": NS(SlashCompleter=lambda **kw: DummyCompleter()),
+    "terminal_text": load_source("action_ui_terminal_text", "ui/terminal_text.py"),
 }):
     SCREEN = load_source("action_ui_screen", "ui/screen.py")
     CONFIRM = load_source("action_ui_confirm", "core/confirm.py")

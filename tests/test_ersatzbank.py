@@ -84,7 +84,7 @@ class ErsatzbankTests(unittest.TestCase):
         self.assertEqual(ersatzbank.abholen()["neu"], C)
 
     def test_nur_cloud_auf_der_bank(self):
-        bank = ersatzbank.setzen(["gguf:lokal", "ollama:lokal", "funke:gross", A, B, B, C])
+        bank = ersatzbank.setzen(["gguf:lokal", "ollama:lokal", A, B, B, C])
         self.assertEqual(bank, [B, C])
 
     def test_begnadigen(self):

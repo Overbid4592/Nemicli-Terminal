@@ -125,9 +125,9 @@ class Schalter(unittest.TestCase):
         s.port, s.schluessel = 1234, "geheim"
         args = s.argumente()
         for verboten in ("--rpc", "--slot-save-path", "--sleep-idle-seconds", "--tools", "--jinja", "--webui",
-                         "--mcp-servers-config", "--props", "--metrics", "-hf", "--models-dir"):
+                         "--mcp-servers-config", "--props", "--metrics", "-hf", "--models-dir", "--ui"):
             self.assertNotIn(verboten, args)
-        for noetig in ("--no-webui", "--no-jinja", "--no-slots", "--no-mmproj", "--offline"):
+        for noetig in ("--no-ui", "--no-jinja", "--no-slots", "--no-mmproj", "--offline"):
             self.assertIn(noetig, args)
         self.assertEqual(args[args.index("--host") + 1], "127.0.0.1")
         self.assertNotIn("geheim", " ".join(args))            # der Schlüssel geht über die Umgebung
@@ -159,6 +159,7 @@ SCHEIN = textwrap.dedent('''
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     port = int(sys.argv[sys.argv.index("--port") + 1])
     ctx = int(os.environ.get("SCHEIN_CTX", "2048"))
+    warten = float(os.environ.get("SCHEIN_WARTEN", "0"))    # so lange „liest“ er den Prompt ein
     antwort = json.loads(os.environ["SCHEIN_ANTWORT"])
     log = os.environ["SCHEIN_LOG"]
     schluessel = os.environ.get("LLAMA_API_KEY", "")
@@ -200,6 +201,9 @@ SCHEIN = textwrap.dedent('''
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream")
             self.end_headers()
+            if warten:
+                import time
+                time.sleep(warten)
             try:
                 for t in toks:
                     self.wfile.write(("data: " + json.dumps({"content": "", "tokens": [t], "stop": False})
@@ -239,6 +243,7 @@ class _ScheinBasis(unittest.TestCase):
         self.umgebung = {"SCHEIN_LOG": str(self.log), "SCHEIN_ANTWORT": json.dumps([72, 97, 108, 108, 111, 258])}
         skript = str(self.skript)
         for p in (patch.object(R, "pruefen", return_value=None),
+                  patch.object(R, "kann", return_value=frozenset()),
                   patch.object(R, "server_pfad", return_value=Path(sys.executable)),
                   patch.object(R, "_daten", return_value=self.tmp),
                   patch.object(R.Server, "argumente",
@@ -409,7 +414,7 @@ class GeteilterServer(_ScheinBasis):
         echt_lebt = R._lebt
         for p in (patch.object(R, "_lebt", lambda pid: pid in (self.HAUPT, self.WACHE) or
                                (pid in self.server_pids and echt_lebt(pid))),
-                  patch.object(R, "_ist_unser_server", lambda pid: pid in self.server_pids)):
+                  patch.object(R, "_ist_unser_server", lambda pid, pfad=None: pid in self.server_pids)):
             p.start()
             self.addCleanup(p.stop)
         self.alle = []
@@ -451,7 +456,7 @@ class GeteilterServer(_ScheinBasis):
         self.assertIsNone(proc.poll())                         # die Wache nutzt ihn noch
         self.assertTrue(wache.laeuft())
         self.assertEqual(json.loads(R._zettel_pfad(self.modell).read_text(encoding="utf-8"))["besitzer"], self.WACHE)
-        with patch.object(R, "_prozess_beenden", side_effect=lambda pid: proc.terminate() or proc.wait(10)):
+        with patch.object(R, "_prozess_beenden", side_effect=lambda *a: proc.terminate() or proc.wait(10)):
             wache.stoppen()                                    # jetzt braucht ihn keiner mehr
         self.assertIsNotNone(proc.poll())
         self.assertFalse(R._zettel_pfad(self.modell).exists())
@@ -751,10 +756,454 @@ class WerkzeugNurMitCloud(unittest.TestCase):
             self.assertIn("llamacpp_holen", persona._llamacpp_hinweis())
 
 
+NEU = "b99999"
+SHA = "a" * 64
+
+
+def _release(tag, assets, draft=False):
+    return {"tag_name": tag, "draft": draft, "assets": [
+        {"name": n, "size": g, "digest": d} for n, g, d in assets]}
+
+
+class Aktualisieren(_Ablage):
+    """Neuester Build laut GitHub: Katalog aus den Release-Daten, Probelauf, Einschalten, drei Builds behalten."""
+
+    def _eingerichtet(self, build, server=b"s"):
+        ordner = R.ablage() / build
+        ordner.mkdir(parents=True)
+        (ordner / "llama-server.exe").write_bytes(server)
+        liste = {"build": build, "pakete": [], "server": "llama-server.exe",
+                 "dateien": {"llama-server.exe": hashlib.sha256(server).hexdigest()}}
+        (ordner / "pruefliste.json").write_text(json.dumps(liste), encoding="utf-8")
+
+    def _api(self, antwort):
+        import httpx
+        echt = httpx.Client
+        self.anfragen = []
+
+        def client(*a, **k):
+            k["transport"] = httpx.MockTransport(lambda req: (self.anfragen.append(req), antwort(req))[1])
+            return echt(*a, **k)
+        return patch.object(httpx, "Client", client)
+
+    def test_neuester_nimmt_nur_gepruefte_windows_pakete(self):
+        import httpx
+        daten = [_release("v1.0.0", [("nightly-tag.txt", 7, "sha256:" + SHA)]),
+                 _release("b99998", [(f"llama-b99998-bin-win-cpu-x64.zip", 10, "sha256:" + SHA)], draft=True),
+                 _release(NEU, [(f"llama-{NEU}-bin-win-cuda-13.6-x64.zip", 100, "sha256:" + SHA),
+                                ("cudart-llama-bin-win-cuda-13.6-x64.zip", 50, "sha256:" + "b" * 64),
+                                (f"llama-{NEU}-bin-win-cpu-x64.zip", 10, ""),              # ohne Hash
+                                (f"llama-b1-bin-win-vulkan-x64.zip", 10, "sha256:" + SHA),  # anderer Build
+                                (f"llama-{NEU}-bin-macos-arm64.zip", 10, "sha256:" + SHA)])]
+        with self._api(lambda req: httpx.Response(200, json=daten)):
+            build, kat = R.neuester()
+        self.assertEqual(build, NEU)
+        self.assertEqual(set(kat), {f"llama-{NEU}-bin-win-cuda-13.6-x64.zip", "cudart-llama-bin-win-cuda-13.6-x64.zip"})
+        self.assertEqual(self.anfragen[0].url.host, "api.github.com")
+        self.assertNotIn("authorization", self.anfragen[0].headers)
+
+    def test_neuester_folgt_keiner_umleitung(self):
+        import httpx
+        with self._api(lambda req: httpx.Response(302, headers={"location": "https://boese.example/"})):
+            with self.assertRaises(OSError):
+                R.neuester()
+        self.assertEqual(len(self.anfragen), 1)
+
+    def test_paketwahl_fuer_neuen_build(self):
+        from types import SimpleNamespace as NS
+        kat = {f"llama-{NEU}-bin-win-cuda-13.6-x64.zip": [SHA, 100], "cudart-llama-bin-win-cuda-13.6-x64.zip": [SHA, 50],
+               f"llama-{NEU}-bin-win-cuda-12.4-x64.zip": [SHA, 100], "cudart-llama-bin-win-cuda-12.4-x64.zip": [SHA, 50],
+               f"llama-{NEU}-bin-win-vulkan-x64.zip": [SHA, 10]}
+        R._katalog_datei(NEU).write_text(json.dumps(kat), encoding="utf-8")
+        karte = NS(name="RTX", cuda_cap="12.0")
+        for cuda, erwartet in ((13.6, "cuda-13.6"), (13.5, "vulkan"), (12.8, "vulkan")):
+            namen, _ = R.passende_pakete(NS(nvidia=karte, cuda_max=cuda, haupt_gpu=karte), build=NEU)
+            self.assertEqual(namen[-1], f"llama-{NEU}-bin-win-{erwartet}-x64.zip", cuda)
+        alt = NS(name="GTX", cuda_cap="8.6")
+        namen, _ = R.passende_pakete(NS(nvidia=alt, cuda_max=12.6, haupt_gpu=alt), build=NEU)
+        self.assertEqual(namen, ["cudart-llama-bin-win-cuda-12.4-x64.zip", f"llama-{NEU}-bin-win-cuda-12.4-x64.zip"])
+
+    def test_aktualisieren_schaltet_erst_nach_probelauf_ein(self):
+        self._eingerichtet(R.BUILD)
+        kat = {f"llama-{NEU}-bin-win-cpu-x64.zip": (SHA, 10)}
+
+        def holen(art, fortschritt, stopp, profil, build):
+            self._eingerichtet(build)
+            return True, ["✅ eingerichtet"]
+        with patch.object(R, "neuester", return_value=(NEU, kat)), patch.object(R, "holen", side_effect=holen), \
+                patch.object(R, "probelauf", return_value=["--fit"]):
+            ok, zeilen = R.aktualisieren()
+        self.assertFalse(ok)
+        self.assertEqual(R.aktiv(), R.BUILD)                   # Schalter fehlt: alter Build bleibt
+        self.assertTrue(any("--fit" in z for z in zeilen), zeilen)
+        with patch.object(R, "neuester", return_value=(NEU, kat)), patch.object(R, "holen") as holen2, \
+                patch.object(R, "probelauf", return_value=[]):
+            ok, zeilen = R.aktualisieren()
+        self.assertTrue(ok, zeilen)
+        holen2.assert_not_called()                             # schon eingerichtet: nicht neu laden
+        self.assertEqual(R.aktiv(), NEU)
+        self.assertIsNone(R.pruefen())
+        self.assertEqual(R.server_pfad(), R.ablage() / NEU / "llama-server.exe")
+        self.assertTrue(R.ist_geprueft(R.ablage() / R.BUILD / "llama-server.exe"))   # alter Build bleibt erkannt
+        with patch.object(R, "neuester", return_value=(NEU, kat)):
+            ok, zeilen = R.aktualisieren()
+        self.assertTrue(ok)
+        self.assertIn("schon der neueste", zeilen[0])
+
+    def test_drei_builds_bleiben_der_rest_in_den_papierkorb(self):
+        import snapshot
+        for b in ("b100", "b200", "b300", "b400"):
+            self._eingerichtet(b)
+        (R.ablage() / "llama-b100-bin-win-cpu-x64.zip").write_bytes(b"z")
+        R.aktivieren("b200")                                   # zurückgeschaltet: der aktive bleibt immer
+        weg = []
+        with patch.object(snapshot, "sichern", side_effect=lambda p, w, verschieben: weg.append(Path(p))
+                          or __import__("shutil").move(str(p), self.tmp.name + "/korb_" + Path(p).name)):
+            zeilen = R.aufraeumen()
+        self.assertEqual(R.installiert(), ["b400", "b300", "b200"])
+        self.assertIn(R.ablage() / "b100", weg)
+        self.assertIn(R.ablage() / "llama-b100-bin-win-cpu-x64.zip", weg)
+        self.assertTrue(any("Papierkorb" in z for z in zeilen), zeilen)
+
+    def test_wechseln_nur_auf_gepruefte_builds(self):
+        self._eingerichtet("b300")
+        with self.assertRaises(ValueError):
+            R.aktivieren("b301")
+        (R.ablage() / "b300" / "llama-server.exe").write_bytes(b"anders")
+        with self.assertRaises(ValueError):
+            R.aktivieren("b300")
+        self.assertEqual(R.aktiv(), R.BUILD)
+
+    def test_probelauf_findet_fehlende_schalter(self):
+        import subprocess
+        self._eingerichtet(NEU)
+        hilfe = " ".join(s for s in (*R.SCHALTER, *R.OHNE_BILDTEIL, *R.PFLICHT) if s != "--kv-unified")
+        hilfe += " --kv-unified-x"                             # ähnlicher Name zählt nicht
+        hilfe += "\n-fa, --flash-attn [on|off|auto]\n"
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, hilfe, "")):
+            self.assertEqual(R.probelauf(NEU), ["--kv-unified"])
+        with patch.object(subprocess, "run", return_value=subprocess.CompletedProcess([], 0, hilfe + " --kv-unified", "")):
+            self.assertEqual(R.probelauf(NEU), [])
+
+    def test_kaputter_katalog_zaehlt_nicht(self):
+        R._katalog_datei(NEU).write_text(json.dumps({f"llama-{NEU}-bin-win-cpu-x64.zip": ["kurz", 10],
+                                                     f"llama-{NEU}-bin-win-vulkan-x64.zip": [SHA, -1],
+                                                     "../boese.zip": [SHA, 10]}), encoding="utf-8")
+        self.assertEqual(R.katalog(NEU), {})
+        (R.ablage() / "aktiv.txt").write_text("../b1", encoding="utf-8")
+        self.assertEqual(R.aktiv(), R.BUILD)
+
+
+class KontextUndKv(unittest.TestCase):
+    """Schalter für Kontext „max“ (--fit), festen Kontext, ältere Builds und den KV-Typ."""
+
+    def _args(self, n_ctx, kann=R.ZUSATZ, **kw):
+        s = R.Server(Path("m.gguf"), n_ctx, **kw)
+        s.port, s._kann = 1234, frozenset(kann)
+        return s, s.argumente()
+
+    def test_max_mit_fit(self):
+        s, a = self._args(0, n_ctx_max=131072)
+        self.assertEqual(a.count("-c"), 1)
+        self.assertEqual(a[a.index("-c") + 1], "0")
+        self.assertEqual(a[a.index("--fit-ctx") + 1], str(R.FIT_CTX))
+        self.assertEqual(a[a.index("--fit-target") + 1], str(R.FIT_ZIEL_MIB))
+        self.assertEqual(a[a.index("--fit") + 1], "on")
+        self.assertEqual(s.c_arg, "0")
+
+    def test_max_kurzes_modell_mindest_hoechstens_modelllaenge(self):
+        _, a = self._args(0, n_ctx_max=2048)
+        self.assertEqual(a[a.index("--fit-ctx") + 1], "2048")
+
+    def test_fester_kontext_bleibt(self):
+        _, a = self._args(8192, n_ctx_max=131072)
+        self.assertEqual(a[a.index("-c") + 1], "8192")
+        self.assertNotIn("--fit-ctx", a)
+        self.assertNotIn("--fit-target", a)
+
+    def test_build_ohne_fit_ctx_wie_frueher(self):
+        _, a = self._args(0, kann=(), n_ctx_max=131072)
+        self.assertEqual(a[a.index("-c") + 1], "131072")
+        self.assertNotIn("--fit-ctx", a)
+
+    def test_kv_quantisiert_mit_flash_attention(self):
+        s, a = self._args(8192, kv="q8_0")
+        self.assertEqual(a[a.index("--flash-attn") + 1], "on")
+        self.assertEqual(a[a.index("--cache-type-k") + 1], "q8_0")
+        self.assertEqual(a[a.index("--cache-type-v") + 1], "q8_0")
+        self.assertEqual(s.kv_wirksam, "q8_0")
+
+    def test_kv_ohne_schalter_im_build_bleibt_f16(self):
+        s, a = self._args(8192, kann=("--fit-ctx", "--fit-target"), kv="q4_0")
+        self.assertNotIn("--cache-type-k", a)
+        self.assertNotIn("--flash-attn", a)
+        self.assertEqual(s.kv_wirksam, "f16")
+        s, a = self._args(8192, kv="f16")
+        self.assertNotIn("--cache-type-k", a)
+
+    def test_unbekannter_kv_typ_wird_f16(self):
+        s, a = self._args(8192, kv="q5_1")
+        self.assertEqual(s.kv, "f16")
+        self.assertNotIn("--cache-type-k", a)
+
+    def test_kv_stufe_feste_regel(self):
+        pro = 100_000                                          # Bytes je Token in f16
+        self.assertEqual(R.kv_stufe("auto", pro, 32768, 4 * 10**9), "f16")
+        self.assertEqual(R.kv_stufe("auto", pro, 32768, 3 * 10**9), "q8_0")
+        self.assertEqual(R.kv_stufe("auto", pro, 32768, 3 * 10**8), "q8_0")   # q8_0 schafft 4096
+        self.assertEqual(R.kv_stufe("auto", pro, 32768, 10**8), "q4_0")
+        self.assertEqual(R.kv_stufe("auto", pro, 32768, -5), "q4_0")
+        self.assertEqual(R.kv_stufe("auto", None, 32768, 10**8), "f16")       # ohne Angaben
+        self.assertEqual(R.kv_stufe("auto", pro, 32768, None), "f16")
+        self.assertEqual(R.kv_stufe("Q4_0", pro, 32768, 10**12), "q4_0")      # ausdrücklich
+        self.assertEqual(R.kv_stufe("unsinn", pro, 32768, 4 * 10**9), "f16")  # wie auto
+
+    def test_flash_attn_ohne_wert_zaehlt_nicht(self):
+        self.assertFalse(R._kennt("  -fa, --flash-attn  enable Flash Attention", "--flash-attn"))
+        self.assertTrue(R._kennt("-fa,    --flash-attn [on|off|auto]  set Flash Attention", "--flash-attn"))
+        self.assertTrue(R._kennt("-fitc, --fit-ctx N  minimum ctx size", "--fit-ctx"))
+        self.assertFalse(R._kennt("--fit-ctx-x N", "--fit-ctx"))
+
+
+class KvRueckfall(unittest.TestCase):
+    def _starten(self, logtext):
+        s = R.Server(Path("m.gguf"), 8192, kv="q8_0")
+        aufrufe = []
+
+        def selbst(abbruch=None):
+            aufrufe.append(s.kv)
+            if len(aufrufe) == 1:
+                s.kv_wirksam = s.kv
+                raise RuntimeError("llama-server hat sich beendet: ...")
+            s.kv_wirksam = s.kv
+            return 1.5
+        import contextlib
+        with patch.object(R, "pruefen", return_value=None), patch.object(R, "kann", return_value=frozenset()), \
+                patch.object(s, "_pause_abwarten"), patch.object(s, "_anhaengen", return_value=False), \
+                patch.object(s, "_sperre", lambda *a, **k: contextlib.nullcontext()), \
+                patch.object(s, "laeuft", return_value=False), patch.object(s, "_selbst_starten", selbst), \
+                patch.object(s, "_log_seit_start", return_value=logtext):
+            try:
+                return s, aufrufe, s.starten()
+            except RuntimeError as exc:
+                return s, aufrufe, exc
+
+    def test_flash_attention_fehler_einmal_zurueck_auf_f16(self):
+        s, aufrufe, ergebnis = self._starten(
+            "llama_init_from_model: quantized V cache was requested, but this requires Flash Attention\n")
+        self.assertEqual(ergebnis, 1.5)
+        self.assertEqual(aufrufe, ["q8_0", "f16"])
+        self.assertTrue(s.kv_rueckfall)
+        self.assertEqual(s.kv_wirksam, "f16")
+
+    def test_anderer_fehler_kein_rueckfall(self):
+        s, aufrufe, ergebnis = self._starten("failed to load model\n")
+        self.assertIsInstance(ergebnis, RuntimeError)
+        self.assertEqual(aufrufe, ["q8_0"])
+        self.assertFalse(s.kv_rueckfall)
+
+
+class ZettelAbgleich(_Ablage):
+    """Anhängen nur an den Server des aktiven Builds; Wechsel und Startzeiten."""
+
+    def setUp(self):
+        super().setUp()
+        self.modell = Path(self.tmp.name) / "m.gguf"
+        self.modell.write_bytes(b"GGUF")
+        self.exe = Path(self.tmp.name) / "llama-server.exe"
+        self.exe.write_bytes(b"s")
+        for p in (patch.object(R, "server_pfad", return_value=self.exe),
+                  patch.object(R, "_lebt_als", return_value=True),
+                  patch.object(R, "_ist_unser_server", lambda pid, pfad=None: True),
+                  patch.object(R, "_entschluesseln", return_value="schluessel"),
+                  patch.object(R.Server, "_props", return_value=4096),
+                  patch.object(R.Server, "benutzt")):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def _zettel(self, **mehr):
+        z = {"build": R.aktiv(), "kennung": R._kennung(self.modell), "server_pid": 4242, "server_start": 10.0,
+             "server_pfad": str(self.exe), "port": 5555, "schluessel": "x", "n_ctx": 4096, "c": "0",
+             "kv": "q8_0", "bildteil": None, "gaeste": {}, "pause": False, "wechseln": False}
+        z.update(mehr)
+        R._zettel_schreiben(self.modell, z)
+
+    def test_passender_zettel(self):
+        self._zettel()
+        s = R.Server(self.modell)
+        self.assertTrue(s._anhaengen())
+        self.assertEqual((s.server_pid, s.port, s.n_ctx, s.kv_wirksam, s.c_arg, s.build),
+                         (4242, 5555, 4096, "q8_0", "0", R.aktiv()))
+        self.assertTrue(s.gast)
+
+    def test_anderer_build_wechsel_oder_server_nicht(self):
+        for mehr in ({"build": "b1"}, {"wechseln": True}, {"server_pfad": str(Path(self.tmp.name) / "x.exe")},
+                     {"pause": True}, {"bildteil": "mmproj.gguf"}):
+            self._zettel(**mehr)
+            self.assertFalse(R.Server(self.modell)._anhaengen(), mehr)
+
+    def test_alter_zettel_ohne_neue_felder(self):
+        R._zettel_schreiben(self.modell, {"build": R.BUILD, "kennung": R._kennung(self.modell), "server_pid": 4242,
+                                          "besitzer": 1, "port": 5555, "schluessel": "x", "n_ctx": 4096,
+                                          "bildteil": None, "gaeste": {"1": 0}, "pause": False})
+        s = R.Server(self.modell)
+        self.assertTrue(s._anhaengen())
+        self.assertEqual(s.kv_wirksam, "f16")
+        self.assertIsNone(s.server_start)
+
+    def test_wechsel_melden_und_faellig(self):
+        self._zettel()
+        s = R.Server(self.modell)
+        self.assertTrue(s._anhaengen())
+        self.assertFalse(s.wechsel_faellig())
+        R._wechsel_melden()
+        self.assertTrue(R._zettel_lesen(self.modell)["wechseln"])
+        self.assertTrue(s.wechsel_faellig())
+        self.assertFalse(R.Server(self.modell)._anhaengen())   # niemand hängt sich mehr an
+        s.build = "b1"
+        self.assertTrue(s.wechsel_faellig())
+
+    def test_zettel_eines_neueren_builds_gilt(self):
+        self._zettel(build="b99999")
+        self.assertIsNotNone(R._zettel_lesen(self.modell))     # früher: nur der Grund-Build
+        with patch.object(R, "aktiv", return_value="b99999"):
+            self.assertTrue(R.Server(self.modell)._anhaengen())
+
+
+class Prozesskennung(unittest.TestCase):
+    def test_startzeit_unterscheidet_neue_pid(self):
+        with patch.object(R, "_lebt", return_value=True), patch.object(R, "_startzeit", return_value=100.0):
+            self.assertTrue(R._lebt_als(5, 100.3))
+            self.assertFalse(R._lebt_als(5, 250.0))
+            self.assertTrue(R._lebt_als(5, None))              # alter Zettel ohne Startzeit
+        with patch.object(R, "_lebt", return_value=False):
+            self.assertFalse(R._lebt_als(5, None))
+
+    def test_eigene_startzeit(self):
+        self.assertIsNotNone(R._startzeit(os.getpid()))
+        self.assertTrue(R._lebt_als(os.getpid(), R._startzeit(os.getpid())))
+
+    def test_horcht_nur_der_erwartete_prozess(self):
+        import socket
+        with socket.socket() as s:
+            s.bind(("127.0.0.1", 0))
+            s.listen()
+            port = s.getsockname()[1]
+            self.assertTrue(R._horcht(port, os.getpid()))
+            self.assertFalse(R._horcht(port, 4))
+        self.assertFalse(R._horcht(port, os.getpid()))         # niemand lauscht mehr
+
+    def test_fremder_server_pfad_zaehlt_nicht(self):
+        with patch.object(R, "_bekannter_server", return_value=False):
+            self.assertFalse(R._ist_unser_server(os.getpid(), sys.executable))
+
+
+class AbbruchDurchgereicht(_ScheinBasis):
+    def test_abbruch_waehrend_der_server_noch_einliest(self):
+        import time
+        from ggufengine.chat import Message
+        with patch.dict(os.environ, {"SCHEIN_WARTEN": "30"}):
+            e = self._engine()
+            t0 = time.monotonic()
+            text = "".join(e.chat([Message("user", "Hi")], max_tokens=8, abbruch=lambda: time.monotonic() - t0 > 0.5))
+            self.assertLess(time.monotonic() - t0, 5.0)        # nicht erst nach SCHEIN_WARTEN
+        self.assertEqual(text, "")
+        self.assertTrue(self._anfragen()[-1]["return_progress"])
+
+    def test_vorlesen_abgebrochen(self):
+        import time
+        from ggufengine.chat import Message
+        with patch.dict(os.environ, {"SCHEIN_WARTEN": "30"}):
+            e = self._engine()
+            t0 = time.monotonic()
+            n = e.vorlesen([Message("user", "Hi")], abbruch=lambda: time.monotonic() - t0 > 0.3)
+            self.assertLess(time.monotonic() - t0, 5.0)
+        self.assertEqual(n, 0)
+
+    def test_ohne_abbruch_wie_bisher(self):
+        from ggufengine.chat import Message
+        e = self._engine()
+        self.assertEqual("".join(e.chat([Message("user", "Hi")], max_tokens=8, abbruch=lambda: False)), "Hallo")
+
+    def test_start_bekommt_abbruch(self):
+        e = self._engine()
+        gesehen = []
+        stopp = lambda: False                                    # noqa: E731
+        with patch.object(e.server, "laeuft", return_value=False), \
+                patch.object(e.server, "starten", side_effect=lambda abbruch=None: gesehen.append(abbruch) or 0.0):
+            e._sicher_laufend(stopp)
+        self.assertEqual(gesehen, [stopp])
+
+    def test_alter_build_wird_vor_der_anfrage_beendet(self):
+        e = self._engine()
+        with patch.object(e.server, "wechsel_faellig", return_value=True), \
+                patch.object(e.server, "stoppen") as stoppen, \
+                patch.object(e.server, "starten", return_value=0.0):
+            e._sicher_laufend()
+        stoppen.assert_called_once()
+
+    def test_sperre_wartet_abbrechbar(self):
+        import time
+        sperre = Path(self.tmp) / "x.lock"
+        with R._Sperre(sperre, 60):
+            t0 = time.monotonic()
+            with self.assertRaises(RuntimeError) as f:
+                with R._Sperre(sperre, 60, abbruch=lambda: time.monotonic() - t0 > 0.3):
+                    pass
+            self.assertIn("abgebrochen", str(f.exception))
+            self.assertLess(time.monotonic() - t0, 5.0)
+
+
+class ReserveLaden(unittest.TestCase):
+    """gguflokal gibt bei Kontext „max“ 0 an llama.cpp weiter (der Server kürzt selbst), sonst den Wert."""
+
+    def _laden(self, einstellung):
+        gesehen = {}
+
+        class Engine:
+            motor_name = "llama.cpp"
+
+            def __init__(self, pfad, **kw):
+                gesehen.update(kw)
+                self.n_ctx, self.server = 4096, None
+        import llamamotor
+        with patch.object(G, "kontext_einstellung", return_value=einstellung), \
+                patch.object(G, "sieht", return_value=False), patch.object(G, "_frei_vram", return_value=None), \
+                patch.object(G, "kv_bytes_pro_token", return_value=None), \
+                patch.object(llamamotor, "LlamaCppEngine", Engine):
+            G._reserve_laden("m", Path("m.gguf"), 131072 if einstellung <= 0 else einstellung)
+        return gesehen
+
+    def test_max_und_fest(self):
+        self.assertEqual(self._laden(0)["n_ctx"], 0)
+        self.assertEqual(self._laden(0)["n_ctx_max"], 131072)
+        self.assertEqual(self._laden(8192)["n_ctx"], 8192)
+        self.assertEqual(self._laden(8192)["kv"], "f16")
+
+    def test_kv_einstellung(self):
+        with patch.object(G, "_config", return_value={"llama_kv": "q4_0"}):
+            self.assertEqual(G.llama_kv(), "q4_0")
+            self.assertEqual(self._laden(8192)["kv"], "q4_0")
+        with patch.object(G, "_config", return_value={"llama_kv": "q2"}):
+            self.assertEqual(G.llama_kv(), "auto")
+
+
 class Befehl(unittest.TestCase):
     def test_registriert(self):
         import commands
         self.assertIn("/llamacpp", commands.COMMANDS)
+        self.assertIn("aktualisieren", [z for z, _, _ in commands.UNTERMENUES["/llamacpp"]])
+
+    def test_ki_aktualisiert_nur_mit_neu(self):
+        import actions
+        import debugbericht
+        with patch.object(debugbericht, "cloud_modell", return_value=True), \
+                patch.object(R, "aktualisieren", return_value=(True, ["✅ aktiv"])) as neu, \
+                patch.object(R, "holen") as holen:
+            self.assertTrue(actions._llamacpp_holen({"neu": "ja"}).ok)
+        neu.assert_called_once()
+        holen.assert_not_called()
+        self.assertIn("aktualisieren", actions.describe({"tool": "llamacpp_holen", "neu": True}))
 
 
 if __name__ == "__main__":

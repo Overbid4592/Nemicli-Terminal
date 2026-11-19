@@ -35,6 +35,44 @@ class SucheTests(unittest.TestCase):
         self.assertEqual(C.find_commands("/xyzq"), [])
 
 
+class EinfacheSucheTests(unittest.TestCase):
+    """„/“ + ein Wort findet auch Unterpunkte jedes Befehls – ohne den Befehl davor zu kennen, mit Tippfehlern."""
+
+    def erster(self, frage):
+        return C.vorschlaege(frage)[0][0].strip()
+
+    def test_unterpunkt_ohne_befehl_davor(self):
+        self.assertEqual(self.erster("/fullscan"), "/wache fullscan")
+        self.assertEqual(self.erster("/vollscan"), "/wache fullscan")       # über die Beschreibung
+        self.assertEqual(self.erster("/termin"), "/wache termin")           # vor /terminal
+        self.assertEqual(self.erster("/schutzliste"), "/web schutz")
+
+    def test_tippfehler_und_mehrere_woerter(self):
+        self.assertEqual(self.erster("/volscan"), "/wache fullscan")
+        self.assertEqual(self.erster("/wachter fullscann"), "/wache fullscan")
+        self.assertEqual(self.erster("/ki tracker"), "/wache ki")
+        self.assertEqual(self.erster("/musick"), "/musik")
+
+    def test_befehle_selbst_bleiben_vorne(self):
+        self.assertEqual([b for b, _ in C.vorschlaege("/bild")][:2], ["/bild", "/bildmodel"])
+        self.assertEqual(self.erster("/wache"), "/wache")
+        self.assertEqual(C.vorschlaege("/xyzq"), [])
+        self.assertEqual(len(C.vorschlaege("/")), len(C.find_commands("/")))
+
+    def test_menue_beim_tippen(self):
+        from prompt_toolkit.document import Document
+        comp = C.SlashCompleter(get_themes=lambda: {}, get_models=lambda: {})
+
+        def vorschlag(text):
+            return [c.text.strip() for c in comp.get_completions(Document(text, len(text)), None)]
+
+        self.assertEqual(vorschlag("/fullscan")[0], "/wache fullscan")
+        self.assertEqual(vorschlag("/wachter fullscann")[0], "/wache fullscan")  # unbekannter Befehl + Wort
+        c = next(iter(comp.get_completions(Document("/fullscan", 9), None)))
+        self.assertEqual(c.start_position, -len("/fullscan"))                    # ersetzt die ganze Eingabe
+        self.assertEqual(vorschlag("/kontextmenue a"), ["an", "aus"])           # bekannter Befehl: wie bisher
+
+
 class HilfeTests(unittest.TestCase):
     def test_uebersicht_hat_alle_befehle(self):
         text = persona.anleitung("nemicli")

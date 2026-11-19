@@ -116,6 +116,7 @@ class VollGetrennt(Basis):
         _schreibe(self.install / ".git" / "HEAD", b"g")
         _schreibe(self.install / "ModelGGUF" / "Gemma" / "g.gguf", b"g")
         _schreibe(self.install / "Vision" / "E2B" / "v.gguf", b"v")
+        _schreibe(self.install / "KI-Modelle" / "KI-Chat" / "Chatmodell" / "Q" / "q.gguf", b"q")
 
     def test_ohne_neu_erzeugbares_und_ohne_modelle(self):
         erg = B.erstellen("voll")
@@ -123,7 +124,7 @@ class VollGetrennt(Basis):
         self.assertIn("Daten/chats/001.json", n)
         self.assertIn("Programm/main.py", n)
         self.assertIn("Programm/.env", n)
-        for weg in ("Cache", "Backup", "Models", "venv", ".git", "__pycache__", "ModelGGUF", "Vision"):
+        for weg in ("Cache", "Backup", "Models", "venv", ".git", "__pycache__", "ModelGGUF", "Vision", "KI-Modelle"):
             self.assertFalse(any(f"/{weg}/" in x for x in n), weg)
         self.assertTrue(erg.pfad.name.startswith("NemiCLI_voll_2"))
         self.assertIn("Programm/venv/", erg.ausgelassen)
@@ -135,6 +136,7 @@ class VollGetrennt(Basis):
         self.assertIn("Daten/Models/Krea2/krea.safetensors", n)
         self.assertIn("Programm/ModelGGUF/Gemma/g.gguf", n)
         self.assertIn("Programm/Vision/E2B/v.gguf", n)
+        self.assertIn("Programm/KI-Modelle/KI-Chat/Chatmodell/Q/q.gguf", n)
         self.assertTrue(erg.pfad.name.startswith("NemiCLI_voll_modelle_"))
         with zipfile.ZipFile(erg.pfad) as zf:            # schon Gepacktes wird nur gespeichert
             self.assertEqual(zipfile.ZIP_STORED, zf.getinfo("Programm/ModelGGUF/Gemma/g.gguf").compress_type)

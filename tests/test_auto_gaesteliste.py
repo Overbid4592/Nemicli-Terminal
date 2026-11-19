@@ -87,10 +87,10 @@ class Dateien(_Basis):
         act = {"tool": "verschieben", "von": str(self.ordner / "unter"), "nach": str(self.ordner / "neu")}
         self.assertEqual("run", self.urteil(act))
 
-    def test_zeitplan_und_programm_updates_halten_an(self):
-        self.assertEqual("ask", self.urteil({"tool": "zeitplan", "aktion": "anlegen", "name": "t"}))
+    def test_programm_updates_halten_an_zeitplan_ist_nur_vorschlag(self):
+        self.assertEqual("run", self.urteil({"tool": "zeitplan", "aktion": "anlegen", "name": "t"}))   # Fenster fragt
         self.assertEqual("ask", self.urteil({"tool": "updates_installieren", "ids": ["x"]}))
-        self.assertIn("Auto hält an", S.frage({"tool": "zeitplan", "aktion": "anlegen", "name": "t"}))
+        self.assertIn("Auto hält an", S.frage({"tool": "updates_installieren", "ids": ["x"]}))
 
     def test_auto_on_gleiche_regeln(self):
         modes.set_mode("autoan")

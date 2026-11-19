@@ -228,12 +228,21 @@ class Freigabe(CodingBasis):
         self.assertIn("todo", self.actions.ACTIONS)
 
     def test_auto_fragt_trotzdem_bei_liste_und_nutzerpruefung(self):
+        config.update(**{coding.FREIGABE_SCHALTER: "vorsicht"})
         for modus in ("normal", "auto", "autoan"):
             modes.set_mode(modus)
             self.assertEqual(self.urteil(dict(LISTE, tool="todo")), "ask", modus)
             self.assertEqual(self.urteil({"tool": "todo", "aktion": "pruefen", "nr": 2}), "ask", modus)
             self.assertEqual(self.urteil({"tool": "todo", "aktion": "streichen", "nr": 2,
                                           "grund": "x"}), "ask", modus)
+
+    def test_frei_legt_die_liste_selbst_fest_gruen_ohne_pruefung_bleibt_beim_nutzer(self):
+        config.update(**{coding.FREIGABE_SCHALTER: "frei"})
+        for modus in ("normal", "auto"):
+            modes.set_mode(modus)
+            self.assertEqual(self.urteil(dict(LISTE, tool="todo")), "run", modus)
+            self.assertEqual(self.urteil({"tool": "todo", "aktion": "streichen", "nr": 2, "grund": "x"}), "run")
+            self.assertEqual(self.urteil({"tool": "todo", "aktion": "pruefen", "nr": 2}), "ask", modus)
 
     def test_arbeiten_laeuft_ohne_frage(self):
         modes.set_mode("normal")
@@ -308,7 +317,7 @@ class PromptUndAnzeige(CodingBasis):
 
     def test_status_text(self):
         self.starten_und_anlegen()
-        self.assertEqual(coding.status_text(), "Coding · notiztool · 0/2")
+        self.assertEqual(coding.status_text(), "Coding · notiztool · 0/2 · 🚀 frei")
 
     def test_todo_json_ist_lesbar(self):
         self.starten_und_anlegen()

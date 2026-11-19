@@ -86,7 +86,9 @@ class LoraKern(unittest.TestCase):
             for s in schichten.values():
                 s.B.normal_(0, 0.05)                                   # wie nach dem Training
             mit_lora = V.WanDiT(self.sd, self.cfg)(self.x, 400.0, self.ctx)
-        pfad = Path(tempfile.mkdtemp()) / "LoRA" / "wan22-5b.safetensors"
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        pfad = Path(tmp.name) / "LoRA" / "wan22-5b.safetensors"
         L.speichern(pfad, schichten, {"ziel": "wan22-5b"})
         self.assertTrue(pfad.is_file() and not pfad.with_suffix(".part").exists())
         lora, meta = L.laden(pfad)

@@ -75,7 +75,7 @@ class Bausteine(unittest.TestCase):
             self.assertEqual("zeit", AK.installieren("Mozilla.Firefox")[0])
 
     def test_winget_fehlt(self):
-        with mock.patch.object(AK.subprocess, "run", side_effect=FileNotFoundError):
+        with mock.patch.object(AK.subprocess, "Popen", side_effect=FileNotFoundError):
             with self.assertRaises(AK.WingetFehlt):
                 AK.liste()
 

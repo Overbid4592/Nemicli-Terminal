@@ -175,6 +175,9 @@ class Pflegen(_Basis):
         p = mock.patch.object(indexdb, "_stand", return_value="")
         self.stand = p.start()
         self.addCleanup(p.stop)
+        self.erlaubt = mock.patch.object(GP, "_ersatzbank_erlaubt", return_value=True)   # pflege_ersatzbank: true
+        self.erlaubt.start()
+        self.addCleanup(self.erlaubt.stop)
 
     def _lauf(self, aktiv, ref, ersatz, gebaut=None):
         a = self.notiz("Nach 15 Uhr kein Kaffee")
@@ -241,6 +244,25 @@ class Pflegen(_Basis):
         self.assertEqual(2, kaputt.gefragt)
         self.assertEqual([("anthropic:a", "keine gültige Antwort")], erg["abgegeben"])
         self.assertEqual("openai:b", erg["modell"])
+
+    def test_ohne_konfig_nur_derselbe_anbieter(self):
+        self.erlaubt.stop()
+        nein = _KI('{"zutrauen": "nein", "grund": "lieber nicht"}')
+        gleich = _KI('{"zutrauen": "ja", "zusammen": [], "veraltet": []}')
+        with mock.patch("config.load", return_value={}):
+            erg, _ids, gebaute = self._lauf(nein, "anthropic:a", ["openai:b", "anthropic:c"], gleich)
+        self.assertEqual(["anthropic:c"], gebaute)                 # openai bekommt die Notizen nicht
+        self.assertEqual(["anthropic:a", "anthropic:c"], erg["gesehen"])
+        self.assertIn("Die Notizen gesehen hat: anthropic:a, anthropic:c", GP.bericht_text(erg))
+        self.erlaubt.start()
+
+    def test_konfig_erlaubt_andere_anbieter(self):
+        self.erlaubt.stop()
+        with mock.patch("config.load", return_value={"pflege_ersatzbank": True}):
+            self.assertTrue(GP._ersatzbank_erlaubt())
+        with mock.patch("config.load", return_value={"pflege_ersatzbank": "ja"}):
+            self.assertFalse(GP._ersatzbank_erlaubt())             # nur ausdrücklich true
+        self.erlaubt.start()
 
     def test_geprueft_markiert(self):
         ki = _KI('{"zutrauen": "ja", "zusammen": [], "veraltet": []}')

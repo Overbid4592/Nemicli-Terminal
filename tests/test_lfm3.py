@@ -372,7 +372,7 @@ class Lfm3Ausnahme(unittest.TestCase):
         sys.path.insert(0, str(ROOT / "tools"))
         import modellkatalog as K
         t = K.teil("lfm3")
-        self.assertEqual(t.ziel().parts[-2:], ("ModelGGUF", "LFM3Familie"))
+        self.assertEqual(t.ziel().parts[-2:], ("Chatmodell", "LFM3Familie"))
         ordner = {}
         for d in t.dateien:
             ordner.setdefault(d.unter, []).append(d.name)

@@ -42,7 +42,9 @@ class Seite(unittest.TestCase):
         debug = [e for (b, _), e in s.items() if b == "/debug"]
         self.assertEqual([[o["wert"] for o in e["optionen"]] for e in debug], [["an", "aus"], ["motor an", "motor aus"]])
         befehle = {b for b, _ in s}
-        self.assertNotIn("/modus", befehle)                                               # ohne Optionen keine Karte
+        modus = sorted(t for b, t in s if b == "/modus")      # Arbeitsweise ohne Menü-Optionen: keine Karte
+        self.assertEqual(["🎨 Bilder: Freigabe", "🟦 Coding: Freigabe"], modus)
+        self.assertEqual(einstellseite.befehl_fuer("/modus", "coding vorsicht"), "/modus coding vorsicht")
         self.assertNotIn("/embeddings", befehle)                                          # nur Eingabe-Einträge
         self.assertEqual(stimme["bereich"], "einfach")
 

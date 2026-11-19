@@ -172,14 +172,22 @@ class Einsetzen(unittest.TestCase):
 
 class Finden(unittest.TestCase):
     """Gesichter findet das Seh-Modell (Vision/) – hier nachgebildet, ohne Modell."""
+    klein = False
+
+    def test_zu_wenig_grafikspeicher_nimmt_das_kleine(self):
+        self.klein = True
+        boxen, _ = self._finden(['[{"box": [400, 200, 600, 450]}]', "Yes."])
+        self.assertEqual(1, len(boxen))
 
     def _finden(self, antworten, arr=None):
         fragen = []
 
-        def fragen_roh(bild, text, max_tokens=0):
+        def fragen_roh(bild, text, max_tokens=0, klein=False):
+            self.assertEqual(klein, self.klein, "Sehmodell laut klein_noetig")
             fragen.append((bild.size, text))
             return antworten.pop(0) if antworten else "no"
-        with mock.patch("bildbeschreiber.finden", return_value=("m.gguf", "mmproj.gguf")),                 mock.patch("bildbeschreiber.fragen_roh", side_effect=fragen_roh):
+        with mock.patch("bildbeschreiber.klein_noetig", return_value=self.klein), \
+                mock.patch("bildbeschreiber.finden", return_value=("m.gguf", "mmproj.gguf")),                 mock.patch("bildbeschreiber.fragen_roh", side_effect=fragen_roh):
             boxen = gesichter.finden(arr if arr is not None else np.zeros((1000, 800, 3), np.uint8))
         return boxen, fragen
 
@@ -233,9 +241,9 @@ class Nachbessern(unittest.TestCase):
         aufrufe = []
 
         def male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype, on_status,
-                 bild=None, staerke=1.0, lora=None, lora_staerke=1.0):
+                 bild=None, staerke=1.0, lora=None, lora_staerke=1.0, cfg=0.0):
             aufrufe.append(dict(prompt=prompt, W=W, H=H, seed=seed, sampler=sampler, staerke=staerke,
-                                bild=bild.shape, steps=steps, lora=lora))
+                                bild=bild.shape, steps=steps, lora=lora, cfg=cfg))
             return np.full((H, W, 3), 220, np.uint8)
 
         with tempfile.TemporaryDirectory() as d:
@@ -333,6 +341,21 @@ class Einbindung(unittest.TestCase):
                 with mock.patch("config.load", return_value={"bild_krea_gesicht": False}):
                     self.assertIsNone(imagegen.gesicht_nachbessern(str(eigen)))
             self.assertEqual(nb.call_count, 1)
+
+    def test_immer_auch_wenn_ausgeschaltet_aber_nur_krea(self):
+        with tempfile.TemporaryDirectory() as d:
+            fremd, eigen = Path(d) / "a.png", Path(d) / "b.png"
+            _krea_png(fremd, params="steps=14, backend=webui")
+            _krea_png(eigen)
+            with mock.patch.object(krea, "gesicht_nachbessern", return_value="neu.png"), \
+                    mock.patch("config.load", return_value={"bild_krea_gesicht": False}):
+                self.assertEqual("neu.png", imagegen.gesicht_nachbessern(str(eigen), immer=True))
+                self.assertIsNone(imagegen.gesicht_nachbessern(str(fremd), immer=True))
+
+    def test_schalter_speichern(self):
+        with mock.patch("config.update") as upd:
+            self.assertFalse(krea.set_gesicht(False))
+            upd.assert_called_once_with(bild_krea_gesicht=False)
 
     def test_bild_option_ohne_gesicht(self):
         o = imagegen.parse_opts("eine Katze --ohne-gesicht --seed 3")

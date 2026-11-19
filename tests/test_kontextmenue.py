@@ -82,10 +82,10 @@ class BefehlTests(unittest.TestCase):
                          (4711, "Schreib die Antwort"))
         self.assertEqual(K.antwort_tag("normal"), (None, "normal"))
         self.assertEqual(K.antwort_tag("[[einfuegen:x]] y"), (None, "[[einfuegen:x]] y"))
-        roh = ("Hallo Herr Müller,\n\nvielen Dank für Ihre Nachricht.\n\nViele Grüße\nAlex\n\n"
+        roh = ("Hallo Herr Beispiel,\n\nvielen Dank für Ihre Nachricht.\n\nViele Grüße\ntest_user\n\n"
                "```aktion\n{\"tool\": \"merken\", \"text\": \"x\"}\n```")
         self.assertEqual(K.antwort_text(roh),
-                         "Hallo Herr Müller,\n\nvielen Dank für Ihre Nachricht.\n\nViele Grüße\nAlex")
+                         "Hallo Herr Beispiel,\n\nvielen Dank für Ihre Nachricht.\n\nViele Grüße\ntest_user")
         self.assertEqual(K.antwort_text('"Danke!"'), "Danke!")
         self.assertEqual(K.antwort_text("```\nText\n```"), "Text")
 
@@ -114,6 +114,7 @@ class BefehlTests(unittest.TestCase):
         K.in_zwischenablage = lambda t: True
         K._hinweis = lambda *a, **k: None
         f = tempfile.NamedTemporaryFile(suffix=".png", delete=False); f.write(b"x"); f.close()
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
         self.assertTrue(K.bild(f.name))
         self.assertEqual(len(gestartet), 1)
         self.assertIn(f.name, gestartet[0])
@@ -144,26 +145,31 @@ class RegistryTests(unittest.TestCase):
     """Schreibt in einen Test-Schlüssel unter HKCU und räumt wieder auf."""
 
     def setUp(self):
-        self._orig = (K._KEY_SCREEN, K._KEY_BILD, K._KEY_ANTWORT)
+        self._orig = (K._KEY_SCREEN, K._KEY_BILD, K._KEY_ANTWORT, K._KEY_SCAN, K._KEY_SCAN_HIER)
         K._KEY_SCREEN = [r"Software\Classes\NemiCLI-Test\Background\shell\NemiCLI.Screenshot"]
         K._KEY_BILD = [r"Software\Classes\NemiCLI-Test\image\shell\NemiCLI.Ansehen"]
         K._KEY_ANTWORT = [r"Software\Classes\NemiCLI-Test\Background\shell\NemiCLI.Antwort"]
+        K._KEY_SCAN = [r"Software\Classes\NemiCLI-Test\datei\shell\NemiCLI.Waechterscan"]
+        K._KEY_SCAN_HIER = [r"Software\Classes\NemiCLI-Test\Background\shell\NemiCLI.Waechterscan"]
 
     def tearDown(self):
         K.entfernen()
-        K._KEY_SCREEN, K._KEY_BILD, K._KEY_ANTWORT = self._orig
+        K._KEY_SCREEN, K._KEY_BILD, K._KEY_ANTWORT, K._KEY_SCAN, K._KEY_SCAN_HIER = self._orig
 
     def test_eintragen_status_entfernen(self):
-        self.assertEqual(K.status(), {"bildschirm": False, "bild": False, "antwort": False})
+        aus = {"bildschirm": False, "bild": False, "antwort": False, "waechterscan": False}
+        self.assertEqual(K.status(), aus)
         labels = K.installieren()
-        self.assertEqual(len(labels), 3)
-        self.assertEqual(K.status(), {"bildschirm": True, "bild": True, "antwort": True})
+        self.assertEqual(len(labels), 4)
+        self.assertEqual(K.status(), {k: True for k in aus})
         import winreg
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, K._KEY_SCREEN[0] + r"\command") as k:
             cmd, _ = winreg.QueryValueEx(k, "")
         self.assertEqual(cmd, K.befehle()["screenshot"])
-        self.assertEqual(K.entfernen(), 3)
-        self.assertEqual(K.status(), {"bildschirm": False, "bild": False, "antwort": False})
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, K._KEY_SCAN[0]) as k:
+            self.assertEqual(winreg.QueryValueEx(k, "MultiSelectModel")[0], "Player")
+        self.assertEqual(K.entfernen(), 5)
+        self.assertEqual(K.status(), aus)
         self.assertEqual(K.entfernen(), 0)
 
 

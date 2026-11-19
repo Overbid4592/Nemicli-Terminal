@@ -270,6 +270,143 @@ class Schritte(unittest.TestCase):
             self.assertEqual(male.call_args.args[4], 9)
 
 
+def _q8_0(w) -> tuple:
+    """Matrix -> (GGML-Typ Q8_0, Form, Rohbytes): je 32 Werte eine fp16-Skala und 32 int8."""
+    import numpy as np
+    x = w.detach().float().reshape(-1, 32)
+    d = x.abs().amax(1, keepdim=True) / 127.0
+    q = torch.where(d > 0, (x / d.clamp(min=1e-12)).round(), torch.zeros_like(x)).clamp(-127, 127).to(torch.int8)
+    return (8, tuple(w.shape), b"".join(np.float16(float(s)).tobytes() + r.numpy().tobytes() for s, r in zip(d[:, 0], q)))
+
+
+@unittest.skipIf(torch is None, "torch fehlt")
+class AndereModelle(unittest.TestCase):
+    """Krea-2-Dateien anderer Herkunft: GGUF, ohne Vorsatz, geteilt, MXFP8, INT8 ConvRot, Raw."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.d = Path(self.tmp.name)
+        krea._ERKANNT.clear()
+        torch.manual_seed(3)
+        self.w = torch.randn(64, 128)
+        self.b = torch.randn(64)
+        self.x = torch.randn(2, 5, 128)
+        self.ref = self.x @ self.w.t() + self.b
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _save(self, name, sd, meta=None):
+        from safetensors.torch import save_file
+        save_file(sd, str(self.d / name), metadata=meta)
+        return self.d / name
+
+    def test_erkennung_gguf_ohne_vorsatz_und_geteilt(self):
+        if str(ROOT / "tests") not in sys.path:
+            sys.path.insert(0, str(ROOT / "tests"))
+        import gguf_testbau as B
+        p = torch.zeros(4, 4)
+        B.schreibe_gguf(str(self.d / "q.gguf"), {"general.architecture": "krea2"}, {"txtfusion.projector.weight": p})
+        self._save("nackt.safetensors", {"txtfusion.projector.weight": p})
+        self._save("teil-00001-of-00002.safetensors", {"model.diffusion_model.txtfusion.projector.weight": p})
+        self._save("teil-00002-of-00002.safetensors", {"model.diffusion_model.blocks.0.x": p})
+        self._save("fremd.safetensors", {"model.diffusion_model.input_blocks.0.weight": p})
+        with mock.patch.object(krea, "KREA_DIRS", [self.d]):
+            self.assertEqual(sorted(krea.discover()), ["nackt", "q", "teil"])
+
+    def test_bewaehrter_lader_nur_fuer_bekannte_dateien(self):
+        alt = self._save("alt.safetensors", {"model.diffusion_model.l.weight": self.w.to(torch.float8_e4m3fn),
+                                             "model.diffusion_model.l.weight_scale": torch.ones(())})
+        nackt = self._save("nackt.safetensors", {"l.weight": self.w})
+        cq = torch.tensor(list(b'{"format": "mxfp8"}'), dtype=torch.uint8)
+        mx = self._save("mx.safetensors", {"model.diffusion_model.l.weight": self.w.to(torch.float8_e4m3fn),
+                                           "model.diffusion_model.l.comfy_quant": cq})
+        self.assertTrue(krea._bisheriger_weg(alt))
+        self.assertFalse(krea._bisheriger_weg(nackt))
+        self.assertFalse(krea._bisheriger_weg(mx))
+
+    def test_int8_convrot_und_gguf_rechnen_wie_dicht(self):
+        from bildmotoren.gewichte import hadamard
+        h = hadamard(64, "cpu", torch.float32)
+        gedreht = (self.w.view(64, 2, 64) @ h.t()).view(64, 128)
+        s = gedreht.abs().amax(1, keepdim=True) / 127.0
+        cq = torch.tensor(list(b'{"format": "int8_tensorwise", "convrot": true, "convrot_groupsize": 64}'),
+                          dtype=torch.uint8)
+        proj = torch.randn(8, 4)
+        p = self._save("cr.safetensors", {"l.weight": (gedreht / s).round().to(torch.int8), "l.weight_scale": s,
+                                          "l.comfy_quant": cq, "l.bias": self.b,
+                                          "txtfusion.projector.weight": proj, "n.scale": torch.ones(64)})
+        if str(ROOT / "tests") not in sys.path:
+            sys.path.insert(0, str(ROOT / "tests"))
+        import gguf_testbau as B
+        g = self.d / "g.gguf"
+        B.schreibe_gguf(str(g), {"general.architecture": "krea2"},
+                        {"l.weight": _q8_0(self.w), "l.bias": self.b, "txtfusion.projector.weight": proj})
+        for pfad in (p, g):
+            sd = krea._lade_dit(pfad, "cpu")
+            self.assertTrue(torch.allclose(sd["txtfusion.projector.weight"].float(), proj, atol=2e-2))
+            lin = krea._Linear(sd, "l", torch.float32)
+            self.assertEqual((lin.art, lin.out_f, lin.in_f), ("lin", 64, 128))
+            self.assertLess(float((lin(self.x) - self.ref).abs().max()), 0.05 * float(self.ref.abs().max()), pfad.name)
+            self.assertEqual(tuple(lin.weight().shape), (64, 128))          # LoRA-Rückweg
+            kopie = krea._kopie(lin, "cpu")
+            self.assertIsNot(kopie.lin, lin.lin)
+
+    def test_nvfp4_ohne_format_angabe(self):
+        """„Bereinigte“ NVFP4-Dateien ohne comfy_quant: gepackte Bytes + zweite Skala sind NVFP4
+        (vorher als dichte Matrix gelesen: mat1 (…x128) und mat2 (64x128) passen nicht)."""
+        from bildmotoren.gewichte import Quelle
+        q, bs, gs = krea._fp4_quant(self.w)
+        sd = {"l.weight": q, "l.weight_scale": bs, "l.weight_scale_2": gs.reshape(()), "l.bias": self.b}
+        p = self._save("clean.safetensors", {"model.diffusion_model." + k: v for k, v in sd.items()})
+        self.assertTrue(krea._bisheriger_weg(p))
+        lin = krea._Linear(krea._lade_dit(p, "cpu"), "l", torch.float32)
+        self.assertEqual((lin.out_f, lin.in_f), (64, 128))
+        grenze = 0.25 * float(self.ref.abs().max())
+        self.assertLess(float((lin(self.x) - self.ref).abs().max()), grenze)
+        with Quelle(self._save("nackt.safetensors", sd)) as quelle:
+            g = quelle.lin("l", torch.float32)
+        self.assertEqual(g.art, "nvfp4")
+        self.assertLess(float((g(self.x) - self.ref).abs().max()), grenze)
+
+    def test_raw_erkennen_und_verschiebung(self):
+        for name, ja in (("krea2_raw_bf16", True), ("Krea-2-Raw", True), ("krea2_turbo_fp8", False),
+                         ("strawberryMix", False), (None, False)):
+            self.assertEqual(krea.ist_raw(name), ja, name)
+        self.assertAlmostEqual(krea.raw_mu(256, 256), 0.5)
+        self.assertAlmostEqual(krea.raw_mu(1280, 1280), 1.15)
+
+    def test_raw_malt_mit_cfg_und_vielen_schritten(self):
+        import numpy as np
+        with tempfile.TemporaryDirectory() as d, mock.patch.object(krea, "OUT_DIR", Path(d)), \
+                mock.patch.object(krea, "missing_reason", return_value=None), \
+                mock.patch.object(krea, "discover", return_value={"krea2_raw": Path("r.safetensors"),
+                                                                  "turbo": Path("t.safetensors")}), \
+                mock.patch.object(krea, "teile", return_value={"text": None, "vae": None}), \
+                mock.patch.object(krea, "_uhr_neu"), \
+                mock.patch.object(krea, "_male", return_value=np.zeros((8, 8, 3), np.uint8)) as male, \
+                mock.patch("profilordner.bild_ziel", return_value=Path(d) / "b.png"), \
+                mock.patch("config.load", return_value={}):
+            krea.generate("x", model="krea2_raw", size=(1024, 1024))
+            a, kw = male.call_args.args, male.call_args.kwargs
+            self.assertEqual((a[4], a[5], kw["cfg"]), (52, "euler", 3.5))
+            self.assertAlmostEqual(a[6], krea.raw_mu(1024, 1024))
+            krea.generate("x", model="krea2_raw", steps=9)                   # zu wenig für Raw
+            self.assertEqual(male.call_args.args[4], 52)
+            krea.generate("x", model="krea2_raw", steps=30)
+            self.assertEqual(male.call_args.args[4], 30)
+            krea.generate("x", model="turbo")
+            self.assertEqual((male.call_args.kwargs["cfg"], male.call_args.args[6]), (0.0, krea.DEFAULTS["shift"]))
+
+    def test_cfg_rechnet_gegen_den_leeren_prompt(self):
+        modell = lambda x, t, txt: torch.full_like(x, float(txt))           # noqa: E731
+        sig = torch.tensor([1.0, 0.0])
+        x = torch.zeros(1, 4)
+        self.assertTrue(torch.allclose(krea._sample(modell, x, 2.0, sig, "euler", 0), x - 2.0))
+        self.assertTrue(torch.allclose(krea._sample(modell, x, 2.0, sig, "euler", 0, ohne=1.0, cfg=3.5),
+                                       x - 5.5))                             # 2 + 3,5 · (2 − 1)
+
+
 def _falscher_tokenizer(text):
     """Vorlage als Token: Systemteil, <|im_start|>user\\n, je Wort ein Token, 5 Schluss-Token."""
     prompt = text.split("<|im_start|>user\n", 1)[1].split("<|im_end|>", 1)[0]

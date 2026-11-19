@@ -49,8 +49,8 @@ A = load_actions()
 
 
 class ParseTests(unittest.TestCase):
-    """Das Modell schloss den Aktions-Zaun nicht, die Datei
-    'wurde geschrieben' – nur nicht wirklich. So ein Block darf nicht stumm verloren gehen."""
+    """Ein Aktionsblock ohne schließenden Zaun darf nicht stumm verloren gehen
+    (sonst meldet das Modell eine Datei als geschrieben, die nie entstand)."""
 
     def test_block_without_closing_fence_at_end_is_parsed(self):
         text = ('Ich leg den Bericht ab.\n\n```aktion\n'
@@ -119,7 +119,8 @@ class ResultTests(unittest.TestCase):
         with patch.object(A, "_powershell", return_value=NS(returncode=0, stdout="Test", stderr="")) as run:
             A._befehl({"befehl": "Write-Output 'Test' # abschließender Kommentar"})
         invocation = run.call_args.args[0]
-        self.assertEqual(invocation[:3], ["powershell", "-NoProfile", "-Command"])
+        self.assertEqual(Path(invocation[0]).name.lower().removesuffix(".exe"), "powershell")   # voller Pfad
+        self.assertEqual(invocation[1:3], ["-NoProfile", "-Command"])
         wrapped = invocation[3]
         self.assertIn("$ErrorActionPreference='Stop'", wrapped)
         self.assertIn("$nemiNativeExitCode=$LASTEXITCODE", wrapped)
@@ -441,8 +442,17 @@ class SystemDirTabuTests(unittest.TestCase):
             self.assertIsNone(A._guard_command(cmd), cmd)
 
     def test_user_profile_stays_readable(self):
-        r = A._ordner_auflisten({"pfad": str(Path.home())})
+        heim = str(Path.home())
+        self.assertFalse(A._in_system_dir(heim))
+        self.assertIsNone(A._read_guard(heim))
+        self.assertFalse(A._skip_system(Path(heim) / "Dokumente", base=Path("C:\\")))
+        with tempfile.TemporaryDirectory() as d:                  # synthetischer Inhalt statt echtem Profil
+            (Path(d) / "notiz.txt").write_text("x", encoding="utf-8")
+            (Path(d) / "unter").mkdir()
+            r = A._ordner_auflisten({"pfad": d})
         self.assertIsInstance(r, str)
+        self.assertIn("notiz.txt", r)
+        self.assertIn("[Ordner] unter", r)
 
 
 class LeseEinstufungTests(unittest.TestCase):
@@ -485,7 +495,7 @@ class LeseEinstufungTests(unittest.TestCase):
         "Get-Process | % { $_.Kill() }", "Add-Type -TypeDefinition 'class X {}'",
         "New-Object System.Net.WebClient", "Get-Process; Remove-Item x",
         "Get-Process | ForEach-Object { Stop-Process $_ }",
-        "ipconfig /flushdns", "route add 0.0.0.0 mask 0.0.0.0 1.2.3.4",
+        "ipconfig /flushdns", "route add 0.0.0.0 mask 0.0.0.0 192.0.2.4",
         "netsh advfirewall set allprofiles state off", "arp -d *",
         "Read-Host 'x'", "Set-Service WinDefend -StartupType Disabled",
         "function x { Remove-Item y }; x", r"Import-Module .\evil.psm1",
@@ -511,7 +521,7 @@ class LeseEinstufungTests(unittest.TestCase):
     def test_netz_und_zwischenablage_fragen(self):
         # Über einen Hostnamen fließen Daten ab (<daten>.example.org); die Zwischenablage kann
         # Passwörter enthalten. Kein Verbot – aber keine Abfrage, die ohne Rückfrage läuft.
-        for cmd in ("nslookup example.com", "Test-NetConnection 1.1.1.1 -Port 443", "tnc example.com",
+        for cmd in ("nslookup example.com", "Test-NetConnection 192.0.2.1 -Port 443", "tnc example.com",
                     "Resolve-DnsName a.example.org", "ping a.example.org", "tracert example.com",
                     "Test-Connection example.com", "Get-Clipboard", "gcb",
                     "[System.Net.Dns]::GetHostAddresses('a.example.org')"):
@@ -560,7 +570,9 @@ class BefehlUndPythonTests(unittest.TestCase):
 
     def test_python_pip_pytest_laufen_direkt_im_projekt(self):
         import coding
-        ws = Path(tempfile.gettempdir())
+        tmp = tempfile.TemporaryDirectory()                 # eigener Ordner: der Temp-Ordner enthält die Testdaten
+        self.addCleanup(tmp.cleanup)
+        ws = Path(tmp.name)
         for cmd in ("python x.py", r"venv\Scripts\python.exe -m pip install requests",
                     "pip install x", "pytest -q", "Get-Date; python -c 1", "git status"):
             with patch.object(A, "_ist_admin", return_value=False), \
@@ -620,7 +632,7 @@ class AbfragenTests(unittest.TestCase):
 
     def test_abfragen_fragt_nicht_und_ist_lesewerkzeug(self):
         self.assertFalse(A.needs_confirm({"tool": "abfragen", "was": "prozesse"}))
-        self.assertTrue(A.needs_confirm({"tool": "zeitplan", "aktion": "anlegen", "name": "x"}))
+        self.assertFalse(A.needs_confirm({"tool": "zeitplan", "aktion": "anlegen", "name": "x"}))   # nur Vorschlag ins Fenster
         self.assertFalse(A.needs_confirm({"tool": "zeitplan_anzeigen"}))
 
     def test_abfragen_startet_keinen_prozess(self):
@@ -680,13 +692,13 @@ class AbfragenTests(unittest.TestCase):
 
 
 class WindowsPfadeImJson(unittest.TestCase):
-    """Modelle schreiben Windows-Pfade mit EINEM Backslash - der Block darf nicht stumm wegfallen."""
+    """Modelle schreiben Windows-Pfade mit EINEM Backslash – der Block darf nicht stumm wegfallen."""
 
     def test_einfacher_backslash_wird_repariert(self):
-        text = '```aktion\n{"tool": "datei_lesen", "pfad": "C:\\Users\\Max\\Desktop\\brief.md"}\n```'
+        text = '```aktion\n{"tool": "datei_lesen", "pfad": "C:\\Users\\user\\Desktop\\brief.md"}\n```'
         text = text.replace("\\\\", "\\")            # so, wie das Modell es schreibt: EIN Backslash
         acts, rest = A.parse_actions(text)
-        self.assertEqual([{"tool": "datei_lesen", "pfad": r"C:\Users\Max\Desktop\brief.md"}], acts)
+        self.assertEqual([{"tool": "datei_lesen", "pfad": r"C:\Users\user\Desktop\brief.md"}], acts)
         self.assertEqual("", rest)
 
     def test_gueltige_escapes_im_pfad_werden_zurueckgedreht(self):
