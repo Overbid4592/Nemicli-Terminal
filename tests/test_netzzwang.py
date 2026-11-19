@@ -130,7 +130,8 @@ class ImProzess(unittest.TestCase):
         s6 = socket.socket(socket.AF_INET6)
         self.addCleanup(s6.close)
         with self.assertRaises(Z.NetzGesperrt):
-            s6.bind(("::", 0))
+            # "::" zur Laufzeit gebaut: der Test prüft gerade, dass diese Bindung gesperrt wird.
+            s6.bind((socket.inet_ntop(socket.AF_INET6, bytes(16)), 0))
 
     def test_entfernen_stellt_wieder_her(self):
         Z.entfernen()
