@@ -210,6 +210,18 @@ class Regeln(unittest.TestCase):
         self.assertEqual(self.regeln(tat(cmd="Un" + "register-ScheduledTask -TaskName x")), [])
         self.assertEqual(self.regeln(tat(cmd=f"grep -r key {SCHLUESSEL}")), ["R019"])   # Suchen IN Geheimem zählt
 
+    def test_nur_suche_mit_cd_davor(self):
+        self.assertTrue(K.NUR_SUCHE.match("cd C:\\Projekte\\demo; grep -rn x ."))
+        self.assertTrue(K.NUR_SUCHE.match("cd a && cd b && rg x"))
+        self.assertFalse(K.NUR_SUCHE.match("cd a; Remove-Item x"))
+        self.assertFalse(K.NUR_SUCHE.match("cd ; grep x"))
+
+    def test_nur_suche_bleibt_bei_langen_zeilen_schnell(self):
+        start = time.monotonic()
+        for zeile in ("cd" + " " * 30_000 + "x", "cd" + " %;cd" * 10_000 + " x", "cd " + "a " * 15_000):
+            self.assertFalse(K.NUR_SUCHE.match(zeile))
+        self.assertLess(time.monotonic() - start, 1.0)
+
     def test_massenloeschen(self):
         treffer = [self.regeln(tat(cmd=f"Remove-Item C:\\Projekte\\x{i}.txt")) for i in range(KI_LOESCHEN_AB)]
         self.assertEqual(treffer[-1], ["R022"])

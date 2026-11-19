@@ -670,7 +670,8 @@ SCHREIBEND = _muster(r"\b(?:set|new)-itemproperty\b", r"\breg(?:\.exe)?\s+add\b"
                      r"\bxcopy\b", r"\brobocopy\b", r"(?<![<>=-])>{1,2}\s*['\"]?[a-z]:\\")
 # Befehle, die nur nach Text suchen: das Suchwort ist keine Absicht (für R020/R021, nicht für R019 –
 # wer in ~/.ssh sucht, greift darauf zu).
-NUR_SUCHE = re.compile(r"(?i)^\s*(?:cd\s+[^;&|]+(?:;|&&)\s*)*(?:grep|rg|egrep|findstr|select-string|sls|git\s+grep)\b")
+# Ordnername beginnt mit einem Nicht-Leerzeichen: so gibt es nur eine Zerlegung (kein Rückverfolgen).
+NUR_SUCHE = re.compile(r"(?i)^\s*(?:cd\s+[^;&|\s][^;&|]*(?:;|&&)\s*)*(?:grep|rg|egrep|findstr|select-string|sls|git\s+grep)\b")
 LOESCHEN = _muster(r"\bremove-item\b", r"\brm\s+-[a-z]*[rf]", r"\bdel\s", r"\berase\b", r"\brmdir\b",
                    r"\brd\s+/s\b", r"shutil\.rmtree", r"\bos\.(?:remove|unlink)\b")
 
