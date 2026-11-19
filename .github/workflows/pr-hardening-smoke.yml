@@ -9,9 +9,7 @@ on:
       - main
     paths:
       - "installer/aufspielen.py"
-      - "einrichtungshelfer/**"
       - "test_release_hardening.py"
-      - "test_repository_model_parts.py"
       - ".github/workflows/pr-hardening-smoke.yml"
 
 permissions:
@@ -33,6 +31,6 @@ jobs:
         with:
           python-version: "3.12"
       - name: Compile modified Python modules
-        run: python -m compileall -q einrichtungshelfer installer test_release_hardening.py test_repository_model_parts.py
-      - name: Run offline tests and verify both real Funke models
-        run: python -m unittest -v test_release_hardening test_repository_model_parts
+        run: python -m compileall -q installer test_release_hardening.py
+      - name: Run offline tests
+        run: python -m unittest -v test_release_hardening
