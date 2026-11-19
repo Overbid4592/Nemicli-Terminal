@@ -33,10 +33,6 @@ Sandra Nicole Tanja Carina Svenja Marlene Rosa Ruth Agnes Mathilda Konstantin Le
 Xaver Zacharias Yannick Valentin Ulrich Wolfgang Horst Edith Erna Hedwig Helga Waltraud Gerda Luise Merle Juna
 Enno Ole Piet Rasmus Smilla Elsa Alva Liv Nora Tessa Fiona Leonie Marlon Jona Levi Mattis Hanna Lotta Lilly""".split()
 
-_SPITZNAMEN = """Schatz Süßer Süße Chef Chefin Boss Kapitän Captain Meister Hase Sonnenschein Prinzessin Kumpel Doc
-Professor Maus Bär Tiger Sternchen Krümel Held Heldin Champion Liebling Spatz Mausi Bärchen Kleiner Kleine
-Großer Kollege Kollegin Partner Partnerin Käpt'n Majestät Sheriff Admiral Zauberer Hexe Ninja Pirat
-Piratin""".split()
 
 _SILBEN_A = "Ka Lo Mi Ra Ti Ne Zu Fe Jo Va Be Ri Sa Do Lu Pe Ma Ki Ny Ro Xa Qui El An Or Ul Ys".split()
 _SILBEN_B = "ra lin to na mo vi ke sa ro dan ja mir lo tis ven ka ri nu bel sol ar en ix om".split()
@@ -397,10 +393,7 @@ class Lehrer:
         return self._erfunden() if self.rng.random() < 0.55 else self.rng.choice(self.namen)
 
     def _name(self) -> str:
-        r = self.rng.random()
-        if r < 0.1:
-            return self.rng.choice(_SPITZNAMEN)
-        if r < 0.2:
+        if self.rng.random() < 0.1:
             return self._einzelname() + " " + self._einzelname()   # Doppelname
         return self._einzelname()
 
