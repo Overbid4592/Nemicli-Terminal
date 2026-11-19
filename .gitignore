@@ -1,6 +1,14 @@
 # Sensible Daten & Umgebung
 .env
+.env.*
+.*.tmp
+chatgpt_konto.json
+chatgpt_konto.tmp
 # .env.example bleibt im Repo – die README verweist darauf.
+!.env.example
+
+# Lokale Werkzeug-Einstellungen
+/.claude/
 
 # Python
 venv/
@@ -14,9 +22,20 @@ dist/
 *.exe
 
 # Große Modelle & GPU-Binaries (49 GB – liegen nur lokal)
+/KI-Modelle/
 /Models/
 /ModelGGUF/
 /Vision/
+# Modell- und Datenbankdateien überall; gewollte Dateien sind bereits eingecheckt
+# und werden weiter verfolgt, neue nur mit `git add -f`.
+*.gguf
+*.safetensors
+*.pt
+*.bin
+*.onnx
+*.db
+*.db-wal
+*.db-shm
 
 # Persönliche Daten: Chat-Verlauf, Gedächtnis, gemalte Bilder, Übungen
 chats/
@@ -26,6 +45,22 @@ NemiSandbox/
 Befehle/
 Persoenlichkeiten/
 memory.md
+# weitere Daten-Bereiche (paths.DATEN_INHALT), falls der Daten-Ordner der Programm-Ordner ist
+/Wissen/
+/Skills/
+/Profile/
+/Agenten/
+/Wache/
+/Apps/
+/Papierkorb/
+/Papierkorb_Aufraeumen/
+/Cache/
+/cache/
+/Doku/
+/Sinne/
+/Charaktergalerie/
+/Debugbericht/
+/VideoGen/
 
 # Logs & Verlauf
 logs/
@@ -37,8 +72,7 @@ logs/
 
 # Lokale Konfig (aktives Modell etc.)
 nemicli.config.json
-nemicli.config.json.bak
-nemicli.config.json.tmp
+nemicli.config.json.*
 # Lebenszeichen/Briefkasten des laufenden Fensters (Rechtsklick-Menue)
 .nemicli.alive
 .nemicli.inbox
@@ -71,17 +105,5 @@ Backup/
 # Zwischenstände des LoRA-Trainings
 *_stand.safetensors
 
-# Weitere Laufzeitdaten im Daten-Ordner (ohne eigenen Daten-Ordner ist das der Programm-Ordner)
-/Agenten/
-/Apps/
-/Cache/
-/Charaktergalerie/
-/Debugbericht/
-/Papierkorb/
-/Profile/
-/Skills/
-/VideoGen/
-/Wache/
-/Wissen/
-chatgpt_konto.json
-chatgpt_konto.tmp
+# Netz-Zwang für Python-Kindprozesse (wird zur Laufzeit angelegt)
+/_netzzwang/
