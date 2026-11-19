@@ -285,8 +285,8 @@ class Sprachmodus(unittest.TestCase):
         knoten = [n for n in ast.parse(quelle).body if isinstance(n, ast.FunctionDef) and n.name == "_kurzfassung"]
         ns = {"re": __import__("re")}
         exec(compile(ast.Module(body=knoten, type_ignores=[]), "main.py", "exec"), ns)
-        kurz = ns["_kurzfassung"]("Hallo Schatz! Hier kommt eine lange Erklärung. Zweiter Satz.")
-        self.assertTrue(kurz.startswith("Hallo Schatz!"))
+        kurz = ns["_kurzfassung"]("Hallo! Hier kommt eine lange Erklärung. Zweiter Satz.")
+        self.assertTrue(kurz.startswith("Hallo!"))
         self.assertNotIn("Zweiter Satz", kurz)
         self.assertIn("/voice text", kurz)
         self.assertLess(len(ns["_kurzfassung"]("Wort " * 100).split("\n")[0]), 125)
