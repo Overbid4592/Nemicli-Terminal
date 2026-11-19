@@ -7,7 +7,7 @@ mindestens MIN_B Milliarden Parameter hat – MoE zählt nach Gesamtgröße, Gem
 der effektiven Größe im Namen. Ausnahme: Bauarten mit `unter_4b` (Modell-Datenbank), Familien kleiner
 Spezialisten wie LFM3; sie stehen in der Größe „unter 4B“. Jede Datei wird
 beim Laden mit SHA-256 geprüft (Wert von Hugging Face) und erst danach unter
-ModelGGUF/<Name>/ abgelegt; ein abgebrochener Download wird fortgesetzt.
+KI-Modelle/KI-Chat/Chatmodell/<Name>/ abgelegt; ein abgebrochener Download wird fortgesetzt.
 """
 from __future__ import annotations
 
@@ -97,6 +97,7 @@ class Datei:
     pfad: str
     groesse: int
     sha256: str
+    revision: str = "main"        # Commit, aus dem Dateibaum und Download stammen
 
     @property
     def name(self) -> str:
@@ -112,17 +113,39 @@ class Datei:
 # Netz
 # ---------------------------------------------------------------------------
 
+_REVISION = re.compile(r"[0-9a-f]{40}")
+JSON_FRIST_S = 60.0
+JSON_MAX_BYTES = 32 * 2**20
+_client = None
+
+
 def _session():
-    import httpx
-    return httpx.Client(headers={"User-Agent": "NemiCLI-Modelllader"}, follow_redirects=True,
-                        timeout=httpx.Timeout(30.0, read=120.0))
+    """Gemeinsamer Client des Moduls (Downloads folgen der Weiterleitung zum Speicher von Hugging Face)."""
+    global _client
+    if _client is None:
+        import httpx
+        import netzhilfe
+        _client = netzhilfe.GeteilterClient(headers={"User-Agent": "NemiCLI-Modelllader"}, follow_redirects=True,
+                                            timeout=httpx.Timeout(30.0, read=120.0))
+    return _client()
 
 
 def _json(url: str, params=None):
-    with _session() as s:
-        r = s.get(url, params=params)
-        r.raise_for_status()
-        return r.json()
+    import netzhilfe
+    r = netzhilfe.abrufen(_session(), "GET", url, params=params, frist_s=JSON_FRIST_S, max_bytes=JSON_MAX_BYTES)
+    r.raise_for_status()
+    return r.json()
+
+
+def revision_von(repo: str, holen: Callable = _json) -> str:
+    """Aktueller Commit (sha) eines Repos – Dateibaum und Download hängen daran, nicht an „main“,
+    das sich zwischen beiden Abrufen ändern kann. "main", wenn die Angabe fehlt."""
+    try:
+        info = holen(f"{API}/models/{repo}")
+    except Exception:
+        return "main"
+    sha = str(info.get("sha") or "") if isinstance(info, dict) else ""
+    return sha if _REVISION.fullmatch(sha) else "main"
 
 
 # ---------------------------------------------------------------------------
@@ -234,7 +257,8 @@ def suchen(groesse: str, moe: Optional[bool], holen: Callable = _json, anzahl: i
 
 def dateien(repo: str, holen: Callable = _json) -> tuple[list[Datei], list[Datei]]:
     """(Sprachmodell-Dateien, mmproj-Dateien) – nur ganze .gguf mit SHA-256."""
-    baum = holen(f"{API}/models/{repo}/tree/main", params={"recursive": "true"})
+    rev = revision_von(repo, holen)
+    baum = holen(f"{API}/models/{repo}/tree/{rev}", params={"recursive": "true"})
     sprach, bild = [], []
     for e in baum if isinstance(baum, list) else []:
         pfad, lfs = e.get("path", ""), e.get("lfs") or {}
@@ -244,7 +268,7 @@ def dateien(repo: str, holen: Callable = _json) -> tuple[list[Datei], list[Datei
         sha = str(lfs.get("oid") or "")
         if not re.fullmatch(r"[0-9a-f]{64}", sha):
             continue
-        d = Datei(pfad=pfad, groesse=int(lfs.get("size") or e.get("size") or 0), sha256=sha)
+        d = Datei(pfad=pfad, groesse=int(lfs.get("size") or e.get("size") or 0), sha256=sha, revision=rev)
         (bild if "mmproj" in d.name.lower() else sprach).append(d)
     return sorted(sprach, key=lambda d: d.groesse), bild
 
@@ -309,6 +333,17 @@ class _Vollstaendig(Exception):
     pass
 
 
+class _ZuViel(Exception):
+    pass
+
+
+def _range_anfang(r) -> int:
+    """Erstes Byte laut Content-Range einer 206-Antwort, -1 wenn die Angabe fehlt oder kaputt ist."""
+    kopf = getattr(r, "headers", None) or {}
+    m = re.match(r"\s*bytes\s+(\d+)-(\d+)/(\d+|\*)\s*$", str(kopf.get("content-range") or ""))
+    return int(m.group(1)) if m else -1
+
+
 def laden(repo: str, datei: Datei, ordner: Path, fortschritt: Callable[[str, int, int], None],
           stopp: threading.Event, session=None, revision: str = "main") -> Path:
     """Lädt `datei` nach `ordner`, prüft Größe und SHA-256 und legt sie erst dann ab.
@@ -333,31 +368,47 @@ def laden(repo: str, datei: Datei, ordner: Path, fortschritt: Callable[[str, int
             start = 0
         else:
             h = _hash_datei(teil, datei.groesse, fortschritt, stopp, nur_hash=False)
+    if revision == "main":                              # Commit aus dem Dateibaum, sonst main
+        revision = getattr(datei, "revision", "") or "main"
+    if revision != "main" and not _REVISION.fullmatch(revision):
+        raise PruefFehler(f"Ungültige Revision {revision!r}")
     s = (session or _session()) if start < datei.groesse else None
     try:
         if s is None:                                   # .part schon vollständig (Absturz vor dem Ablegen)
             raise _Vollstaendig()
-        kopf = {"Range": f"bytes={start}-"} if start else {}
         url = DATEI_URL.format(repo=repo, pfad=datei.pfad, revision=revision)
-        with s.stream("GET", url, headers=kopf) as r:
-            if start and r.status_code == 200:          # Server setzt nicht fort: von vorn
-                start, h = 0, hashlib.sha256()
-            elif r.status_code not in (200, 206):
-                raise OSError(f"Hugging Face antwortet mit {r.status_code}")
-            with open(teil, "ab" if start else "wb") as f:
-                erledigt = start
-                for stueck in r.iter_bytes(_BLOCK):
-                    if stopp.is_set():
-                        raise Abbruch()
-                    f.write(stueck)
-                    h.update(stueck)
-                    erledigt += len(stueck)
-                    fortschritt("lade", erledigt, datei.groesse)
+        neu_versucht = False
+        while True:
+            kopf = {"Range": f"bytes={start}-"} if start else {}
+            with s.stream("GET", url, headers=kopf) as r:
+                if r.status_code not in (200, 206):
+                    raise OSError(f"Hugging Face antwortet mit {r.status_code}")
+                if r.status_code == 206 and _range_anfang(r) != start:
+                    # Teilantwort von einer anderen Stelle als erbeten: von vorn, ohne Range
+                    if neu_versucht or not start:
+                        raise OSError("Hugging Face liefert einen anderen Abschnitt als erbeten")
+                    start, h, neu_versucht = 0, hashlib.sha256(), True
+                    continue
+                if start and r.status_code == 200:      # Server setzt nicht fort: von vorn
+                    start, h = 0, hashlib.sha256()
+                with open(teil, "ab" if start else "wb") as f:
+                    erledigt = start
+                    for stueck in r.iter_bytes(_BLOCK):
+                        if stopp.is_set():
+                            raise Abbruch()
+                        erledigt += len(stueck)
+                        if erledigt > datei.groesse:
+                            raise _ZuViel()
+                        f.write(stueck)
+                        h.update(stueck)
+                        fortschritt("lade", erledigt, datei.groesse)
+            break
     except _Vollstaendig:
         pass                                            # nichts mehr zu laden, nur noch prüfen
-    finally:
-        if session is None and s is not None:
-            s.close()
+    except _ZuViel:
+        teil.unlink(missing_ok=True)
+        raise PruefFehler(f"{datei.name}: Hugging Face liefert mehr als {datei.groesse} Bytes – die Datei wurde "
+                          "verworfen.") from None
     groesse = teil.stat().st_size
     if groesse != datei.groesse or h.hexdigest() != datei.sha256:
         teil.unlink()

@@ -53,8 +53,46 @@ def lock_schreiben() -> None:
     """Lebenszeichen (alle 10 s). `start` bleibt die Startzeit des Prozesses, `build`
     sein Programmstand – beides braucht veraltet()."""
     ordner_anlegen()
-    LOCK.write_text(json.dumps({"pid": os.getpid(), "start": _START, "build": _build(),
-                                "zuletzt": time.time(), "python": sys.executable}), encoding="utf-8")
+    text = _lock_text()
+    # Erst daneben schreiben, dann ersetzen: ein Leser sieht nie eine halbe Datei (und hielte sie für eine Leiche).
+    tmp = LOCK.with_name(f"{LOCK.name}.{os.getpid()}.tmp")
+    try:
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, LOCK)
+    except OSError:
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        LOCK.write_text(text, encoding="utf-8")
+
+
+def _lock_text() -> str:
+    return json.dumps({"pid": os.getpid(), "start": _START, "build": _build(),
+                       "zuletzt": time.time(), "python": sys.executable})
+
+
+def lock_beanspruchen() -> bool:
+    """Lock-Datei exklusiv anlegen (O_EXCL). False, wenn schon eine andere Wache lebt – zwei
+    gleichzeitig gestartete Wachen bekommen so nicht beide dieselbe Datenbank."""
+    ordner_anlegen()
+    for _ in range(3):
+        try:
+            fd = os.open(LOCK, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            info = _lock_lesen()                 # räumt eine Leiche weg
+            if info is None:
+                continue
+            return int(info.get("pid", 0)) == os.getpid()
+        except OSError:
+            return True                          # Ordner nicht beschreibbar: wie bisher weiterlaufen
+        try:
+            os.write(fd, _lock_text().encode("utf-8"))
+        finally:
+            os.close(fd)
+        return True
+    lock_schreiben()                             # Datei bleibt unlesbar: übernehmen wie bisher
+    return True
 
 
 def lock_loeschen() -> None:
@@ -81,10 +119,22 @@ def laeuft() -> dict | None:
     Lebenszeichen – der Prozess kann leben und trotzdem hängen (dann schreibt er keins mehr)."""
     if motor is not None:
         return {"pid": os.getpid(), "start": getattr(motor, "start_zeit", 0.0), "hier": True, "still_s": 0.0}
+    return _lock_lesen()
+
+
+def _lock_lesen() -> dict | None:
+    """Inhalt der Lock-Datei, wenn ihr Prozess noch lebt – sonst wird sie gelöscht."""
     try:
         info = json.loads(LOCK.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except FileNotFoundError:
         return None
+    except (OSError, json.JSONDecodeError):
+        # Gerade angelegt oder kurz gesperrt: einmal nachsehen; bleibt sie unlesbar, nicht löschen.
+        time.sleep(0.2)
+        try:
+            info = json.loads(LOCK.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
     pid = int(info.get("pid", 0))
     try:
         p = psutil.Process(pid)

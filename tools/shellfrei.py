@@ -47,7 +47,9 @@ _NATIV: dict[str, re.Pattern] = {
     "tasklist": re.compile(r"(?i)/nh|/v"),
 }
 _NV_FELDER = re.compile(r"(?i)--query-[a-z-]+=[\w.-]+(,[\w.-]+)+")
-_GIT_NIE = re.compile(r"(?i)^(--output|--ext-diff|--exec|--open-files-in-pager|--no-index|-O)")
+# Beim Ausführen schaltet actions._git_gehaertet zusätzlich Hooks, fsmonitor, gpg, externe Diffs und textconv ab.
+_GIT_NIE = re.compile(r"(?i)^(--output|--ext-diff|--textconv|--exec|--open-files-in-pager|--no-index|-O|"
+                      r"--show-signature)")
 _GIT_BRANCH = re.compile(r"(?i)-a|-r|-v|-vv|--all|--list|--show-current")
 _GIT_ARG = re.compile(r"[\w@^~.:/\\=%,*-]+")
 
@@ -88,6 +90,8 @@ _PARSER = (
     "if($c.PSObject.Properties['ParameterName']){$w.p=$c.ParameterName;$w.a=[bool]$c.Argument};"
     "if($c.PSObject.Properties['StringConstantType']){$w.v=$c.Value};$w})}"
     "'VariableExpressionAst'{$o.v=$x.VariablePath.UserPath}"
+    "'StringConstantExpressionAst'{$o.v=$x.Value}"
+    "'ExpandableStringExpressionAst'{$o.v=$x.Value}"
     "'InvokeMemberExpressionAst'{$o.m=$x.Member.Extent.Text;$o.s=[bool]$x.Static;$o.z=$x.Expression.Extent.Text}"
     "'UnaryExpressionAst'{$o.k=[string]$x.TokenKind}"
     "};$o};"
@@ -106,15 +110,32 @@ def _bekannter_anfang(cmd: str) -> bool:
             or w.split(".")[0] == "$psversiontable")
 
 
+def powershell_exe() -> str:
+    """Windows PowerShell mit vollem Pfad – ein bloßer Name würde zuerst im aktuellen Ordner gesucht."""
+    exe = os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "WindowsPowerShell", "v1.0",
+                       "powershell.exe")
+    return exe if os.path.isfile(exe) else "powershell"
+
+
+@lru_cache(maxsize=128)
+def _baum_text(cmd: str) -> str | None:
+    """Syntaxbaum als JSON-Text – ein PowerShell-Start je Befehl, geteilt von grund() und zeichenketten()."""
+    try:
+        r = subprocess.run([powershell_exe(), "-NoProfile", "-NonInteractive", "-Command", _PARSER], input=cmd.encode("utf-8"),
+                           capture_output=True, timeout=ZEITLIMIT_S,
+                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        return r.stdout.decode("utf-8-sig") if r.returncode == 0 else None
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
+
 def _baum(cmd: str) -> dict | None:
     if os.name != "nt":
         return None
+    text = _baum_text(cmd)
     try:
-        r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", _PARSER], input=cmd.encode("utf-8"),
-                           capture_output=True, timeout=ZEITLIMIT_S,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
-        return json.loads(r.stdout.decode("utf-8-sig")) if r.returncode == 0 else None
-    except (OSError, subprocess.SubprocessError, ValueError):
+        return json.loads(text) if text else None
+    except ValueError:
         return None
 
 
@@ -258,6 +279,24 @@ def grund(cmd: str) -> str | None:
 
 def frei(cmd: str) -> bool:
     return grund(cmd) is None
+
+
+_ZEICHENKETTEN_MAX = 20_000
+
+
+@lru_cache(maxsize=128)
+def zeichenketten(cmd: str) -> tuple[str, ...]:
+    """Werte aller Zeichenketten und Klartext-Argumente, wie PowerShell sie liest (` aufgelöst) – für die
+    Netz-Prüfung (netzzwang.befehl_pruefen). Leer ohne Parser oder bei sehr langen Befehlen."""
+    cmd = (cmd or "").strip()
+    if not cmd or len(cmd) > _ZEICHENKETTEN_MAX:
+        return ()
+    baum = _baum(cmd)
+    if baum is None:
+        return ()
+    return tuple(str(k["v"]) for k in baum.get("n") or []
+                 if k.get("t") in ("StringConstantExpressionAst", "ExpandableStringExpressionAst")
+                 and isinstance(k.get("v"), str) and k["v"])
 
 
 def liste_text() -> str:

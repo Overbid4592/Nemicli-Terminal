@@ -345,17 +345,25 @@ def anlegen(name: str, wann: str, auftrag: str) -> str:
         raise ValueError(f"Der Auftrag ist zu lang ({len(text)} Zeichen, höchstens {MAX_AUFTRAG}).")
     w = parse_wann(wann)
 
+    from atomar import text_schreiben
     ORDNER.mkdir(parents=True, exist_ok=True)
     BERICHTE.mkdir(parents=True, exist_ok=True)
-    _datei(n).write_text(json.dumps({
+    try:                                  # gleichnamiger Auftrag: bleibt, falls Windows den neuen ablehnt
+        alt = _datei(n).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        alt = None
+    text_schreiben(_datei(n), json.dumps({
         "name": n, "auftrag": text, "wann": w, "wann_text": wann_text(w),
         "angelegt": datetime.now().strftime("%Y-%m-%d %H:%M"),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    }, ensure_ascii=False, indent=2))
 
     kurz = text if len(text) <= 120 else text[:119] + "…"
     r = _eintragen(n, aufgabe_xml(n, w, f"NemiCLI-Auftrag: {kurz}"))
     if r.returncode != 0:
-        _datei(n).unlink(missing_ok=True)
+        if alt is None:
+            _datei(n).unlink(missing_ok=True)
+        else:
+            text_schreiben(_datei(n), alt)
         raise ValueError("Windows hat die Aufgabe nicht angenommen: "
                          + (r.stderr or r.stdout or "keine Meldung").strip())
     return (f"Aufgabe '{n}' angelegt – {wann_text(w)}. Der Bericht landet danach in "
@@ -458,3 +466,101 @@ def bericht_kopfzeile(p: Path) -> str:
     except Exception:
         pass
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Zeitplan-Fenster (ui/zeitplan_fenster.py): Vorschläge der KI, Kalender
+# ---------------------------------------------------------------------------
+# Die KI legt keine Aufgabe selbst an und löscht keine: Ihr Vorschlag öffnet das Fenster, gespeichert oder
+# gelöscht wird erst mit dem Klick des Nutzers.
+VORSCHLAEGE = ORDNER / "_vorschlaege"
+_KURZTAG = {"Monday": "mo", "Tuesday": "di", "Wednesday": "mi", "Thursday": "do", "Friday": "fr",
+            "Saturday": "sa", "Sunday": "so"}
+WOCHE = tuple(_KURZTAG)                  # Montag zuerst, wie date.weekday()
+
+
+def wann_eingabe(w: dict) -> str:
+    """Geparste Zeitangabe zurück in eine Eingabe, die parse_wann versteht (für das Fenster)."""
+    art = w.get("art")
+    if art == "intervall":
+        m = int(w["minuten"])
+        return f"alle {m // 60} stunden" if m % 60 == 0 else f"alle {m} minuten"
+    if art == "anmeldung":
+        return "anmeldung"
+    if art == "taeglich":
+        return f"täglich {w['zeit']}"
+    if art == "woechentlich":
+        return "wöchentlich " + ",".join(_KURZTAG.get(t, t) for t in w["tage"]) + f" {w['zeit']}"
+    if art == "einmal":
+        return f"einmal {w['datum']} {w['zeit']}"
+    raise ValueError(f"Unbekannte Zeitangabe: {w}")
+
+
+def laeuft_am(w: dict, tag) -> list[str]:
+    """Uhrzeiten, zu denen der Auftrag an diesem Tag (datetime.date) startet; „laufend“ für Intervalle."""
+    art = w.get("art")
+    if art in ("taeglich",):
+        return [w["zeit"]]
+    if art == "woechentlich":
+        return [w["zeit"]] if WOCHE[tag.weekday()] in w.get("tage", []) else []
+    if art == "einmal":
+        return [w["zeit"]] if w.get("datum") == tag.isoformat() else []
+    if art == "intervall":
+        return ["laufend"]
+    return []
+
+
+def vorschlag_ablegen(aktion: str, name: str, wann: str = "", auftrag: str = "", wer: str = "") -> Path:
+    """Vorschlag der KI prüfen und für das Fenster ablegen. ValueError wie bei anlegen()."""
+    n = sauberer_name(name)
+    if not n:
+        raise ValueError("Der Name darf nur Buchstaben, Ziffern, Leerzeichen, - und _ "
+                         "enthalten (höchstens 60 Zeichen).")
+    d = {"aktion": aktion, "name": n, "wer": " ".join(str(wer or "").split())[:60]}
+    if aktion == "anlegen":
+        text = str(auftrag or "").strip()
+        if not text:
+            raise ValueError("Es fehlt der Auftrag – was soll NemiCLI zu der Zeit tun?")
+        if len(text) > MAX_AUFTRAG:
+            raise ValueError(f"Der Auftrag ist zu lang ({len(text)} Zeichen, höchstens {MAX_AUFTRAG}).")
+        d.update(wann=parse_wann(wann), auftrag=text)
+    elif not _datei(n).exists():
+        raise ValueError(f"Keine NemiCLI-Aufgabe namens '{n}' gefunden.")
+    VORSCHLAEGE.mkdir(parents=True, exist_ok=True)
+    ziel = VORSCHLAEGE / f"{datetime.now():%Y%m%d-%H%M%S-%f}.json"
+    from atomar import text_schreiben
+    text_schreiben(ziel, json.dumps(d, ensure_ascii=False, indent=2))
+    return ziel
+
+
+def vorschlag_lesen(pfad: str | Path) -> dict | None:
+    """Vorschlag einlesen und wegräumen – nur aus dem eigenen Ordner, sonst None."""
+    try:
+        p = Path(pfad).resolve()
+        if p.parent != VORSCHLAEGE.resolve() or p.suffix != ".json":
+            return None
+        d = json.loads(p.read_text(encoding="utf-8"))
+        p.unlink(missing_ok=True)
+    except (OSError, ValueError):
+        return None
+    if not isinstance(d, dict) or d.get("aktion") not in ("anlegen", "loeschen") or not sauberer_name(d.get("name")):
+        return None
+    if d["aktion"] == "anlegen" and not (isinstance(d.get("wann"), dict) and str(d.get("auftrag") or "").strip()):
+        return None
+    return d
+
+
+def fenster_befehl(vorschlag: Path | None = None) -> list[str]:
+    """Befehl für das Zeitplan-Fenster (eigener Prozess, ohne Konsole)."""
+    if _FROZEN:
+        from paths import exe_ohne_fenster
+        befehl = [str(exe_ohne_fenster()), "--zeitplan"]
+    else:
+        py = Path(sys.executable)
+        fensterlos = py.with_name("pythonw.exe")
+        befehl = [str(fensterlos if fensterlos.is_file() else py), str(_INSTALL / "main.py"), "--zeitplan"]
+    return befehl + (["--vorschlag", str(vorschlag)] if vorschlag else [])
+
+
+def fenster_oeffnen(vorschlag: Path | None = None) -> None:
+    subprocess.Popen(fenster_befehl(vorschlag), cwd=str(_INSTALL))

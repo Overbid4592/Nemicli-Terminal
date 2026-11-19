@@ -42,6 +42,7 @@ PROZESS = "prozess"
 NETZ = "netz"
 DATEI = "datei"
 SYSTEM = "system"
+KI = "ki"                                # Taten der KIs auf dem Rechner (kitracker.py)
 
 
 @dataclass

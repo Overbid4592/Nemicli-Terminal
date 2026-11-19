@@ -46,7 +46,7 @@ def adresse(ziel: str) -> tuple[str | None, str]:
             return None, "Nur lokale Dateien – nichts aus dem Internet."
         return None, ("Server-Adressen (localhost) öffnet NemiView nicht – gib die HTML-Datei an, "
                       "z. B. index.html oder dist/index.html.")
-    if ziel.startswith(("\\\\", "//")) or ziel.lower().startswith("file:"):
+    if ziel.replace("/", "\\").startswith(("\\\\", "\\??\\")) or ziel.lower().startswith("file:"):
         return None, "Nur lokale Dateien mit Laufwerk (C:\\…) – keine Netzwerkpfade."
     p = Path(ziel).expanduser()
     if p.is_dir():
@@ -123,6 +123,20 @@ def ansehen(ziel: str, breite: int = BREITE, hoehe: int = HOEHE) -> tuple[Path |
 _VERWEIS = re.compile(r"""\b(?:src|href)\s*=\s*["']([^"'#?]*)""", re.I)
 
 
+def extern(ziel: str, laufwerk: str = "") -> bool:
+    """Zeigt der Verweis aus dem Ordner der Seite hinaus auf einen anderen Rechner oder ein anderes Laufwerk –
+    roh und nach dem Entschlüsseln (%5C%5C …)? Solche Verweise werden nie aufgelöst: schon der Blick auf
+    \\\\rechner\\x schickt die Windows-Anmeldung dorthin."""
+    for t in (ziel, unquote(ziel)):
+        t = t.strip().replace("/", "\\")
+        if re.match(r"^[a-z][a-z0-9+.-]+:", t, re.I) or t.startswith(("\\\\", "\\??\\")):
+            return True                                        # http:, data:, mailto:, \\rechner, //rechner …
+        m = re.match(r"^([a-z]):", t, re.I)
+        if m and m.group(1).lower() != laufwerk[:1].lower():
+            return True                                        # anderes Laufwerk
+    return False
+
+
 def fehlende_dateien(datei: Path) -> list[str]:
     """Lokale Verweise der HTML-Datei (src/href), deren Datei es nicht gibt."""
     try:
@@ -131,7 +145,7 @@ def fehlende_dateien(datei: Path) -> list[str]:
         return []
     fehlt = []
     for ziel in dict.fromkeys(m.group(1).strip() for m in _VERWEIS.finditer(html)):
-        if not ziel or re.match(r"^[a-z][a-z0-9+.-]*:|^//", ziel, re.I):    # http:, data:, mailto:, //host …
+        if not ziel or extern(ziel, datei.drive):
             continue
         p = (datei.parent / unquote(ziel)).resolve()
         if not (p / "index.html" if p.is_dir() else p).is_file():

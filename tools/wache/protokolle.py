@@ -29,6 +29,8 @@ QUELLEN = (
 INSTALLATION = {"evtlog_dienst_installiert", "evtlog_aufgabe_angelegt"}
 _NS = "{http://schemas.microsoft.com/win/2004/08/events/event}"
 SKRIPT_MAX = 1500
+ABFRAGE_N = 50                 # neueste Ereignisse je Kanal und Durchlauf
+NACHHOLEN_N = 1000             # bei einer Flut höchstens so viele seit dem letzten Stand
 
 
 def lesen(xml: str) -> dict | None:
@@ -105,9 +107,15 @@ class ProtokollSensor:
     def sammeln(self) -> list[Ereignis]:
         out: list[Ereignis] = []
         for kanal, eid, zusatz, art in QUELLEN:
-            roh = self._abfragen(kanal, f"*[System[(EventID={eid}){zusatz}]]", 50)
+            roh = self._abfragen(kanal, f"*[System[(EventID={eid}){zusatz}]]", ABFRAGE_N)
             eintraege = [d for d in (lesen(x) for x in roh) if d is not None]
             hoechste = max((d["rec"] for d in eintraege), default=0)
+            stand = self._stand.get(kanal)
+            if stand and eintraege and len(roh) >= ABFRAGE_N and min(d["rec"] for d in eintraege) > stand:
+                # Flut: die neuesten ABFRAGE_N reichen nicht bis zum letzten Stand – den Rest gezielt nachholen.
+                mehr = self._abfragen(kanal, f"*[System[(EventID={eid}){zusatz} and (EventRecordID>{stand})]]",
+                                      NACHHOLEN_N)
+                eintraege = [d for d in (lesen(x) for x in mehr) if d is not None] or eintraege
             if kanal not in self._stand:                # erster Durchlauf: nur den Stand merken
                 self._stand[kanal] = hoechste
                 continue

@@ -16,6 +16,7 @@ import json
 import re
 from html.parser import HTMLParser
 from pathlib import Path
+from urllib.parse import unquote
 
 MAX_FUNDE = 12
 _LEER = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source",
@@ -148,11 +149,14 @@ def _html(p: Path, inhalt: str) -> list[str]:
     funde += [f"Zeile {z}: <{t}> wird nicht geschlossen" for t, z in h.stapel if t not in _OPTIONAL_ZU]
     js = "\n".join(h.skripte)
     for ziel, zeile in h.verweise:
-        sauber = ziel.split("#", 1)[0].split("?", 1)[0]
+        sauber = unquote(ziel.split("#", 1)[0].split("?", 1)[0])          # %20 → Leerzeichen
         if not sauber or re.match(r"^(?:[a-z][a-z0-9+.-]*:|//|#|\{)", ziel, re.I):
             continue
-        datei = (p.parent / sauber).resolve()
+        wurzelbezogen = sauber.startswith("/")                          # /app.js: Wurzel des Servers unbekannt
+        datei = (p.parent / sauber.lstrip("/")).resolve()
         if not datei.exists():
+            if wurzelbezogen:
+                continue
             funde.append(f"Zeile {zeile}: verweist auf '{ziel}' – die Datei gibt es nicht")
         elif datei.suffix.lower() in (".js", ".mjs"):
             try:
@@ -213,7 +217,8 @@ def _klammern(inhalt: str, arten: str, js: bool) -> list[str]:
                     break
                 j += 1
             zeile += inhalt.count("\n", i, min(j, n))
-            i = j + 1
+            # Offene Zeichenkette endet am Zeilenende: den Umbruch selbst zählt die Hauptschleife.
+            i = j + 1 if j < n and inhalt[j] == c else j
             continue
         elif c in arten and c in "([{":
             stapel.append((c, zeile))

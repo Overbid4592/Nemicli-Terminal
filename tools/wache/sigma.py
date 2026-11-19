@@ -2,7 +2,7 @@
 
 Unterstützt die Teilmenge, die zu den Ereignissen der Wache passt: logsource category process_creation,
 product windows; Felder Image, OriginalFileName, CommandLine, ParentImage, User; Modifikatoren contains,
-startswith, endswith, all, re, windash; Bedingungen mit and/or/not, Klammern, „1 of …“, „all of …“, „them“.
+startswith, endswith, all, re (mit i, m, s), windash, cased; Bedingungen mit and/or/not, Klammern, „1 of …“, „all of …“, „them“.
 Eine Regel mit einem Feld oder Modifikator, den die Wache nicht kennt, wird nicht geladen – lieber keine
 Regel als eine, die falsch anschlägt (gemeldet unter `uebersprungen`).
 
@@ -19,7 +19,9 @@ from pathlib import Path
 from .ereignisse import Schwere
 
 _FELDER = {"Image", "OriginalFileName", "CommandLine", "ParentImage", "User"}
-_MODIFIKATOREN = {"contains", "startswith", "endswith", "all", "re", "windash", "cased"}
+_MODIFIKATOREN = {"contains", "startswith", "endswith", "all", "re", "windash", "cased", "i", "m", "s"}
+CMD_MAX = 8192                     # so viel der Kommandozeile sieht eine Sigma-Regel
+RE_ZEITLIMIT_S = 0.05              # |re: höchstens so lange je Wert (Paket regex)
 _STUFEN = {"informational": Schwere.NIEDRIG, "low": Schwere.NIEDRIG, "medium": Schwere.MITTEL,
            "high": Schwere.HOCH, "critical": Schwere.KRITISCH}
 
@@ -57,8 +59,10 @@ def _gruppen(wert) -> list[list[tuple[str, list[str], list]]]:
                 raise Unbekannt(f"Feld {feld}")
             if set(mods) - _MODIFIKATOREN:
                 raise Unbekannt(f"Modifikator {', '.join(sorted(set(mods) - _MODIFIKATOREN))}")
+            if set(mods) & {"i", "m", "s"} and "re" not in mods:
+                raise Unbekannt("Modifikator i/m/s nur mit re")
             liste = werte if isinstance(werte, list) else [werte]
-            teile.append((feld, mods, liste))
+            teile.append((feld, mods, [_vergleicher(w, mods) for w in liste]))
         gruppen.append(teile)
     return gruppen
 
@@ -94,7 +98,7 @@ def _feldwert(feld: str, e, originalname) -> str:
     if feld == "Image":
         return e.exe or ""
     if feld == "CommandLine":
-        return e.cmdline or ""
+        return (e.cmdline or "")[:CMD_MAX]
     if feld == "User":
         return e.nutzer or ""
     if feld == "ParentImage":                     # die Wache kennt vom Elternprozess nur den Namen
@@ -110,38 +114,101 @@ def _windash(wert: str) -> list[str]:
     return [wert, wert.replace("-", "/"), wert.replace("-", "–"), wert.replace("-", "—")]
 
 
-def _passt_wert(ist: str, soll, mods: list[str]) -> bool:
+def _als_regex(soll: str) -> str:
+    """Sigma-Wert → Regex: nur `*` und `?` sind Platzhalter; `\\*`, `\\?`, `\\\\` stehen für das Zeichen
+    selbst, alles andere (auch `[`) gilt wörtlich."""
+    teile, i = [], 0
+    while i < len(soll):
+        c = soll[i]
+        if c == "\\" and i + 1 < len(soll) and soll[i + 1] in "*?\\":
+            teile.append(re.escape(soll[i + 1]))
+            i += 2
+            continue
+        teile.append(".*" if c == "*" else "." if c == "?" else re.escape(c))
+        i += 1
+    return "".join(teile)
+
+
+def _woertlich(soll: str) -> str | None:
+    """Sigma-Wert ohne Platzhalter als Text (Maskierungen aufgelöst) – None, wenn `*` oder `?` darin steht."""
+    teile, i = [], 0
+    while i < len(soll):
+        c = soll[i]
+        if c == "\\" and i + 1 < len(soll) and soll[i + 1] in "*?\\":
+            teile.append(soll[i + 1])
+            i += 2
+            continue
+        if c in "*?":
+            return None
+        teile.append(c)
+        i += 1
+    return "".join(teile)
+
+
+def _regex_modul():
+    """`regex` (mit Zeitlimit) aus dem venv, sonst `re`."""
+    try:
+        import regex
+        return regex
+    except ImportError:                               # pragma: no cover
+        return None
+
+
+def _vergleicher(soll, mods: list[str]):
+    """Sigma-Wert einmal beim Laden in eine Prüffunktion übersetzen: ohne Platzhalter einfache Textvergleiche
+    (enthält, beginnt, endet, gleich), sonst ein vorkompilierter Ausdruck; `|re` mit Zeitlimit."""
     if soll is None:
-        return ist == ""
+        return lambda ist: ist == ""
     soll = str(soll)
-    if "re" in mods:
+    if "re" in mods:                                  # Sigma: re unterscheidet Groß/klein, außer mit |i
+        flags = ((re.IGNORECASE if "i" in mods else 0) | (re.MULTILINE if "m" in mods else 0)
+                 | (re.DOTALL if "s" in mods else 0))
+        rx = _regex_modul()
         try:
-            return re.search(soll, ist, 0 if "cased" in mods else re.IGNORECASE) is not None
-        except re.error:
-            return False
-    if "cased" not in mods:
-        ist, soll = ist.lower(), soll.lower()
+            muster = rx.compile(soll, flags) if rx is not None else re.compile(soll, flags)
+        except Exception:
+            return lambda ist: False
+        if rx is None:
+            return lambda ist: muster.search(ist) is not None
+
+        def suchen(ist: str) -> bool:
+            try:
+                return muster.search(ist, timeout=RE_ZEITLIMIT_S) is not None
+            except TimeoutError:                      # zu teurer Ausdruck: kein Treffer statt Hänger
+                return False
+        return suchen
+    egal = "cased" not in mods                        # ohne |cased: Groß/klein egal
+    art = "in" if "contains" in mods else "anfang" if "startswith" in mods else "ende" if "endswith" in mods \
+        else "gleich"
+    pruefer: list[tuple[str, object]] = []
     for s in (_windash(soll) if "windash" in mods else [soll]):
-        if "contains" in mods:
-            muster = f"*{s}*"
-        elif "startswith" in mods:
-            muster = f"{s}*"
-        elif "endswith" in mods:
-            muster = f"*{s}"
-        else:
-            muster = s
-        if "*" in muster or "?" in muster:
-            if fnmatch.fnmatchcase(ist, muster):
+        text = _woertlich(s)
+        if text is not None:
+            pruefer.append((art, text.lower() if egal else text))
+            continue
+        muster = _als_regex(s)
+        muster = {"in": f".*{muster}.*", "anfang": f"{muster}.*", "ende": f".*{muster}"}.get(art, muster)
+        pruefer.append(("rx", re.compile(muster, re.DOTALL | (re.IGNORECASE if egal else 0))))
+
+    def pruefen(ist: str) -> bool:
+        k = ist.lower() if egal else ist
+        for a, w in pruefer:
+            if ((a == "rx" and w.fullmatch(ist) is not None) or (a == "in" and w in k)
+                    or (a == "anfang" and k.startswith(w)) or (a == "ende" and k.endswith(w))
+                    or (a == "gleich" and k == w)):
                 return True
-        elif ist == muster:
-            return True
-    return False
+        return False
+    return pruefen
+
+
+def _passt_wert(ist: str, soll, mods: list[str]) -> bool:
+    return _vergleicher(soll, mods)(ist)
 
 
 def _passt_gruppe(gruppe, e, originalname) -> bool:
     for feld, mods, werte in gruppe:
         ist = _feldwert(feld, e, originalname)
-        treffer = [_passt_wert(ist, w, mods) for w in werte]
+        treffer = [w(ist) for w in werte]
         if not (all(treffer) if "all" in mods else any(treffer)):
             return False
     return True

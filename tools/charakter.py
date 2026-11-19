@@ -312,12 +312,16 @@ def sprechweise(name: str | None = None) -> str:
 def _kern_schreiben(text: str, name: str | None, grund: str, gesperrt: bool | None = None,
                     sprech: str | None = None) -> Path:
     """Kern-Datei (A) und ihre Sicherung (B) schreiben; der vorige Kern wandert in `vorher`."""
-    from atomar import text_schreiben
     alt = kern_stand(name)
     stand = {"kern": text, "sprechweise": alt["sprechweise"] if sprech is None else _text(sprech)[:MAX_SPRECHWEISE],
              "gesperrt": alt["gesperrt"] if gesperrt is None else bool(gesperrt), "vorher": list(alt["vorher"])}
     if alt["kern"] and alt["kern"] != text:
         stand["vorher"] = ([alt["kern"]] + [v for v in alt["vorher"] if v != alt["kern"]])[:KERN_VORHER]
+    return _stand_schreiben(stand, name, grund)
+
+
+def _stand_schreiben(stand: dict, name: str | None, grund: str) -> Path:
+    from atomar import text_schreiben
     a = kern_datei(name)
     if a.is_file() and _json(a) == stand:
         return a
@@ -342,13 +346,18 @@ def kern_setzen(text: str, name: str | None = None, *, gesperrt: bool | None = N
     if not text:
         raise ValueError("Der Kern ist leer.")
     p = _kern_schreiben(text, name, grund, gesperrt)
+    _spiegeln(text, name, grund)
+    return p
+
+
+def _spiegeln(text: str, name: str | None, grund: str) -> None:
+    """Den Kern in die Charakter-Datei spiegeln."""
     d = _lesen(name)
     if d is None:                                       # noch keine Charakter-Datei: mit festem Seed anlegen
         _json_schreiben(_neu(None, {"name": name or "", "kern": text}), name, grund)
     elif d.get("kern") != text:
         d["kern"] = text
         _json_schreiben(d, name, grund)
-    return p
 
 
 def kern_sperren(an: bool, name: str | None = None) -> bool:
@@ -373,6 +382,61 @@ def kern_zurueck(name: str | None = None) -> str:
     frueher = stand["vorher"][0]
     kern_setzen(frueher, name, grund="kern_zurueck")
     return frueher
+
+
+KERN_FELDER = ("kern", "sprechweise", "gesperrt", "vorher")
+
+
+def kern_json(name: str | None = None) -> str:
+    """Der ganze Kern-Stand als lesbares JSON (für das Kern-Fenster)."""
+    return json.dumps(kern_stand(name), indent=2, ensure_ascii=False)
+
+
+def kern_json_lesen(text: str) -> dict:
+    """Einen bearbeiteten Kern-Stand prüfen. Fehler als ValueError mit verständlicher Meldung."""
+    try:
+        d = json.loads(text)
+    except ValueError as e:
+        raise ValueError(f"Kein gültiges JSON (Zeile {getattr(e, 'lineno', '?')}): {getattr(e, 'msg', e)}") from None
+    if not isinstance(d, dict):
+        raise ValueError("Erwartet wird ein Objekt in { … }.")
+    if (fremd := [k for k in d if k not in KERN_FELDER]):
+        raise ValueError(f"Unbekanntes Feld: {', '.join(map(str, fremd))} – erlaubt: {', '.join(KERN_FELDER)}.")
+    for feld in ("kern", "sprechweise"):
+        if not isinstance(d.get(feld, ""), str):
+            raise ValueError(f"„{feld}“ muss Text in Anführungszeichen sein.")
+    if not isinstance(d.get("gesperrt", False), bool):
+        raise ValueError("„gesperrt“ ist true oder false (ohne Anführungszeichen).")
+    vorher = d.get("vorher", [])
+    if not isinstance(vorher, list) or not all(isinstance(v, str) for v in vorher):
+        raise ValueError("„vorher“ ist eine Liste aus Texten: [\"…\", \"…\"].")
+    if len(d.get("sprechweise", "")) > MAX_SPRECHWEISE:
+        raise ValueError(f"Die Sprechweise ist zu lang (höchstens {MAX_SPRECHWEISE} Zeichen).")
+    stand = {"kern": _text(d.get("kern")), "sprechweise": _text(d.get("sprechweise")),
+             "gesperrt": bool(d.get("gesperrt")), "vorher": []}
+    if not stand["kern"]:
+        raise ValueError("Der Kern ist leer.")
+    for v in vorher:
+        if (v := _text(v)) and v not in stand["vorher"]:
+            stand["vorher"].append(v)
+    return stand
+
+
+def kern_json_setzen(text: str, name: str | None = None, *, basis: dict | None = None,
+                     grund: str = "kern_fenster") -> dict:
+    """Den ganzen Kern-Stand aus dem Kern-Fenster übernehmen (nur der Nutzer). `basis` ist der Stand beim
+    Öffnen: Hat sich der Kern inzwischen geändert, wird nichts überschrieben. Der bisherige Kern bleibt in
+    `vorher`, damit /kern zurueck immer möglich ist."""
+    neu = kern_json_lesen(text)
+    alt = kern_stand(name)
+    if basis is not None and _kern_sauber(basis) != _kern_sauber(alt):
+        raise ValueError("Der Kern wurde inzwischen woanders geändert – bitte neu laden.")
+    if alt["kern"] and alt["kern"] != neu["kern"] and alt["kern"] not in neu["vorher"]:
+        neu["vorher"].insert(0, alt["kern"])
+    neu["vorher"] = [v for v in neu["vorher"] if v != neu["kern"]][:KERN_VORHER]
+    _stand_schreiben(neu, name, grund)
+    _spiegeln(neu["kern"], name, grund)
+    return neu
 
 
 def kern_aenderung(a: dict, name: str | None = None) -> str | None:
@@ -432,10 +496,63 @@ def frisur_text(d: dict, frisur: str | None = None) -> str:
     return (d.get("frisuren") or {}).get(frisur, frisur) if frisur else ""
 
 
+# Ich-Perspektive: die Kamera sind die Augen der Figur. Ein Selfie ohne Spiegel zeigt dagegen das Gesicht.
+_ICH_SICHT = re.compile(r"(?i)\bfirst[- ]person\b|\bich[- ]perspektive\b|^\W*(?:an?\s+)?POV\b")
+_SELFIE = re.compile(r"(?i)\bselfie\b")
+_SPIEGEL = re.compile(r"(?i)\bmirror\b")
+# Merkmale, die aus den eigenen Augen nicht zu sehen sind; im Prompt rufen sie ein Gesicht herbei.
+_KOPF = re.compile(r"(?i)\b(face|faces|facial|eyes?|eyebrows?|brows?|lashes|eyelashes|eyeliner|lips?|mouth|smile"
+                   r"|smiling|teeth|nose|cheeks?|jaw|jawline|chin|forehead|expression|hair|hairstyle|haircut"
+                   r"|sidecut|undercut|bangs|fringe|ponytail|braids?|make-?up|gesicht\w*|augen\w*|lippen|mund"
+                   r"|lächeln|nase|haare?|frisur\w*|schminke)\b")
+_POV_SCHLUSS = re.compile(r"(?i)[\s,;.]*keep the image POV[\s.!]*$")
+POV_SCHLUSS = "Keep the image POV."
+
+
+def ich_perspektive(szene: str) -> bool:
+    """Zeigt die Szene den Blick durch die Augen der Figur (POV / first-person)?"""
+    szene = szene or ""
+    return bool(_ICH_SICHT.search(szene)) and not (_SELFIE.search(szene) and not _SPIEGEL.search(szene))
+
+
+def sichtbarer_kern(kern: str) -> str:
+    """Der kern ohne Sätze über Kopf, Gesicht und Haare – was aus den eigenen Augen sichtbar bleibt
+    (Körper, Haut, Hände, Nägel). Bleibt nichts übrig, gilt der erste Satz. Immer erwachsen."""
+    saetze = [s for s in re.split(r"(?<=[.!?])\s+", kern_erwachsen(kern)) if s.strip()]
+    sichtbar = [s for s in saetze if not _KOPF.search(s)] or saetze[:1]
+    return kern_erwachsen(" ".join(sichtbar))
+
+
+def pov_szene(szene: str) -> str:
+    """Die Szene ohne ein „keep the image POV“ am Ende – das steht im Prompt genau einmal, ganz hinten."""
+    return _POV_SCHLUSS.sub("", (szene or "").strip())
+
+
+def koerper_satz(kern: str) -> str:
+    """„My own body: …“ aus den sichtbaren Merkmalen des Kerns – leer ohne Kern."""
+    koerper = sichtbarer_kern(kern) if (kern or "").strip() else ""
+    return _satz("My own body: " + koerper[:1].lower() + koerper[1:]) if koerper else ""
+
+
+def _pov_prompt(d: dict, szene: str, outfit: str | None, pose: str | None) -> str:
+    """Szene vorn (Perspektive zuerst) · sichtbare Körpermerkmale · Kleidung · Pose · Stil · POV-Verstärkung."""
+    szene = pov_szene(szene)
+    teile = [_satz(szene), koerper_satz(d["kern"])]
+    if (kleidung := kleidung_text(d, szene, outfit)):
+        teile.append(_satz("Wearing " + kleidung))
+    if pose:
+        teile.append(_satz(d["posen"].get(pose, pose)))
+    teile += [_satz(d["stil"]), POV_SCHLUSS]
+    return " ".join(t for t in teile if t)
+
+
 def prompt_bauen(d: dict, szene: str = "", outfit: str | None = None, pose: str | None = None,
                  frisur: str | None = None) -> str:
     """Kern · Frisur · Kleidung · Pose · Szene · Stil – der Kern steht immer vorne.
+    Ausnahme Ich-Perspektive: dort steht die Szene vorn, Kopf, Gesicht und Frisur fallen weg (_pov_prompt).
     Ein unbekannter Outfit-/Posen-/Frisuren-Schlüssel gilt als freier Text."""
+    if ich_perspektive(szene):
+        return _pov_prompt(d, szene, outfit, pose)
     teile = [_satz(kern_erwachsen(d["kern"]))]
     if (haare := frisur_text(d, frisur)):
         teile.append(_satz("Hair: " + haare))
@@ -468,6 +585,17 @@ def bausteine_einsetzen(text: str, bausteine: dict[str, str]) -> tuple[str, list
             return m.group(0)
         return wert
     return _PLATZHALTER.sub(ersetzen, text or ""), unbekannt
+
+
+def seed_setzen(wert: int, name: str | None = None, grund: str = "seed") -> Path:
+    """Den Referenz-Seed setzen (Nutzer: Kopf-Fenster); alles andere in der Charakter-Datei bleibt."""
+    if not isinstance(wert, int) or isinstance(wert, bool) or not 1 <= wert < 2 ** 32:
+        raise ValueError("Der Seed ist eine ganze Zahl ab 1.")
+    d = _lesen(name)
+    if d is None:
+        raise ValueError("Es gibt noch keine Charakter-Datei – erst einen Kern eintragen.")
+    d["seed_referenz"] = wert
+    return _json_schreiben(d, name, grund)
 
 
 def seed(d: dict, neues_gesicht: bool = False) -> int | None:

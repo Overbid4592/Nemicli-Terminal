@@ -5,7 +5,7 @@ sentence-transformers zieht scikit-learn mit, dessen unsignierte DLL Smart App C
 blockieren kann. Nötig ist nur, was die Modell-Konfiguration vorgibt (modules.json,
 1_Pooling/config.json, config_sentence_transformers.json): Text durchs Modell, Pooling
 (letztes echtes Token), auf Länge 1 normieren – dafür reichen torch und transformers.
-Die Vektoren müssen zu den gespeicherten passen (eigener Test).
+Die Vektoren müssen zu den gespeicherten passen (tests/test_embedder.py).
 """
 
 from __future__ import annotations
@@ -74,8 +74,23 @@ _QWEN_VORLAGE = re.compile(r"Instruct: .+\nQuery: ?", re.S)
 
 
 #: EmbeddingGemma („task: … | query: “): Aufgaben aus der Modellkarte; Code hat eine eigene, sonst Suche.
+#: „question answering“ für Notizen und Dokumente trennte im Test schlechter als „search result“ (Abstand richtig ↔
+#: falsch 0,208 statt 0,215, mehr falsche Treffer über der Kandidaten-Schwelle) und bleibt deshalb aus.
 _GEMMA_VORLAGE = re.compile(r"task: [^|]+\| query: ?")
 _GEMMA_AUFGABEN = {"code": "code retrieval"}
+#: Dokument-Vorsatz von EmbeddingGemma; „none“ wird durch den Titel ersetzt, wenn es einen gibt.
+_GEMMA_DOKUMENT = "title: none | text: "
+#: Matryoshka-Längen, auf die EmbeddingGemma 2 gekürzt werden darf (Config embedding_dim, 0 = volle 768)
+MRL_LAENGEN = (512, 256, 128)
+
+
+def dokument_vorsatz(einstellungen: dict, titel: str = "") -> str:
+    """Vorsatz eines gespeicherten Textes; bei der Gemma-Vorlage mit Titel („title: {titel} | text: “)."""
+    p = einstellungen.get("dokument_prompt") or ""
+    titel = " ".join(str(titel or "").replace("|", " ").split())[:120]
+    if titel and p == _GEMMA_DOKUMENT:
+        return f"title: {titel} | text: "
+    return p
 
 
 def such_prompt(einstellungen: dict, aufgabe: str | None = None) -> str:
@@ -214,13 +229,45 @@ def einstellungen_lesen(ordner) -> dict:
     return e
 
 
+def mrl_laenge(ordner) -> int:
+    """Gekürzte Vektor-Länge (Config embedding_dim) – nur für EmbeddingGemma 2 und nur MRL_LAENGEN, sonst 0."""
+    try:
+        import config
+        n = int(config.load().get("embedding_dim") or 0)
+    except Exception:
+        return 0
+    if n not in MRL_LAENGEN or (datei := gguf_datei(ordner)) is None:
+        return 0
+    return n if _gguf_kopf(datei)["arch"] == "gemma-embedding2" else 0
+
+
+def kuerzen(vecs: list, n: int) -> list:
+    """Matryoshka: die ersten n Werte behalten und neu auf Länge 1 bringen."""
+    if not n:
+        return vecs
+    import numpy as np
+    raus = []
+    for v in vecs:
+        if v is None:
+            raus.append(None)
+            continue
+        k = np.asarray(v, np.float32)[:n]
+        raus.append(k / max(float(np.linalg.norm(k)), 1e-12))
+    return raus
+
+
 def kennung(ordner) -> str:
     """Fingerabdruck des Modells für gespeicherte Vektoren: Bauart + Rechenweise.
     Vektoren mit anderer Kennung passen nicht zu diesem Modell."""
     if (datei := gguf_datei(ordner)) is not None:
         kopf = _gguf_kopf(datei)
         teile = [str(kopf[k]) for k in ("arch", "dim", "schichten", "vokabular")]
-        return "-".join(teile + [einstellungen_lesen(ordner)["pooling"]])
+        teile.append(einstellungen_lesen(ordner)["pooling"])
+        if kopf["arch"] == "gemma-embedding2":
+            teile.append("t1")                    # Dokumente mit Titel (dokument_vorsatz)
+            if (n := mrl_laenge(ordner)):
+                teile.append(f"d{n}")
+        return "-".join(teile)
     cfg = _json(Path(ordner) / "config.json") or {}
     teile = [str(cfg.get(k, "?")) for k in ("model_type", "hidden_size", "num_hidden_layers", "vocab_size")]
     return "-".join(teile + [einstellungen_lesen(ordner)["pooling"]])
@@ -372,6 +419,21 @@ class Embedder:
         return self
 
 
+VIDEO_BILDER = 32                # höchstens so viele Einzelbilder je Video (1 je Sekunde)
+TON_SEKUNDEN = 600               # gelesen werden höchstens die ersten 10 Minuten (daraus 8 Stücke zu 30 s)
+
+
+def _medium_lesen(art: str, wert):
+    """Pfade zu dem, was der Einbetter nimmt: Video -> Einzelbilder, Ton -> 16-kHz-Mono-Welle."""
+    if art == "video" and not isinstance(wert, list):
+        import videodatei
+        return videodatei.bilder_lesen(wert, 1.0, VIDEO_BILDER)
+    if art == "ton" and isinstance(wert, (str, Path)):
+        from musik import tondatei
+        return tondatei.mono(Path(wert), 16_000, max_sekunden=TON_SEKUNDEN)
+    return wert
+
+
 class GGUFEmbedder:
     """Embedding-Modell als GGUF über den eigenen Motor. Kurze Texte rechnen gepackt in einem
     Durchgang. `to` auf ein anderes Gerät lädt eine zweite Fassung dazu (auf der GPU bleiben die
@@ -383,6 +445,7 @@ class GGUFEmbedder:
             raise FileNotFoundError(f"keine eindeutige .gguf in {ordner}")
         self.einstellungen = einstellungen_lesen(ordner)
         self.kennung = kennung(ordner)
+        self.laenge = mrl_laenge(ordner)                     # 0 = volle Länge
         self._lock = threading.RLock()
         self._grund = self._bauen(device)
         self._zweit = None
@@ -396,41 +459,71 @@ class GGUFEmbedder:
                              max_tokens=int(self.einstellungen["max_tokens"]))
 
     def encode(self, texts, *, normalize_embeddings: bool = True,
-               prompt_name: str | None = None, aufgabe: str | None = None, **_ignored):
+               prompt_name: str | None = None, aufgabe: str | None = None, titel=None, **_ignored):
+        """`titel`: je Text ein Titel (oder leer) für den Dokument-Vorsatz; nur ohne `prompt_name`."""
         if isinstance(texts, str):
             texts = [texts]
-        vorsatz = (such_prompt(self.einstellungen, aufgabe) if prompt_name == "query"
-                   else self.einstellungen["dokument_prompt"])
+        texts = list(texts)
+        if prompt_name == "query":
+            vorsaetze = [such_prompt(self.einstellungen, aufgabe)] * len(texts)
+        else:
+            titel = list(titel or [])
+            vorsaetze = [dokument_vorsatz(self.einstellungen, titel[i] if i < len(titel) else "")
+                         for i in range(len(texts))]
         with self._lock:
             e = self._zweit or self._grund
-            vecs = e.vektoren([(vorsatz or "") + t for t in texts], normieren=normalize_embeddings,
+            vecs = e.vektoren([(v or "") + t for v, t in zip(vorsaetze, texts)], normieren=normalize_embeddings,
                               pooling=self.einstellungen["pooling"],
                               sperre=gpu_sperre if e.device.type == "cuda" else None)
-        return [v.cpu().numpy() for v in vecs]
+        return kuerzen([v.cpu().numpy() for v in vecs], getattr(self, "laenge", 0))
 
     def kann_sehen(self) -> bool:
-        """Bilder einbetten möglich: Bauart mit Bild-Eingang und ein mmproj im Modell-Ordner."""
+        """Bilder und Videos einbetten möglich: Bauart mit Bild-Eingang und ein mmproj im Modell-Ordner."""
         return (getattr(self._grund.model, "supports_images", False) and hasattr(self._grund.model, "eingabe")
                 and mmproj_datei(self._datei.parent) is not None)
+
+    def kann_hoeren(self) -> bool:
+        """Ton einbetten möglich: wie kann_sehen, und der mmproj hat einen Audio-Encoder."""
+        if not self.kann_sehen():
+            return False
+        from ggufengine.tonlader import hat_ton
+        return hat_ton(str(mmproj_datei(self._datei.parent)))
+
+    def _teile_laden(self, e, arten: set) -> None:
+        mm = str(mmproj_datei(self._datei.parent))
+        with (gpu_sperre() if e.device.type == "cuda" else contextlib.nullcontext()):
+            if arten & {"bild", "video"} and not e.kann_sehen():
+                e.sehen_laden(mm)
+            if "ton" in arten and not e.kann_hoeren():
+                e.hoeren_laden(mm)
+
+    def medien(self, eintraege, normalize_embeddings: bool = True) -> list:
+        """Je Eintrag eine Liste von Teilen ("text", str) · ("bild", Pfad) · ("video", Pfad) · ("ton", Pfad) ->
+        ein Vektor im selben Raum wie die Texte; None für einen Eintrag, der sich nicht lesen lässt. Bild- und
+        Ton-Teil werden beim ersten Bedarf dazugeladen. Video: 1 Bild je Sekunde, höchstens 32; Ton: 16 kHz mono."""
+        if not self.kann_sehen():
+            raise RuntimeError("dieses Embedding-Modell kann keine Medien einbetten")
+        raus = []
+        for teile in eintraege:
+            try:                                          # Dateien lesen ohne Sperre: Suchfragen warten nicht darauf
+                gelesen = [(a, _medium_lesen(a, w)) for a, w in teile]
+            except Exception:
+                raus.append(None)
+                continue
+            with self._lock:
+                e = self._zweit or self._grund
+                try:
+                    self._teile_laden(e, {a for a, _w in teile})
+                    with (gpu_sperre() if e.device.type == "cuda" else contextlib.nullcontext()):
+                        raus.append(e.medien_vektor(gelesen, normieren=normalize_embeddings).cpu().numpy())
+                except Exception:
+                    raus.append(None)
+        return kuerzen(raus, getattr(self, "laenge", 0))
 
     def bilder(self, pfade, normalize_embeddings: bool = True) -> list:
         """Bilder (Pfade) -> Vektoren im selben Raum wie die Texte; None für ein Bild, das sich nicht lesen
         lässt. Der Bild-Teil wird beim ersten Mal dazugeladen."""
-        if not self.kann_sehen():
-            raise RuntimeError("dieses Embedding-Modell kann keine Bilder einbetten")
-        raus = []
-        with self._lock:
-            e = self._zweit or self._grund
-            if not e.kann_sehen():
-                with (gpu_sperre() if e.device.type == "cuda" else contextlib.nullcontext()):
-                    e.sehen_laden(str(mmproj_datei(self._datei.parent)))
-            for p in pfade:
-                try:
-                    with (gpu_sperre() if e.device.type == "cuda" else contextlib.nullcontext()):
-                        raus.append(e.bild_vektor(str(p), normieren=normalize_embeddings).cpu().numpy())
-                except Exception:
-                    raus.append(None)
-        return raus
+        return self.medien([[("bild", str(p))] for p in pfade], normalize_embeddings)
 
     def to(self, device):
         ziel = "cuda" if str(device).startswith("cuda") else "cpu"

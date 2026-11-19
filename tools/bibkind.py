@@ -59,6 +59,16 @@ def lauf_hier(chat_id, alles: bool, on_status, erzwingen: bool = False, nur_kurz
     Brocken in diesem Lauf einen Vektor bekommen haben. Das bloße Sammeln läuft so: Es braucht kein Modell."""
     import indexdb
     out = {"n": 0, "err": None, "mit_vektor": 0, "neu": 0}
+    if alles or erzwingen:                        # mit Modell: nie neben dem Einlesen im Entpackt-Fenster
+        with indexdb.einbett_sperre() as frei:
+            if not frei:
+                out["err"] = "ein anderer Prozess liest gerade ins Gedächtnis ein – folgt im nächsten Lauf"
+                return out
+            return _lauf(indexdb, out, chat_id, alles, on_status, erzwingen, nur_kurz)
+    return _lauf(indexdb, out, chat_id, alles, on_status, erzwingen, nur_kurz)
+
+
+def _lauf(indexdb, out: dict, chat_id, alles: bool, on_status, erzwingen: bool, nur_kurz: bool) -> dict:
     try:
         vorher = indexdb.offen()
         out["n"] = indexdb.after_turn(chat_id, status=on_status, alles=alles, chat_erzwingen=erzwingen,

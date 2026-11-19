@@ -33,6 +33,7 @@ from pathlib import Path
 from urllib.parse import urljoin, urlparse
 
 import httpx
+import netzhilfe
 
 # --- Web-Suche (Ollama Web Search API) -------------------------------------
 # Doku: https://docs.ollama.com/capabilities/web-search
@@ -304,10 +305,12 @@ def _host(url: str) -> str:
 
 
 def _match(url: str) -> dict | None:
-    """Findet den Allowlist-Eintrag (registrierbare Domain inkl. Subdomains)."""
-    h = _host(url)
-    for d, e in _ALLOW.items():
-        if h == d or h.endswith("." + d):
+    """Findet den Allowlist-Eintrag (registrierbare Domain inkl. Subdomains). Der genaueste Eintrag
+    gewinnt: discourse.ubuntu.com (Tier 2) vor ubuntu.com (Tier 1)."""
+    teile = _host(url).split(".")
+    for i in range(len(teile)):
+        e = _ALLOW.get(".".join(teile[i:]))
+        if e is not None:
             return e
     return None
 
@@ -317,18 +320,20 @@ def is_allowed(url: str) -> bool:
 
 
 def is_private(host: str) -> bool:
-    """True bei lokalen/privaten Adressen (localhost, 127.x, 10.x, 192.168.x …)."""
+    """True bei allen nicht öffentlich routbaren Adressen (localhost, 127.x, 10.x, 192.168.x,
+    100.64.0.0/10 …); IPv4 in IPv6 verpackt zählt wie die IPv4-Adresse."""
     if not host:
         return True
-    h = host.lower()
-    if h == "localhost" or h.endswith((".local", ".internal", ".lan", ".home", ".intranet")):
+    h = host.lower().strip("[]")
+    if h == "localhost" or h.endswith((".localhost", ".local", ".internal", ".lan", ".home", ".intranet")):
         return True
     try:
         ip = ipaddress.ip_address(h)
-        return (ip.is_private or ip.is_loopback or ip.is_link_local
-                or ip.is_reserved or ip.is_multicast or ip.is_unspecified)
     except ValueError:
         return False  # normaler Domainname -> ok
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped is not None:
+        ip = ip.ipv4_mapped
+    return not ip.is_global or ip.is_multicast
 
 
 def zeigt_auf_privat(host: str) -> bool:
@@ -494,7 +499,8 @@ def _anhaenge(links: list[str], basis: str) -> list[str]:
     for href in links:
         voll = urljoin(basis, href.strip())
         pfad = urlparse(voll).path.lower()
-        if voll.lower().startswith("https://") and pfad.endswith(_ANHANG_ENDUNGEN) and voll not in raus:
+        if voll.lower().startswith("https://") and pfad.endswith(_ANHANG_ENDUNGEN) and voll not in raus \
+                and not _schutz(voll):
             raus.append(voll)
     return raus[:30]
 
@@ -522,15 +528,23 @@ def _html_lesen(html: str, basis: str = "") -> tuple[str, dict]:
     return text, angaben
 
 
+PDF_FRIST_S = 20.0                # Zerlegen eines PDF: danach mit den bis dahin gelesenen Seiten weiter
+PDF_MAX_ZEICHEN = 2_000_000
+
+
 def _pdf_text(daten: bytes) -> str:
     from pypdf import PdfReader
+    ende = time.monotonic() + PDF_FRIST_S
     leser = PdfReader(io.BytesIO(daten))
     seiten = []
+    zeichen = 0
     for i, seite in enumerate(leser.pages):
-        if i >= MAX_PDF_SEITEN:
-            seiten.append(f"… (nur die ersten {MAX_PDF_SEITEN} von {len(leser.pages)} Seiten)")
+        if i >= MAX_PDF_SEITEN or time.monotonic() > ende or zeichen > PDF_MAX_ZEICHEN:
+            seiten.append(f"… (nur die ersten {i} von {len(leser.pages)} Seiten)")
             break
-        seiten.append(f"[Seite {i + 1}]\n{(seite.extract_text() or '').strip()}")
+        text = (seite.extract_text() or "").strip()
+        zeichen += len(text)
+        seiten.append(f"[Seite {i + 1}]\n{text}")
     return "\n\n".join(seiten)
 
 
@@ -566,6 +580,13 @@ def http_fehler(status: int, url: str) -> str:
     else:
         grund = "die Seite hat den Abruf abgelehnt"
     return f"❌ {host} meldet {status}: {grund}."
+
+
+ABWEISUNG = (403, 429, 503)      # typische Antworten eines Bot-Schutzes auf direkte Abrufe
+
+
+class _Abgewiesen(str):
+    """Fehlermeldung einer Seite, die den direkten Abruf abweist – über Ollama oft noch lesbar."""
 
 
 def _netzfehler(e: Exception, url: str) -> str:
@@ -719,8 +740,58 @@ def _lesebericht(angaben: dict, teile: int) -> str:
 
 # --- Öffentliche Funktionen ------------------------------------------------
 
+def _schutz(url: str) -> str | None:
+    """Meldung, wenn die Adresse auf der Schutzliste steht (schutzliste.py), sonst None."""
+    try:
+        import schutzliste
+        liste = schutzliste.gesperrt(url)
+        return schutzliste.meldung(url, liste) if liste else None
+    except Exception:
+        return None
+
+
+_ARCHIV = "archive.org"
+_ARCHIV_KOPIE = re.compile(r"(?i)^/web/[^/]*/(.+)$")
+
+
+def _archiv_pruefen(url: str) -> str | None:
+    """Internet Archive: /save/ lässt das Archiv beliebige Adressen abrufen (Abflusskanal) – gesperrt.
+    Bei einer Wayback-Kopie (/web/<zeit>/<adresse>) gilt für die eingebettete Adresse dasselbe wie für
+    eine direkte: Schutzliste, keine lokale Adresse, keine Paste-Dienste, Kurz-Links oder freien Hoster."""
+    h = _host(url)
+    if h != _ARCHIV and not h.endswith("." + _ARCHIV):
+        return None
+    from urllib.parse import unquote
+    teile = urlparse(url)
+    pfad = unquote(teile.path)
+    if re.match(r"(?i)^/+save(/|$)", pfad):
+        return "❌ archive.org/save lässt das Archiv fremde Adressen abrufen – gesperrt (Sicherheit)."
+    m = _ARCHIV_KOPIE.match(pfad + (f"?{unquote(teile.query)}" if teile.query else ""))
+    if not m:
+        return None
+    ziel = m.group(1).strip()
+    if not re.match(r"(?i)^https?://", ziel):
+        ziel = "https://" + ziel.lstrip("/")
+    if (gesperrt := _schutz(ziel)):
+        return gesperrt
+    zielhost = _host(ziel)
+    if is_private(zielhost):
+        return "❌ Archiv-Kopie einer privaten/lokalen Adresse – gesperrt (Sicherheit)."
+    try:
+        import einstellungen
+        dienst = einstellungen.nie_erlaubt(zielhost)
+    except Exception:
+        dienst = None
+    if dienst:
+        return (f"❌ Archiv-Kopie von {zielhost} ({dienst}: Paste-Dienst, Kurz-Link oder freies Hosting) – "
+                "dort kann jeder alles ablegen. Nicht geladen.")
+    return None
+
+
 def _check(url: str) -> str | None:
     """Sicherheitsprüfung. Gibt eine Fehlermeldung zurück, wenn etwas nicht passt, sonst None."""
+    if (gesperrt := _schutz(url)):
+        return gesperrt
     if not url.lower().startswith("https://"):
         return "❌ Nur HTTPS erlaubt – http:// ist unverschlüsselt und gesperrt."
     if is_private(_host(url)):
@@ -728,6 +799,8 @@ def _check(url: str) -> str | None:
     if not is_allowed(url):
         return (f"❌ '{_host(url)}' ist nicht auf der Whitelist. "
                 f"Erlaubt sind nur: {', '.join(sorted(ALLOWED))}")
+    if (archiv := _archiv_pruefen(url)):
+        return archiv
     if zeigt_auf_privat(_host(url)):
         return f"❌ '{_host(url)}' zeigt auf eine private/lokale Adresse – gesperrt (Sicherheit)."
     return None
@@ -746,33 +819,53 @@ def _gegenstelle(r) -> str | None:
         return None
 
 
+LADEN_FRIST_S = 30.0             # Gesamtfrist je Seite, alle Weiterleitungen zusammen
+_client = netzhilfe.GeteilterClient(follow_redirects=False, timeout=15.0, headers=_UA)
+
+
 def _laden(url: str) -> tuple[str, str, bytes, str | None] | str:
     """Lädt `url`; jede Weiterleitung wird VOR ihrem Aufruf geprüft.
     Gibt (endgültige URL, content-type, Daten, Zeichensatz) oder eine Fehlermeldung zurück."""
-    with httpx.Client(follow_redirects=False, timeout=15.0, headers=_UA) as c:
-        for schritt in range(MAX_WEITERLEITUNGEN + 1):
-            fehler = _check(url)
-            if fehler:
-                return fehler if schritt == 0 else \
-                    f"❌ Weiterleitung auf eine gesperrte Seite ({_host(url)}) – nicht aufgerufen.\n{fehler}"
-            with c.stream("GET", url) as r:
-                # Die DNS-Prüfung in _check und die Verbindung lösen getrennt auf – ein Name kann
-                # dazwischen auf eine lokale Adresse umspringen. Deshalb die echte Gegenstelle prüfen.
-                if (ip := _gegenstelle(r)) and is_private(ip):
-                    return f"❌ '{_host(url)}' zeigt auf eine private/lokale Adresse – gesperrt (Sicherheit)."
-                if r.is_redirect:
-                    url = urljoin(url, r.headers.get("location", ""))
-                    continue
+    c = _client()
+    ende = time.monotonic() + LADEN_FRIST_S
+    wiederholt = False
+    schritt = 0
+    while schritt <= MAX_WEITERLEITUNGEN:
+        fehler = _check(url)
+        if fehler:
+            return fehler if schritt == 0 else \
+                f"❌ Weiterleitung auf eine gesperrte Seite ({_host(url)}) – nicht aufgerufen.\n{fehler}"
+        if time.monotonic() > ende:
+            return f"❌ {_host(url)} antwortet zu langsam (mehr als {LADEN_FRIST_S:.0f} s) – abgebrochen."
+        pause = None
+        with c.stream("GET", url) as r:
+            # Die DNS-Prüfung in _check und die Verbindung lösen getrennt auf – ein Name kann
+            # dazwischen auf eine lokale Adresse umspringen. Deshalb die echte Gegenstelle prüfen.
+            if (ip := _gegenstelle(r)) and is_private(ip):
+                return f"❌ '{_host(url)}' zeigt auf eine private/lokale Adresse – gesperrt (Sicherheit)."
+            if r.is_redirect:
+                url = urljoin(url, r.headers.get("location", ""))
+                schritt += 1
+                continue
+            if r.status_code in netzhilfe.WIEDERHOLEN_BEI and not wiederholt:
+                pause = netzhilfe.warten_s(r)
+                if pause is not None and time.monotonic() + pause >= ende:
+                    pause = None
+            if pause is None:
                 if r.status_code >= 400:
-                    return http_fehler(r.status_code, url)
+                    meldung = http_fehler(r.status_code, url)
+                    return _Abgewiesen(meldung) if r.status_code in ABWEISUNG else meldung
                 if int(r.headers.get("content-length") or 0) > MAX_BYTES:
                     return f"❌ Seite ist größer als {MAX_BYTES // (1024 * 1024)} MB – nicht geladen."
-                daten = bytearray()
-                for stueck in r.iter_bytes():
-                    daten += stueck
-                    if len(daten) > MAX_BYTES:
-                        return f"❌ Seite ist größer als {MAX_BYTES // (1024 * 1024)} MB – abgebrochen."
-                return str(r.url), r.headers.get("content-type", "").lower(), bytes(daten), r.charset_encoding
+                try:
+                    daten = netzhilfe.lesen(r, ende, MAX_BYTES)
+                except netzhilfe.ZuGross:
+                    return f"❌ Seite ist größer als {MAX_BYTES // (1024 * 1024)} MB – abgebrochen."
+                except netzhilfe.FristAbgelaufen:
+                    return (f"❌ {_host(url)} liefert zu langsam (mehr als {LADEN_FRIST_S:.0f} s) – abgebrochen.")
+                return str(r.url), r.headers.get("content-type", "").lower(), daten, r.charset_encoding
+        wiederholt = True                          # 429/503: einmal nach Retry-After
+        netzhilfe._schlafen(pause)
     return f"❌ Mehr als {MAX_WEITERLEITUNGEN} Weiterleitungen – abgebrochen."
 
 
@@ -819,12 +912,31 @@ def _ganz_lesen(url: str, quelle: str, text: str, tier, stuecke: list[str]) -> s
     return _untrusted(quelle, zusammen, tier)
 
 
+def _allowlist_ueber_ollama(url: str, meldung: str) -> tuple[str, str, int | str] | str:
+    """Allowlist-Seite, die direkte Abrufe abweist (Bot-Schutz): Ollama lädt sie. Der Inhalt kam nicht
+    direkt vom Server der Domain und gilt deshalb als fremd. Klappt auch das nicht, gilt die
+    ursprüngliche Meldung."""
+    geladen = fremd_laden(url)
+    if isinstance(geladen, str):
+        return meldung
+    _, text = geladen
+    e = _match(url) or {}
+    tier, note = e.get("tier", "?"), e.get("note", "")
+    quelle = (f"{url}  ·  Domain in der Allowlist (Tier {tier}" + (f", {note}" if note else "")
+              + ") · über Ollama gelesen (die Seite weist direkte Abrufe ab) – Inhalt ungeprüft wie eine fremde Seite")
+    _merken(url, quelle, text, FREMD_TIER)
+    return quelle, text, FREMD_TIER
+
+
 def text_holen(url: str) -> tuple[str, str, int | str] | str:
     """Ganzer Text einer Seite als (Quellzeile, Text, Tier) – oder eine Fehlermeldung.
-    Allowlist-Seiten direkt, andere über Ollama web_fetch (wenn eingeschaltet)."""
+    Allowlist-Seiten direkt (weist eine den Abruf ab, über Ollama), andere über Ollama web_fetch
+    (wenn eingeschaltet). Adressen der Schutzliste nie."""
     url = url.strip()
     if not url.lower().startswith(("http://", "https://")):
         url = "https://" + url
+    if (gesperrt := _schutz(url)):
+        return gesperrt
     # Gemerktes nur, solange die Seite noch lesbar wäre (Allowlist und Schalter können sich geändert haben)
     if (alt := _gemerkt(url)) and (fremdseiten_an() if alt[3] == FREMD_TIER else is_allowed(url)):
         return alt[1], alt[2], alt[3]
@@ -843,6 +955,8 @@ def text_holen(url: str) -> tuple[str, str, int | str] | str:
             text, final, angaben = api
         else:
             geladen = _laden(url)
+            if isinstance(geladen, _Abgewiesen) and fremdseiten_an():
+                return _allowlist_ueber_ollama(url, geladen)
             if isinstance(geladen, str):
                 return geladen
             final, ctype, daten, zeichensatz = geladen
@@ -897,29 +1011,36 @@ def wikipedia_ergebnis(query: str, lang: str = "de", teil: int = 1) -> tuple[str
     return text, webanzeige.lesen(url, alt[2], alt[3], min(_zahl(teil), len(stuecke)), len(stuecke), titel=titel)
 
 
+_WIKI_SPRACHE = re.compile(r"[a-z]{2,3}(?:-[a-z]+)*|simple")
+
+
 def _wikipedia(query: str, lang: str = "de", teil: int = 1) -> str:
     teil = _zahl(teil)
     schluessel = f"wiki:{lang}:{(query or '').strip().lower()}"
     weiter = f"web_wiki mit suche: {query}"
     if (alt := _gemerkt(schluessel)):
         return _als_teil(alt[1], alt[2], alt[3], teil, weiter)
+    if not isinstance(lang, str) or not _WIKI_SPRACHE.fullmatch(lang):
+        return f"❌ Ungültige Wikipedia-Sprache {str(lang)[:20]!r} (z. B. de, en, simple)."
     base = f"https://{lang}.wikipedia.org/w/api.php"
+    if (fehler := _check(base)):
+        return fehler
     try:
-        with httpx.Client(timeout=15.0, headers=_UA) as c:
-            s = c.get(base, params={
-                "action": "query", "list": "search", "srsearch": query,
-                "format": "json", "srlimit": 5,
-            }).json()
-            hits = s.get("query", {}).get("search", [])
-            if not hits:
-                return f"Kein Wikipedia-Artikel zu '{query}' gefunden."
-            title = hits[0]["title"]
-            e = c.get(base, params={
-                "action": "query", "prop": "extracts", "explaintext": 1, "exsectionformat": "wiki",
-                "redirects": 1, "titles": title, "format": "json",
-            }).json()
-            pages = e.get("query", {}).get("pages", {})
-            extract = next(iter(pages.values()), {}).get("extract", "")
+        c = _client()
+
+        def abfrage(param: dict) -> dict:
+            r = netzhilfe.abrufen(c, "GET", base, params=param, frist_s=LADEN_FRIST_S, max_bytes=MAX_BYTES)
+            r.raise_for_status()
+            return r.json()
+        s = abfrage({"action": "query", "list": "search", "srsearch": query, "format": "json", "srlimit": 5})
+        hits = s.get("query", {}).get("search", [])
+        if not hits:
+            return f"Kein Wikipedia-Artikel zu '{query}' gefunden."
+        title = hits[0]["title"]
+        e = abfrage({"action": "query", "prop": "extracts", "explaintext": 1, "exsectionformat": "wiki",
+                     "redirects": 1, "titles": title, "format": "json"})
+        pages = e.get("query", {}).get("pages", {})
+        extract = next(iter(pages.values()), {}).get("extract", "")
     except Exception as e:
         return f"Fehler bei Wikipedia: {e}"
     quelle = f"Wikipedia: {title} — https://{lang}.wikipedia.org/wiki/{title.replace(' ', '_')}"
@@ -971,8 +1092,8 @@ def _ollama_post(endpunkt: str, nutzlast: dict, dienst: str) -> dict | str:
         "User-Agent": _UA["User-Agent"],
     }
     try:
-        with httpx.Client(timeout=30.0) as c:
-            r = c.post(endpunkt, headers=headers, json=nutzlast)
+        r = netzhilfe.abrufen(_client(), "POST", endpunkt, headers=headers, json=nutzlast, timeout=30.0,
+                              frist_s=60.0, max_bytes=MAX_BYTES * 2)
         if r.status_code in (401, 403):
             return (f"❌ {dienst}: API-Key ungültig/nicht autorisiert. "
                     "Mit /web key neu eintragen (https://ollama.com/settings/keys).")
@@ -1034,9 +1155,10 @@ def _bereinigt(s: str) -> str:
     return re.sub(r"<[^>]+>", "", (s or "").strip())
 
 
-def treffer(query: str, count: int = 5) -> list[dict] | str:
+def treffer(query: str, count: int = 5, ausgeblendet: list | None = None) -> list[dict] | str:
     """Web-Suche als Liste aus {titel, url, text, tier, notiz} – tier: 1–4, FREMD_TIER
-    (lesbar über Ollama) oder None (nicht lesbar). Sonst eine Fehlermeldung."""
+    (lesbar über Ollama) oder None (nicht lesbar). Sonst eine Fehlermeldung.
+    Treffer der Schutzliste fehlen; ihre Adressen landen in `ausgeblendet`."""
     query = (query or "").strip()
     if not query:
         return "Bitte gib einen Suchbegriff an."
@@ -1048,6 +1170,10 @@ def treffer(query: str, count: int = 5) -> list[dict] | str:
     raus = []
     for item in (data.get("results") or [])[:n]:
         url = (item.get("url") or "").strip()
+        if _schutz(url):
+            if ausgeblendet is not None:
+                ausgeblendet.append(url)
+            continue
         https = url.lower().startswith("https://")
         e = _match(url) if https else None
         if e:
@@ -1074,15 +1200,18 @@ def search_ergebnis(query: str, count: int = 5) -> tuple[str, dict | None]:
     """Wie search, dazu die Trefferliste für die Anzeige (webanzeige.suche) – None bei einem Fehler."""
     import webanzeige
     query = (query or "").strip()
-    results = treffer(query, count)
+    ausgeblendet: list = []
+    results = treffer(query, count, ausgeblendet)
     if isinstance(results, str):
         return results, None
-    return _suche_text(query, results), webanzeige.suche(query, results, warn=verdaechtig)
+    return _suche_text(query, results, len(ausgeblendet)), webanzeige.suche(query, results, warn=verdaechtig)
 
 
-def _suche_text(query: str, results: list[dict]) -> str:
+def _suche_text(query: str, results: list[dict], ausgeblendet: int = 0) -> str:
+    gesperrt = (f"⛔ {ausgeblendet} Treffer auf der Schutzliste (bekannte Schad- oder Phishing-Adresse) "
+                "ausgeblendet." if ausgeblendet else "")
     if not results:
-        return f"Keine Web-Treffer zu „{query}“."
+        return f"Keine Web-Treffer zu „{query}“." + (f" {gesperrt}" if gesperrt else "")
 
     lines = []
     lesbar = 0
@@ -1103,6 +1232,7 @@ def _suche_text(query: str, results: list[dict]) -> str:
             block += f"\n   {_kurz(t['text'])}"
         lines.append(block)
     kopf = (f"{len(results)} Treffer, davon {lesbar} aus der Allowlist (✓). "
-            "Schnipsel sind keine Fakten – Konkretes (Versionen, Befehle, Zahlen) erst nachlesen.")
+            "Schnipsel sind keine Fakten – Konkretes (Versionen, Befehle, Zahlen) erst nachlesen."
+            + (f"\n{gesperrt}" if gesperrt else ""))
     return _untrusted(f"Web-Suche (Ollama) zu „{query}“", kopf + "\n\n" + _cut("\n\n".join(lines)),
                       tier=3)

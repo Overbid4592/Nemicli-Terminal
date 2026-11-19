@@ -65,6 +65,7 @@ class ProzessSensor:
         self.intervall = intervall
         self._bekannt: dict[int, dict] = {}
         self._erster = True
+        self._zuletzt = 0.0                       # letzter Durchlauf (Lücke nach Pause oder Ruhezustand)
 
     def schnappschuss(self) -> dict[int, dict]:
         procs: dict[int, dict] = {}
@@ -101,6 +102,11 @@ class ProzessSensor:
     def sammeln(self) -> list[Ereignis]:
         aktuell = self.schnappschuss()
         out: list[Ereignis] = []
+        jetzt = time.time()
+        # Nach einer Lücke kommen alle Starts der Pause auf einmal: als nachgeholt markiert zählen sie
+        # nicht zur Prozess-Flut (R004), die übrigen Regeln sehen sie weiter.
+        luecke = bool(self._zuletzt) and jetzt - self._zuletzt > max(30.0, 10 * self.intervall)
+        self._zuletzt = jetzt
         if self._erster:
             self._bekannt = aktuell
             self._erster = False
@@ -109,14 +115,19 @@ class ProzessSensor:
         alt, neu = set(self._bekannt), set(aktuell)
         for pid in neu - alt:
             p = aktuell[pid]
+            eltern = self._elternname(p["ppid"], aktuell)
+            extra = {"cpu": round(p["cpu"], 2), "mem_mb": round(p["mem"], 2), "threads": p["threads"]}
+            if luecke:
+                extra["nachgeholt"] = True
+            if self._eigen_kandidat(p["name"], eltern):      # Pfad des Elternprozesses für regeln.eigener_aufruf
+                extra["eltern_exe"] = self._elternexe(p["ppid"], aktuell)
+                extra.update(self._elternaufruf(p["ppid"]))
             out.append(Ereignis(
                 PROZESS, "process_start", f"Prozess gestartet: {p['name']} (PID {pid})",
                 prozess=p["name"], pid=pid, ppid=p["ppid"],
-                eltern=self._elternname(p["ppid"], aktuell), nutzer=p["nutzer"],
+                eltern=eltern, nutzer=p["nutzer"],
                 exe=p["exe"], cmdline=p["cmdline"], start=p["start"],
-                eltern_start=self._elternstart(p, aktuell),
-                extra={"cpu": round(p["cpu"], 2), "mem_mb": round(p["mem"], 2),
-                       "threads": p["threads"]}))
+                eltern_start=self._elternstart(p, aktuell), extra=extra))
         for pid in alt - neu:
             p = self._bekannt[pid]
             out.append(Ereignis(PROZESS, "process_stop", f"Prozess beendet: {p['name']} (PID {pid})",
@@ -148,6 +159,39 @@ class ProzessSensor:
         if not e or not e.get("start") or e["start"] > kind["start"] + 1.0:
             return 0.0
         return e["start"]
+
+    @staticmethod
+    def _eigen_kandidat(kind: str, eltern: str) -> bool:
+        try:
+            from .regeln import _EIGENE_ELTERN
+        except Exception:
+            return False
+        return (kind or "").lower() in ("powershell.exe", "pwsh.exe") and (eltern or "").lower() in _EIGENE_ELTERN
+
+    @staticmethod
+    def _elternexe(ppid: int, tabelle: dict[int, dict]) -> str:
+        e = tabelle.get(ppid)
+        if e:
+            return e.get("exe") or ""
+        try:
+            return psutil.Process(ppid).exe()
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
+            return ""
+
+    @staticmethod
+    def _elternaufruf(ppid: int) -> dict:
+        """Aufruf und Arbeitsordner des Elternprozesses (nur bei Shells unter Python/NemiCLI): welches Skript
+        er ausführt, entscheidet in regeln.eigener_aufruf, ob es NemiCLI selbst ist."""
+        try:
+            p = psutil.Process(ppid)
+            argv = [str(a) for a in p.cmdline()][:12]
+            try:
+                cwd = p.cwd()
+            except (psutil.AccessDenied, OSError):
+                cwd = ""
+        except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, OSError):
+            return {}
+        return {"eltern_argv": [a[:500] for a in argv], "eltern_cwd": cwd[:500]}
 
     @staticmethod
     def _elternname(ppid: int, tabelle: dict[int, dict]) -> str:
@@ -231,7 +275,8 @@ class NetzSensor:
                 continue
             lokal = f"{c.laddr.ip}:{c.laddr.port}" if c.laddr else ""
             ziel = f"{c.raddr.ip}:{c.raddr.port}" if c.raddr else ""
-            key = (c.pid or 0, lokal, ziel, c.status)
+            # SYN_SENT → ESTABLISHED ist dieselbe Verbindung: nur Listener und Verbindung unterscheiden.
+            key = (c.pid or 0, lokal, ziel, "LISTEN" if c.status == "LISTEN" else "conn")
             aktuell.add(key)
             details[key] = {"pid": c.pid or 0, "lokal": lokal, "ziel": ziel,
                             "ip": c.raddr.ip if c.raddr else "",

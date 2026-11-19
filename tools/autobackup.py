@@ -131,7 +131,7 @@ def notizen_zaehlen(dateien: list[backup.Datei]) -> tuple[int, list[str]]:
         if d.pfad.name.lower() != "memory.json":
             continue
         try:
-            daten = json.loads(d.pfad.read_text(encoding="utf-8"))
+            daten = json.loads(d.pfad.read_text(encoding="utf-8-sig"))     # von Hand mit BOM gespeichert
             anzahl += len(daten["entries"])
         except (OSError, ValueError, KeyError, TypeError):
             kaputt.append(d.name)
@@ -205,11 +205,11 @@ def _gedaechtnis_kopie() -> Path | None:
         ziel.parent.mkdir(parents=True, exist_ok=True)
         ziel.unlink(missing_ok=True)
         from contextlib import closing                 # „with connect()“ allein schließt nicht (nur commit)
-        with closing(sqlite3.connect(f"file:{quelle}?mode=ro", uri=True, timeout=10)) as alt, \
+        with closing(sqlite3.connect(quelle.as_uri() + "?mode=ro", uri=True, timeout=10)) as alt, \
                 closing(sqlite3.connect(ziel)) as neu:
             alt.backup(neu)
         return ziel
-    except (OSError, sqlite3.Error):
+    except (OSError, ValueError, sqlite3.Error):
         return None
 
 

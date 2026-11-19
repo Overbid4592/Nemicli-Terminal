@@ -161,10 +161,11 @@ class DnsSpeicher:
 # ---------------------------------------------------------------- Adressregister
 
 class _NurRegister(urllib.request.HTTPRedirectHandler):
-    """Weiterleitungen nur zu den fünf Adressregistern folgen."""
+    """Weiterleitungen nur per https zu den fünf Adressregistern folgen."""
 
     def redirect_request(self, req, fp, code, msg, headers, newurl):
-        if urllib.parse.urlparse(newurl).hostname not in RDAP_SERVER:
+        ziel = urllib.parse.urlparse(newurl)
+        if ziel.scheme != "https" or ziel.hostname not in RDAP_SERVER:
             raise urllib.error.HTTPError(newurl, code, "Weiterleitung außerhalb der Register", headers, fp)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
@@ -204,7 +205,8 @@ def rdap_abfragen(ip: str, timeout: float = 8.0) -> dict | None:
                                      headers={"Accept": "application/rdap+json", "User-Agent": "NemiCLI-Wache"})
     try:
         with oeffner.open(anfrage, timeout=timeout) as r:
-            if urllib.parse.urlparse(r.geturl()).hostname not in RDAP_SERVER:
+            angekommen = urllib.parse.urlparse(r.geturl())
+            if angekommen.scheme != "https" or angekommen.hostname not in RDAP_SERVER:
                 return None
             daten = json.loads(r.read(512_000).decode("utf-8", "replace"))
     except (OSError, ValueError, urllib.error.URLError):
@@ -223,6 +225,7 @@ class Auskunft:
         self.register = register
         self.dns = DnsSpeicher()
         self._eigene: dict[str, tuple[str, str]] = {}      # ip → (name, programm)
+        self._eigene_pids: dict[str, set[int]] = {}        # ip → Prozessnummern von NemiCLI, die ihn auflösten
         self._eigene_gelesen = 0.0
 
     def _eigene_auffrischen(self) -> None:
@@ -231,18 +234,29 @@ class Auskunft:
         self._eigene_gelesen = time.time()
         for d in netzspur.lesen():
             for ip in d["ips"]:
-                self._eigene[str(ip)] = (str(d["name"]), str(d.get("programm") or ""))
+                ip = str(ip)
+                self._eigene.pop(ip, None)               # neu einsortieren: jüngste stehen hinten
+                self._eigene[ip] = (str(d["name"]), str(d.get("programm") or ""))
+                if isinstance(d.get("pid"), int):
+                    self._eigene_pids.setdefault(ip, set()).add(d["pid"])
+        if len(self._eigene) > 20_000:
+            self._eigene = dict(list(self._eigene.items())[-10_000:])
+            self._eigene_pids = {ip: p for ip, p in self._eigene_pids.items() if ip in self._eigene}
 
     def eigener(self, ip: str) -> tuple[str, str] | None:
         self._eigene_auffrischen()
         return self._eigene.get(ip)
 
-    def name(self, ip: str) -> str:
-        """Name zur Adresse für den Stempel am Ereignis – nur lokale Quellen, keine Netzabfrage."""
+    def name(self, ip: str, pid: int | None = None) -> str:
+        """Name zur Adresse für den Stempel am Ereignis – nur lokale Quellen, keine Netzabfrage. Mit `pid`
+        gilt NemiCLIs eigene Auflösung nur für den NemiCLI-Prozess, der sie gemacht hat: hinter einer Adresse
+        (CDN) stehen oft viele Namen – für fremde Programme zählt der DNS-Speicher von Windows."""
         if not ip:
             return ""
         e = self.eigener(ip)
-        return e[0] if e else self.dns.name(ip)
+        if e and (pid is None or pid in self._eigene_pids.get(ip, set())):
+            return e[0]
+        return self.dns.name(ip)
 
     def besitzer(self, ip: str, abfragen: bool = True) -> dict | None:
         if not oeffentlich(ip):
@@ -266,12 +280,18 @@ class Auskunft:
         ip = str(ipaddress.ip_address(ip.strip().strip("[]")))
         eigen = self.eigener(ip)
         name = eigen[0] if eigen else self.dns.name(ip) or self.speicher.netz_name_fuer(ip)
+        programme = self.speicher.netz_programme_fuer(ip)
+        # NemiCLIs eigene Auflösung belegt den Namen nur für NemiCLI; andere Programme an derselben Adresse
+        # (geteiltes CDN) haben ihn nur laut DNS-Speicher.
+        nemicli = {str(eigen[1]).lower(), "nemicli.exe", "nemiclic.exe"} if eigen else set()
+        fremde = sorted({str(p.get("prozess") or "?") for p in programme
+                         if str(p.get("prozess") or "").lower() not in nemicli}) if eigen else []
         return {"ip": ip, "oeffentlich": oeffentlich(ip), "name": name,
                 "domain": registriert(name) if name else "",
                 "zweck": zweck(name) if name else "", "eigen": bool(eigen),
-                "eigen_programm": eigen[1] if eigen else "",
+                "eigen_programm": eigen[1] if eigen else "", "geteilt": fremde,
                 "besitzer": self.besitzer(ip, abfragen),
-                "programme": self.speicher.netz_programme_fuer(ip)}
+                "programme": programme}
 
 
 def bericht_text(b: dict) -> str:
@@ -285,6 +305,9 @@ def bericht_text(b: dict) -> str:
     if b["eigen"]:
         zeilen.append(f"NemiCLI selbst hat diesen Namen aufgelöst ({b['eigen_programm'] or 'NemiCLI'})"
                       + (f" – Zweck: {b['zweck']}" if b["zweck"] else ""))
+        if b.get("geteilt"):
+            zeilen.append(f"Für {', '.join(b['geteilt'][:5])}: Name nur laut DNS-Speicher (geteilte Adresse möglich) – "
+                          "dass dieses Programm denselben Dienst nutzt, ist damit nicht belegt")
     elif b["zweck"]:
         zeilen.append(f"Bekannter Dienst: {b['zweck']}")
     bs = b.get("besitzer")

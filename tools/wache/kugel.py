@@ -891,7 +891,7 @@ class _Eingabe(QPlainTextEdit):
 
 
 def _link_oeffnen(url: str) -> None:
-    if str(url).lower().startswith(("https://", "http://")):
+    if str(url).lower().startswith("https://"):            # unverschlüsselte Links nicht öffnen
         QDesktopServices.openUrl(QUrl(url))
 
 

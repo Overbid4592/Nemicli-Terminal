@@ -27,6 +27,8 @@ Nutzer ändert das Limit mit /limit; die KI hat dafür kein Werkzeug.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
 import json
 import os
 import re
@@ -63,7 +65,30 @@ WHITELIST_VORGABE = [
 # Umleitungen in Dateien und Zeichen, mit denen sich ein zweiter Befehl
 # einschleusen ließe, machen jeden Whitelist-Befehl zu einem normalen.
 _UMLEITUNG = re.compile(r"(?<![<>])>{1,2}(?!>)|\|\s*(out-file|set-content|add-content|tee)\b", re.I)
-_TRENNER = re.compile(r"[;\n]|&&|\|\||\|")
+_TRENNER = re.compile(r"[;\r\n]|&&|\|\||\|")        # PowerShell trennt auch an einem einzelnen \r
+# Schalter, mit denen ein Whitelist-Befehl Programme startet, Dateien schreibt oder Erweiterungen installiert.
+_OPTION_GEFAEHRLICH = re.compile(
+    r"(?i)(?<![\w-])(--upload-pack|--receive-pack|--exec|--config|--output|--ext-diff|--textconv|"
+    r"--open-files-in-pager|--install-extension|--uninstall-extension|--extensions-dir|--user-data-dir|"
+    r"--git-dir|--work-tree)(?![\w-])")
+# VS Code (`code` steht auf der Whitelist): Server und Tunnel öffnen den Rechner nach außen, Entwicklungs-
+# erweiterungen und der Debug-Port führen fremden Code aus, Remote-Adressen verbinden zu anderen Rechnern.
+_CODE_BEFEHL = re.compile(r"""(?i)(?:^|[;|&\r\n({])\s*&?\s*["']?code(?:\.cmd|\.exe)?["']?(?![\w.-])""")
+_CODE_GEFAEHRLICH = re.compile(
+    r"(?i)(?<![\w-])(serve-web|tunnel|--extensiondevelopmentpath|--extensiontestspath|--inspect[\w-]*|"
+    r"--enable-proposed-api|--remote|--folder-uri|--file-uri|--server-data-dir)(?![\w-])")
+
+
+def _option_gefaehrlich(roh: str) -> bool:
+    """Auch in Anführungszeichen und mit ` dazwischen: PowerShell reicht das Argument so weiter."""
+    for text in (roh, roh.replace("`", "")):
+        if _OPTION_GEFAEHRLICH.search(text):
+            return True
+        if _CODE_BEFEHL.search(text) and _CODE_GEFAEHRLICH.search(text):
+            return True
+    return False
+
+
 _STRINGS = re.compile(r"'[^']*'|\"[^\"]*\"")
 # PowerShell zählt auch typografische Anführungszeichen; ` maskiert das nächste Zeichen.
 _EINFACH = "'\u2018\u2019\u201a\u201b"
@@ -209,7 +234,28 @@ def arbeitsordner() -> Path:
     return Path(os.getcwd()).resolve()
 
 
+def _pfad_grund(roh) -> str | None:
+    """actions.pfad_vorpruefen: Freigabe eines anderen Rechners oder Gerätepfad – vor jedem Dateizugriff."""
+    try:
+        import actions
+        return actions.pfad_vorpruefen(roh)
+    except ImportError:
+        s = str(roh or "").strip().strip("\"'").replace("/", "\\")
+        return "Netzwerkpfad" if s.startswith(("\\\\", "\\??\\")) else None
+
+
+def _aktion_pfad_grund(act: dict) -> str | None:
+    try:
+        import actions
+        return actions.aktion_vorpruefen(act)
+    except ImportError:
+        return next((g for f in _PFAD_FELDER + ("ordner", "projekt")
+                     if isinstance(act.get(f), str) and (g := _pfad_grund(act[f]))), None)
+
+
 def _im_ordner(roh: str, basis: Path) -> bool:
+    if _pfad_grund(roh):
+        return False
     try:
         p = Path(os.path.expandvars(roh)).expanduser()
         p = (p if p.is_absolute() else basis / p).resolve()
@@ -218,27 +264,81 @@ def _im_ordner(roh: str, basis: Path) -> bool:
     return p == basis or basis in p.parents
 
 
-def _python_normal(segment: str) -> str:
-    """`& .\\venv\\Scripts\\python.exe -m pytest` → `python -m pytest`."""
+def _fremder_ort(p: Path) -> bool:
+    """Sandbox, Entpackt- oder Daten-Ordner (pyumgebung.fremder_ort): dort legt auch Code der KI Dateien ab."""
+    try:
+        import pyumgebung
+        return pyumgebung.fremder_ort(p) is not None
+    except ImportError:
+        return ist_entpackt_pfad(p)
+
+
+def _python_vertraut(roh: str, basis: Path | None) -> bool:
+    """Gilt der Programmname als „python“? Der bloße Name (PowerShell sucht ihn über PATH, nie im aktuellen Ordner)
+    oder das venv des Projekts: …\\Scripts\\python.exe unter `basis`, nicht in Sandbox, Entpackt- oder Daten-Ordner."""
+    roh = roh.strip("\"'")
+    name = roh.replace("/", "\\").rsplit("\\", 1)[-1].lower()
+    if name not in _PYTHON_NAMEN:
+        return False
+    if roh.lower() == name:
+        return True
+    if basis is None or _pfad_grund(roh) or not _im_ordner(roh, basis):
+        return False
+    try:
+        p = Path(os.path.expandvars(roh)).expanduser()
+        p = (p if p.is_absolute() else basis / p).resolve()
+    except (OSError, ValueError):
+        return False
+    return p.parent.name.lower() == "scripts" and not _fremder_ort(p)
+
+
+def _python_normal(segment: str, basis: Path | None = None) -> str:
+    """`& .\\venv\\Scripts\\python.exe -m pytest` → `python -m pytest` (nur das venv unter `basis`)."""
     teile = segment.strip().split()
     if teile and teile[0] == "&":
         teile = teile[1:]
-    if teile and Path(teile[0]).name.lower() in _PYTHON_NAMEN:
+    if teile and _python_vertraut(teile[0], basis):
         teile[0] = "python"
     return " ".join(teile)
 
 
-def _auto_segment(segment: str, liste: list[str], basis: Path) -> bool:
-    s = _python_normal(segment)
+def ausfuehrungsordner() -> Path | None:
+    """Ordner, in dem `befehl` wirklich läuft (actions.befehl_ordner). None, wenn er dorthin umgeleitet wird
+    (Sandbox, Profil): dort schreibt auch Code aus code_ausfuehren – ein Skript darin ist keins des Projekts."""
+    try:
+        import actions
+        import coding
+        gewuenscht = coding.arbeitsordner() or Path(os.getcwd())
+        echt = actions.befehl_ordner(gewuenscht)
+    except Exception:
+        return None
+    return Path(echt).resolve() if echt == gewuenscht else None
+
+
+def _nur_abfrage(roh: str) -> bool:
+    """Liest der Befehl nur (wie die Lese-Stufe in befehl_harmlos)?"""
+    ohne_strings, ausdruck = _ohne_strings(roh)
+    try:
+        import actions
+        return (not ausdruck and not actions.ausdruck_in_text(roh) and _STRINGS.sub("''", roh) == ohne_strings
+                and actions._nur_lesend(roh) is None and actions._guard_command(roh, lesend=True) is None)
+    except Exception:
+        return False
+
+
+def _auto_segment(segment: str, liste: list[str], basis: Path | None) -> bool:
+    s = _python_normal(segment, basis)
     if _segment_passt(s, liste):
         return True
     teile = s.split()
-    return (len(teile) >= 2 and teile[0] == "python" and teile[1].lower().endswith(".py")
-            and _im_ordner(teile[1], basis) and (basis / teile[1]).resolve().is_file())
+    return (basis is not None and len(teile) >= 2 and teile[0] == "python" and teile[1].lower().endswith(".py")
+            and _im_ordner(teile[1], basis) and (basis / teile[1]).resolve().is_file()
+            and not _fremder_ort((basis / teile[1]).resolve()))
 
 
 def auto_befehl_frei(cmd: str, basis: Path | None = None) -> bool:
-    """Darf `befehl` in Auto ohne Rückfrage laufen?"""
+    """Darf `befehl` in Auto ohne Rückfrage laufen? `basis`: Ordner, in dem er läuft (Vorgabe: der echte
+    Ausführungsordner; wird er umgeleitet, startet Auto dort keine Skripte)."""
     roh = (cmd or "").strip()
     if not roh:
         return False
@@ -251,10 +351,10 @@ def auto_befehl_frei(cmd: str, basis: Path | None = None) -> bool:
     except Exception:
         return False
     ohne_strings, ausdruck = _ohne_strings(roh)
-    if ausdruck or _UMLEITUNG.search(ohne_strings) or "(" in ohne_strings:
+    if ausdruck or _UMLEITUNG.search(ohne_strings) or "(" in ohne_strings or _option_gefaehrlich(roh):
         return False
     liste = whitelist() + auto_liste()
-    basis = basis or arbeitsordner()
+    basis = basis or ausfuehrungsordner()
     return all(_auto_segment(seg, liste, basis) for seg in _TRENNER.split(ohne_strings))
 
 
@@ -266,13 +366,21 @@ def auto_grund(act: dict) -> str | None:
         return "installiert Programme für den ganzen Rechner"
     if tool == "llamacpp_holen":
         return "lädt ein Programm aus dem Netz (llama.cpp)"
+    if tool == "coding_start" and _neues_projekt(act):
+        return "das Projekt wird der Ordner, in dem Auto ohne Rückfrage arbeitet"
+    if tool == "befehl" and ausfuehrungsordner() is None and not _nur_abfrage(_befehl_text(act)):
+        # Umgeleitet (Sandbox): Whitelist-Befehle wie pytest oder git commit führten dort Code aus, den
+        # code_ausfuehren geschrieben haben kann.
+        return "der Befehl liefe in der Sandbox statt in einem Projekt"
     if stufe(act) != RISKANT:
         return None
     basis = arbeitsordner()
     if tool == "befehl":
-        return None if auto_befehl_frei(_befehl_text(act), basis) else "der Befehl steht nicht auf der Auto-Liste"
+        return None if auto_befehl_frei(_befehl_text(act)) else "der Befehl steht nicht auf der Auto-Liste"
     if tool == "loeschen":
         pfad = str(act.get("pfad") or "")
+        if _pfad_grund(pfad):
+            return "der Pfad ist eine Netzwerkfreigabe oder ein Gerätepfad"
         try:
             ordner = Path(pfad).is_dir()
         except OSError:
@@ -288,8 +396,105 @@ def auto_grund(act: dict) -> str | None:
     return "riskante Aktion"
 
 
+# ---------------------------------------------------------------------------
+# Coding-Freigabe „frei“: im Projekt läuft alles, nur die Rote Liste fragt.
+# Die harten Sperren (_guard_command, sperr_grund, Netz-Zwang, Persönlichkeiten,
+# Programm-Ordner, Schlüssel) gelten unabhängig davon beim Ausführen.
+# ---------------------------------------------------------------------------
+_GIT_ROT = re.compile(r"(?i)\bgit\b[^;|&\r\n]*?\s(push|reset\s+--hard|clean|filter-branch|filter-repo|update-ref|"
+                      r"reflog\s+(?:expire|delete)|gc\s+--prune|rebase(?!\s+--(?:continue|abort)))\b")
+_SYSTEM_INSTALL = re.compile(r"(?i)(?<![\w-])(winget|choco|chocolatey|scoop|msiexec|npm|npx|pnpm|yarn)(?:\.exe)?\b")
+_PIP_INSTALL = re.compile(r"(?i)(?:^|[;|&\s])&?\s*[\"']?([^\s\"';|&]*?)(pip3?(?:\.exe)?|python3?(?:\.exe)?\s+-m\s+pip|"
+                          r"py(?:\.exe)?\s+-m\s+pip)[\"']?\s+install\b")
+# Python-Code, der schreibt oder löscht (Pfade außerhalb des Projekts fragen dann)
+_PY_AENDERT = re.compile(r"(?i)\b(rmtree|os\.remove|os\.unlink|os\.rmdir|\.unlink\(|\.rmdir\(|write_text|write_bytes|"
+                         r"shutil\.(?:copy\w*|move)|os\.rename|os\.replace|send2trash)\b|open\([^)]*[\"'][wax]")
+
+
+def _ausserhalb_projekt_im_befehl(cmd: str) -> str | None:
+    """Ein absoluter Pfad im Befehl, der nicht im Coding-Projekt liegt – sonst None."""
+    try:
+        import actions
+        import coding
+        _t, orte, verdaechtig = actions._befehl_orte(cmd)
+    except Exception:
+        return None
+    if verdaechtig:
+        return verdaechtig
+    for ort in filter(None, orte.split("\n")):
+        if not coding.drin(ort):
+            return ort
+    return None
+
+
+def coding_grund(act: dict) -> str | None:
+    """Rote Liste der Coding-Freigabe „frei“: warum diese Aktion trotzdem fragt – None, wenn sie läuft."""
+    act = _als_befehl(act)
+    tool = act.get("tool", "")
+    if tool == "updates_installieren":
+        return "installiert Programme für den ganzen Rechner"
+    if tool == "llamacpp_holen":
+        return "lädt ein Programm aus dem Netz (llama.cpp)"
+    if tool == "zeitplan" and stufe(act) == RISKANT:
+        return "läuft künftig ohne dich im Hintergrund"
+    if tool == "coding_start" and _neues_projekt(act):
+        return "das Projekt wird der Ordner, in dem NemiCLI frei arbeitet"
+    if tool == "loeschen":
+        pfad = str(act.get("pfad") or "")
+        if _pfad_grund(pfad):
+            return "der Pfad ist eine Netzwerkfreigabe oder ein Gerätepfad"
+        try:
+            if Path(pfad).is_dir():
+                return "löscht einen ganzen Ordner"
+        except OSError:
+            return "löscht einen ganzen Ordner"
+        return None
+    if tool != "befehl":
+        return None
+    cmd = _befehl_text(act)
+    if ausfuehrungsordner() is None and not _nur_abfrage(cmd):
+        return "der Befehl liefe in der Sandbox statt im Projekt"
+    if (m := _GIT_ROT.search(cmd)):
+        return f"git {m.group(1).split()[0]} ändert das Repository dauerhaft oder schickt es weg"
+    if (m := _SYSTEM_INSTALL.search(cmd)):
+        return f"{m.group(1)} installiert etwas für den ganzen Rechner"
+    if (m := _PIP_INSTALL.search(cmd)):
+        praefix, prog = m.group(1), m.group(2).split()[0]
+        exe = praefix + ("python.exe" if prog.lower().startswith("pip") else prog)
+        if not praefix or not _python_vertraut(exe, ausfuehrungsordner()):   # bloßes pip/python: das des Rechners
+            return "pip installierte ins Python des Rechners statt ins venv des Projekts"
+    try:
+        import actions
+        if actions._NETZ_BEFEHL.search(cmd):
+            return "der Befehl lädt etwas aus dem Netz"
+        loescht = actions._DESTRUCTIVE.search(cmd)
+        if loescht and actions._REKURSIV.search(cmd) and re.search(r"(?i)\b(remove-item|ri|rm|rmdir|rd|del|erase)\b",
+                                                                    cmd):
+            return "löscht einen ganzen Ordner"
+    except Exception:
+        return "der Befehl ließ sich nicht prüfen"
+    if (loescht or _PY_AENDERT.search(cmd)) and (draussen := _ausserhalb_projekt_im_befehl(cmd)):
+        return f"ändert etwas außerhalb des Projekts ({draussen})"
+    return None
+
+
+def _neues_projekt(act: dict) -> bool:
+    """Setzt coding_start ein anderes Projekt als das laufende? Im Zweifel ja."""
+    try:
+        import coding
+        neu, _fehler = coding.pruefe_projekt(str(act.get("projekt") or ""))
+        alt = coding.projekt()
+        return neu is None or alt is None or neu != alt.resolve()
+    except Exception:
+        return True
+
+
 def _auto_vorsatz(act: dict) -> str:
     try:
+        import coding
+        if coding.frei():                            # Coding-Freigabe „frei“: nur die Rote Liste fragt
+            grund = coding_grund(act)
+            return f"🟦 Coding frei hält an: {grund}.\n" if grund else ""
         import modes
         if modes.current() not in modes.AUTO_MODES:
             return ""
@@ -310,7 +515,11 @@ def _segment_passt(segment: str, liste: list[str]) -> bool:
     for eintrag in liste:
         if s == eintrag or s.startswith(eintrag + " "):
             return True
-        if s.startswith(eintrag) and s[len(eintrag):len(eintrag) + 1] in ("", " ", ".", ";"):
+        rest = s[len(eintrag):] if s.startswith(eintrag) else None
+        if rest is None:
+            continue
+        # Angehängt zählt nur ".exe": notepad.cmd oder code.bat wären beliebige Skripte gleichen Namens.
+        if rest[:1] in ("", " ", ";") or (rest[:4] == ".exe" and rest[4:5] in ("", " ", ";")):
             return True
     return False
 
@@ -332,7 +541,7 @@ def befehl_harmlos(cmd: str) -> bool:
             return True
     except Exception:
         return False
-    if _UMLEITUNG.search(ohne_strings):
+    if _UMLEITUNG.search(ohne_strings) or _option_gefaehrlich(roh):
         return False
     liste = whitelist()
     if not liste:
@@ -352,7 +561,7 @@ LESEN, HARMLOS, AENDERT, RISKANT = "lesen", "harmlos", "aendert", "riskant"
 
 _HARMLOS = {"ordner_erstellen", "bildschirm_ansehen", "merken", "skill_merken",
             "ordner_lernen", "bild_malen", "bild_serie", "comic_malen", "tagesrueckblick", "musik_machen", "musik_cover", "wache_bewerten", "wache_justieren", "kugel",
-            "kugel_anziehen", "erinnern"}
+            "kugel_anziehen", "erinnern", "figur_bewegen", "figur_justieren"}
 _MIT_VORSCHAU = {"datei_schreiben", "datei_bearbeiten", "pdf_erstellen", "skill_schreiben", "skill_ausbessern"}
 
 
@@ -381,14 +590,12 @@ def stufe(act: dict) -> str:
     """Risikostufe einer Aktion – unabhängig vom Modus."""
     act = _als_befehl(act)
     tool = act.get("tool", "")
-    if tool == "loeschen":
+    if tool == "loeschen" or _aktion_pfad_grund(act):     # Netzwerkpfad: ohne Blick ins Dateisystem riskant
         return RISKANT
     if tool == "befehl":
         return AENDERT if befehl_harmlos(_befehl_text(act)) else RISKANT
-    if tool == "zeitplan":
-        was = str(act.get("aktion", "")).lower()
-        anlegen = was.startswith("anl") or was in ("neu", "erstellen", "planen")
-        return RISKANT if anlegen else HARMLOS
+    if tool == "zeitplan":                  # öffnet nur das Zeitplan-Fenster; eintragen macht der Nutzer per Klick
+        return HARMLOS
     if tool == "verschieben":
         try:
             return RISKANT if Path(str(act.get("von", ""))).is_dir() else HARMLOS
@@ -442,14 +649,17 @@ def arbeitsbereich(act: dict) -> bool:
         skills = daten / "Skills"                   # Skills werden befolgt: nur übers Prüffenster
         profile = daten / "Profile"
         for roh in pfade:
-            p = Path(os.path.expandvars(roh)).expanduser().resolve()
-            if p != daten and daten not in p.parents:
+            kandidaten = actions._kandidaten(roh)     # wie Windows öffnet: "Skills.\x" ist Skills\x
+            if not kandidaten:
                 return False
-            if p == skills or skills in p.parents:
-                return False
-            if profile in p.parents and len(p.relative_to(profile).parts) >= 2 \
-                    and p.relative_to(profile).parts[1].casefold() == "skills":   # Windows: Groß/Klein egal
-                return False
+            for p in kandidaten:
+                if p != daten and daten not in p.parents:
+                    return False
+                if p == skills or skills in p.parents:
+                    return False
+                if profile in p.parents and len(p.relative_to(profile).parts) >= 2 \
+                        and p.relative_to(profile).parts[1].casefold() == "skills":   # Windows: Groß/Klein egal
+                    return False
         if steuerdatei_grund(act):
             return False
         return actions._guard(*pfade) is None
@@ -529,6 +739,8 @@ def steuerdatei_grund(act: dict) -> str | None:
                 erster = p.relative_to(daten).parts[0].lower()
                 if erster == "profile" and p.name.lower().endswith("_kern.json"):
                     return "die Kern-Datei hält das Aussehen der Figur – ändern entscheidest du"
+                if erster == "profile" and p.name.lower() == "selbstentwurf.json":
+                    return "den Selbstentwurf ändert die KI nur mit dem Werkzeug selbstentwurf – sonst entscheidest du"
                 if erster in _STEUERND_IMMER:
                     return f"{p.relative_to(daten).parts[0]}/ läuft später von allein – das entscheidest du"
                 if erster in _SICHERUNGEN:
@@ -594,7 +806,17 @@ def schluessel_hinweis() -> str:
 def doppelt_fragen(act: dict) -> bool:
     """`befehl` außerhalb der Whitelist: zwei Fragen statt einer."""
     act = _als_befehl(act)
+    if _coding_frei_an():                  # Coding frei: was dann noch fragt, steht auf der Roten Liste – einmal
+        return False
     return act.get("tool") == "befehl" and stufe(act) == RISKANT
+
+
+def _coding_frei_an() -> bool:
+    try:
+        import coding
+        return coding.frei()
+    except Exception:
+        return False
 
 
 def frage(act: dict) -> str:
@@ -613,12 +835,17 @@ def _frage_text(act: dict) -> str:
         if tool == "loeschen":
             return "⚠ RISIKO – löschen. Landet im Papierkorb (/undo). Wie weiter?"
         if tool == "befehl":
+            if _coding_frei_an() and coding_grund(act):
+                return "⚠ Wie weiter?"              # der Grund steht schon darüber (Rote Liste)
             return "⚠ RISIKO – Befehl steht NICHT auf der Whitelist. Wie weiter?"
         if tool == "zeitplan":
             return "⚠ RISIKO – läuft künftig OHNE dich im Hintergrund. Wie weiter?"
         return "⚠ RISIKO – ganzer Ordner. Wie weiter?"
     if (grund := _netz_grund(act)):
         return f"🛡 Netz-Sperre: {grund}. Trotzdem ausführen?"
+    if act.get("tool") == "entpacken":
+        return ("📦 Die KI möchte ein Archiv entpacken – ein Fenster zeigt den Fortschritt, jede Datei wird geprüft, "
+                "nichts wird gestartet. Entpacken?")
     if act.get("tool") == "web_lesen" and _verdaechtig(act):
         return "⚠ Diese Seite hat schon einmal versucht, die KI zu steuern. Trotzdem laden?"
     if act.get("tool") == "web_lesen" and not _fremd_frei(act):
@@ -671,7 +898,8 @@ def optionen(act: dict) -> list[tuple[str, str]]:
         import coding
         return coding.frage_und_optionen(act)[1]
     s = stufe(act)
-    if (s == RISKANT or act.get("tool") in ("befehl", "web_lesen") or steuerdatei_grund(act)
+    if (s == RISKANT or act.get("tool") in ("befehl", "web_lesen", "coding_start", *NUR_VORDERGRUND)
+            or steuerdatei_grund(act)
             or _netz_grund(act)):
         return [("yes", "Ja, ausführen"), ("no", "Nein, abbrechen")]
     return [("yes", "Ja, ausführen"),
@@ -782,6 +1010,8 @@ def grenze_pruefen(act: dict) -> str | None:
         return (f"STOPP: Obergrenze erreicht – in dieser Sitzung wurden schon {_geloescht} "
                 f"Dateien gelöscht (Limit {limit}). Mehr geht erst, wenn der Nutzer das Limit "
                 "mit /limit erhöht oder NemiCLI neu startet.")
+    if (grund := _pfad_grund(act.get("pfad"))):
+        return grund
     p = Path(str(act.get("pfad", "")))
     try:
         if p.is_dir():
@@ -799,6 +1029,8 @@ def grenze_pruefen(act: dict) -> str | None:
 def anzahl_dateien(pfad: str | Path, grenze: int = 100_000) -> int:
     """Wie viele Dateien eine Löschung betrifft (Datei = 1, Ordner = Inhalt).
     Zählt höchstens bis `grenze` – ein riesiger Ordner soll die Anzeige nicht aufhalten."""
+    if _pfad_grund(str(pfad)):
+        return 1
     p = Path(pfad)
     try:
         if p.is_dir():
@@ -806,3 +1038,136 @@ def anzahl_dateien(pfad: str | Path, grenze: int = 100_000) -> int:
     except OSError:
         pass
     return 1
+
+
+# ---------------------------------------------------------------------------
+# Entpacken: nur im Vordergrund, nichts aus Entpackt-Ordnern ausführen
+# ---------------------------------------------------------------------------
+# Gilt in jedem Modus und vor jeder Rückfrage (modes.decide → block) und noch einmal in actions.run.
+NUR_VORDERGRUND = {"entpacken"}
+# Prozesse ohne Gespräch im Vordergrund (main_start.py): Zeitplan-Auftrag, Wache samt Kugel und Weckruf,
+# Kindprozesse für Bilder, Gedächtnis und das Entpack-Fenster selbst. --sag ist ein normales Gespräch.
+HINTERGRUND_SCHALTER = ("--wache", "--vollscan", "--auftrag", "--selftest", "--bild", "--systemcheck",
+                        "--kontext", "--malkind", "--bibliothekar", "--vorpruefer-lernen", "--entpacken")
+# Werkzeuge, die Programme oder Code starten.
+_AUSFUEHRENDE = {"befehl", "code_ausfuehren", "paket_installieren"}
+# Ordnername wie in entpacken.ziel_fuer_chat/ziel_fuer_profil, dazu entpackt_* und der 8.3-Kurzname.
+_ENTPACKT_NAME = re.compile(r"(?i)^(entpackt(_.*)?|entpac~\d+)$")
+_ENTPACKT_TEIL = r"(?:entpackt(?:_[^\\/\s\"'`;|&)]*)?|entpac~\d+)"
+_TRENN = r"[\\/]"
+_ENTPACKT_IM_TEXT = re.compile(
+    rf"(?i)(?:{_TRENN}{_ENTPACKT_TEIL}(?=$|[\\/\s\"'`;|&),])"           # …\Entpackt  …\Entpackt\x.exe
+    rf"|(?<![\w.~-]){_ENTPACKT_TEIL}{_TRENN}"                              # Entpackt\x.exe
+    rf"|(?:^|[\s;(&|])(?:cd|sl|chdir|pushd|set-location|push-location)\s+[\"']?{_ENTPACKT_TEIL}(?![\w~-]))")
+
+_helfer_kontext = contextvars.ContextVar("sicherheit_helfer", default=False)
+
+
+@contextlib.contextmanager
+def als_helfer():
+    """Markiert alles darin (auch Threads aus asyncio.to_thread) als Arbeit eines Helfer-Agenten."""
+    token = _helfer_kontext.set(True)
+    try:
+        yield
+    finally:
+        _helfer_kontext.reset(token)
+
+
+def vordergrund_grund() -> str | None:
+    """Warum gerade niemand im Vordergrund sitzt – None im normalen Gespräch (Terminal, Fenster, Browser)."""
+    import sys
+    if (schalter := next((a for a in sys.argv[1:] if a in HINTERGRUND_SCHALTER), None)):
+        return f"Hintergrund-Prozess ({schalter})"
+    if _helfer_kontext.get():
+        return "Helfer-Agent"
+    try:
+        import modes
+        if modes._wache_dienst or modes._kugel_runde:
+            return "Wache"
+    except ImportError:
+        pass
+    try:
+        import vonsichaus
+        if vonsichaus.in_runde():
+            return "freier Moment"
+    except ImportError:
+        pass
+    return None
+
+
+def _entpacken_modus() -> str:
+    try:
+        import entpacken
+        return entpacken.modus()
+    except Exception:
+        return "aus"
+
+
+def ist_entpackt_pfad(pfad: str | Path) -> bool:
+    """Liegt der Pfad in einem Entpackt-Ordner (DATEN/Entpackt/…, Profile/<Name>/Entpackt/…, entpackt_*)?"""
+    roh = str(pfad or "").strip().strip('"')
+    if not roh:
+        return False
+    teile = list(Path(roh).parts)
+    if not _pfad_grund(roh):                       # resolve() auf einer Freigabe schickte die Anmeldung dorthin
+        try:
+            teile += list(Path(os.path.expandvars(roh)).expanduser().resolve().parts)
+        except (OSError, ValueError):
+            pass
+    return any(_ENTPACKT_NAME.match(t) for t in teile)
+
+
+def _arbeitsordner_entpackt(tool: str) -> bool:
+    orte: list = [os.getcwd()]
+    try:
+        import coding
+        orte += [coding.projekt(), coding.arbeitsordner()]
+    except Exception:
+        pass
+    if tool == "code_ausfuehren":                  # freigegebene Projekte liegen auf dem Python-Pfad der Sandbox
+        try:
+            import sandbox
+            orte += sandbox.projekte()
+        except Exception:
+            pass
+    return any(o and ist_entpackt_pfad(o) for o in orte)
+
+
+def entpackt_grund(act: dict) -> str | None:
+    """Werkzeuge, die etwas starten, dürfen nichts aus einem Entpackt-Ordner ausführen. Lesen bleibt frei."""
+    act = _als_befehl(act)
+    tool = act.get("tool", "")
+    if tool == "oeffnen":                     # Standardprogramme führen Makros und Skripte in Dokumenten aus
+        pfad = str(act.get("pfad") or "").strip().strip('"')
+        if pfad and ist_entpackt_pfad(pfad) and (_pfad_grund(pfad) or not Path(pfad).is_dir()):
+            return "die Datei liegt in einem Entpackt-Ordner (nur der Ordner lässt sich öffnen)"
+        return None
+    if tool not in _AUSFUEHRENDE:
+        return None
+    if _arbeitsordner_entpackt(tool):
+        return "der Arbeitsordner liegt in einem Entpackt-Ordner"
+    werte = [v for k, v in act.items() if k != "tool"]
+    texte = [str(x) for v in werte for x in (v if isinstance(v, (list, tuple)) else [v]) if isinstance(x, str)]
+    if any(_ENTPACKT_IM_TEXT.search(t) for t in texte):
+        return "der Aufruf zeigt in einen Entpackt-Ordner"
+    pfad = act.get("pfad")
+    if isinstance(pfad, str) and ist_entpackt_pfad(pfad):           # auch relativ oder als Kurzname
+        return "das Skript liegt in einem Entpackt-Ordner"
+    return None
+
+
+def sperr_grund(act: dict) -> str | None:
+    """Harte Sperren vor jeder Rückfrage, in jedem Modus – None, wenn keine greift."""
+    tool = act.get("tool", "")
+    if (grund := _aktion_pfad_grund(act)):              # vor allem anderen: nichts davon fasst das Dateisystem an
+        return grund
+    if tool in NUR_VORDERGRUND:
+        if (wo := vordergrund_grund()):
+            return (f"Abgelehnt: '{tool}' geht nur im Gespräch mit dem Nutzer, nicht hier ({wo}). "
+                    "Nicht erneut versuchen – sag dem Nutzer, was du entpacken wolltest.")
+        if _entpacken_modus() == "aus":
+            return "Abgelehnt: /zip ist aus – Entpacken ist abgeschaltet. Nur der Nutzer schaltet es mit /zip an."
+    if (grund := entpackt_grund(act)):
+        return (f"Abgelehnt: {grund}. Aus Entpackt-Ordnern startet die KI keine Programme, Skripte oder "
+                "Installationen. Ansehen geht mit datei_lesen, ordner_auflisten und den Such-Werkzeugen.")
+    return None

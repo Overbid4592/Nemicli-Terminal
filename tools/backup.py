@@ -5,7 +5,7 @@ Zwei Arten:
   teil  Bilder/, Persoenlichkeiten/ und Profile/ aus dem Daten-Ordner.
   voll  der ganze Daten-Ordner und die Programmdateien – ohne, was sich neu erzeugen
         lässt (venv, .runtime, build, dist, .git, __pycache__, Cache/) und ohne die
-        Sicherungen selbst. Modelldateien (ModelGGUF/, Vision/, Models/) nur mit modelle=True.
+        Sicherungen selbst. Modelldateien (KI-Modelle/, früher ModelGGUF/, Vision/, Models/) nur mit modelle=True.
 
 Differenziell: Gibt es ein volles Backup derselben Art, das höchstens BASIS_TAGE alt ist,
 entsteht ein Nachtrag (…_nachtrag_…zip) mit allem, was seit DIESEM vollen Backup neu oder
@@ -50,7 +50,7 @@ ARTEN = ("teil", "voll")
 _PROGRAMM_AUS = {"venv", ".venv", ".runtime", "build", "dist", ".git"}
 # Oberste Ebene des Daten-Ordners: Präfix-Cache (neu erzeugbar) und die Sicherungen selbst.
 _DATEN_AUS = {"cache", ORDNER_NAME.lower()}
-_MODELL_AUS = {"modelgguf", "vision", "models"}
+_MODELL_AUS = {"ki-modelle", "modelgguf", "vision", "models"}
 _UEBERALL_AUS = {"__pycache__"}
 _DATEI_AUS = (".pyc", "-wal", "-shm", "-journal", ".zip.part")
 
@@ -276,6 +276,26 @@ def _sqlite_kopie(p: Path, tmp: Path) -> Path:
     return ziel
 
 
+def _sqlite_roh(p: Path, tmp: Path) -> tuple[Path, str]:
+    """Ersatz, wenn die Backup-API scheitert: Datei und `-wal` roh kopieren und in der Kopie zusammenführen –
+    die Sicherung enthält dann auch, was noch nur im `-wal` stand. Rückgabe (Quelle, Hinweis)."""
+    wal = p.with_name(p.name + "-wal")
+    if not wal.is_file() or wal.stat().st_size == 0:
+        return p, ""
+    ziel = tmp / f"{len(list(tmp.iterdir()))}_roh.db"
+    try:
+        shutil.copyfile(p, ziel)
+        shutil.copyfile(wal, ziel.with_name(ziel.name + "-wal"))
+        con = sqlite3.connect(ziel, timeout=5)
+        try:
+            con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        finally:
+            con.close()
+        return ziel, ", -wal eingearbeitet"
+    except (OSError, sqlite3.Error):
+        return p, " OHNE -wal – jüngste Änderungen können fehlen"
+
+
 def _datei_hash(p: Path, melde: Callable[[str], None] | None = None) -> str:
     h = hashlib.sha256()
     gesamt, fertig = max(p.stat().st_size, 1), 0
@@ -495,7 +515,8 @@ def _erstellen(plan: Plan, melde: Callable[[str], None],
                     try:
                         quelle = _sqlite_kopie(d.pfad, tmp_pfad)
                     except sqlite3.Error as e:
-                        fehler.append(f"{d.name} (Datenbank roh kopiert: {e})")
+                        quelle, hinweis = _sqlite_roh(d.pfad, tmp_pfad)
+                        fehler.append(f"{d.name} (Datenbank roh kopiert{hinweis}: {e})")
                 try:
                     src = open(quelle, "rb")
                 except OSError as e:
@@ -534,6 +555,8 @@ def _erstellen(plan: Plan, melde: Callable[[str], None],
             zf.writestr("BACKUP.json", json.dumps(kopf, ensure_ascii=False, indent=2))
         melde("Prüfsumme des Zips …")
         sha = _datei_hash(teil, melde)
+        with open(teil, "r+b") as f:                # erst auf der Platte, dann unter endgültigem Namen
+            os.fsync(f.fileno())
         os.replace(teil, endgueltig)
     except BaseException:
         try:
@@ -541,7 +564,8 @@ def _erstellen(plan: Plan, melde: Callable[[str], None],
         except OSError:
             pass
         raise
-    (ziel / (name + ".sha256")).write_text(f"{sha}  {name}\n", encoding="utf-8")
+    from atomar import text_schreiben
+    text_schreiben(ziel / (name + ".sha256"), f"{sha}  {name}\n")
     return Ergebnis(endgueltig, sha, len(summen), roh, endgueltig.stat().st_size, plan.ausgelassen, fehler,
                     basis=plan.basis["name"] if plan.nachtrag else None,
                     unveraendert=plan.unveraendert, geloescht=len(plan.geloescht))
@@ -658,10 +682,23 @@ def auspacken(name: str, melde: Callable[[str], None] | None = None,
     if not d:
         raise ValueError(f"{p.name} ist kein NemiCLI-Backup (BACKUP.json fehlt).")
     kette, geloescht = [p], set()
+    basis_fehler: list[str] = []
     if d.get("nachtrag"):
         basis = z / Path(str(d.get("basis") or "")).name
-        if not basis.is_file() or info(basis).get("nachtrag"):
+        basis_info = info(basis) if basis.is_file() else {}
+        if not basis.is_file() or basis_info.get("nachtrag"):
             raise ValueError(f"Das volle Backup zu diesem Nachtrag fehlt: {basis.name}")
+        if d.get("basis_erstellt") and basis_info.get("erstellt") != d.get("basis_erstellt"):
+            raise ValueError(f"{basis.name} ist nicht das volle Backup, zu dem dieser Nachtrag gehört "
+                             "(anderer Zeitpunkt) – nichts ausgepackt.")
+        soll = str(d.get("basis_sha256") or "").lower()
+        if soll:
+            melde(f"prüfe {basis.name} …")
+            if _datei_hash(basis, melde) != soll:
+                raise ValueError(f"{basis.name} hat sich seit dem Nachtrag verändert (Prüfsumme stimmt nicht) – "
+                                 "nichts ausgepackt.")
+        else:
+            basis_fehler.append(f"{basis.name} (Nachtrag ohne Prüfsumme der Basis – Basis ungeprüft)")
         kette, geloescht = [basis, p], set(d.get("geloescht") or [])
     if not _LOCK.acquire(blocking=False):
         raise RuntimeError("Es läuft schon ein Backup.")
@@ -683,7 +720,7 @@ def auspacken(name: str, melde: Callable[[str], None] | None = None,
             n += 1
             ziel = z / f"Wiederhergestellt_{p.stem}_{n}"
         teil = ziel.with_name(ziel.name + ".part")
-        fehler: list[str] = []
+        fehler: list[str] = list(basis_fehler)
         fertig = 0
         try:
             for i, zp in enumerate(kette):

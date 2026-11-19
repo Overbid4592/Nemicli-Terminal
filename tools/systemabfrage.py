@@ -35,7 +35,8 @@ ARTEN = {
     "signatur":     "Authenticode-Signatur einer Datei (pfad)",
     "hash":         "SHA-256 einer Datei (pfad)",
     "datei":        "Größe und Zeitstempel einer Datei (pfad)",
-    "registry":     "Werte und Unterschlüssel eines Registry-Schlüssels (schluessel)",
+    "registry":     "Unterschlüssel eines Registry-Schlüssels (schluessel); Werte nur unter Autostart, Dienste, "
+                    "Uninstall, Winlogon, IFEO, Richtlinien",
     "laufwerke":    "Laufwerke mit Belegung",
     "system":       "Betriebssystem, Laufzeit, CPU, Arbeitsspeicher, Grafikkarten, Rechenweg lokaler Modelle",
     "netz":         "Netzwerkadapter mit Adressen und Zählern",
@@ -332,6 +333,20 @@ def _schutz_pruefen(*texte) -> None:
             raise AbfrageFehler(S.HINWEIS)
 
 
+def _kanal_pruefen(kanal) -> None:
+    """Protokollkanäle tragen den Produktnamen mit Bindestrich davor (…-<Produkt>/Operational)."""
+    if not kanal:
+        return
+    try:
+        import schutzsoftware as S
+        namen = {o.name.lower() for o in S.ordner()} - {"microsoft", "windows", "common files"}
+    except Exception:
+        return
+    k = str(kanal).lower()
+    if any(n and n in k for n in namen):
+        raise AbfrageFehler(S.HINWEIS)
+
+
 def _datei_pfad(pfad: str) -> Path:
     if not str(pfad or "").strip():
         raise AbfrageFehler("Es fehlt 'pfad'.")
@@ -385,12 +400,71 @@ def _schluessel_teilen(roh: str):
     return getattr(winreg, hive), rest.strip("\\"), hive
 
 
-def registry(schluessel: str) -> str:
+# Zweige, deren Werte die KI lesen darf: Autostart, Dienste, Installiertes, Anmeldung, Umleitungen beim
+# Programmstart, Richtlinien – was eine Systemprüfung braucht. Unter allen anderen Schlüsseln (Zugangsdaten,
+# Browser-, Programm-Einstellungen …) sieht sie nur die Namen der Unterschlüssel.
+KI_ZWEIGE = tuple(z.lower() for z in (
+    r"Software\Microsoft\Windows\CurrentVersion\Run",            # auch RunOnce, RunOnceEx, RunServices…
+    r"Software\Microsoft\Windows\CurrentVersion\Uninstall",
+    r"Software\Microsoft\Windows\CurrentVersion\Policies",
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved",
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders",
+    r"Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders",
+    r"Software\Microsoft\Windows\CurrentVersion\App Paths",
+    r"Software\Microsoft\Windows NT\CurrentVersion\Winlogon",
+    "=" + r"Software\Microsoft\Windows NT\CurrentVersion",        # nur die Werte selbst (Windows-Version)
+    r"Software\Microsoft\Windows NT\CurrentVersion\Image File Execution Options",
+    r"Software\Microsoft\Windows NT\CurrentVersion\SilentProcessExit",
+    r"Software\Microsoft\Windows NT\CurrentVersion\Windows",     # AppInit_DLLs, Load, Run
+    r"Software\Microsoft\Windows NT\CurrentVersion\Schedule\TaskCache",
+    r"Software\Microsoft\Active Setup\Installed Components",
+    r"Software\Policies",
+    r"System\CurrentControlSet\Services",
+    r"System\CurrentControlSet\Control\Session Manager",          # BootExecute, KnownDLLs, AppCertDlls
+))
+_WOW = re.compile(r"(?i)^software\\(wow6432node)\\")
+_ZUFALL_TEIL = re.compile(r"[A-Za-z0-9+/=_\-]{32,}")
+_GUID = re.compile(r"^\{?[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}?$")
+
+
+def ki_zweig(pfad: str) -> bool:
+    """Liegt der Schlüssel (ohne Hive) in einem Zweig, dessen Werte die KI lesen darf?"""
+    p = _WOW.sub("software\\\\", str(pfad or "").strip("\\")).lower()
+    p = re.sub(r"^system\\controlset\d{3}\\", r"system\\currentcontrolset\\", p)
+    return any(p == z[1:] if z.startswith("=") else                  # "=…": nur genau dieser Schlüssel
+               p == z or p.startswith(z + "\\") or (z.endswith("\\run") and p.startswith(z)) for z in KI_ZWEIGE)
+
+
+def _entropie(text: str) -> float:
+    import math
+    n = len(text)
+    if not n:
+        return 0.0
+    haeufig: dict[str, int] = {}
+    for c in text:
+        haeufig[c] = haeufig.get(c, 0) + 1
+    return -sum(k / n * math.log2(k / n) for k in haeufig.values())
+
+
+def schwaerzen(text: str) -> str:
+    """Lange zufällig wirkende Teile (Schlüssel, Token, Kennwörter) unkenntlich machen – GUIDs bleiben."""
+    def ersetzen(m):
+        t = m.group(0)
+        if _GUID.match(t) or _entropie(t) < 3.5 or not (any(c.isdigit() for c in t) and any(c.isalpha() for c in t)):
+            return t
+        return f"[geschwärzt: {len(t)} Zeichen]"
+    return _ZUFALL_TEIL.sub(ersetzen, text)
+
+
+def registry(schluessel: str, *, nutzer: bool = False) -> str:
+    """Werte und Unterschlüssel. Für die KI (Standard) nur in KI_ZWEIGE mit Werten (lange zufällige Werte
+    geschwärzt), sonst nur die Namen der Unterschlüssel. `nutzer=True`: alles wie angefragt."""
     if winreg is None:
         return "Registry gibt es nur unter Windows."
     if not str(schluessel or "").strip():
         raise AbfrageFehler("Es fehlt 'schluessel', z.B. HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run")
     wurzel, pfad, hive = _schluessel_teilen(schluessel)
+    werte_zeigen = nutzer or ki_zweig(pfad)
     try:
         k = winreg.OpenKey(wurzel, pfad, 0, winreg.KEY_READ)
     except FileNotFoundError:
@@ -398,14 +472,19 @@ def registry(schluessel: str) -> str:
     except PermissionError:
         return f"Kein Lesezugriff: {hive}\\{pfad}"
     zeilen = [f"{hive}\\{pfad}"]
+    if not werte_zeigen:
+        zeilen.append("  (Werte nicht angezeigt: außerhalb der Zweige für Autostart, Dienste, Installiertes, "
+                      "Anmeldung, Startumleitungen und Richtlinien – nur die Unterschlüssel)")
     with k:
         i = 0
-        while True:
+        while werte_zeigen:
             try:
                 name, wert, _typ = winreg.EnumValue(k, i)
             except OSError:
                 break
             text = wert.hex() if isinstance(wert, bytes) else str(wert)
+            if not nutzer:
+                text = schwaerzen(text)
             zeilen.append(f"  {name or '(Standard)'} = {text[:400]}")
             i += 1
         i, unter = 0, []
@@ -499,15 +578,17 @@ def ereignisse(kanal: str, ereignis_id: int | None = None, anzahl: int = 20) -> 
 # Einstieg
 # ---------------------------------------------------------------------------
 
-def ausfuehren(a: dict) -> str:
-    """Führt die Abfrage aus `a` aus. AbfrageFehler bei fehlenden/falschen Feldern."""
+def ausfuehren(a: dict, *, von_hand: bool = False) -> str:
+    """Führt die Abfrage aus `a` aus. AbfrageFehler bei fehlenden/falschen Feldern. Standard: Abfrage der KI
+    (Werkzeug `abfragen`); `von_hand=True` für Abfragen des Nutzers ohne die Grenzen der KI."""
     w = art(a.get("was") or a.get("art") or "")
     if not w:
         raise AbfrageFehler(f"Unbekannte Abfrage '{a.get('was', '')}'.\n" + hilfe())
     filt = str(a.get("filter") or a.get("name") or "").strip()
     pid = _int(a.get("pid"))
     pfad = a.get("pfad") or ""
-    _schutz_pruefen(filt, a.get("schluessel"))
+    _schutz_pruefen(filt, a.get("schluessel"), pfad, a.get("kanal"))
+    _kanal_pruefen(a.get("kanal"))
     if w == "prozesse":
         return prozesse(filt)
     if w == "prozess":
@@ -529,7 +610,7 @@ def ausfuehren(a: dict) -> str:
     if w == "datei":
         return datei(pfad)
     if w == "registry":
-        return registry(a.get("schluessel") or a.get("pfad") or "")
+        return registry(a.get("schluessel") or a.get("pfad") or "", nutzer=von_hand)
     if w == "laufwerke":
         return laufwerke()
     if w == "system":

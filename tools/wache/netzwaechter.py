@@ -75,26 +75,28 @@ class NetzMerkmale:
         self.domains: dict[str, int] = {}
         self.prozesse: dict[str, int] = {}
         self.paare: set[str] = set()          # prozess|domain
-        self.ziele: set[str] = set()          # prozess|ip
+        self.ziele: dict[str, None] = {}      # prozess|ip, zuletzt gesehene hinten
 
     def anpassen(self, ereignisse: list[Ereignis]) -> None:
-        self.domains, self.prozesse, self.paare, self.ziele = {}, {}, set(), set()
-        for e in ereignisse:
+        self.domains, self.prozesse, self.paare, self.ziele = {}, {}, set(), {}
+        for e in sorted(ereignisse, key=lambda e: e.zeit or 0.0):
             d, p = domain_von(e), _prozess(e)
             self.domains[d] = self.domains.get(d, 0) + 1
             self.prozesse[p] = self.prozesse.get(p, 0) + 1
             self.paare.add(f"{p}|{d}")
-            self.ziele.add(f"{p}|{e.ziel}")
+            k = f"{p}|{e.ziel}"
+            self.ziele.pop(k, None)
+            self.ziele[k] = None
 
     def zustand(self) -> dict:
         return {"domains": self.domains, "prozesse": self.prozesse, "paare": sorted(self.paare),
-                "ziele": sorted(self.ziele)[-50_000:]}
+                "ziele": list(self.ziele)[-50_000:]}            # gekürzt wird beim Ältesten, nicht nach dem Alphabet
 
     def zustand_laden(self, z: dict) -> None:
         self.domains = dict(z.get("domains") or {})
         self.prozesse = dict(z.get("prozesse") or {})
         self.paare = set(z.get("paare") or [])
-        self.ziele = set(z.get("ziele") or [])
+        self.ziele = dict.fromkeys(z.get("ziele") or [])
 
     def vektor(self, e: Ereignis) -> list[float]:
         zeit, _ = _zeitmerkmale(e.zeit)

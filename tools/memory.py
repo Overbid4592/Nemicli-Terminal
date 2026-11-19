@@ -9,7 +9,7 @@ Zwei Stufen: eine Notiz bleibt kurz; mehr dazu (Erläuterung, Links, Quelle) lie
 Pipeline nach der Runde (siehe indexdb.after_turn):
   Chat → json/md + memory.json → Embedding → learned/memory.db.
 
-Der „Bibliothekar" ist das Embedding-Modell aus Models/embeddings (tools/embedder.py, GGUF oder
+Der „Bibliothekar" ist das Embedding-Modell aus KI-Modelle/KI-Gedaechtnis/Suchmodell (tools/embedder.py, GGUF oder
 safetensors), geladen nur von der Platte. Gerät laut `embedding_geraet` (geraet_gewuenscht).
 Er bleibt nach der Runde geladen und wird erst nach IDLE_UNLOAD_S Ruhe entladen.
 """
@@ -86,12 +86,103 @@ _gelesen_lock = threading.Lock()
 _schreib_lock = threading.RLock()
 
 
-def _schreibend(f):
-    @functools.wraps(f)
-    def huelle(*a, **k):
-        with _schreib_lock:
-            return f(*a, **k)
-    return huelle
+class NichtGespeichert(OSError):
+    """_save konnte die Datei nicht schreiben – der Aufrufer darf keinen Erfolg melden."""
+
+
+SPERRE_WARTEN_S = 10.0   # so lange wartet ein Schreiber auf einen anderen Prozess, dann gilt: nicht gespeichert
+_sperre_tiefe = 0        # Verschachtelung der Prozess-Sperre im Faden, der _schreib_lock hält
+
+
+def _sperr_pfad() -> Path:
+    """Eine Sperr-Datei je Notizbuch, im Temp-Ordner (nicht bei den Daten)."""
+    import hashlib
+    import tempfile
+    ort = os.path.normcase(os.path.abspath(str(_FILE)))
+    kurz = hashlib.sha1(ort.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / "NemiCLI" / f"notizen_{kurz}.sperre"
+
+
+def _sperre_nehmen(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _sperre_lassen(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextmanager
+def _datei_sperre():
+    """Lesen-Ändern-Schreiben der Notizen: im Prozess über _schreib_lock, prozessübergreifend (Terminal, Wache,
+    Bibliothekar) über eine Sperr-Datei. Was darunter gelesen wird, ist der neueste Stand – Änderungen eines
+    anderen Prozesses gehen nicht verloren. Verschachtelt zählt nur die äußere Sperre. Bleibt die Sperre
+    SPERRE_WARTEN_S belegt: NichtGespeichert. Ohne Sperr-Datei (Temp nicht beschreibbar) nur die Faden-Sperre."""
+    global _sperre_tiefe
+    with _schreib_lock:
+        if _sperre_tiefe:
+            _sperre_tiefe += 1
+            try:
+                yield
+            finally:
+                _sperre_tiefe -= 1
+            return
+        try:
+            pfad = _sperr_pfad()
+            pfad.parent.mkdir(parents=True, exist_ok=True)
+            fd = os.open(str(pfad), os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            fd = None
+        if fd is not None:
+            ende = time.monotonic() + SPERRE_WARTEN_S
+            while not _sperre_nehmen(fd):
+                if time.monotonic() >= ende:
+                    os.close(fd)
+                    raise NichtGespeichert("Notizen gerade von einem anderen Prozess gesperrt")
+                time.sleep(0.02)
+        _sperre_tiefe = 1
+        try:
+            yield
+        finally:
+            _sperre_tiefe = 0
+            if fd is not None:
+                _sperre_lassen(fd)
+                os.close(fd)
+
+
+def _schreibend(f=None, *, bei_fehler=None):
+    """Unter der Schreibsperre (_datei_sperre) ausführen. Scheitert das Speichern, liefert die Funktion
+    `bei_fehler` (ihren üblichen Misserfolg) und `letzter_grund` nennt den Grund."""
+    def deko(f):
+        @functools.wraps(f)
+        def huelle(*a, **k):
+            global letzter_grund
+            try:
+                with _datei_sperre():
+                    return f(*a, **k)
+            except NichtGespeichert as exc:
+                letzter_grund = f"nicht gespeichert ({exc})"
+                return bei_fehler
+        return huelle
+    return deko(f) if f is not None else deko
 
 
 def _stand(pfad: Path) -> tuple[int, int] | None:
@@ -123,7 +214,7 @@ def _lesen(pfad: Path) -> dict | None:
     if treffer is not None and treffer[0] == stand:
         return _kopie(treffer[1])
     try:
-        data = json.loads(pfad.read_text(encoding="utf-8"))
+        data = json.loads(pfad.read_text(encoding="utf-8-sig"))      # von Hand mit BOM gespeichert
     except Exception:
         return None
     if isinstance(data, dict) and isinstance(data.get("entries"), list):
@@ -167,21 +258,23 @@ def _als_text(data: dict) -> str:
 
 
 def _save(data: dict, datei: Path | None = None) -> None:
-    """Sicher schreiben: erst eine Zwischendatei, dann tauschen. Die bisherige Fassung bleibt als
-    .bak, wenn sie lesbar ist – eine beschädigte überschreibt nie die letzte gute Sicherung."""
+    """Sicher schreiben (atomar.text_schreiben: Zwischendatei mit fsync, dann tauschen), unter der Prozess-Sperre.
+    Die bisherige Fassung bleibt als .bak, wenn sie lesbar ist – eine beschädigte überschreibt nie die letzte
+    gute Sicherung."""
     ziel = datei or _FILE
-    try:
-        ziel.parent.mkdir(parents=True, exist_ok=True)
-        tmp = ziel.with_name(ziel.name + ".tmp")
-        tmp.write_text(_als_text(data), encoding="utf-8")
-        if _lesen(ziel) is not None:
-            shutil.copyfile(ziel, ziel.with_name(ziel.name + ".bak"))    # kopieren: ziel bleibt bis zum Tausch da
-        os.replace(tmp, ziel)
-        if (stand := _stand(ziel)) is not None:                          # der neue Stand ist schon bekannt
-            with _gelesen_lock:
-                _gelesen[ziel] = (stand, _kopie(data))
-    except Exception as exc:
-        _DBG.fehler(f"Gedächtnis {ziel.name} nicht gespeichert: {exc}")
+    with _datei_sperre():
+        try:
+            from atomar import text_schreiben
+            ziel.parent.mkdir(parents=True, exist_ok=True)
+            if _lesen(ziel) is not None:
+                shutil.copyfile(ziel, ziel.with_name(ziel.name + ".bak"))
+            text_schreiben(ziel, _als_text(data))
+            if (stand := _stand(ziel)) is not None:                      # der neue Stand ist schon bekannt
+                with _gelesen_lock:
+                    _gelesen[ziel] = (stand, _kopie(data))
+        except Exception as exc:
+            _DBG.fehler(f"Gedächtnis {ziel.name} nicht gespeichert: {exc}")
+            raise NichtGespeichert(f"{ziel.name}: {exc}") from exc
 
 
 def _profil_datei() -> Path | None:
@@ -228,11 +321,17 @@ def _cos(a: list[float], b: list[float]) -> float:
 # Embedding-Modell – austauschbar, lazy geladen
 # ---------------------------------------------------------------------------
 
-# Jedes Modell liegt als eigener Ordner im PROGRAMM-Ordner (neben NemiCLI.exe bzw.
-# main.py) unter Models/embeddings/<Name>. NemiCLI lädt nie etwas aus dem Netz nach.
-# Welches gilt, sagt die Config `embedding_modell` (Ordnername); ohne Eintrag das
-# erste vollständige. Fehlt jedes, bleibt die Suche bei Stichworten.
-EMBED_ORDNER = _INSTALL / "Models" / "embeddings"
+# Jedes Modell liegt als eigener Ordner unter KI-Modelle/KI-Gedaechtnis/Suchmodell/<Name>
+# (früher Models/embeddings/<Name> im Programm-Ordner; dort wird weiter gelesen).
+# NemiCLI lädt nie etwas aus dem Netz nach. Welches gilt, sagt die Config
+# `embedding_modell` (Ordnername); ohne Eintrag das erste vollständige. Fehlt jedes,
+# bleibt die Suche bei Stichworten.
+try:
+    import modellorte as _MO
+    EMBED_ORDNER = _MO.ordner("suche")
+    ALTE_EMBED_ORDNER = _MO.alte("suche")
+except Exception:                                    # Selbsttest ohne Bootstrap
+    EMBED_ORDNER, ALTE_EMBED_ORDNER = _INSTALL / "Models" / "embeddings", []
 # Pflicht: Konfiguration, Gewichte nur als safetensors (kein pickle), ein Tokenizer –
 # oder genau eine .gguf-Datei (läuft über den eigenen GGUF-Motor, gepackt auf der GPU).
 _PFLICHT = ("config.json", "model.safetensors")
@@ -346,8 +445,9 @@ def gpu_budget_mb() -> int | None:
 
 
 def _vram_deckeln() -> None:
-    """Im Bibliothekar-Prozess den PyTorch-Speicher auf das Budget begrenzen (der Prozess endet nach dem Lauf)."""
-    if not _im_bibliothekar():
+    """In einem Einlese-Prozess (Bibliothekar, NUR_GPU) den PyTorch-Speicher auf das Budget begrenzen
+    (der Prozess endet nach dem Lauf)."""
+    if not (_im_bibliothekar() or NUR_GPU):
         return
     budget = gpu_budget_mb()
     if not budget:
@@ -485,8 +585,8 @@ def encoder_status() -> str:
         return _fehlt_text()
     if not _ist_gguf(ordner) and not _transformers_da():
         return (f"{ordner.name} ist ein safetensors-Modell und braucht transformers, das NemiCLI nicht "
-                "mehr mitbringt. Lege die GGUF-Fassung (z. B. Qwen3-Embedding-0.6B-Q8_0.gguf) in einen "
-                "eigenen Ordner unter Models/embeddings und wähle sie mit /embeddings.")
+                "mehr mitbringt. Lege eine GGUF-Fassung (z. B. embeddinggemma-2-Q8_0.gguf) in einen "
+                "eigenen Ordner unter KI-Modelle/KI-Gedaechtnis/Suchmodell und wähle sie mit /embeddings.")
     return f"{ordner.name} bereit ({ordner}), lädt bei Bedarf"
 
 
@@ -503,9 +603,9 @@ def _fehlt_text() -> str:
     if gewuenscht:
         return (f"Modell „{gewuenscht}“ (Config embedding_modell) fehlt oder ist unvollständig in "
                 f"{EMBED_ORDNER} – nötig: {', '.join(_PFLICHT)} und ein Tokenizer, oder genau eine .gguf")
-    return (f"Kein Embedding-Modell – einen Ordner je Modell in {EMBED_ORDNER} anlegen "
-            f"(z. B. …\\Qwen3Embedding) mit {', '.join(_PFLICHT)} und Tokenizer (tokenizer.json o. ä.) "
-            f"oder mit genau einer .gguf")
+    return (f"Kein Embedding-Modell – /einrichten modelle lädt EmbeddingGemma 2, oder einen Ordner je Modell in "
+            f"{EMBED_ORDNER} anlegen (z. B. …\\EmbeddingGemma2Q8_0) mit genau einer .gguf – oder mit "
+            f"{', '.join(_PFLICHT)} und Tokenizer (tokenizer.json o. ä.)")
 
 
 def modell_name() -> str:
@@ -520,6 +620,8 @@ def modell_kennung() -> str:
     o = modell_ordner()
     if o is None:
         return ""
+    if encoder_loaded() and getattr(_encoder, "kennung", None):
+        return _encoder.kennung               # die Kennung der Rechenweise, mit der gerade gerechnet wird
     try:
         import embedder
         return embedder.kennung(o)
@@ -549,16 +651,29 @@ def _gewuenscht() -> str:
         return ""
 
 
+def _unterordner() -> list[Path]:
+    """Modellordner des neuen und der früheren Orte; bei gleichem Namen gilt der erste Ort."""
+    raus: dict[str, Path] = {}
+    for w in dict.fromkeys([EMBED_ORDNER, *ALTE_EMBED_ORDNER]):
+        try:
+            for d in sorted(w.iterdir()) if w.is_dir() else []:
+                if d.is_dir():
+                    raus.setdefault(d.name, d)
+        except OSError:
+            pass
+    return list(raus.values())
+
+
 def modelle() -> list[Path]:
-    """Alle vollständigen Modell-Ordner unter Models/embeddings (für /einrichten)."""
+    """Alle vollständigen Modell-Ordner (für /einrichten)."""
     try:
-        return [d for d in sorted(EMBED_ORDNER.iterdir()) if d.is_dir() and _vollstaendig(d)]
+        return [d for d in _unterordner() if _vollstaendig(d)]
     except OSError:
         return []
 
 
 def modell_ordner() -> Path | None:
-    """Der aktive Modell-Ordner unter Models/embeddings – oder None.
+    """Der aktive Suchmodell-Ordner – oder None.
 
     Ist `embedding_modell` gesetzt, gilt nur dieser Ordner. Sonst der erste
     vollständige Unterordner – GGUF vor safetensors (das braucht transformers, das
@@ -566,14 +681,13 @@ def modell_ordner() -> Path | None:
     Installationen (models--…/snapshots/<id>)."""
     gewuenscht = _gewuenscht()
     if gewuenscht:
-        o = EMBED_ORDNER / gewuenscht
+        o = next((d for d in _unterordner() if d.name == gewuenscht), EMBED_ORDNER / gewuenscht)
         return o if o.is_dir() and _vollstaendig(o) else None
     vorhanden = sorted(modelle(), key=lambda d: not _ist_gguf(d))
     if vorhanden:
         return vorhanden[0]
     try:
-        kandidaten = sorted(EMBED_ORDNER.iterdir()) if EMBED_ORDNER.is_dir() else []
-        for d in kandidaten:
+        for d in _unterordner():
             snaps = d / "snapshots"
             if d.name.startswith("models--") and snaps.is_dir():
                 for s in sorted(snaps.iterdir(), key=lambda x: -x.stat().st_mtime):
@@ -594,8 +708,23 @@ def _get_encoder():
                 return None
             _encoder = None                     # Modell inzwischen hingelegt? Neu versuchen.
         if _encoder is not None:
-            _last_use = time.time()
-            return _encoder
+            o = modell_ordner()
+            try:
+                import embedder
+                passt = o is not None and getattr(_encoder, "kennung", None) in (None, embedder.kennung(o))
+            except Exception:
+                passt = True
+            if passt:
+                _last_use = time.time()
+                return _encoder
+            # Rechenweise geändert (z. B. Config embedding_dim): neu laden, damit Vektor und Kennung zusammenpassen
+            alt, _encoder = _encoder, None
+            try:
+                if hasattr(alt, "to"):
+                    alt.to("cpu")
+            except Exception:
+                pass
+            del alt
         ordner = modell_ordner()
         if ordner is None:
             _encoder, _fehlschlag_zeit = False, time.time()
@@ -821,9 +950,9 @@ def _fragen_vektoren(enc, texte: list[str], aufgabe: str) -> list[list[float]] |
 
 
 def _embed_texts(texts: list[str], *, query: bool = False,
-                 aufgabe: str = "gedaechtnis") -> list[list[float]] | None:
+                 aufgabe: str = "gedaechtnis", titel: list[str] | None = None) -> list[list[float]] | None:
     """Vektoren vom aktiven Modell. query=True: Suchfragen mit dem Such-Vorsatz der `aufgabe`
-    (embedder.AUFGABEN), gemerkt im Fragen-Speicher.
+    (embedder.AUFGABEN), gemerkt im Fragen-Speicher. `titel`: je Text ein Titel für den Dokument-Vorsatz.
 
     ACHTUNG: lädt den Encoder nach, wenn er nicht im RAM ist (~6 s). Aus dem
     Chat-Pfad nur aufrufen, wenn encoder_loaded() True ist."""
@@ -837,10 +966,38 @@ def _embed_texts(texts: list[str], *, query: bool = False,
     if query:
         return _fragen_vektoren(enc, list(texts), aufgabe)
     try:
-        vecs = enc.encode(list(texts), normalize_embeddings=True)
+        vecs = enc.encode(list(texts), normalize_embeddings=True, **({"titel": list(titel)} if titel else {}))
     except Exception:
         return None
     return [v.tolist() for v in vecs]
+
+
+def kann_hoeren() -> bool:
+    """Kann das gewählte Embedding-Modell Ton einbetten (EmbeddingGemma 2 + mmproj mit Audio-Encoder)? Lädt nichts."""
+    if not kann_bilder():
+        return False
+    try:
+        import embedder
+        from ggufengine.tonlader import hat_ton
+        return hat_ton(str(embedder.mmproj_datei(modell_ordner())))
+    except Exception:
+        return False
+
+
+def medien_einbetten(eintraege: list) -> list | None:
+    """Vektoren für gemischte Einträge (embedder.GGUFEmbedder.medien; None je unlesbarem Eintrag); None, wenn das
+    Modell keine Medien kann. Lädt den Encoder nach wie _embed_texts – nur im Bibliothekar aufrufen."""
+    if not eintraege or not kann_bilder():
+        return None
+    if gpu_pause() and not encoder_loaded():
+        return None
+    enc = _get_encoder()
+    if enc is None or not hasattr(enc, "medien") or not enc.kann_sehen():
+        return None
+    try:
+        return [None if v is None else v.tolist() for v in enc.medien(list(eintraege))]
+    except Exception:
+        return None
 
 
 def kann_bilder() -> bool:
@@ -858,17 +1015,9 @@ def kann_bilder() -> bool:
 def bilder_einbetten(pfade: list) -> list | None:
     """Bild-Vektoren vom aktiven Modell (None je unlesbarem Bild); None, wenn es keine Bilder kann.
     Lädt den Encoder nach wie _embed_texts – nur im Bibliothekar aufrufen."""
-    if not pfade or not kann_bilder():
+    if not pfade:
         return None
-    if gpu_pause() and not encoder_loaded():
-        return None
-    enc = _get_encoder()
-    if enc is None or not hasattr(enc, "bilder") or not enc.kann_sehen():
-        return None
-    try:
-        return [None if v is None else v.tolist() for v in enc.bilder(list(pfade))]
-    except Exception:
-        return None
+    return medien_einbetten([[("bild", str(p))] for p in pfade])
 
 
 def frage_einbetten(text: str, aufgabe: str = "gedaechtnis") -> list[list[float]] | None:
@@ -1080,7 +1229,12 @@ def remember(text: str, kind: str = "fakt", detail: str | None = None) -> dict |
         daten["entries"].append(entry)
         _save(daten, eigen)
     zaehler["next_id"] = entry["id"] + 1
-    _save(zaehler, _FILE)
+    try:
+        _save(zaehler, _FILE)
+    except NichtGespeichert:
+        if eigen is None:                              # die Notiz selbst steht in _FILE
+            raise
+        # nur der Zähler fehlt: die nächste Nummer ergibt sich auch aus den vorhandenen Notizen
     return entry
 
 
@@ -1145,7 +1299,7 @@ def ersetzen(entry_id: int, text: str, kind: str | None = None, detail: str | No
     return e
 
 
-@_schreibend
+@_schreibend(bei_fehler=False)
 def vergessen(entry_id: int, grund: str = "vergessen") -> bool:
     """Eintrag entfernen, aber im Archiv aufheben (nachvollziehbar, nicht mehr im Prompt)."""
     datei = _datei_von(entry_id)
@@ -1239,7 +1393,7 @@ def zurueckholen(entry_id: int) -> dict | None:
     return None
 
 
-@_schreibend
+@_schreibend(bei_fehler=0)
 def als_geprueft(ids) -> int:
     """Notizen als geprüft markieren (Gedächtnis-Pflege): sie kommen erst nach einer Weile wieder dran."""
     ids, heute, n = set(ids), datetime.now().strftime("%Y-%m-%d %H:%M"), 0
@@ -1284,7 +1438,7 @@ def kern_block() -> str:
             + "\n".join(teile) + "\n" + fuss + "\n")
 
 
-@_schreibend
+@_schreibend(bei_fehler=False)
 def forget(entry_id: int) -> bool:
     datei = _datei_von(entry_id)
     if datei is None:
@@ -1304,7 +1458,7 @@ def forget(entry_id: int) -> bool:
     return False
 
 
-@_schreibend
+@_schreibend(bei_fehler=0)
 def clear() -> int:
     ids, namen = [], set()
     for datei in _dateien():
@@ -1356,6 +1510,19 @@ def _aehnlich(a, b) -> float:
     return _cos(a, b)
 
 
+def _text_dublette(a: str, b: str) -> bool:
+    """Ohne Vektoren: gleich, oder die kürzere (mind. 3 Wörter) steht als ganze Wortfolge in der längeren
+    und macht mindestens die Hälfte davon aus. Ein bloßer Teilstring („Tee“ in „Kein Tee mehr“) reicht nicht."""
+    wa, wb = re.findall(r"\w+", a.lower()), re.findall(r"\w+", b.lower())
+    if wa == wb:
+        return bool(wa) or a.strip().lower() == b.strip().lower()
+    kurz, lang = sorted((wa, wb), key=len)
+    if len(kurz) < 3 or len(kurz) * 2 < len(lang):
+        return False
+    n = len(kurz)
+    return any(lang[i:i + n] == kurz for i in range(len(lang) - n + 1))
+
+
 @_schreibend
 def _verdichten(datei: Path, threshold: float, vektoren: dict | None = None) -> dict:
     """`vektoren`: Notiz-Nr → Vektor (indexdb.notiz_vektoren)."""
@@ -1372,11 +1539,12 @@ def _verdichten(datei: Path, threshold: float, vektoren: dict | None = None) -> 
     for e in sorted(entries, key=lambda x: x.get("id", 0), reverse=True):
         twin = None
         for k in keep:
+            if (e.get("kind") or "fakt") != (k.get("kind") or "fakt"):     # Vorliebe ≠ Lehre, auch bei gleichem Text
+                continue
             if e["id"] in vec and k["id"] in vec:
                 sim = _aehnlich(vec[e["id"]], vec[k["id"]])
             else:
-                a, b = e["text"].lower().strip(), k["text"].lower().strip()
-                sim = 1.0 if (a == b or a in b or b in a) else 0.0
+                sim = 1.0 if _text_dublette(e["text"], k["text"]) else 0.0
             if sim >= threshold:
                 twin = k
                 break
@@ -1398,5 +1566,8 @@ def _verdichten(datei: Path, threshold: float, vektoren: dict | None = None) -> 
 
     keep.sort(key=lambda x: x.get("id", 0))
     data["entries"] = keep
-    _save(data, datei)
+    try:
+        _save(data, datei)
+    except NichtGespeichert:
+        return {"before": before, "after": before, "merged": 0}
     return {"before": before, "after": len(keep), "merged": merged}

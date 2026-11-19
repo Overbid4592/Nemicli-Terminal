@@ -24,6 +24,7 @@ from __future__ import annotations
 import math
 import os
 import time
+from collections import OrderedDict, deque
 from datetime import datetime
 
 from .ereignisse import DATEI, NETZ, PROZESS, Ereignis
@@ -101,22 +102,30 @@ def seltenheit(n: int) -> float:
 
 
 class Burst:
-    """Ereignisse je Schlüssel in einem gleitenden 60-s-Fenster (wird beim Aufnehmen gestempelt)."""
+    """Ereignisse je Schlüssel in einem gleitenden 60-s-Fenster (wird beim Aufnehmen gestempelt).
+    Höchstens MAX_SCHLUESSEL Fenster; darüber fallen die am längsten nicht mehr gesehenen weg – nie alle, sonst
+    begänne ein laufender Schwall bei jedem neuen Schlüssel wieder bei null."""
+
+    MAX_SCHLUESSEL = 500
 
     def __init__(self, fenster: float = 60.0, saettigung: float = 30.0):
         self.fenster, self.saettigung = fenster, saettigung
-        self._k: dict[str, list[float]] = {}
+        self._k: OrderedDict[str, deque] = OrderedDict()
 
     def beobachten(self, key: str, ts: float) -> float:
         if not key:
             return 0.0
-        w = self._k.setdefault(key, [])
+        w = self._k.get(key)
+        if w is None:
+            w = self._k[key] = deque()
+        else:
+            self._k.move_to_end(key)
         w.append(ts)
         grenze = ts - self.fenster
         while w and w[0] < grenze:
-            w.pop(0)
-        if len(self._k) > 500:
-            self._k.clear()
+            w.popleft()
+        while len(self._k) > self.MAX_SCHLUESSEL:
+            self._k.popitem(last=False)
         return min(len(w) / self.saettigung, 1.0)
 
 

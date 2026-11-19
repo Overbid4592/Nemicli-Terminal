@@ -16,12 +16,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import re
 import sqlite3
 import threading
 import time
 from array import array
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 
@@ -77,6 +79,9 @@ def unterbrechen() -> None:
 
 def _unterbrochen() -> bool:
     """Soll der laufende Lauf aufhören?"""
+    stopp = getattr(_lauf, "stopp", None)          # entpackt_einlesen: Abbruch aus dem Fenster
+    if stopp is not None and stopp.is_set():
+        return True
     if _lauf_marke is None:
         return False
     return _lauf_marke != _unterbrechung or (SIGNAL_DATEI is not None and SIGNAL_DATEI.exists())
@@ -163,6 +168,8 @@ def _nachruesten(con: sqlite3.Connection) -> None:
         con.commit()
     # Abgleich des Such-Index (_zustand_lesen) ohne die Vektoren: datum und vec_modell liegen hinter dem
     # großen vec-Text, ohne diesen Index liest SQLite dafür jede Zeile ganz.
+    if "herkunft" not in spalten:
+        _herkunft_nachruesten(con)
     con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_stand ON chunks(hash, vec_modell, datum)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_chunks_ref_stand ON chunks(ref, vec_modell)")
     # wissen_namen liest nur diesen Index statt der Tabelle mit allen Texten
@@ -184,6 +191,96 @@ def _nachruesten(con: sqlite3.Connection) -> None:
         _datum_nachtragen(con)
     if neu_datum or not fts_da:
         con.commit()
+    # Wissen/: Stand je Datei und die Satz-Fingerabdrücke fürs Entdoppeln (ingest_wissen liest nur Geändertes)
+    con.execute("CREATE TABLE IF NOT EXISTS wissen_stand (pfad TEXT PRIMARY KEY, mtime INTEGER, groesse INTEGER, "
+                "sha TEXT)")
+    con.execute("CREATE TABLE IF NOT EXISTS wissen_satz (pfad TEXT NOT NULL, satz TEXT NOT NULL)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_wissen_satz ON wissen_satz(pfad)")
+    con.commit()
+
+
+def _herkunft_nachruesten(con: sqlite3.Connection) -> None:
+    """Spalte `herkunft` anbauen – nur die Spalte (sofort, auch bei großen Datenbanken). Vorhandene Brocken
+    bleiben leer: beim Lesen gilt `herkunft_ableiten`, nachgetragen wird im Bibliothekar (herkunft_nachtragen).
+    Ein UPDATE schriebe jede Zeile samt Text und Vektor neu – das hielte den Start minutenlang an."""
+    con.commit()
+    con.execute("BEGIN IMMEDIATE")
+    try:
+        if "herkunft" not in {r[1] for r in con.execute("PRAGMA table_info(chunks)")}:
+            con.execute("ALTER TABLE chunks ADD COLUMN herkunft TEXT DEFAULT ''")
+        con.commit()
+    except BaseException:
+        con.rollback()
+        raise
+
+
+HERKUNFT_NACHTRAGEN_JE_LAUF = 400          # so viele Quellen (refs) trägt ein Bibliothekar-Lauf höchstens nach
+HERKUNFT_NACHTRAGEN_JE_SCHUB = 40          # je Schreib-Transaktion: andere Prozesse warten nie lange
+
+
+def herkunft_ableiten(kind: str, ref: str, text: str) -> str:
+    """Herkunft eines einzelnen Brockens ohne gespeicherten Wert (ältere Einträge). Ein Folge-Brocken eines
+    Chats („[Nutzer] …“) kann ohne den Brocken davor auch ein Werkzeug-Ergebnis sein: gilt als Werkzeug,
+    nie als Nutzer – er kommt so erst nach dem Nachtragen in den Vorgeschmack."""
+    kind = kind or "chat"
+    if kind in MEDIEN_ARTEN:
+        return _medien_herkunft(ref)
+    if kind != "chat":
+        return _ART_HERKUNFT.get(kind, "datei")
+    text = text or ""
+    h = _herkunft_reihe("chat", [text])[0]
+    if h == "nutzer" and _FOLGE.match(text):
+        return "werkzeug"
+    return h
+
+
+def herkunft_nachtragen(max_refs: int = HERKUNFT_NACHTRAGEN_JE_LAUF) -> int:
+    """Leere Herkunft vorhandener Brocken nachtragen (Bibliothekar, in kleinen Schüben). Je Quelle in
+    Dokument-Reihenfolge, damit Folge-Brocken die Herkunft ihrer Nachricht erben. Gibt die Zahl der Quellen zurück."""
+    try:
+        con = _connect()
+    except sqlite3.Error:
+        return 0
+    try:
+        refs = [r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE herkunft='' OR herkunft IS NULL "
+                                          "LIMIT ?", (max(1, int(max_refs)),))]
+        try:
+            import fremddaten
+            marken = list(fremddaten.FREMD_MARKEN)
+        except Exception:
+            marken = []
+        fremd_sql = " OR ".join("instr(text, ?) > 0" for _m in marken) or "0"
+        fertig = 0
+        for i in range(0, len(refs), HERKUNFT_NACHTRAGEN_JE_SCHUB):
+            if _unterbrochen():
+                break
+            schub = refs[i:i + HERKUNFT_NACHTRAGEN_JE_SCHUB]
+            updates: list[tuple[str, int]] = []
+            for ref in schub:
+                zeilen = con.execute(f"SELECT rowid, kind, substr(text, 1, 200), ({fremd_sql}) FROM chunks "
+                                     "WHERE ref=? ORDER BY rowid", [*marken, ref]).fetchall()
+                if not zeilen:
+                    continue
+                kind = zeilen[0][1] or "chat"
+                if kind in MEDIEN_ARTEN:
+                    werte = [_medien_herkunft(ref)] * len(zeilen)
+                else:
+                    werte = _herkunft_reihe(kind, [z[2] for z in zeilen], [bool(z[3]) for z in zeilen])
+                updates += [(h, z[0]) for h, z in zip(werte, zeilen)]
+            con.execute("BEGIN IMMEDIATE")
+            try:
+                con.executemany("UPDATE chunks SET herkunft=? WHERE rowid=? AND (herkunft='' OR herkunft IS NULL)",
+                                updates)
+                con.commit()
+            except BaseException:
+                con.rollback()
+                raise
+            fertig += len(schub)
+        return fertig
+    except sqlite3.Error:
+        return 0
+    finally:
+        con.close()
 
 
 def vec_packen(v) -> bytes:
@@ -276,8 +373,76 @@ def _hash(kind: str, ref: str, text: str) -> str:
 
 
 _SATZENDE = re.compile(r"(?<=[.!?…])\s+")
-_SPRECHER = re.compile(r"^(Nutzer|Nemi):\s")
+_SPRECHER = re.compile(r"^(Nutzer|KI|Nemi|Werkzeug|Netz):\s")   # „Nemi“: ältere Einträge
 _UEBERSCHRIFT = re.compile(r"^#{1,6}\s+(.+)")
+
+# Herkunft eines Brockens (Spalte `herkunft`). Nur HERKUNFT_PROMPT darf ungefragt in den Systemprompt (guide_block);
+# alles andere findet die gezielte Suche. HERKUNFT_FREMD gilt beim Lesen als Inhalt von außen (Netz-Sperre).
+# Wissen/ legt der Nutzer selbst an – es bleibt im Vorgeschmack, gerahmt als Daten wie jeder Treffer dort.
+HERKUNFT_PROMPT = ("nutzer", "ki", "note", "skill", "wissen")
+HERKUNFT_FREMD = ("netz", "export")
+_ART_HERKUNFT = {"note": "note", "skill": "skill", "code": "skill", "bericht": "netz", "wissen": "wissen",
+                 "export": "export", "chatmd": "datei"}
+ERGEBNIS_VORSATZ = "Ergebnis von '"           # Werkzeug-Ergebnisse stehen im Verlauf als Nachricht der Rolle user
+_START = re.compile(r"^(Nutzer|KI|Nemi|Werkzeug|Netz): ")
+_FOLGE = re.compile(r"^\[(Nutzer|KI|Nemi|Werkzeug|Netz)(?: › [^\]\n]*)?\] ")
+
+
+def _fremd_markiert(text: str) -> bool:
+    try:
+        import fremddaten
+        return fremddaten.im_text(text)
+    except Exception:
+        return False
+
+
+def _herkunft_reihe(kind: str, texte: list[str], fremd: list[bool] | None = None) -> list[str]:
+    """Herkunft je Brocken einer Quelle, Brocken in Dokument-Reihenfolge. Bei Chats entscheidet der Vorsatz
+    (ingest_chat); Folge-Brocken („[Nutzer] …“) erben die Herkunft ihrer Nachricht. Ältere Einträge mit
+    „Nutzer: Ergebnis von '…“ gelten als Werkzeug-Ergebnis. Unklares nie als Nutzer oder KI.
+    `fremd`: je Brocken, ob er Netz-Marken trägt (sonst aus dem Text)."""
+    if fremd is None:
+        fremd = [_fremd_markiert(t) for t in texte]
+    if kind != "chat":
+        return [_ART_HERKUNFT.get(kind, "datei")] * len(texte)
+    raus: list[str] = []
+    stand = ""
+    for text, markiert in zip(texte, fremd):
+        if text.startswith("Chat #"):
+            h = "nutzer"                                     # Titelzeile aus der ersten Eingabe
+        elif (m := _START.match(text)):
+            wer, rest = m.group(1), text[m.end():]
+            if wer == "Netz":
+                h = "netz"
+            elif wer == "Werkzeug" or (wer == "Nutzer" and rest.startswith(ERGEBNIS_VORSATZ)):
+                h = "werkzeug"
+            elif wer == "Nutzer":
+                h = "nutzer"
+            else:
+                h = "ki"
+            if markiert and h in ("nutzer", "werkzeug"):
+                h = "netz"
+            stand = h
+        elif (m := _FOLGE.match(text)):
+            wer = m.group(1)
+            if wer in ("KI", "Nemi"):
+                h = "ki"
+            elif wer == "Netz":
+                h = "netz"
+            elif wer == "Werkzeug":
+                h = stand if stand in ("werkzeug", "netz") else "werkzeug"
+            else:
+                h = stand if stand in ("nutzer", "werkzeug", "netz") else "werkzeug"
+            if markiert and h in ("nutzer", "werkzeug"):
+                h = "netz"
+        else:
+            h = "netz" if markiert else "werkzeug"
+        raus.append(h)
+    return raus
+
+
+def _medien_herkunft(ref: str) -> str:
+    return "netz" if f":{ENTPACKT}/" in str(ref) else "datei"
 
 
 def _bloecke(text: str) -> list[tuple[str, str]]:
@@ -413,10 +578,27 @@ def _gpu_vorrat_leeren() -> None:
         pass
 
 
-def _einbetten(texte: list[str]) -> list[list[float]] | None:
+#: Arten mit einem natürlichen Titel (Dateiname) – das Embedding-Modell bekommt ihn im Dokument-Vorsatz
+_TITEL_ARTEN = ("skill", "code", "bericht", "wissen")
+
+
+def _titel(kind: str, ref: str) -> str:
+    """Titel eines Brockens für den Dokument-Vorsatz: Dateiname ohne Endung, sonst leer („none“)."""
+    if kind not in _TITEL_ARTEN:
+        return ""
+    name = str(ref).split(":", 1)[-1].replace("\\", "/").rsplit("/", 1)[-1]
+    return Path(name).stem.replace("_", " ").strip()
+
+
+def _mit_titel(texte: list[str], titel: list[str]) -> tuple:
+    """Aufruf-Felder für _einbetten: die Titel nur, wenn es mindestens einen gibt."""
+    return (texte, titel) if any(titel) else (texte,)
+
+
+def _einbetten(texte: list[str], titel: list[str] | None = None) -> list[list[float]] | None:
     """Portionsweise einbetten und dabei Fortschritt melden. None, wenn der Encoder fehlt oder der Lauf
     nur sammelt (`_lauf.nur_text`). Bei Speichermangel halbiert er den Stapel; was gar nicht passt, bleibt im
-    Einlese-Speicher."""
+    Einlese-Speicher. `titel`: je Text ein Titel (oder leer)."""
     if getattr(_lauf, "nur_text", False):
         return None
     try:
@@ -440,9 +622,10 @@ def _einbetten(texte: list[str]) -> list[list[float]] | None:
             if _unterbrochen():
                 return out or None                # Rest landet ohne Vektor, nachvektorisieren holt ihn
             teil = texte[i:i + stapel]
+            teil_titel = list(titel[i:i + stapel]) if titel and any(titel[i:i + stapel]) else None
             _melden(f"{_kontext} · Brocken {i}/{n}{wo}" if _kontext else f"Brocken {i}/{n}{wo}")
             try:
-                vecs = memory._embed_texts(teil)
+                vecs = memory._embed_texts(teil, **({"titel": teil_titel} if teil_titel else {}))
             except Exception:
                 vecs = None
             if not vecs:
@@ -475,17 +658,27 @@ def _chat_ref(chat_id: int) -> str:
         return f"chat:{chat_id}"
 
 
+EXPORT = "export"                  # Chats aus entpackten Export-Archiven: export:<Profil>:<Archiv>/<Chat>
+
+
+def _profil_arten() -> tuple[str, ...]:
+    """Arten, deren Refs <art>:<Profil>:… je Persönlichkeit getrennt sind."""
+    return ("chat", "chatmd") + MEDIEN_ARTEN + (EXPORT,)
+
+
 def _profil_bedingung() -> tuple[str, list]:
-    """SQL: Chats und Bilder anderer Persönlichkeiten ausblenden (chat:<Profil>:<Nr>, chatmd:<Profil>:…,
-    bild:<Profil>:…)."""
+    """SQL: Chats, Medien und Export-Chats anderer Persönlichkeiten ausblenden (chat:<Profil>:<Nr>,
+    chatmd:<Profil>:…, bild:/video:/ton:<Profil>:…, export:<Profil>:…)."""
+    arten = _profil_arten()
     try:
         import profilordner
         eigen = profilordner.aktiv()
     except Exception:
-        return "", []
-    return ("(c.ref NOT GLOB 'chat:*:*' OR c.ref GLOB ?) AND (c.ref NOT GLOB 'chatmd:*:*' OR c.ref GLOB ?) "
-            "AND (c.ref NOT GLOB 'bild:*:*' OR c.ref GLOB ?)",
-            [f"chat:{eigen}:*", f"chatmd:{eigen}:*", f"bild:{eigen}:*"])
+        eigen = None
+    if not eigen:                                 # Persönlichkeit unbekannt: nichts Persönliches zeigen
+        return " AND ".join(f"c.ref NOT GLOB '{a}:*:*'" for a in arten), []
+    return (" AND ".join(f"(c.ref NOT GLOB '{a}:*:*' OR c.ref GLOB ?)" for a in arten),
+            [f"{a}:{eigen}:*" for a in arten])
 
 
 def _aktives_profil() -> str | None:
@@ -500,10 +693,99 @@ def _fremdes_profil(ref: str, aktiv: str | None = None) -> bool:
     """Chat oder Bild einer anderen Persönlichkeit? `aktiv` vorher einmal holen, wenn viele Refs geprüft werden –
     profilordner.aktiv() liest Einstellungen und Persönlichkeiten von der Platte."""
     teile = str(ref).split(":")
-    if teile[0] not in ("chat", "chatmd", "bild") or len(teile) < 3:
+    if teile[0] not in _profil_arten() or len(teile) < 3:
         return False
     aktiv = aktiv or _aktives_profil()
-    return aktiv is not None and teile[1] != aktiv
+    return aktiv is None or teile[1] != aktiv     # unbekannt: als fremd behandeln
+
+
+def _profil_sql(profil: str) -> tuple[str, list]:
+    """SQL-Bedingung: alle Refs <art>:<profil>:… der Profil-Arten (Groß/klein egal, wie Windows-Ordner)."""
+    vorsaetze = [f"{a}:{profil}:".lower() for a in _profil_arten()]
+    return ("(" + " OR ".join("lower(substr(ref, 1, ?)) = ?" for _v in vorsaetze) + ")",
+            [x for v in vorsaetze for x in (len(v), v)])
+
+
+def profil_austragen(profil: str, beiseite: Path | None = None) -> int:
+    """Gelöschte Persönlichkeit: ihre Chats, Medien und Export-Chats (Refs <art>:<profil>:…) und deren
+    Merkzettel aus memory.db austragen – eine spätere gleichnamige Persönlichkeit findet sie nicht.
+    `beiseite`: der beiseitegelegte Profil-Ordner; dessen Lehren (note:/detail:) werden ebenfalls ausgetragen,
+    soweit sie nicht auch gemeinsam sind. Die Dateien bleiben unberührt. Rückgabe: ausgetragene Brocken."""
+    if not profil or not _db_path().exists():
+        return 0
+    refs: set[str] = set()
+    if beiseite is not None:
+        try:
+            import memory as mem
+            gemeinsam = {e["id"] for e in mem._load(mem._FILE)["entries"]}
+            gemeinsam_details = {p.stem for p in (mem._FILE.parent / mem.DETAIL_ORDNER).glob("*.md")}
+            erinnerungen = Path(beiseite) / "Erinnerungen"
+            refs |= {f"note:{e['id']}" for e in mem._load(erinnerungen / "memory.json")["entries"]
+                     if e.get("id") not in gemeinsam}
+            refs |= {f"detail:{p.stem}" for p in (erinnerungen / mem.DETAIL_ORDNER).glob("*.md")
+                     if p.stem not in gemeinsam_details}
+        except Exception:
+            pass
+    bedingung, werte = _profil_sql(profil)
+    con = _connect()
+    try:
+        n = con.execute(f"DELETE FROM chunks WHERE {bedingung}", werte).rowcount
+        if refs:
+            n += con.executemany("DELETE FROM chunks WHERE ref=?", [(r,) for r in sorted(refs)]).rowcount
+        vorsatz = f"{EXPORT}:{profil}:".lower()
+        con.execute("DELETE FROM stand WHERE lower(substr(schluessel, 1, ?)) = ?", (len(vorsatz), vorsatz))
+        con.commit()
+    finally:
+        con.close()
+    _invalidate()
+    return max(0, n)
+
+
+def profil_umbenennen(alt: str, neu: str) -> int:
+    """Umbenannte Persönlichkeit (Profil-Ordner zieht mit): Refs <art>:<alt>:… auf <art>:<neu>:… umschreiben,
+    samt Fingerabdruck – die Vektoren bleiben, nichts wird doppelt eingelesen. Liegt eine Quelle unter dem
+    neuen Namen schon vor, fällt die alte Fassung weg. Rückgabe: umgeschriebene Brocken."""
+    if not alt or not neu or alt == neu or not _db_path().exists():
+        return 0
+    bedingung, werte = _profil_sql(alt)
+    con = _connect()
+    n = 0
+    try:
+        if con.in_transaction:
+            con.commit()
+        con.execute("BEGIN IMMEDIATE")
+        zeilen = con.execute(f"SELECT rowid, kind, ref, text FROM chunks WHERE {bedingung} ORDER BY rowid",
+                             werte).fetchall()
+        neu_bedingung, neu_werte = _profil_sql(neu)
+        neue_refs = {r for (r,) in con.execute(f"SELECT DISTINCT ref FROM chunks WHERE {neu_bedingung}", neu_werte)
+                     if r.split(":", 2)[1] == neu}
+        weg, um = [], []
+        for rowid, kind, ref, text in zeilen:
+            art, name, rest = ref.split(":", 2)
+            if name == neu:                       # nur Groß/klein geändert: schon unter dem neuen Namen
+                continue
+            neuer = f"{art}:{neu}:{rest}"
+            if neuer in neue_refs:
+                weg.append((rowid,))
+            else:
+                um.append((neuer, _hash(kind, neuer, text), rowid))
+        con.executemany("DELETE FROM chunks WHERE rowid=?", weg)
+        con.executemany("UPDATE OR REPLACE chunks SET ref=?, hash=? WHERE rowid=?", um)
+        vorsatz = f"{EXPORT}:{alt}:"
+        for schluessel, wert in con.execute("SELECT schluessel, wert FROM stand WHERE lower(substr(schluessel, 1, ?)) "
+                                            "= ?", (len(vorsatz), vorsatz.lower())).fetchall():
+            con.execute("DELETE FROM stand WHERE schluessel=?", (schluessel,))
+            con.execute("INSERT OR REPLACE INTO stand(schluessel, wert) VALUES (?, ?)",
+                        (f"{EXPORT}:{neu}:{schluessel[len(vorsatz):]}", wert))
+        con.commit()
+        n = len(um)
+    except BaseException:
+        con.rollback()
+        raise
+    finally:
+        con.close()
+    _invalidate()
+    return n
 
 
 def ingest_chat(chat_id: int, title: str, prompts: list[str], messages: list, datum: str | None = None) -> int:
@@ -514,18 +796,20 @@ def ingest_chat(chat_id: int, title: str, prompts: list[str], messages: list, da
         texts.append(f"Chat #{chat_id}: {title}")
     for p in prompts or []:
         if p and p.strip():
-            texts.append("Nutzer: " + p.strip())
+            texts.append(("Netz: " if _fremd_markiert(p) else "Nutzer: ") + p.strip())
     for m in messages or []:
         role = m.get("role") or ""
         body = _msg_text(m)
         if not body:
             continue
         if role == "assistant":
-            texts.append("Nemi: " + body)
-        elif role == "user":
+            texts.append("KI: " + body)                  # neutral: gilt für jede Persönlichkeit
+        elif _fremd_markiert(body):
+            texts.append("Netz: " + body)                # Inhalt aus dem Netz (Web-Werkzeug, Seite aus dem Browser)
+        elif role == "user" and not body.startswith(ERGEBNIS_VORSATZ):
             texts.append("Nutzer: " + body)
         else:
-            texts.append(body)
+            texts.append("Werkzeug: " + body)            # Werkzeug-Ergebnis: steht als user im Verlauf, ist keine Eingabe
     return _upsert("chat", _chat_ref(chat_id), texts, datum)
 
 
@@ -636,6 +920,69 @@ def nachzuegler_chats(aktuell: int | None, anzahl: int = NACHZUEGLER_CHATS) -> i
     return n
 
 
+class _NotizenGesperrt(frozenset):
+    """Ersatz für _fremde_notizen, wenn sich die Lehren nicht auflisten ließen: jede note:/detail:-Ref gilt als
+    fremd, außer den eigenen und gemeinsamen in `erlaubt` (fail-closed)."""
+
+    def __new__(cls, erlaubt=()):
+        obj = super().__new__(cls)
+        obj.erlaubt = frozenset(erlaubt)
+        return obj
+
+    def __contains__(self, ref) -> bool:
+        return str(ref).startswith(("note:", "detail:")) and ref not in self.erlaubt
+
+
+def _eigene_notizen(mem, eigen) -> set[str]:
+    """note:/detail:-Refs der gemeinsamen Datei und der eigenen Lehren (ohne Ausnahme: leer)."""
+    erlaubt: set[str] = set()
+    for datei in (mem._FILE, eigen):
+        if datei is None:
+            continue
+        try:
+            erlaubt |= {f"note:{e['id']}" for e in mem._load(datei)["entries"]}
+            erlaubt |= {f"detail:{p.stem}" for p in (datei.parent / mem.DETAIL_ORDNER).glob("*.md")}
+        except Exception:
+            continue
+    return erlaubt
+
+
+def _fremde_notizen(profil: str | None = None) -> frozenset[str]:
+    """note:/detail:-Refs, die nur bei einer anderen Persönlichkeit stehen (Lehren sind je Persönlichkeit).
+    Leer, wenn das Gedächtnis auf eine einzige Datei umgelenkt ist. `profil`: Ordnername der aktiven
+    Persönlichkeit, einmal je Suche geholt (profilordner.aktiv liest von der Platte). Lässt sich das nicht
+    feststellen, gilt jede Notiz außer den eigenen und gemeinsamen als fremd (_NotizenGesperrt)."""
+    mem, eigen = None, None
+    try:
+        import memory as mem
+        if profil is None:
+            eigen = mem._profil_datei()
+        elif mem._FILE == mem._STANDARD_FILE:
+            import profilordner
+            eigen = profilordner.wurzel() / profil / "Erinnerungen" / "memory.json"
+        else:
+            eigen = None
+        if eigen is None:
+            return frozenset()
+        ids = {e["id"] for d in (mem._FILE, eigen) for e in mem._load(d)["entries"]}
+        namen = {p.stem for o in (mem._FILE.parent, eigen.parent) for p in (o / mem.DETAIL_ORDNER).glob("*.md")}
+        eigen_ort = os.path.normcase(os.path.abspath(eigen))
+        raus: set[str] = set()
+        for datei in eigen.parent.parent.parent.glob(f"*/{eigen.parent.name}/{eigen.name}"):
+            if os.path.normcase(os.path.abspath(datei)) == eigen_ort:
+                continue
+            raus |= {f"note:{e['id']}" for e in mem._load(datei)["entries"] if e.get("id") not in ids}
+            raus |= {f"detail:{p.stem}" for p in (datei.parent / mem.DETAIL_ORDNER).glob("*.md")
+                     if p.stem not in namen}
+        return frozenset(raus)
+    except Exception:
+        try:
+            erlaubt = _eigene_notizen(mem, eigen) if mem is not None else set()
+        except Exception:
+            erlaubt = set()
+        return _NotizenGesperrt(erlaubt)
+
+
 def ingest_all_notes() -> int:
     """Liest learned/memory.json und legt Notiz-Vektoren in memory.db."""
     try:
@@ -645,13 +992,14 @@ def ingest_all_notes() -> int:
     entries = mem.all_entries()
     details = mem.details() if hasattr(mem, "details") else []
     live = {f"note:{e['id']}" for e in entries} | {f"detail:{name}" for name, _ in details}
+    fremd = _fremde_notizen()                      # bleiben liegen: sonst nach jedem Wechsel neu einbetten
     con = _connect()
     try:
         drin = _hashes_je_ref(con, "note")
     finally:
         con.close()
     for ref in drin:
-        if ref not in live:
+        if ref not in live and ref not in fremd:
             drop_ref(ref)
     quellen: list[tuple[str, str, str]] = []       # (ref, Text, Kontext der Fortschrittsmeldung)
     for e in entries:
@@ -750,22 +1098,25 @@ def _ref_vollstaendig(ref: str) -> bool:
 
 def ohne_vektor_token(bild_token: int = 800) -> int | None:
     """Füllstand des Einlese-Speichers: Token aller Brocken ohne Vektor des aktiven Modells (Text: Zeichen / 4,
-    Bild pauschal). Bilder nur die der aktiven Persönlichkeit – die anderen bettet das Einlesen erst ein, wenn
+    Bild, Video und Ton pauschal). Medien nur die der aktiven Persönlichkeit – die anderen bettet das Einlesen erst ein, wenn
     ihre Persönlichkeit aktiv ist, sie blieben sonst als Rest im Stand. None ohne Embedding-Modell."""
     kennung = _kennung()
     if not kennung:
         return None
     try:
         import profilordner
-        bilder_von = f"bild:{profilordner.aktiv()}:*"
+        profil = profilordner.aktiv()
     except Exception:
-        bilder_von = "bild:*"
+        profil = "*"
+    medien = "kind IN (" + ",".join(f"'{a}'" for a in MEDIEN_ARTEN) + ")"
+    eigene = " OR ".join("ref GLOB ?" for _a in MEDIEN_ARTEN)
     con = _connect()
     try:
         bilder, zeichen = con.execute(
-            "SELECT COALESCE(SUM(kind='bild'), 0), COALESCE(SUM(CASE WHEN kind='bild' THEN 0 ELSE LENGTH(text) END), 0) "
-            "FROM chunks INDEXED BY idx_chunks_stand WHERE vec_modell != ? AND (kind != 'bild' OR ref GLOB ?)",
-            (kennung, bilder_von)).fetchone()
+            f"SELECT COALESCE(SUM({medien}), 0), COALESCE(SUM(CASE WHEN {medien} THEN 0 ELSE LENGTH(text) END), 0) "
+            f"FROM chunks INDEXED BY idx_chunks_stand WHERE vec_modell != ? AND vec_modell != ? "
+            f"AND (NOT {medien} OR {eigene})",
+            (kennung, kennung + FEHLGESCHLAGEN, *[f"{a}:{profil}:*" for a in MEDIEN_ARTEN])).fetchone()
     finally:
         con.close()
     return int(zeichen) // 4 + int(bilder) * bild_token
@@ -808,7 +1159,7 @@ def _block_einlesen() -> int:
     if not kennung:
         return 0
     import memory
-    ohne_bilder = " AND kind != 'bild'" if _bilder_sehen() else ""
+    ohne_bilder = _ohne_medien_sql()
     con = _connect()
     try:
         grenze = int(con.execute("SELECT COALESCE(MAX(rowid), 0) FROM chunks").fetchone()[0])
@@ -822,7 +1173,7 @@ def _block_einlesen() -> int:
         with memory.auftrag(gesamt):
             while (neu := nachvektorisieren(NACHRECHNEN_STUECK, f"Einlesen {n}/{gesamt}", grenze)):
                 n += neu
-    n += ingest_bilder(None)
+    n += ingest_medien(None)
     ingest_berichte(je_runde=None)                # jetzt mit Vektoren: alte Berichte dürfen in den Papierkorb
     return n
 
@@ -834,11 +1185,11 @@ def nachvektorisieren(limit: int = BACKFILL_BATCH, kontext: str = "Nachzügler o
     kennung = _kennung()
     if not kennung:
         return 0
-    ohne_bilder = " AND kind != 'bild'" if _bilder_sehen() else ""   # die bettet ingest_bilder als Bild ein
+    ohne_bilder = _ohne_medien_sql()               # die bettet ingest_medien als Medium ein
     con = _connect()
     bis_sql = "" if bis is None else f" AND rowid <= {int(bis)}"
     try:
-        rows = con.execute("SELECT hash, text FROM chunks WHERE rowid IN (SELECT rowid FROM chunks "
+        rows = con.execute("SELECT hash, text, kind, ref FROM chunks WHERE rowid IN (SELECT rowid FROM chunks "
                            f"INDEXED BY idx_chunks_stand WHERE vec_modell != ?{ohne_bilder}{bis_sql} LIMIT ?)",
                            (kennung, limit)).fetchall()
     finally:
@@ -847,13 +1198,13 @@ def nachvektorisieren(limit: int = BACKFILL_BATCH, kontext: str = "Nachzügler o
         return 0
     global _kontext
     _kontext = kontext
-    vecs = _einbetten([t for _h, t in rows])
+    vecs = _einbetten(*_mit_titel([t for _h, t, _k, _r in rows], [_titel(k, r) for _h, _t, k, r in rows]))
     if not vecs:
         return 0
     con = _connect()
     try:
         con.executemany("UPDATE chunks SET vec=?, vec_modell=? WHERE hash=?",
-                        [(vec_packen(v), kennung, h) for (h, _t), v in zip(rows, vecs)])
+                        [(vec_packen(v), kennung, row[0]) for row, v in zip(rows, vecs)])
         con.commit()
     finally:
         con.close()
@@ -973,6 +1324,9 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str], datum: str | None =
     Quelle, wenn schon bekannt (sonst _datum_fuer).
     Rückgabe: neu eingebettete Brocken, None wenn sich nichts geändert hat."""
     reihe = _reihe(kind, ref, pieces)
+    herkunft: dict[str, str] = {}
+    for p, hk in zip(pieces, _herkunft_reihe(kind, pieces)):   # über alle Brocken: Folge-Brocken erben
+        herkunft.setdefault(_hash(kind, ref, p), hk)
     con = _connect()
     try:
         alt = {h: (v, m, u, s) for h, v, m, u, s in con.execute(
@@ -986,8 +1340,8 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str], datum: str | None =
         return None
     neu = [(h, p) for h, p in reihe if h not in alt]
     if alt and list(alt) == hashes[:len(alt)]:    # nur hinten dazu (ein Chat wächst): anhängen
-        return _anhaengen(kind, ref, neu, datum)
-    vecs = _einbetten([p for _h, p in neu]) if neu else None
+        return _anhaengen(kind, ref, neu, datum, herkunft)
+    vecs = _einbetten(*_mit_titel([p for _h, p in neu], [_titel(kind, ref)] * len(neu))) if neu else None
     kennung = _kennung() if vecs else ""
     neue_vec = {h: vec_packen(vecs[i]) for i, (h, _p) in enumerate(neu) if vecs and i < len(vecs)}
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
@@ -999,13 +1353,13 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str], datum: str | None =
         else:
             v = neue_vec.get(h)
             m, u = (kennung if v else ""), now
-        rows.append((h, kind, ref, p, v, u, datum, m, SCHNITT))
+        rows.append((h, kind, ref, p, v, u, datum, m, SCHNITT, herkunft.get(h, "datei")))
     con = _connect()
     try:
         con.execute("DELETE FROM chunks WHERE ref=?", (ref,))
         con.executemany(
-            "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt) "
-            "VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt, herkunft) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
         con.commit()
     finally:
         con.close()
@@ -1013,21 +1367,25 @@ def _upsert_geordnet(kind: str, ref: str, pieces: list[str], datum: str | None =
     return len(neu)
 
 
-def _anhaengen(kind: str, ref: str, neu: list[tuple[str, str]], datum: str | None = None) -> int:
-    """Neue Brocken hinter die vorhandenen einer Quelle (Reihenfolge bleibt, nichts wird umgeschrieben)."""
-    vecs = _einbetten([p for _h, p in neu])
+def _anhaengen(kind: str, ref: str, neu: list[tuple[str, str]], datum: str | None = None,
+               herkunft: dict[str, str] | None = None) -> int:
+    """Neue Brocken hinter die vorhandenen einer Quelle (Reihenfolge bleibt, nichts wird umgeschrieben).
+    `herkunft`: Hash → Herkunft (_upsert_geordnet bestimmt sie über die ganze Quelle)."""
+    if herkunft is None:
+        herkunft = dict(zip((h for h, _p in neu), _herkunft_reihe(kind, [p for _h, p in neu])))
+    vecs = _einbetten(*_mit_titel([p for _h, p in neu], [_titel(kind, ref)] * len(neu)))
     kennung = _kennung() if vecs else ""
     now = datetime.now().strftime("%Y-%m-%d %H:%M")
     datum = (_datum_fuer(kind, ref) if datum is None else datum) or now
     rows = []
     for i, (h, p) in enumerate(neu):
         v = vec_packen(vecs[i]) if vecs and i < len(vecs) else None
-        rows.append((h, kind, ref, p, v, now, datum, kennung if v else "", SCHNITT))
+        rows.append((h, kind, ref, p, v, now, datum, kennung if v else "", SCHNITT, herkunft.get(h, "datei")))
     con = _connect()
     try:
         con.executemany(
-            "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt) "
-            "VALUES (?,?,?,?,?,?,?,?,?)", rows)
+            "INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt, herkunft) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)", rows)
         con.execute("UPDATE chunks SET datum=? WHERE ref=?", (datum, ref))
         con.commit()
     finally:
@@ -1070,70 +1428,155 @@ def wissen_namen() -> list[str]:
 def ingest_wissen(je_runde: int | None = WISSEN_JE_RUNDE) -> int:
     """Wissen/ (PDF, Markdown, Text) → Vektoren (kind „wissen“), für alle Persönlichkeiten.
 
-    Läuft nur, wenn sich am Ordner etwas geändert hat. Dann wird über alle Dateien
-    entdoppelt (wortgleiche Sätze nur einmal, siehe wissen.py) und jede Datei mit
-    geänderten Brocken neu geschrieben; gelöschte Dateien verschwinden aus dem Index.
-    `je_runde`: höchstens so viele geänderte Dateien je Lauf (None = alle), der Rest
-    folgt in der nächsten Runde. Rückgabe: neu eingebettete Brocken."""
+    Gelesen wird nur, was sich geändert hat (Tabelle wissen_stand: Änderungszeit, Größe, Fingerabdruck).
+    Entdoppelt wird über alle Dateien (wortgleiche Sätze nur einmal, die älteste Datei behält sie, siehe
+    wissen.py) – mit den Satz-Fingerabdrücken aus wissen_satz statt aller Sätze im Speicher. Eine unveränderte
+    Datei wird nur neu gelesen, wenn sich für einen ihrer Sätze ändert, ob eine ältere Datei ihn schon hat.
+    Gelöschte Dateien verschwinden aus dem Index. `je_runde`: höchstens so viele geschriebene Dateien je Lauf
+    (None = alle), der Rest folgt in der nächsten Runde. Rückgabe: neu eingebettete Brocken."""
     global _kontext
     try:
         import wissen
     except Exception:
         return 0
-    basis = wissen.ordner()
-    liste = wissen.dateien(basis)
-    stempel = f"schnitt{SCHNITT}:{wissen.stempel(liste, basis)}"   # neue Schnitt-Fassung: einmal neu
-    if stempel == _stand("wissen") or _unterbrochen():
+    if _unterbrochen():
         return 0
-    texte, unlesbar = [], set()
-    for p in liste:
-        try:
-            texte.append(wissen.lesen(p))
-        except Exception:
-            texte.append("")
-            unlesbar.add(f"wissen:{wissen.name(p, basis)}")
-    absaetze, _entfernt = wissen.entdoppeln(texte)
-    live: dict[str, list[str]] = {}
-    for p, a in zip(liste, absaetze):
-        rel = wissen.name(p, basis)
-        live[f"wissen:{rel}"] = wissen.brocken(f"📚 {rel}", a, CHUNK)
+    basis = wissen.ordner()
+    liste = wissen.dateien_stand(basis)                 # älteste zuerst, ein stat je Datei
+    verfahren = f"schnitt{SCHNITT}:{getattr(wissen, 'VERFAHREN', '')}:{CHUNK}"
     con = _connect()
     try:
-        drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks WHERE kind='wissen'")}
+        if (con.execute("SELECT wert FROM stand WHERE schluessel='wissen_verfahren'").fetchone() or ("",))[0] \
+                != verfahren:                           # neues Lesen oder Schneiden: alles einmal neu
+            con.execute("DELETE FROM wissen_stand")
+            con.execute("DELETE FROM wissen_satz")
+            con.execute("INSERT OR REPLACE INTO stand(schluessel, wert) VALUES ('wissen_verfahren', ?)", (verfahren,))
+            con.commit()
+        stand = {p: (m, g, s or "") for p, m, g, s in con.execute("SELECT pfad, mtime, groesse, sha FROM wissen_stand")}
+        saetze_alt: dict[str, list[str]] = {}
+        for p, s in con.execute("SELECT pfad, satz FROM wissen_satz ORDER BY rowid"):
+            saetze_alt.setdefault(p, []).append(s)
+        drin = {r[0] for r in con.execute("SELECT DISTINCT ref FROM chunks INDEXED BY idx_chunks_kind_ref "
+                                          "WHERE kind='wissen'")}
     finally:
         con.close()
-    for ref in drin - set(live):
-        drop_ref(ref)
-    n, geschrieben, fertig = 0, 0, True
-    for ref, stuecke in live.items():
-        if ref in unlesbar:                       # alten Stand behalten
+    live = {rel: (p, m, g) for p, rel, m, g in liste}
+    weg = (set(stand) - set(live)) | {r.split(":", 1)[1] for r in drin} - set(live)
+    geaendert = [rel for rel, (_p, m, g) in live.items()
+                 if rel not in stand or stand[rel][:2] != (m, g) or not stand[rel][2]]
+    if not geaendert and not weg:
+        return 0
+    for rel in weg:
+        if f"wissen:{rel}" in drin:
+            drop_ref(f"wissen:{rel}")
+    texte: dict[str, str] = {}
+    neue_hashes: dict[str, list[str]] = {}
+    neuer_stand: dict[str, tuple[int, int, str]] = {}
+    neu_inhalt: set[str] = set()
+    for rel in geaendert:
+        if _unterbrochen():
+            return 0                                    # nichts gemerkt: der nächste Lauf liest neu
+        p, m, g = live[rel]
+        try:
+            text = wissen.lesen(p)
+        except Exception:
+            neuer_stand[rel] = (m, g, "!unlesbar")      # alten Stand behalten, erst nach Änderung neu versuchen
             continue
-        if not stuecke:                           # leer oder ganz doppelt
-            if ref in drin:
-                drop_ref(ref)
+        sha = hashlib.sha1(text.encode("utf-8", "replace"), usedforsecurity=False).hexdigest()[:20]
+        texte[rel], neue_hashes[rel], neuer_stand[rel] = text, wissen.satz_hashes(text), (m, g, sha)
+        if rel not in stand or stand[rel][2] != sha:
+            neu_inhalt.add(rel)
+
+    def hashes(rel: str) -> list[str]:
+        return neue_hashes[rel] if rel in neue_hashes else saetze_alt.get(rel, [])
+
+    eigner_alt: dict[str, str] = {}                     # Satz → älteste Datei, die ihn hat (vorher)
+    for rel in sorted(stand, key=lambda r: (stand[r][0], r.casefold())):
+        for h in saetze_alt.get(rel, []):
+            eigner_alt.setdefault(h, rel)
+    eigner: dict[str, str] = {}                         # … und jetzt
+    for rel in live:
+        for h in hashes(rel):
+            eigner.setdefault(h, rel)
+    betroffen = {rel for rel in live if rel not in neu_inhalt and neuer_stand.get(rel, (0, 0, ""))[2] != "!unlesbar"
+                 and any((eigner_alt.get(h) == rel) != (eigner.get(h) == rel) for h in hashes(rel))}
+    n, geschrieben, erledigt = 0, 0, set()
+    for rel in live:                                    # älteste zuerst
+        if rel not in neu_inhalt and rel not in betroffen:
+            if rel in neuer_stand:                      # nur berührt oder unlesbar: Stand merken
+                _wissen_merken(rel, neuer_stand[rel], hashes(rel))
             continue
         if (je_runde is not None and geschrieben >= je_runde) or _unterbrochen():
-            fertig = False
+            for rest in betroffen - neu_inhalt - erledigt:   # unverändert, aber betroffen: im nächsten Lauf neu
+                if rest in stand:
+                    _wissen_merken(rest, stand[rest][:2] + ("",), saetze_alt.get(rest, []))
             break
-        _kontext = f"Wissen {ref.split(':', 1)[1]}"
-        neu = _upsert_geordnet("wissen", ref, stuecke)
-        if neu is not None:
-            geschrieben += 1
-            n += neu
-    if fertig:
-        _stand("wissen", stempel)
+        erledigt.add(rel)
+        if rel not in texte:
+            try:
+                texte[rel] = wissen.lesen(live[rel][0])
+            except Exception:
+                continue
+            p, m, g = live[rel]
+            sha = hashlib.sha1(texte[rel].encode("utf-8", "replace"), usedforsecurity=False).hexdigest()[:20]
+            neuer_stand[rel], neue_hashes[rel] = (m, g, sha), wissen.satz_hashes(texte[rel])
+        absaetze = wissen.entdoppeln_eine(texte[rel], lambda h, r=rel: eigner.get(h, r) != r)
+        stuecke = wissen.brocken(f"📚 {rel}", absaetze, CHUNK)
+        ref = f"wissen:{rel}"
+        if not stuecke:                                 # leer oder ganz doppelt
+            if ref in drin:
+                drop_ref(ref)
+        else:
+            _kontext = f"Wissen {rel}"
+            neu = _upsert_geordnet("wissen", ref, stuecke)
+            if neu is not None:
+                geschrieben += 1
+                n += neu
+        _wissen_merken(rel, neuer_stand[rel], hashes(rel))
+    if weg:
+        con = _connect()
+        try:
+            con.executemany("DELETE FROM wissen_stand WHERE pfad=?", [(r,) for r in weg])
+            con.executemany("DELETE FROM wissen_satz WHERE pfad=?", [(r,) for r in weg])
+            con.commit()
+        finally:
+            con.close()
     return n
 
 
+def _wissen_merken(rel: str, stand: tuple, saetze: list[str]) -> None:
+    """Stand einer Wissen-Datei und ihre Satz-Fingerabdrücke speichern."""
+    m, g, sha = stand
+    con = _connect()
+    try:
+        con.execute("INSERT OR REPLACE INTO wissen_stand(pfad, mtime, groesse, sha) VALUES (?, ?, ?, ?)",
+                    (rel, m, g, sha))
+        con.execute("DELETE FROM wissen_satz WHERE pfad=?", (rel,))
+        con.executemany("INSERT INTO wissen_satz(pfad, satz) VALUES (?, ?)", [(rel, h) for h in saetze])
+        con.commit()
+    finally:
+        con.close()
+
+
 # ---------------------------------------------------------------------------
-# Bilder der aktiven Persönlichkeit (Bildsuche)
+# Bilder, Videos und Ton der aktiven Persönlichkeit (Medien-Suche)
 # ---------------------------------------------------------------------------
-# Kann das Embedding-Modell sehen (EmbeddingGemma 2 + mmproj), bekommt jedes Bild einen Bild-Vektor im selben Raum
-# wie Text – eine Suchfrage findet es nach Inhalt. Sonst bleibt der Text (Name, Datum, Mal-Prompt) für Stichworte
-# und einen Text-Vektor. Liegt ein Bild auch nachgebessert in Gesichtszuege/, zählt nur diese Fassung.
+# Kann das Embedding-Modell sehen (EmbeddingGemma 2 + mmproj), bekommt jedes Bild einen Vektor aus Bild und Mal-Prompt,
+# jedes Video einen aus seinen Einzelbildern (1 je Sekunde); hat der mmproj einen Audio-Encoder, bekommt Ton (Lieder
+# mit Titel und Stil, Stimm-Proben) einen aus dem Klang – alles im selben Raum wie Text, eine Suchfrage findet es nach
+# Inhalt. Sonst bleibt der Text (Name, Datum, Prompt, Liedtext) für Stichworte und einen Text-Vektor. Liegt ein Bild
+# auch nachgebessert in Gesichtszuege/, zählt nur diese Fassung.
 
 BILD_ENDUNGEN = (".png", ".jpg", ".jpeg", ".webp")
-BILDER_JE_RUNDE = 12             # ≈ 45 s Prozessor je Bibliothekar-Lauf
+VIDEO_ENDUNGEN = (".mp4", ".mov", ".m4v", ".wmv", ".avi", ".mkv")
+TON_ENDUNGEN = (".wav", ".mp3", ".m4a", ".aac", ".flac", ".wma", ".ogg", ".opus")
+MEDIEN_ARTEN = ("bild", "video", "ton")
+#: Art -> Unterordner der Persönlichkeit (profilordner), aus denen eingelesen wird
+MEDIEN_ORDNER = {"bild": ("Bilder",), "video": ("Videos",), "ton": ("Musik", "Stimme")}
+#: Entpackte Archive: Profile/<profil>/Entpackt/<Archiv>/<Unterordner>; Refs <art>:<profil>:Entpackt/<Archiv>/<U>/<rel>
+ENTPACKT = "Entpackt"
+ENTPACKT_MEDIEN = {"bild": ("Bilder",), "video": ("Videos",), "ton": ("Audio",)}
+BILDER_JE_RUNDE = 12             # ≈ 45 s Prozessor je Bibliothekar-Lauf (Videos und Ton zählen je Datei mit)
 _PROMPT_MAX = 600
 
 
@@ -1145,113 +1588,688 @@ def _bilder_sehen() -> bool:
         return False
 
 
+def _ton_hoeren() -> bool:
+    try:
+        import memory
+        return memory.kann_hoeren()
+    except Exception:
+        return False
+
+
+def _medien_als_medium() -> tuple[str, ...]:
+    """Arten, die das Modell als Medium einbettet (die übrigen bekommen einen Text-Vektor)."""
+    sehen = _bilder_sehen()
+    return tuple(a for a in MEDIEN_ARTEN if (a == "ton" and sehen and _ton_hoeren()) or (a != "ton" and sehen))
+
+
+def _ohne_medien_sql() -> str:
+    arten = _medien_als_medium()
+    return (" AND kind NOT IN (" + ",".join(f"'{a}'" for a in arten) + ")") if arten else ""
+
+
 def _bild_dateien(wurzel: Path) -> list[Path]:
     try:
         alle = [p for p in wurzel.rglob("*") if p.suffix.lower() in BILD_ENDUNGEN and p.is_file()]
     except OSError:
         return []
+    alle = _nur_darunter(alle, wurzel)
     nachgebessert = {p.name for p in alle if p.parent.name == "Gesichtszuege"}
     return sorted((p for p in alle if p.parent.name == "Gesichtszuege" or p.name not in nachgebessert),
                   key=lambda p: p.stat().st_mtime, reverse=True)          # neueste zuerst
 
 
+#: Endung von vec_modell, wenn ein Medium sich nicht einbetten ließ: bis die Datei sich ändert, kein neuer Versuch
+FEHLGESCHLAGEN = ":fehlgeschlagen"
+
+
+def _medien_ordner(art: str, ref: str) -> str:
+    """Unterordner der Persönlichkeit, aus dem ein Medien-Eintrag stammt (entpackt: 'Entpackt/<Archiv>/<U>')."""
+    teile = str(ref).split(":", 2)[-1].split("/", 3)
+    if len(teile) == 4 and teile[0] == ENTPACKT and teile[2] in ENTPACKT_MEDIEN.get(art, ()):
+        return "/".join(teile[:3])
+    if art == "bild":
+        return "Bilder"
+    return teile[0]
+
+
+def _im_profil(pfad: Path, profil: str) -> bool:
+    """Liegt der Ordner wirklich im Ordner der Persönlichkeit (keine Verknüpfung hinaus)?"""
+    try:
+        import profilordner
+        return Path(pfad).resolve().is_relative_to((profilordner.wurzel() / profil).resolve())
+    except (OSError, ValueError):
+        return False
+
+
+def _entpackt_ordner(profil: str) -> list[Path]:
+    """Die Archiv-Ordner unter Profile/<profil>/Entpackt/, die wirklich dort liegen."""
+    try:
+        import profilordner
+        basis = profilordner.wurzel() / profil / ENTPACKT
+        kinder = sorted(p for p in basis.iterdir() if p.is_dir())
+    except OSError:
+        return []
+    return [p for p in kinder if _im_profil(p, profil)]
+
+
+def _medien_wurzeln(profil: str, art: str, nur: Path | None = None, entpackt: bool = True) -> list[tuple]:
+    """(Schlüssel wie _medien_ordner, Ordner, Ref-Vorsatz) für eine Art. `nur`: nur dieses entpackte Archiv."""
+    import profilordner
+    basis = profilordner.wurzel() / profil
+    raus = [] if nur is not None else [(u, basis / u, "" if art == "bild" else u + "/") for u in MEDIEN_ORDNER[art]]
+    archive = [basis / ENTPACKT / nur.name] if nur is not None else (_entpackt_ordner(profil) if entpackt else [])
+    for archiv in archive:
+        for u in ENTPACKT_MEDIEN[art]:
+            schluessel = f"{ENTPACKT}/{archiv.name}/{u}"
+            raus.append((schluessel, archiv / u, schluessel + "/"))
+    return raus
+
+
+def _medien_dateien(art: str, wurzel: Path) -> list[Path]:
+    if art == "bild":
+        return _bild_dateien(wurzel)
+    endungen = VIDEO_ENDUNGEN if art == "video" else TON_ENDUNGEN
+    try:
+        alle = [p for p in wurzel.rglob("*") if p.suffix.lower() in endungen and p.is_file()]
+    except OSError:
+        return []
+    return sorted(_nur_darunter(alle, wurzel), key=lambda p: p.stat().st_mtime, reverse=True)
+
+
+def _nur_darunter(dateien: list[Path], wurzel: Path) -> list[Path]:
+    """Nur Dateien, die wirklich im Ordner liegen: Verknüpfungen (Junction, Symlink) dürfen nicht in den Ordner einer
+    anderen Persönlichkeit oder anderswohin zeigen."""
+    try:
+        w = wurzel.resolve()
+    except OSError:
+        return []
+    raus = []
+    for p in dateien:
+        try:
+            if p.resolve().is_relative_to(w):
+                raus.append(p)
+        except OSError:
+            continue
+    return raus
+
+
 def _bild_text(p: Path) -> tuple[str, str]:
     """(Text für Suche und Anzeige, Datum der Datei). Der Mal-Prompt steht bei NemiCLI-Bildern im PNG."""
+    text, datum, _teile = _medien_text("bild", p)
+    return text, datum
+
+
+def _medien_text(art: str, p: Path) -> tuple[str, str, list]:
+    """(Text für Suche und Anzeige, Datum, Teile für den Medien-Vektor). Bilder: Mal-Prompt aus dem PNG; Lieder:
+    Titel, Stil und Liedtext aus dem WAV-INFO-Block (Musik-Motor). Der Vektor sieht das Medium und danach einen kurzen
+    Text – Prompt bzw. Titel und Stil, sonst den Dateinamen. Text hebt die Ähnlichkeit zu jeder Frage um rund 0,06;
+    bekäme nur ein Teil der Medien Text, lägen die ohne ihn grundlos weiter hinten (gemessen: Medium vor Text trennt
+    passend ↔ unpassend am besten)."""
     st = p.stat()
     datum = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
-    prompt = ""
+    kopf = f"Pfad: {p}\nDatum: {datum} · {st.st_size // 1024} KB"
+    if art == "bild":
+        prompt = ""
+        try:
+            from PIL import Image
+            with Image.open(p) as img:
+                prompt = " ".join(str(img.info.get("prompt") or "").split())[:_PROMPT_MAX]
+        except Exception:
+            pass
+        teile = [("bild", str(p)), ("text", " " + (prompt or _dateiname(p)))]
+        return f"Bild {p.name}\n{kopf}" + (f"\nPrompt: {prompt}" if prompt else ""), datum, teile
+    if art == "video":
+        return f"Video {p.name}\n{kopf}", datum, [("video", str(p)), ("text", " " + _dateiname(p))]
+    info = {}
+    if p.suffix.lower() == ".wav":
+        try:
+            from musik import tondatei
+            info = tondatei.info(p)
+        except Exception:
+            info = {}
+    titel = " ".join(str(info.get("INAM") or "").split())[:120]
+    stil = " ".join(str(info.get("IGNR") or "").split())[:_PROMPT_MAX]
+    liedtext = " ".join(str(info.get("ICMT") or "").split())[:_PROMPT_MAX]
+    zeilen = [f"Ton {p.name}", kopf] + ([f"Titel: {titel}"] if titel else []) + ([f"Stil: {stil}"] if stil else []) \
+        + ([f"Liedtext: {liedtext}"] if liedtext else [])
+    teile = [("ton", str(p)), ("text", " " + (" · ".join(x for x in (titel, stil) if x) or _dateiname(p)))]
+    return "\n".join(zeilen), datum, teile
+
+
+def _dateiname(p: Path) -> str:
+    """Dateiname als kurzer Text (ohne Endung, Trenner als Leerzeichen)."""
+    return " ".join(p.stem.replace("_", " ").replace("-", " ").split()) or p.name
+
+
+def _vektor_passt(art: str, modell: str, als_medium: tuple, kennung: str) -> bool:
+    """Braucht ein unveränderter Eintrag keinen neuen Versuch? (Text-Vektoren holt nachvektorisieren.)"""
+    return art not in als_medium or modell in (kennung, kennung + FEHLGESCHLAGEN)
+
+
+def _kopf_gleich(p: Path, alter_text: str) -> bool:
+    """Pfad, Datum und Größe wie beim letzten Einlesen: die Datei ist unverändert, ohne sie zu öffnen."""
     try:
-        from PIL import Image
-        with Image.open(p) as img:
-            prompt = " ".join(str(img.info.get("prompt") or "").split())[:_PROMPT_MAX]
-    except Exception:
-        pass
-    text = f"Bild {p.name}\nPfad: {p}\nDatum: {datum} · {st.st_size // 1024} KB"
-    return (text + (f"\nPrompt: {prompt}" if prompt else "")), datum
+        st = p.stat()
+    except OSError:
+        return False
+    datum = datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M")
+    return f"Pfad: {p}\nDatum: {datum} · {st.st_size // 1024} KB" in (alter_text or "")
 
 
-def ingest_bilder(je_runde: int | None = BILDER_JE_RUNDE) -> int:
-    """Neue und geänderte Bilder der aktiven Persönlichkeit einlesen, verschwundene austragen."""
+def _medien_offen(profil: str, arten: tuple[str, ...], als_medium: tuple, kennung: str,
+                  nur: Path | None = None, entpackt: bool = True) -> tuple[list, list[str], int]:
+    """(neue und geänderte Medien, verschwundene Refs, Zahl aller gefundenen Dateien). `nur`: nur dieses
+    entpackte Archiv; `entpackt=False`: entpackte Archive weder lesen noch austragen."""
+    import profilordner
+    entpackt_da = entpackt and (profilordner.wurzel() / profil).is_dir()
+    vorsatz_nur = f"{ENTPACKT}/{nur.name}/" if nur is not None else None
+    offen: list[tuple[str, str, Path, str, str, str, list]] = []    # (art, ref, pfad, text, datum, hash, teile)
+    weg: list[str] = []
+    anzahl = 0
+    for art in arten:
+        con = _connect()
+        try:
+            alt = {r: (h, m, t) for r, h, m, t in con.execute(
+                "SELECT ref, hash, vec_modell, text FROM chunks WHERE kind=? AND ref GLOB ?", (art, f"{art}:{profil}:*"))}
+        finally:
+            con.close()
+        if vorsatz_nur is not None:
+            alt = {r: v for r, v in alt.items() if _medien_ordner(art, r).startswith(vorsatz_nur)}
+        da, gelesen = set(), set()
+        for schluessel, wurzel, vorsatz in _medien_wurzeln(profil, art, nur, entpackt):
+            aus_archiv = schluessel.startswith(ENTPACKT + "/")
+            if not wurzel.is_dir() or (aus_archiv and not _im_profil(wurzel, profil)):
+                continue
+            gelesen.add(schluessel)
+            for p in _medien_dateien(art, wurzel):
+                ref = f"{art}:{profil}:{vorsatz}{p.relative_to(wurzel).as_posix()}"
+                if _medien_ordner(art, ref) != schluessel:
+                    continue                              # sähe aus wie ein entpacktes Archiv: Refs bleiben eindeutig
+                da.add(ref)
+                vorher = alt.get(ref)
+                if (aus_archiv and vorher and _kopf_gleich(p, vorher[2])
+                        and _vektor_passt(art, vorher[1], als_medium, kennung)):
+                    continue                              # Archive ändern sich kaum: ohne die Datei zu öffnen
+                try:
+                    text, datum, teile = _medien_text(art, p)
+                except OSError:
+                    continue
+                h = _hash(art, ref, text)
+                if vorher and vorher[0] == h and _vektor_passt(art, vorher[1], als_medium, kennung):
+                    continue                              # unverändert – auch nicht erneut, wenn es schon misslang
+                offen.append((art, ref, p, text, datum, h, teile))
+        anzahl += len(da)
+        # nur austragen, was in einem gelesenen Ordner fehlt (ein Laufwerk, das kurz weg ist, löscht nichts);
+        # entpackte Archive, deren Ordner fehlt, sind gelöscht, solange der Ordner der Persönlichkeit da ist
+        weg += [r for r in alt if r not in da and (
+            _medien_ordner(art, r) in gelesen
+            or (entpackt_da and _medien_ordner(art, r).startswith(ENTPACKT + "/")))]
+    return offen, weg, anzahl
+
+
+def _austragen(refs: list[str]) -> None:
+    if not refs:
+        return
+    con = _connect()
+    try:
+        con.executemany("DELETE FROM chunks WHERE ref=?", [(r,) for r in refs])
+        con.commit()
+    finally:
+        con.close()
+
+
+def _medium_schreiben(eintrag: tuple, als_medium: tuple, kennung: str) -> None:
+    """Ein Medium einbetten (als Medium, wenn das Modell es kann) und speichern."""
+    art, ref, p, text, datum, h, teile = eintrag
+    vec = None
+    if art in als_medium:
+        vecs = None
+        try:
+            import memory
+            vecs = memory.medien_einbetten([teile])
+        except Exception:
+            pass
+        vec = vecs[0] if vecs else None
+    modell = kennung if vec else (kennung + FEHLGESCHLAGEN if art in als_medium else "")
+    con = _connect()
+    try:
+        con.execute("DELETE FROM chunks WHERE ref=?", (ref,))
+        con.execute("INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt, "
+                    "herkunft) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                    (h, art, ref, text, vec_packen(vec) if vec else None,
+                     datetime.now().strftime("%Y-%m-%d %H:%M"), datum, modell, SCHNITT, _medien_herkunft(ref)))
+        con.commit()
+    finally:
+        con.close()
+
+
+_MEDIEN_NAMEN = {"bild": "Bild", "video": "Video", "ton": "Ton"}
+
+
+def ingest_medien(je_runde: int | None = BILDER_JE_RUNDE, arten: tuple[str, ...] = MEDIEN_ARTEN) -> int:
+    """Neue und geänderte Bilder, Videos und Ton der aktiven Persönlichkeit einlesen (auch aus Entpackt/),
+    verschwundene austragen. Liest gerade ein anderer Prozess ein (einbett_sperre), bleibt Entpackt/ liegen."""
     try:
         import profilordner
         profil = profilordner.aktiv()
-        wurzel = profilordner.ordner("Bilder", anlegen=False)
     except Exception:
         return 0
-    if not wurzel.is_dir():
-        return 0
-    sehen = not getattr(_lauf, "nur_text", False) and _bilder_sehen()   # beim Sammeln kommt nur der Text
-    kennung = _kennung() if sehen else ""
-    con = _connect()
-    try:
-        alt = {r: (h, m) for r, h, m in con.execute(
-            "SELECT ref, hash, vec_modell FROM chunks WHERE kind='bild' AND ref GLOB ?", (f"bild:{profil}:*",))}
-    finally:
-        con.close()
-    dateien = _bild_dateien(wurzel)
-    da = set()
-    offen: list[tuple[str, Path, str, str, str]] = []           # (ref, pfad, text, datum, hash)
-    for p in dateien:
-        ref = f"bild:{profil}:{p.relative_to(wurzel).as_posix()}"
-        da.add(ref)
-        try:
-            text, datum = _bild_text(p)
-        except OSError:
-            continue
-        h = _hash("bild", ref, text)
-        vorher = alt.get(ref)
-        if vorher and vorher[0] == h and (not sehen or vorher[1] == kennung):
-            continue
-        offen.append((ref, p, text, datum, h))
-    weg = [r for r in alt if r not in da]
-    if weg:
-        con = _connect()
-        try:
-            con.executemany("DELETE FROM chunks WHERE ref=?", [(r,) for r in weg])
-            con.commit()
-        finally:
-            con.close()
+    sammeln = getattr(_lauf, "nur_text", False)                     # beim Sammeln kommt nur der Text
+    als_medium = () if sammeln else _medien_als_medium()
+    kennung = _kennung() if als_medium else ""
+    offen, weg, _anzahl = _medien_offen(profil, arten, als_medium, kennung, entpackt=not _fremd_gesperrt())
+    _austragen(weg)
     if je_runde is not None:
         offen = offen[:je_runde]
     global _kontext
     n = 0
-    for i, (ref, p, text, datum, h) in enumerate(offen):
+    for i, eintrag in enumerate(offen):
         if _unterbrochen():
             break
-        _kontext = f"Bild {p.name}"
-        _melden(f"Bilder {i}/{len(offen)}")
-        vec = None
-        if sehen:
-            vecs = None
-            try:
-                import memory
-                vecs = memory.bilder_einbetten([p])
-            except Exception:
-                pass
-            vec = vecs[0] if vecs else None
-        con = _connect()
-        try:
-            con.execute("DELETE FROM chunks WHERE ref=?", (ref,))
-            con.execute("INSERT OR REPLACE INTO chunks(hash, kind, ref, text, vec, updated, datum, vec_modell, schnitt) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (h, "bild", ref, text, vec_packen(vec) if vec else None,
-                         datetime.now().strftime("%Y-%m-%d %H:%M"), datum, kennung if vec else "", SCHNITT))
-            con.commit()
-        finally:
-            con.close()
+        _kontext = f"{_MEDIEN_NAMEN[eintrag[0]]} {eintrag[2].name}"
+        _melden(f"Medien {i}/{len(offen)}")
+        _medium_schreiben(eintrag, als_medium, kennung)
         n += 1
     if n or weg:
         _invalidate()
     return n
 
 
-def bilder_suchen(frage: str, k: int = 5) -> list[dict]:
-    """Bilder der aktiven Persönlichkeit zu einer Frage: nach Inhalt (Bild-Vektor), Mal-Prompt und Namen.
-    Die Ähnlichkeit entscheidet; reine Stichwort-Treffer folgen danach – Wörter wie „Bild“ stehen in jedem
-    Eintrag und würden die Rangliste sonst verwässern."""
-    hits = suchen(frage, max(3 * k, 15), arten=("bild",), laden=True, lernen=False, nachsortieren=False)
+def ingest_bilder(je_runde: int | None = BILDER_JE_RUNDE) -> int:
+    """Nur die Bilder (ingest_medien)."""
+    return ingest_medien(je_runde, ("bild",))
+
+
+def medien_suchen(frage: str, k: int = 5, arten: tuple[str, ...] = MEDIEN_ARTEN) -> list[dict]:
+    """Bilder, Videos oder Ton der aktiven Persönlichkeit zu einer Frage: nach Inhalt (Medien-Vektor), Prompt,
+    Titel und Namen. Die Ähnlichkeit entscheidet; reine Stichwort-Treffer folgen danach – Wörter wie „Bild“ stehen
+    in jedem Eintrag und würden die Rangliste sonst verwässern."""
+    arten = tuple(a for a in arten if a in MEDIEN_ARTEN) or MEDIEN_ARTEN
+    hits = suchen(frage, max(3 * k, 15), arten=arten, laden=True, lernen=False, nachsortieren=False)
     hits.sort(key=lambda h: (h.get("aehnlich") is None, -(h.get("aehnlich") or 0.0), -h["score"]))
     return hits[:k]
+
+
+def bilder_suchen(frage: str, k: int = 5) -> list[dict]:
+    """Nur Bilder (medien_suchen)."""
+    return medien_suchen(frage, k, ("bild",))
+
+
+# ---------------------------------------------------------------------------
+# Einbett-Sperre über Prozesse: Bibliothekar-Kind (bibkind) und Entpackt-Fenster laden nie beide ein Modell
+# ---------------------------------------------------------------------------
+
+SPERRE_WARTEN_S = 600.0            # so lange wartet entpackt_einlesen auf den Bibliothekar, danach nur Text
+SPERRE_TAKT_S = 0.5
+_sperre_tiefe = 0                  # hält dieser Prozess die Sperre schon? (verschachtelt: frei)
+
+
+def _sperr_datei() -> Path:
+    """Eine Sperr-Datei je Datenbank, im Temp-Ordner (nicht bei den Daten)."""
+    import tempfile
+    ort = os.path.normcase(os.path.abspath(str(_db_path())))
+    kurz = hashlib.sha1(ort.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
+    return Path(tempfile.gettempdir()) / "NemiCLI" / f"einbetten_{kurz}.sperre"
+
+
+def _sperre_nehmen(fd: int) -> bool:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+def _sperre_lassen(fd: int) -> None:
+    try:
+        if os.name == "nt":
+            import msvcrt
+            os.lseek(fd, 0, os.SEEK_SET)
+            msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    except OSError:
+        pass
+
+
+@contextmanager
+def einbett_sperre(warten_s: float = 0.0, stopp=None, beim_warten=None):
+    """Prozessübergreifend: nur ein Prozess bettet mit Modell ein. Liefert True, wenn dieser Prozess sie hält.
+    `beim_warten` läuft einmal, bevor gewartet wird. Endet der Prozess, gibt das System die Sperre frei."""
+    global _sperre_tiefe
+    if _sperre_tiefe:
+        _sperre_tiefe += 1
+        try:
+            yield True
+        finally:
+            _sperre_tiefe -= 1
+        return
+    try:
+        pfad = _sperr_datei()
+        pfad.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(pfad), os.O_RDWR | os.O_CREAT, 0o600)
+    except OSError:
+        fd = None
+    frei = fd is None or _sperre_nehmen(fd)                  # ohne Sperr-Datei: kein Schutz, aber kein Stillstand
+    if not frei and warten_s > 0 and not (stopp is not None and stopp.is_set()):
+        if beim_warten is not None:
+            try:
+                beim_warten()
+            except Exception:
+                pass
+        ende = time.monotonic() + warten_s
+        while not frei and time.monotonic() < ende and not (stopp is not None and stopp.is_set()):
+            time.sleep(SPERRE_TAKT_S)
+            frei = _sperre_nehmen(fd)
+    if frei:
+        _sperre_tiefe += 1
+    try:
+        yield frei
+    finally:
+        if frei:
+            _sperre_tiefe -= 1
+        if fd is not None:
+            if frei:
+                _sperre_lassen(fd)
+            os.close(fd)
+            if frei and os.name == "nt":
+                try:
+                    pfad.unlink()               # Windows löscht keine Datei, die ein anderer gerade offen hat
+                except OSError:
+                    pass
+
+
+def _fremd_gesperrt() -> bool:
+    """Bettet gerade ein anderer Prozess ein (Entpackt-Fenster oder Bibliothekar-Kind)?"""
+    with einbett_sperre() as frei:
+        return not frei
+
+
+def _bibliothekar_anhalten() -> None:
+    """Laufende Bibliothekar-Kinder hören nach dem laufenden Stapel auf (Signal-Datei, siehe bibkind)."""
+    try:
+        import bibkind
+        ordner = list(bibkind.ordner().parent.glob("bibliothekar_*"))
+    except Exception:
+        return
+    for o in ordner:
+        try:
+            if o.is_dir():
+                (o / "unterbrechen").touch()
+        except OSError:
+            pass
+
+
+# ---------------------------------------------------------------------------
+# Chats aus Export-Archiven (chatexport) in Profile/<profil>/Entpackt/<Archiv>/
+# ---------------------------------------------------------------------------
+
+_SATZZEICHEN_VOR_LEER = re.compile(r"[.!?…]+(?=\s|$)")
+
+
+def _export_text(chat) -> str:
+    """Ein Export-Chat als Text: Kopfzeile (Anbieter, Titel, Datum) und je Nachricht ein Abschnitt. Die Kopfzeile
+    steht vor jedem Folge-Brocken (_pieces); die Antworten heißen nach dem Anbieter, nicht „KI“."""
+    titel = " ".join(str(chat.titel or "").split())
+    kurz = _SATZZEICHEN_VOR_LEER.sub("", titel)[:50].strip() or "Ohne Titel"
+    kopf = f"{chat.anbieter}-Chat „{kurz}“" + (f" · {chat.datum[:10]}" if chat.datum else "")
+    zeilen = [kopf, f"Export aus {chat.anbieter}" + (f", begonnen {chat.datum}" if chat.datum else "")
+              + f". Titel: {titel}", ""]
+    for rolle, zeit, text in chat.nachrichten:
+        wer = "Nutzer" if rolle == "nutzer" else chat.anbieter
+        zeilen += [f"## {wer}" + (f" · {zeit}" if zeit else ""), text, ""]
+    return "\n".join(zeilen)
+
+
+def _export_vorsatz(profil: str, archiv: str) -> str:
+    return f"{EXPORT}:{profil}:{archiv}/"
+
+
+def _exporte_lesen(archiv: Path, profil: str) -> tuple[dict[str, tuple[list[str], str, str]], bool]:
+    """ref → (Brocken, Datum, Titel) aller Chats eines Archivs; zweiter Wert: alle Export-Dateien lesbar."""
+    try:
+        import chatexport
+    except Exception:
+        return {}, False
+    fehler: list = []
+    live: dict[str, tuple[list[str], str, str]] = {}
+    for c in chatexport.lesen(archiv, fehler):
+        stuecke = _pieces(_export_text(c))
+        if stuecke:
+            live[_export_vorsatz(profil, archiv.name) + c.kennung] = (stuecke, c.datum, c.titel)
+    return live, not fehler
+
+
+def _export_stempel(archiv: Path) -> str:
+    try:
+        import chatexport
+        return f"schnitt{SCHNITT}:{chatexport.stempel(archiv)}"
+    except Exception:
+        return ""
+
+
+def _export_drin(profil: str) -> dict[str, list[tuple[str, int]]]:
+    con = _connect()
+    try:
+        alle = _hashes_je_ref(con, EXPORT)
+    finally:
+        con.close()
+    vorsatz = f"{EXPORT}:{profil}:"
+    return {r: v for r, v in alle.items() if r.startswith(vorsatz)}
+
+
+def _unveraendert(ref: str, stuecke: list[str], drin: dict) -> bool:
+    return drin.get(ref) == [(h, SCHNITT) for h, _p in _reihe(EXPORT, ref, stuecke)]
+
+
+def ingest_exporte(je_runde: int | None = None, profil: str | None = None) -> int:
+    """Chats aus den Export-Archiven der Persönlichkeit (Profile/<profil>/Entpackt/*/JSON) → kind „export“.
+    Ein Archiv, dessen Export-Dateien sich nicht geändert haben, wird nicht erneut gelesen; verschwundene Archive
+    und Chats werden ausgetragen. `je_runde`: höchstens so viele geänderte Chats (None = alle).
+    Rückgabe: neu eingebettete Brocken."""
+    global _kontext
+    profil = profil or _aktives_profil()
+    if not profil or _fremd_gesperrt():           # das Fenster liest gerade ein: nicht dazwischenschreiben
+        return 0
+    try:
+        import profilordner
+        if not (profilordner.wurzel() / profil).is_dir():
+            return 0                              # Persönlichkeit (oder Laufwerk) gerade nicht da: nichts austragen
+    except Exception:
+        return 0
+    archive = _entpackt_ordner(profil)
+    namen = {a.name for a in archive}
+    drin = _export_drin(profil)
+    for ref in [r for r in drin if r.split(":", 2)[2].split("/", 1)[0] not in namen]:
+        drop_ref(ref)
+    n, geschrieben = 0, 0
+    for archiv in archive:
+        if _unterbrochen() or (je_runde is not None and geschrieben >= je_runde):
+            break
+        schluessel = f"{EXPORT}:{profil}:{archiv.name}"
+        stempel = _export_stempel(archiv)
+        if stempel == _stand(schluessel):
+            continue
+        live, lesbar = _exporte_lesen(archiv, profil)
+        vorsatz = _export_vorsatz(profil, archiv.name)
+        if lesbar:
+            for ref in [r for r in drin if r.startswith(vorsatz) and r not in live]:
+                drop_ref(ref)
+        fertig = True
+        for ref, (stuecke, datum, titel) in live.items():
+            if _unveraendert(ref, stuecke, drin):
+                continue
+            if (je_runde is not None and geschrieben >= je_runde) or _unterbrochen():
+                fertig = False
+                break
+            _kontext = f"Export „{titel[:24]}“"
+            n += _upsert_geordnet(EXPORT, ref, stuecke, datum or None) or 0
+            geschrieben += 1
+        if fertig and lesbar:
+            _stand(schluessel, stempel)
+    return n
+
+
+def _ref_nachrechnen(ref: str, ohne_arten: tuple[str, ...] = ()) -> int:
+    """Brocken einer Quelle ohne Vektor des aktiven Modells jetzt einbetten (Arten in `ohne_arten` nicht)."""
+    kennung = _kennung()
+    if not kennung or getattr(_lauf, "nur_text", False):
+        return 0
+    ohne = (" AND kind NOT IN (" + ",".join("?" * len(ohne_arten)) + ")") if ohne_arten else ""
+    con = _connect()
+    try:
+        rows = con.execute(f"SELECT hash, text, kind FROM chunks WHERE ref=? AND vec_modell != ?{ohne} ORDER BY rowid",
+                           (ref, kennung, *ohne_arten)).fetchall()
+    finally:
+        con.close()
+    if not rows:
+        return 0
+    vecs = _einbetten(*_mit_titel([t for _h, t, _k in rows], [_titel(k, ref) for _h, _t, k in rows]))
+    if not vecs:
+        return 0
+    con = _connect()
+    try:
+        con.executemany("UPDATE chunks SET vec=?, vec_modell=? WHERE hash=?",
+                        [(vec_packen(v), kennung, row[0]) for row, v in zip(rows, vecs)])
+        con.commit()
+    finally:
+        con.close()
+    return len(vecs)
+
+
+def _ohne_vektor_unter(vorsaetze: list[str]) -> int:
+    """Brocken unter diesen Ref-Anfängen ohne Vektor des aktiven Modells (Fehlversuche bei Medien zählen nicht)."""
+    kennung = _kennung()
+    bedingung = " OR ".join("substr(ref, 1, ?) = ?" for _v in vorsaetze)
+    werte = [x for v in vorsaetze for x in (len(v), v)]
+    con = _connect()
+    try:
+        return int(con.execute(f"SELECT COUNT(*) FROM chunks WHERE ({bedingung}) AND vec_modell != ? "
+                               "AND vec_modell != ?", (*werte, kennung, kennung + FEHLGESCHLAGEN)).fetchone()[0])
+    finally:
+        con.close()
+
+
+def entpackt_einlesen(ordner: Path, profil: str, fortschritt=None, stopp=None) -> dict:
+    """Ein entpacktes Archiv (Profile/<profil>/Entpackt/<Archiv>) jetzt ganz ins Gedächtnis der Persönlichkeit
+    `profil` lesen: Bilder, Videos, Audio und Export-Chats, ohne Grenze je Runde, mit Vektoren.
+
+    Für einen eigenen Prozess (Fenster): Das Modell lädt hier nach; läuft gerade ein Bibliothekar-Kind, hört es
+    nach seinem Stapel auf (einbett_sperre). Wird die Sperre nicht frei, bleibt es beim Text (Stichworte), die
+    Vektoren holt der Bibliothekar nach. `fortschritt(name, erledigt, gesamt)` je Datei und Chat;
+    `stopp.is_set()` bricht nach dem laufenden Stück ab – Geschriebenes bleibt, der nächste Lauf macht weiter.
+    Rückgabe: eingelesen (erledigte Dateien und Chats, auch unveränderte), gesamt, abgebrochen, neu (geschrieben),
+    ohne_vektor (Brocken), fehler (Text, leer wenn keiner)."""
+    erg = {"eingelesen": 0, "gesamt": 0, "abgebrochen": False, "neu": 0, "ohne_vektor": 0, "fehler": ""}
+
+    def melden(name: str, erledigt: int, gesamt: int) -> None:
+        if fortschritt is not None:
+            try:
+                fortschritt(name, erledigt, gesamt)
+            except Exception:
+                pass
+
+    try:
+        import profilordner
+        profil = profilordner.ordnername(profil)
+        basis = profilordner.wurzel() / profil / ENTPACKT
+        ordner = Path(ordner)
+        archiv = basis / ordner.name
+        passt = (ordner.is_dir() and os.path.normcase(str(ordner.parent.resolve())) ==
+                 os.path.normcase(str(basis.resolve())) and _im_profil(archiv, profil))
+    except Exception:
+        passt = False
+    if not passt:
+        erg["fehler"] = "kein Archiv-Ordner unter Entpackt/ dieser Persönlichkeit"
+        return erg
+    vorher_stopp, vorher_text = getattr(_lauf, "stopp", None), getattr(_lauf, "nur_text", False)
+    _lauf.stopp, _lauf.nur_text = stopp, False
+    global _kontext
+    try:
+        melden("Archiv wird gelesen …", 0, 0)
+        als_medium = _medien_als_medium()
+        kennung = _kennung()
+        offen, weg, anzahl = _medien_offen(profil, MEDIEN_ARTEN, als_medium, kennung, nur=archiv)
+        live, lesbar = _exporte_lesen(archiv, profil)
+        vorsatz = _export_vorsatz(profil, archiv.name)
+        gesamt = anzahl + len(live)
+        erledigt = anzahl - len(offen)                       # unveränderte Medien sind schon fertig
+        erg["gesamt"] = gesamt
+        melden("Gedächtnis wird vorbereitet …", erledigt, gesamt)
+
+        def warten() -> None:
+            _bibliothekar_anhalten()
+            melden("wartet auf den Bibliothekar …", erledigt, gesamt)
+
+        with einbett_sperre(SPERRE_WARTEN_S, stopp, warten) as frei:
+            if not frei:
+                _lauf.nur_text = True                        # nur Text: die Vektoren folgen im Bibliothekar
+                erg["fehler"] = "Bibliothekar rechnet noch – erst einmal nur Stichworte, Vektoren folgen"
+            medium = als_medium if frei else ()
+            _austragen(weg)
+            drin = _export_drin(profil)
+            if lesbar:
+                _austragen([r for r in drin if r.startswith(vorsatz) and r not in live])
+            ohne_vektor: set[str] = set()                    # schon da, aber ohne Text-Vektor (Abbruch, Sammeln)
+            if kennung:
+                vorsaetze = [vorsatz] + [f"{a}:{profil}:{ENTPACKT}/{archiv.name}/" for a in MEDIEN_ARTEN
+                                         if a not in als_medium]
+                con = _connect()
+                try:
+                    for v in vorsaetze:
+                        ohne_vektor |= {r for (r,) in con.execute(
+                            "SELECT DISTINCT ref FROM chunks WHERE substr(ref, 1, ?) = ? AND vec_modell != ?",
+                            (len(v), v, kennung))}
+                finally:
+                    con.close()
+            for eintrag in offen:
+                if _unterbrochen():
+                    break
+                art, ref, p = eintrag[0], eintrag[1], eintrag[2]
+                melden(p.name, erledigt, gesamt)
+                _kontext = f"{_MEDIEN_NAMEN[art]} {p.name}"
+                _medium_schreiben(eintrag, medium, kennung if medium else "")
+                if art not in als_medium:
+                    _ref_nachrechnen(ref)                    # Text-Vektor
+                erg["neu"] += 1
+                erledigt += 1
+            for ref in sorted(ohne_vektor - set(live) - {e[1] for e in offen}):
+                if _unterbrochen():
+                    break
+                _ref_nachrechnen(ref)                        # unveränderte Medien: Text-Vektor nachholen
+            for ref, (stuecke, datum, titel) in live.items():
+                if _unterbrochen():
+                    break
+                melden(titel, erledigt, gesamt)
+                _kontext = f"Export „{titel[:24]}“"
+                if not _unveraendert(ref, stuecke, drin):
+                    _upsert_geordnet(EXPORT, ref, stuecke, datum or None)
+                    erg["neu"] += 1
+                    _ref_nachrechnen(ref)                    # was beim Abbruch eines Stapels liegen blieb
+                elif ref in ohne_vektor:
+                    _ref_nachrechnen(ref)
+                erledigt += 1
+            erg["abgebrochen"] = erledigt < gesamt and _unterbrochen()
+            if not erg["abgebrochen"] and lesbar:
+                _stand(f"{EXPORT}:{profil}:{archiv.name}", _export_stempel(archiv))
+        erg["eingelesen"] = erledigt
+        erg["ohne_vektor"] = _ohne_vektor_unter([vorsatz] + [f"{a}:{profil}:{ENTPACKT}/{archiv.name}/"
+                                                             for a in MEDIEN_ARTEN])
+        if not lesbar and not erg["fehler"]:
+            erg["fehler"] = "eine Export-Datei war nicht lesbar"
+        melden("abgebrochen" if erg["abgebrochen"] else "fertig", erledigt, gesamt)
+    finally:
+        _lauf.stopp, _lauf.nur_text = vorher_stopp, vorher_text
+        _kontext = ""
+        _invalidate()
+    return erg
 
 
 def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
@@ -1284,9 +2302,12 @@ def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
             lambda: backfill(10_000 if alles else BACKFILL_BATCH, ausser=None if alles else chat_id),
             lambda: ingest_berichte(je_runde=None)[0],
             lambda: ingest_wissen(None),
-            lambda: ingest_bilder(None),
+            lambda: ingest_medien(None),
+            lambda: ingest_exporte(None),
             lambda: neu_schneiden(1_000_000 if alles else NEU_SCHNEIDEN_JE_LAUF),
             lambda: vektoren_umwandeln(1_000_000 if alles else UMWANDELN_JE_LAUF) and 0,   # zählt nicht als neu
+            lambda: herkunft_nachtragen() and 0,                                         # ältere Brocken, in Schüben
+            lambda: (pflege(), 0)[1],                                                    # höchstens einmal am Tag
         ]
         for schritt in rueckstand:
             if _unterbrochen():
@@ -1301,6 +2322,61 @@ def after_turn(chat_id: int | None = None, status=None, alles: bool = False,
         _status, _kontext, _lauf_marke = None, "", None
         _lauf.nur_text = False
     return n
+
+
+PFLEGE_STAND = "pflege"            # Merkzettel: Tag der letzten Pflege
+FTS_MERGE_SEITEN = 500             # so viel Arbeit je Pflege für das Zusammenlegen des Stichwort-Index
+
+
+def verwaiste_profile() -> list[str]:
+    """Profil-Namen aus Refs <art>:<profil>:…, deren Profil-Ordner fehlt. Leer, solange Profile/ selbst fehlt
+    oder leer ist (Laufwerk weg, Umzug): dann wird nichts ausgetragen."""
+    try:
+        import profilordner
+        wurzel = profilordner.wurzel()
+        vorhanden = {p.name.lower() for p in wurzel.iterdir() if p.is_dir()}
+    except OSError:
+        return []
+    except Exception:
+        return []
+    if not vorhanden:
+        return []
+    con = _connect()
+    try:
+        namen: set[str] = set()
+        for a in _profil_arten():
+            namen |= {r for (r,) in con.execute(
+                "SELECT DISTINCT substr(ref, ?, instr(substr(ref, ?), ':') - 1) FROM chunks "
+                "WHERE kind=? AND ref GLOB ?", (len(a) + 2, len(a) + 2, a, f"{a}:*:*"))}
+    finally:
+        con.close()
+    return sorted(n for n in namen if n and n.lower() not in vorhanden)
+
+
+def pflege(erzwingen: bool = False) -> dict:
+    """Pflege von memory.db, höchstens einmal am Tag (`erzwingen`: jetzt): Brocken verschwundener Profil-Ordner
+    austragen, den Stichwort-Index zusammenlegen (FTS5 merge) und PRAGMA optimize. Kein VACUUM – das bräuchte
+    die Datei für sich allein, während andere Prozesse lesen. Rückgabe: was getan wurde ({} = nicht fällig)."""
+    heute = datetime.now().strftime("%Y-%m-%d")
+    if not _db_path().exists() or (not erzwingen and _stand(PFLEGE_STAND) == heute):
+        return {}
+    erg = {"verwaist": 0, "profile": []}
+    for profil in verwaiste_profile():
+        if _unterbrochen():
+            return erg                            # nicht als erledigt merken: der nächste Lauf macht weiter
+        erg["verwaist"] += profil_austragen(profil)
+        erg["profile"].append(profil)
+    con = _connect()
+    try:
+        con.execute("INSERT INTO chunks_fts(chunks_fts, rank) VALUES('merge', ?)", (FTS_MERGE_SEITEN,))
+        con.commit()
+        con.execute("PRAGMA optimize")
+    except sqlite3.Error:
+        pass
+    finally:
+        con.close()
+    _stand(PFLEGE_STAND, heute)
+    return erg
 
 
 def offen() -> dict:
@@ -1567,9 +2643,9 @@ def _voll_aufbauen(stamp, kennung: str, db: str, np) -> None:
     try:
         con = _connect()
         try:
-            for rowid, h, kind, ref, text, vec_s, datum, vec_modell in con.execute(
-                    "SELECT rowid, hash, kind, ref, text, vec, datum, vec_modell FROM chunks"):
-                meta.append((kind, ref, text, datum or "", rowid))
+            for rowid, h, kind, ref, text, vec_s, datum, vec_modell, herkunft in con.execute(
+                    "SELECT rowid, hash, kind, ref, text, vec, datum, vec_modell, herkunft FROM chunks"):
+                meta.append((kind, ref, text, datum or "", rowid, herkunft or herkunft_ableiten(kind, ref, text)))
                 hat = vec_s is not None and bool(kennung) and vec_modell == kennung
                 zustand[rowid] = (h, hat, datum or "")
                 if not hat:
@@ -1593,6 +2669,11 @@ def _voll_aufbauen(stamp, kennung: str, db: str, np) -> None:
         return
     mat = None
     if vecs and np is not None:
+        laengen = [len(v) for v in vecs]
+        if len(set(laengen)) > 1:             # gemischte Längen (Rechenweise gewechselt): die häufigste gilt
+            haeufig = max(set(laengen), key=laengen.count)
+            behalten = [i for i, n in enumerate(laengen) if n == haeufig]
+            vecs, vec_zeilen = [vecs[i] for i in behalten], [vec_zeilen[i] for i in behalten]
         mat = np.vstack(vecs)
         vecs = []                         # numpy hat die Daten, Listen freigeben
     _CACHE_setzen(stamp, kennung, db, meta, mat, vecs, vec_zeilen, zustand)
@@ -1617,7 +2698,7 @@ def _nachladen(stamp, kennung: str, np) -> bool:
         for i in range(0, len(laden), _IN_BLOCK):
             teil = laden[i:i + _IN_BLOCK]
             zeilen.update({r[0]: r[1:] for r in con.execute(
-                "SELECT rowid, kind, ref, text, vec, datum FROM chunks WHERE rowid IN "
+                "SELECT rowid, kind, ref, text, vec, datum, herkunft FROM chunks WHERE rowid IN "
                 f"({','.join('?' * len(teil))})", teil)})
     finally:
         con.close()
@@ -1629,8 +2710,8 @@ def _nachladen(stamp, kennung: str, np) -> bool:
     for r in neu + vec_dazu:
         if r not in zeilen:
             continue                      # inzwischen gelöscht: der nächste Abgleich sieht es
-        kind, ref, text, vec_s, datum = zeilen[r]
-        meta_von[r] = (kind, ref, text, datum or "", r)
+        kind, ref, text, vec_s, datum, herkunft = zeilen[r]
+        meta_von[r] = (kind, ref, text, datum or "", r, herkunft or herkunft_ableiten(kind, ref, text))
         if jetzt[r][1] and (v := _vektor(vec_s, np)) is not None:
             dazu_r.append(r)
             dazu_v.append(v)
@@ -1640,8 +2721,11 @@ def _nachladen(stamp, kennung: str, np) -> bool:
         behalten = [j for j, r in enumerate(vz) if r not in raus]
         mat, vz = mat[behalten], [vz[j] for j in behalten]
     if dazu_v:
-        mat = np.vstack(([mat] if mat is not None and len(mat) else []) + dazu_v)
-        vz += dazu_r
+        breite = mat.shape[1] if mat is not None and len(mat) else len(dazu_v[0])
+        passend = [(r, v) for r, v in zip(dazu_r, dazu_v) if len(v) == breite]      # andere Länge: nicht mischen
+        if passend:
+            mat = np.vstack(([mat] if mat is not None and len(mat) else []) + [v for _r, v in passend])
+            vz += [r for r, _v in passend]
     if mat is not None and not len(mat):
         mat = None
     meta = [meta_von[r] for r in sorted(meta_von)]
@@ -1672,7 +2756,8 @@ def _scores(ix: dict, qv: list[float], ab: float = -1.0) -> list[tuple[float, in
 
 def _hit(meta_row: tuple, score: float, wie: str = "") -> dict:
     kind, ref, text, datum = meta_row[:4]
-    return {"kind": kind, "ref": ref, "text": text, "datum": datum, "score": score, "wie": wie}
+    return {"kind": kind, "ref": ref, "text": text, "datum": datum, "score": score, "wie": wie,
+            "herkunft": meta_row[5] if len(meta_row) > 5 else ""}
 
 
 # ---------------------------------------------------------------------------
@@ -1754,7 +2839,8 @@ def _seltene_woerter(con: sqlite3.Connection, woerter: list[str]) -> list[str]:
     return selten or sorted(vorhanden, key=lambda w: zahl[w])[:SELTENSTE_REST]
 
 
-def _stichwort_treffer(con: sqlite3.Connection, frage: str, arten, seit, bis, ref_praefix) -> list[tuple]:
+def _stichwort_treffer(con: sqlite3.Connection, frage: str, arten, seit, bis, ref_praefix,
+                       herkunft=None) -> list[tuple]:
     """(rowid, kind, ref, text, datum) nach BM25. Zwei Stufen: erst die besten VORAUSWAHL nur im Index, dann deren
     Zeilen mit den Filtern – statt jede passende Zeile zu holen und danach zu sortieren. Bleiben nach den Filtern zu
     wenige übrig, entscheidet die volle Abfrage wie bisher."""
@@ -1762,30 +2848,38 @@ def _stichwort_treffer(con: sqlite3.Connection, frage: str, arten, seit, bis, re
     ausdruck = " OR ".join(_fts_teil(w) for w in woerter)
     if not ausdruck:
         return []
-    bedingung, werte = _filter_sql(arten, seit, bis, ref_praefix)
+    bedingung, werte = _filter_sql(arten, seit, bis, ref_praefix, herkunft)
     ids = [r[0] for r in con.execute("SELECT rowid FROM chunks_fts WHERE chunks_fts MATCH ? ORDER BY rank LIMIT ?",
                                      (ausdruck, VORAUSWAHL))]
     if not ids:
         return []
     rang = {r: i for i, r in enumerate(ids)}
-    zeilen = con.execute(f"SELECT c.rowid, c.kind, c.ref, c.text, c.datum FROM chunks c WHERE c.rowid IN "
+    zeilen = con.execute(f"SELECT c.rowid, c.kind, c.ref, c.text, c.datum, c.herkunft FROM chunks c WHERE c.rowid IN "
                          f"({','.join('?' * len(ids))}){bedingung}", [*ids, *werte]).fetchall()
     zeilen.sort(key=lambda z: rang[z[0]])
-    if len(zeilen) >= KANDIDATEN or len(ids) < VORAUSWAHL:
-        return zeilen[:KANDIDATEN]
-    return con.execute(
-        "SELECT c.rowid, c.kind, c.ref, c.text, c.datum FROM chunks_fts JOIN chunks c "
-        f"ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ?{bedingung} "
-        "ORDER BY bm25(chunks_fts) LIMIT ?", [ausdruck, *werte, KANDIDATEN]).fetchall()
+    if not (len(zeilen) >= KANDIDATEN or len(ids) < VORAUSWAHL):
+        zeilen = con.execute(
+            "SELECT c.rowid, c.kind, c.ref, c.text, c.datum, c.herkunft FROM chunks_fts JOIN chunks c "
+            f"ON c.rowid = chunks_fts.rowid WHERE chunks_fts MATCH ?{bedingung} "
+            "ORDER BY bm25(chunks_fts) LIMIT ?", [ausdruck, *werte, KANDIDATEN]).fetchall()
+    zeilen = [z[:5] + (z[5] or herkunft_ableiten(z[1], z[2], z[3]),) for z in zeilen[:KANDIDATEN]]
+    if herkunft:                                 # leere (noch nicht nachgetragene) Herkunft: abgeleitet prüfen
+        zeilen = [z for z in zeilen if z[5] in herkunft]
+    return zeilen
 
 
-def _filter_sql(arten, seit, bis, ref_praefix) -> tuple[str, list]:
+def _filter_sql(arten, seit, bis, ref_praefix, herkunft=None) -> tuple[str, list]:
+    """`herkunft`: nur Brocken dieser Herkünfte und keine Berichte (Suche für den Systemprompt)."""
     teile, werte = [], []
+    if herkunft:
+        teile.append(f"(c.herkunft IN ({','.join('?' * len(herkunft))}) OR c.herkunft = '' OR c.herkunft IS NULL) "
+                     "AND c.kind != 'bericht'")
+        werte += list(herkunft)
     if arten:
         teile.append(f"c.kind IN ({','.join('?' * len(arten))})")
         werte += list(arten)
     else:
-        teile.append("c.kind != 'bild'")         # Bilder nur in der Bildsuche
+        teile.append("c.kind NOT IN (" + ",".join(f"'{a}'" for a in MEDIEN_ARTEN) + ")")   # nur in der Medien-Suche
     if seit:
         teile.append("c.datum >= ?")
         werte.append(seit)
@@ -1793,9 +2887,11 @@ def _filter_sql(arten, seit, bis, ref_praefix) -> tuple[str, list]:
         teile.append("c.datum <= ?")
         werte.append(bis + " 99")               # ganzer Tag
     if ref_praefix:                             # "ref$" = genau diese Quelle
-        teile.append("(" + " OR ".join("c.ref = ?" if p.endswith("$") else "c.ref LIKE ?"
+        # substr statt LIKE: „_“/„%“ im Präfix sind keine Platzhalter, Groß/klein zählt – wie in _passt
+        teile.append("(" + " OR ".join("c.ref = ?" if p.endswith("$") else "substr(c.ref, 1, ?) = ?"
                                         for p in ref_praefix) + ")")
-        werte += [p[:-1] if p.endswith("$") else p + "%" for p in ref_praefix]
+        for p in ref_praefix:
+            werte += [p[:-1]] if p.endswith("$") else [len(p), p]
     profil, profil_werte = _profil_bedingung()
     if profil:
         teile.append(profil)
@@ -1803,13 +2899,15 @@ def _filter_sql(arten, seit, bis, ref_praefix) -> tuple[str, list]:
     return (" AND " + " AND ".join(teile)) if teile else "", werte
 
 
-def _passt(meta_row: tuple, arten, seit, bis, ref_praefix, aktiv: str | None = None) -> bool:
+def _passt(meta_row: tuple, arten, seit, bis, ref_praefix, aktiv: str | None = None, herkunft=None) -> bool:
     kind, ref, _t, datum = meta_row[:4]
     if _fremdes_profil(ref, aktiv):
         return False
+    if herkunft and (kind == "bericht" or (meta_row[5] if len(meta_row) > 5 else "") not in herkunft):
+        return False
     if arten and kind not in arten:
         return False
-    if not arten and kind == "bild":             # Bilder nur in der Bildsuche
+    if not arten and kind in MEDIEN_ARTEN:       # Medien nur in der Medien-Suche
         return False
     if seit and (datum or "") < seit:
         return False
@@ -1855,14 +2953,16 @@ def _aufgabe(arten) -> str:
 
 
 _MERK = threading.local()          # Stichwort-Treffer je guide_block: Vorab- und volle Suche teilen sie
+_NUR_PROMPT = threading.local()    # _treffer_block: die Suche liefert nur Herkünfte aus HERKUNFT_PROMPT
 
 
-def _worte(con: sqlite3.Connection, f: str, arten, seit, bis, ref_praefix) -> list[tuple]:
+def _worte(con: sqlite3.Connection, f: str, arten, seit, bis, ref_praefix, herkunft=None) -> list[tuple]:
     merk = getattr(_MERK, "worte", None)
-    schluessel = (f, tuple(arten) if arten else None, seit, bis, tuple(ref_praefix) if ref_praefix else None)
+    schluessel = (f, tuple(arten) if arten else None, seit, bis, tuple(ref_praefix) if ref_praefix else None,
+                  tuple(herkunft) if herkunft else None)
     if merk is not None and schluessel in merk:
         return merk[schluessel]
-    zeilen = _stichwort_treffer(con, f, arten, seit, bis, ref_praefix)
+    zeilen = _stichwort_treffer(con, f, arten, seit, bis, ref_praefix, herkunft)
     if merk is not None:
         merk[schluessel] = zeilen
     return zeilen
@@ -1899,19 +2999,23 @@ def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "
     wie: dict[int, set] = {}
     aehnlich: dict[int, float] = {}      # rowid → bester Kosinus
     gefunden: dict[int, tuple] = {}      # rowid → (kind, ref, text, datum, rowid)
+    aktiv = _aktives_profil()                                     # einmal je Suche
+    fremd = _fremde_notizen(aktiv) if not arten or "note" in arten else frozenset()   # Lehren anderer Persönlichkeiten
+    herkunft = HERKUNFT_PROMPT if getattr(_NUR_PROMPT, "an", False) else None      # Suche für den Systemprompt
 
     if any(_fts_anfrage(f) for f in fragen):
         try:
             con = _connect()
             try:
-                listen = [_worte(con, f, arten, seit, bis, ref_praefix) for f in fragen if _fts_anfrage(f)]
+                listen = [_worte(con, f, arten, seit, bis, ref_praefix, herkunft) for f in fragen if _fts_anfrage(f)]
             finally:
                 con.close()
         except sqlite3.Error:
             listen = []
         for zeilen in listen:
-            for rang, (rowid, kind, ref, text, datum) in enumerate(zeilen):
-                gefunden[rowid] = (kind, ref, text, datum or "", rowid)
+            zeilen = [z for z in zeilen if z[2] not in fremd]
+            for rang, (rowid, kind, ref, text, datum, *rest) in enumerate(zeilen):
+                gefunden[rowid] = (kind, ref, text, datum or "", rowid, (rest[0] if rest else "") or "")
                 punkte[rowid] = punkte.get(rowid, 0.0) + 1.0 / (RRF_K + rang)
                 wie.setdefault(rowid, set()).add("wort")
     uhr = _messen("Stichworte", uhr)
@@ -1933,12 +3037,11 @@ def suchen(frage, k: int = SEARCH_K, *, arten=None, seit: str = "", bis: str = "
         except Exception:
             vektoren = []
         uhr = _messen("Einbetten", uhr)
-        aktiv = _aktives_profil()
         kandidat_ab = schwelle("kandidat") if vektoren else 0.0
         for qv, art in vektoren:
             bewertet = []                # beste zuerst, gefiltert nur bis genug beisammen sind
             for s, i in sorted(_scores(ix, qv, kandidat_ab), key=lambda x: -x[0]):
-                if _passt(meta[i], arten, seit, bis, ref_praefix, aktiv):
+                if _passt(meta[i], arten, seit, bis, ref_praefix, aktiv, herkunft) and meta[i][1] not in fremd:
                     bewertet.append((s, i))
                     if len(bewertet) >= KANDIDATEN:
                         break
@@ -2043,13 +3146,17 @@ def nachbarn(rowid: int) -> tuple[str, str]:
 def quelle_lesen(ref: str, max_zeichen: int = 12_000, ab: int = 1) -> dict | None:
     """Die Brocken einer Quelle (z. B. 'chat:152') in Reihenfolge, ab Abschnitt `ab`
     (1 = Anfang), so viele ganze Abschnitte wie in `max_zeichen` passen. `weiter`
-    nennt den nächsten Abschnitt (0 = Ende). Überlappungen werden nicht entfernt."""
-    if _fremdes_profil(ref):                     # Chats einer anderen Persönlichkeit
+    nennt den nächsten Abschnitt (0 = Ende). Überlappungen werden nicht entfernt.
+    `herkunft`: die Herkünfte der gezeigten Brocken (agentrag setzt danach die Netz-Marke)."""
+    aktiv = _aktives_profil()
+    if _fremdes_profil(ref, aktiv):              # Chats einer anderen Persönlichkeit
+        return None
+    if str(ref).startswith(("note:", "detail:")) and ref in _fremde_notizen(aktiv):   # Lehren einer anderen
         return None
     try:
         con = _connect()
         try:
-            zeilen = con.execute("SELECT kind, text, datum FROM chunks WHERE ref=? ORDER BY rowid",
+            zeilen = con.execute("SELECT kind, text, datum, herkunft FROM chunks WHERE ref=? ORDER BY rowid",
                                  (ref,)).fetchall()
         finally:
             con.close()
@@ -2058,18 +3165,24 @@ def quelle_lesen(ref: str, max_zeichen: int = 12_000, ab: int = 1) -> dict | Non
     if not zeilen:
         return None
     start = min(max(1, int(ab or 1)), len(zeilen))
-    teile, laenge, weiter = [], 0, 0
-    for nr, (_k, t, _d) in enumerate(zeilen[start - 1:], start):
+    if any(not z[3] for z in zeilen):           # noch nicht nachgetragen: aus der ganzen Quelle ableiten
+        kind = zeilen[0][0] or "chat"
+        abgeleitet = ([_medien_herkunft(ref)] * len(zeilen) if kind in MEDIEN_ARTEN
+                      else _herkunft_reihe(kind, [z[1] for z in zeilen]))
+        zeilen = [z[:3] + (z[3] or h,) for z, h in zip(zeilen, abgeleitet)]
+    teile, laenge, weiter, herkunft = [], 0, 0, set()
+    for nr, (_k, t, _d, hk) in enumerate(zeilen[start - 1:], start):
         if teile and laenge + len(t) > max_zeichen:
             weiter = nr
             break
         teile.append(t)
+        herkunft.add(hk)
         laenge += len(t) + 3
     text = "\n…\n".join(teile)
     gekuerzt = bool(weiter) or len(text) > max_zeichen
     return {"ref": ref, "kind": zeilen[0][0], "datum": zeilen[0][2] or "",
             "text": text[:max_zeichen], "gekuerzt": gekuerzt, "brocken": len(zeilen),
-            "ab": start, "weiter": weiter}
+            "ab": start, "weiter": weiter, "herkunft": sorted(herkunft)}
 
 
 def search(query: str, k: int = SEARCH_K, nur_worte: bool = False) -> list[dict]:
@@ -2103,15 +3216,37 @@ def _laufender_chat() -> tuple[str, list[str], int]:
         return "", [], 0
 
 
-_HERKUNFT = re.compile(r"^(?:(?:Nutzer|Nemi): |\[(?:Nutzer|Nemi)(?: › [^\]\n]*)?\] )")
+_HERKUNFT = re.compile(r"^(?:(?:Nutzer|KI|Nemi|Werkzeug|Netz): |\[(?:Nutzer|KI|Nemi|Werkzeug|Netz)(?: › [^\]\n]*)?\] )")
+
+
+def _herkunft_von(h: dict) -> str:
+    """Herkunft eines Treffers; ohne das Feld (Aufrufer mit eigenen Treffern) aus Art und Text abgeleitet."""
+    wert = h.get("herkunft")
+    if wert:
+        return str(wert)
+    text = str(h.get("text") or "")
+    if wert is not None:                         # leer: älterer Brocken, noch nicht nachgetragen
+        return herkunft_ableiten(h.get("kind") or "chat", str(h.get("ref") or ""), text)
+    if (h.get("kind") or "chat") != "chat":
+        return _ART_HERKUNFT.get(h.get("kind"), "datei")
+    if _fremd_markiert(text) or re.match(r"^(?:Werkzeug|Netz): |^\[(?:Werkzeug|Netz)[\] ]|^(?:Nutzer: )?"
+                                         + re.escape(ERGEBNIS_VORSATZ), text):
+        return "werkzeug"
+    return "ki" if re.match(r"^(?:KI|Nemi): |^\[(?:KI|Nemi)[\] ]", text) else "nutzer"
+
+
+def _fuer_prompt(h: dict) -> bool:
+    """Darf dieser Treffer ungefragt in den Systemprompt? Nur Eingaben des Nutzers, Antworten der KI, Notizen
+    Skills und Wissen-Dokumente – keine Werkzeug-Ergebnisse, Netz-Inhalte, Berichte oder Exporte."""
+    return h.get("kind") != "bericht" and _herkunft_von(h) in HERKUNFT_PROMPT
 
 
 def _vorhin_im_chat(query: str, ref: str, kontext: list[str], nur_worte: bool = False) -> list[dict]:
-    """Treffer aus dem laufenden Chat, die nicht mehr im Kontext stehen."""
+    """Treffer aus dem laufenden Chat, die nicht mehr im Kontext stehen (ohne Werkzeug-Ergebnisse und Netz-Inhalt)."""
     raus = []
     for h in suchen(query, VORHIN_K * 4, arten=("chat",), ref_praefix=(ref + "$",), nur_worte=nur_worte):
         text = h.get("text") or ""
-        if text.startswith("Chat #"):                       # Titelzeile
+        if text.startswith("Chat #") or not _fuer_prompt(h):     # Titelzeile, Fremdinhalt
             continue
         text = _HERKUNFT.sub("", text, count=1)              # „Nutzer: “ oder „[Nutzer] “ (Folge-Brocken)
         probe = text.strip()[:200]
@@ -2190,16 +3325,20 @@ def guide_block(query: str, ausser: set[str] | None = None) -> str:
 
 def _treffer_block(query: str, ref: str, kontext: list[str], ausgelagert: int, nur_worte: bool = False,
                    ausser: set[str] | None = None) -> str:
-    if nur_worte:
-        vorhin = _vorhin_im_chat(query, ref, kontext, nur_worte=True) if ref and ausgelagert else []
-        hits = search(query, GUIDE_KANDIDATEN, nur_worte=True)
-    else:
-        vorhin = _vorhin_im_chat(query, ref, kontext) if ref and ausgelagert else []
-        hits = search(query, GUIDE_KANDIDATEN)
-    # Berichte (Recherche, Zeitplan, Wache) bestehen aus Fremdinhalt: nie ungefragt in den Systemprompt –
-    # über gedaechtnis_suchen kommen sie mit Netz-Marke. Was schon im Prompt steht, zählt nicht.
+    vorher, _NUR_PROMPT.an = getattr(_NUR_PROMPT, "an", False), True   # Fremdes belegt keine Plätze
+    try:
+        if nur_worte:
+            vorhin = _vorhin_im_chat(query, ref, kontext, nur_worte=True) if ref and ausgelagert else []
+            hits = search(query, GUIDE_KANDIDATEN, nur_worte=True)
+        else:
+            vorhin = _vorhin_im_chat(query, ref, kontext) if ref and ausgelagert else []
+            hits = search(query, GUIDE_KANDIDATEN)
+    finally:
+        _NUR_PROMPT.an = vorher
+    # Berichte, Werkzeug-Ergebnisse, Netz-Inhalt und Exporte nie ungefragt in den Systemprompt –
+    # über gedaechtnis_suchen kommen sie gerahmt (Fremdes mit Netz-Marke). Was schon im Prompt steht, zählt nicht.
     weg = set(ausser or ()) | ({ref} if ref else set())
-    hits = [h for h in hits if h.get("kind") != "bericht" and h.get("ref") not in weg]
+    hits = [h for h in hits if _fuer_prompt(h) and h.get("ref") not in weg]
     if not nur_worte:                  # unsichere Treffer nur nach Bedeutung: lieber keiner als ein falscher
         ab = schwelle("vorgeschmack")
         hits, vorhin = (_sicher(hits, ab)[:GUIDE_K], _sicher(vorhin, ab))

@@ -30,19 +30,22 @@ def _datei() -> Path:
     return profilordner.ordner("Erinnerungen", anlegen=False) / "tagebuch.json"
 
 
-def _laden(datei: Path) -> list:
+def _laden(datei: Path, streng: bool = False) -> list:
+    """Kaputte Datei wird beiseitegelegt statt überschrieben. `streng`: Lesefehler weitergeben –
+    vor dem Schreiben, sonst ersetzte ein gesperrtes Tagebuch sich durch einen einzigen Eintrag."""
+    from atomar import json_lesen
     try:
-        d = json.loads(datei.read_text(encoding="utf-8"))
-        return d if isinstance(d, list) else []
-    except (OSError, ValueError):
+        return json_lesen(datei, [], list)
+    except OSError:
+        if streng:
+            raise
         return []
 
 
 def _speichern(datei: Path, daten) -> None:
+    from atomar import text_schreiben
     datei.parent.mkdir(parents=True, exist_ok=True)
-    tmp = datei.with_suffix(".tmp")
-    tmp.write_text(json.dumps(daten, ensure_ascii=False, indent=1), encoding="utf-8")
-    tmp.replace(datei)
+    text_schreiben(datei, json.dumps(daten, ensure_ascii=False, indent=1))
 
 
 def eintraege() -> list[dict]:
@@ -74,7 +77,7 @@ def schreiben(text: str, stimmung_nutzer: str = "", meine_stimmung: str = "") ->
         if teil and (grund := _pruefen(str(teil), grenze)):
             raise ValueError(grund)
     datei = _datei()
-    alle = _laden(datei)
+    alle = _laden(datei, streng=True)
     eintrag = {"zeit": datetime.now().strftime("%Y-%m-%d %H:%M"), "text": text}
     if stimmung_nutzer.strip():
         eintrag["stimmung_nutzer"] = stimmung_nutzer.strip()
@@ -161,8 +164,8 @@ def _bild_pfad(pfad: str) -> Path:
     return p
 
 
-def lieblinge() -> list[dict]:
-    d = _laden(_lieblinge_datei())
+def lieblinge(streng: bool = False) -> list[dict]:
+    d = _laden(_lieblinge_datei(), streng)
     return [e for e in d if isinstance(e, dict) and e.get("pfad")]
 
 
@@ -173,7 +176,7 @@ def markieren(pfad: str, name: str) -> str:
         raise ValueError("ein Name fehlt (z. B. „mein Strandbild“)")
     if (grund := _pruefen(name, MAX_NAME)):
         raise ValueError(grund)
-    alle = [e for e in lieblinge() if e["pfad"] != str(p)]
+    alle = [e for e in lieblinge(streng=True) if e["pfad"] != str(p)]
     alle.append({"pfad": str(p), "name": name, "seit": datetime.now().strftime("%Y-%m-%d %H:%M")})
     _speichern(_lieblinge_datei(), alle)
     return name
@@ -181,7 +184,7 @@ def markieren(pfad: str, name: str) -> str:
 
 def entfernen(pfad_oder_name: str) -> str | None:
     such = str(pfad_oder_name or "").strip().strip('"').lower()
-    alle = lieblinge()
+    alle = lieblinge(streng=True)
     treffer = next((e for e in alle if e["name"].lower() == such or e["pfad"].lower() == such
                     or Path(e["pfad"]).name.lower() == Path(such).name), None)
     if treffer is None:

@@ -62,7 +62,8 @@ KONTEXT_ANTEIL = 0.5
 ZEICHEN_JE_TOKEN = 3                # vorsichtig gerechnet (Deutsch, Code)
 # Ab dieser Größe schauen wir gar nicht erst rein (kein Log, keine Datenbank).
 MAX_BYTES = 20_000_000
-MIN_REST = 500                      # weniger frei: Datei nicht mehr anreißen, nur nennen
+_BOM16 = (codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)
+MIN_REST = 500                     # weniger frei: Datei nicht mehr anreißen, nur nennen
 
 # Pfade in der Nachricht: in Anführungszeichen (auch mit Leerzeichen) oder roh
 # (Windows „C:\…", UNC „\\…", Unix „/…", relativ „./…", „~/…").
@@ -108,6 +109,13 @@ def _ist_text(p: Path, probe: int = 8192) -> bool:
         return False
     if not roh:
         return True                            # leere Datei = leerer Text
+    if roh.startswith(_BOM16):                 # UTF-16 mit BOM (z. B. Umleitung in Windows PowerShell)
+        try:
+            t = codecs.getincrementaldecoder("utf-16")().decode(roh, final=False)
+        except UnicodeDecodeError:
+            return False
+        steuer = sum(1 for z in t if ord(z) < 32 and z not in "\t\n\r\f\x1b")
+        return "\x00" not in t and steuer / max(1, len(t)) < 0.05
     if b"\x00" in roh:
         return False
     try:                                       # die Probe kann mitten in einem Mehrbyte-Zeichen enden
@@ -228,17 +236,27 @@ def _mb(n: int) -> str:
 # Lesen
 # ---------------------------------------------------------------------------
 
-def lese_text(p: Path, grenze: int = MAX_ZEICHEN) -> tuple[str, int]:
-    """(Inhalt bis zur Grenze, Gesamtzahl der Zeichen) – UTF-8, sonst cp1252.
+def lese_text(p: Path, grenze: int = MAX_ZEICHEN) -> tuple[str, int, int]:
+    """(Inhalt bis zur Grenze, Gesamtzahl der Zeichen, Zeilen) – UTF-8, sonst cp1252.
 
     Die Gesamtzahl steht dabei, damit der Hinweis sagen kann, WAS fehlt
-    („Zeichen 12.000–145.977") – nicht nur, dass etwas fehlt."""
+    („Zeichen 12.000–145.977") – nicht nur, dass etwas fehlt. Zeichen sind Unicode-Zeichen,
+    nicht Bytes: Umlaute und Emojis belegen in UTF-8 mehrere Bytes."""
     roh = p.read_bytes()
     try:
-        t = roh.decode("utf-8")
+        t = roh.decode("utf-16", errors="replace") if roh.startswith(_BOM16) else roh.decode("utf-8-sig")
     except UnicodeDecodeError:
         t = roh.decode("cp1252", errors="replace")
-    return t[:grenze], len(t)
+    return t[:grenze], len(t), len(t.splitlines())
+
+
+def _zahl(n: int) -> str:
+    return f"{n:,}".replace(",", ".")
+
+
+def text_masse(zeichen: int, groesse: int, zeilen: int) -> str:
+    """Kopfzeile eines Textanhangs: Zeichen, Bytes und Zeilen ausdrücklich getrennt."""
+    return f"{_zahl(zeichen)} Zeichen · {_zahl(groesse)} Bytes · {_zahl(zeilen)} Zeilen"
 
 
 def lese_pdf(p: Path, grenze: int = MAX_ZEICHEN) -> tuple[str, int, int]:
@@ -568,8 +586,8 @@ def anhaengen(text: str, grenze: int = MAX_ZEICHEN) -> dict:
                     continue
                 zusatz = zusatz or f"{p.stat().st_size:,} Bytes".replace(",", ".")
             else:
-                inhalt, gesamt = lese_text(p, frei)
-                zusatz = f"{p.stat().st_size:,} Bytes".replace(",", ".")
+                inhalt, gesamt, zeilen = lese_text(p, frei)
+                zusatz = text_masse(gesamt, p.stat().st_size, zeilen)
             frei -= len(inhalt)
             if gesamt > len(inhalt):
                 # Den fehlenden Bereich nennen: dann ist klar, ob Nachlesen lohnt.

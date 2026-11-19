@@ -61,8 +61,22 @@ class Teil:
 # Wo die Motoren suchen (ohne sie zu importieren – manche laden torch schon beim Import)
 # ---------------------------------------------------------------------------
 
-def _erster(kandidaten: list[Path], sonst: Path) -> Path:
-    return next((k for k in kandidaten if k.is_dir()), sonst)
+try:
+    import modellorte as _MO
+except Exception:                                    # Selbsttest ohne Bootstrap
+    _MO = None
+
+
+def _neu(art: str, name: str = "") -> list[Path]:
+    """Der neue Ort einer Art (modellorte), optional mit festem Modellordner; ohne modellorte leer."""
+    if _MO is None:
+        return []
+    return [_MO.ordner(art) / name if name else _MO.ordner(art)]
+
+
+def _ziel(art: str, alt: Path) -> Path:
+    """Wohin geladen wird: der neue Ort, ohne modellorte der frühere."""
+    return (_neu(art) or [alt])[0]
 
 
 def _unterordner(basis: Path) -> list[Path]:
@@ -79,25 +93,30 @@ def _ggufs(d: Path) -> list[str]:
         return []
 
 
+def _alle_unter(*wurzeln: Path) -> list[Path]:
+    return [d for w in wurzeln for d in _unterordner(w)]
+
+
 def _gedaechtnis_da() -> bool:
-    return any(_ggufs(d) or (d / "config.json").is_file() for d in _unterordner(_INSTALL / "Models" / "embeddings"))
+    return any(_ggufs(d) or (d / "config.json").is_file()
+               for d in _alle_unter(*_neu("suche"), _INSTALL / "Models" / "embeddings"))
 
 
 def _reranker_da() -> bool:
-    return any(len(_ggufs(d)) == 1 for d in _unterordner(_INSTALL / "Models" / "reranker"))
+    return any(len(_ggufs(d)) == 1 for d in _alle_unter(*_neu("sortieren"), _INSTALL / "Models" / "reranker"))
 
 
 def _sehen_da() -> bool:
     return any(any("mmproj" in n for n in g) and any("mmproj" not in n for n in g)
-               for g in map(_ggufs, _unterordner(_INSTALL / "Vision")))
+               for g in map(_ggufs, _alle_unter(*_neu("sehen"), _INSTALL / "Vision")))
 
 
 def _stimme_da() -> bool:
-    ordner = [d for o in ("Vision", "Sinne") for d in _unterordner(_INSTALL / o)]
+    ordner = _alle_unter(*_neu("stimme"), _INSTALL / "Vision", _INSTALL / "Sinne")
     return any(any("talker" in n for n in g) and any("tokenizer" in n for n in g) for g in map(_ggufs, ordner))
 
 
-_MUSIK = [b / "Models" / n for b in (_ROOT, _INSTALL) for n in ("Musik", "Music")]
+_MUSIK = [*_neu("musik"), *(b / "Models" / n for b in (_ROOT, _INSTALL) for n in ("Musik", "Music"))]
 
 
 def _musik_da() -> bool:
@@ -108,18 +127,8 @@ def _musik_da() -> bool:
     return all(any(n.startswith(a) for n in namen) for a in ("acestep-v15-", "Qwen3-Embedding-", "vae-"))
 
 
-_VIDEO = [_INSTALL / "VideoGen", _ROOT / "VideoGen", _ROOT / "Models" / "Video", _INSTALL / "Models" / "Video"]
-
-
-def _video_da() -> bool:
-    for o in _VIDEO:
-        for d in _unterordner(o):
-            if d.name not in ("text_encoders", "tokenizer", "tae") and (_ggufs(d) or any(d.glob("*.safetensors"))):
-                return True
-    return False
-
-
-_PORTRAET = [_ROOT / "Models" / "LivePortrait", _INSTALL / "Models" / "LivePortrait"]
+_PORTRAET = [*_neu("portraet", _MO.PORTRAET if _MO else ""), _ROOT / "Models" / "LivePortrait",
+             _INSTALL / "Models" / "LivePortrait"]
 _PORTRAET_TEILE = ("appearance_feature_extractor", "motion_extractor", "spade_generator", "warping_module",
                    "stitching_retargeting_module")
 
@@ -132,8 +141,18 @@ def _portraet_da() -> bool:
     return False
 
 
+def _vorpruefer_ordner() -> Path:
+    return _ziel("wache", _INSTALL / "KI-Modelle" / "KI-Wache" / "Vorpruefer") / (
+        _MO.VORPRUEFER if _MO else "granite-4.0-h-350m")
+
+
+def _vorpruefer_da() -> bool:
+    o = _vorpruefer_ordner()
+    return all((o / n).is_file() for n in ("config.json", "model.safetensors", "tokenizer.json"))
+
+
 def _lfm3_da() -> bool:
-    return bool(_ggufs(_INSTALL / "ModelGGUF" / "LFM3Familie" / "Text"))
+    return any(_ggufs(w / "LFM3Familie" / "Text") for w in (*_neu("chat"), _INSTALL / "ModelGGUF"))
 
 
 def _krea_ordner() -> Path:
@@ -159,15 +178,13 @@ def _krea_da() -> bool:
 _APACHE = ("Apache 2.0", "https://www.apache.org/licenses/LICENSE-2.0")
 _MIT = ("MIT", "https://opensource.org/license/mit")
 
-_EMB = ("Qwen/Qwen3-Embedding-0.6B-GGUF", "370f27d7550e0def9b39c1f16d3fbaa13aa67728")
+_EMB = ("unsloth/embeddinggemma-2-GGUF", "031f0d4b35536f69ab3509d4893c923264fcf253")
 _RR = ("ggml-org/Qwen3-Reranker-0.6B-Q8_0-GGUF", "a02f48bb4f057028298c21fa033da2b30d7742d5")
 _VL = ("Qwen/Qwen3-VL-4B-Instruct-GGUF", "1cd86afb9a95c410a6038ab3b40d8b578c892266")
 _TTS = ("Serveurperso/Qwen3-TTS-GGUF", "b7ee2e8c7459c3bea99da23e3d178125a7d1713c")
 _ACE = ("Serveurperso/ACE-Step-1.5-GGUF", "666ac70204440867d8c01ba4b119cc79c95b370a")
-_WAN = ("unsloth/Wan2.2-TI2V-5B-GGUF", "b5c2a3816e7056e57e200f6be726fb36ce523b49")
-_UMT5 = ("city96/umt5-xxl-encoder-gguf", "b535255bee98c2b0a59ea7c0ae2dcd0c6657b3b7")
-_UMT5_TOK = ("alibaba-pai/Wan2.1-Fun-1.3B-InP", "9bcbbcf673c0e6a996df6f3f25bee596ffa36d47")
 _LP = ("KlingTeam/LivePortrait", "82a4fa6735ca58432b6ce39301b4b9ee066dea47")
+_GRANITE = ("ibm-granite/granite-4.0-h-350m", "3b17b717b8f2f5d305b0a92c1491e239aeda19c8")
 
 # LFM3: je Mitglied ein Unterordner (gguflokal.familien); die Entscheider eine Ebene tiefer, sie chatten nicht
 _LFM3_LIZENZ = f"{HF}/LiquidAI/LFM3-1.7B-GGUF/blob/bad5729bba61d076fff20d2548e62526665af215/LICENSE"
@@ -203,28 +220,31 @@ _LFM3_DATEIEN = (
 )
 
 KATALOG: tuple[Teil, ...] = (
-    Teil("gedaechtnis", "💾 Gedächtnis", "Suche nach Bedeutung in Chats, Notizen und Wissen", *_APACHE,
-         ziel=lambda: _INSTALL / "Models" / "embeddings" / "Qwen3GGUFQ8_0", da=_gedaechtnis_da,
-         dateien=(Datei(*_EMB, "Qwen3-Embedding-0.6B-Q8_0.gguf", 639150592,
-                        "06507c7b42688469c4e7298b0a1e16deff06caf291cf0a5b278c308249c3e439"),)),
+    Teil("gedaechtnis", "💾 Gedächtnis", "Suche nach Bedeutung in Chats, Notizen, Wissen und Bildern "
+         "(EmbeddingGemma 2, Text 310 MB + Bild-Teil)", *_APACHE,
+         ziel=lambda: _ziel("suche", _INSTALL / "Models" / "embeddings") / "EmbeddingGemma2Q8_0", da=_gedaechtnis_da,
+         dateien=(Datei(*_EMB, "embeddinggemma-2-Q8_0.gguf", 309855520,
+                        "6f1bd4ac6c5df7444f9cca7ca36cafe6cfa34cd6f49fefb1e0b4be8143aed8bc"),
+                  Datei(*_EMB, "mmproj-BF16.gguf", 982074880,
+                        "995aaa56e88b9b631f651861d659b728a625ccc02a238be37cff56cf11dc0032"))),
     Teil("reranker", "🎯 Reranker", "sortiert Gedächtnis-Treffer nach Relevanz", *_APACHE,
-         ziel=lambda: _INSTALL / "Models" / "reranker" / "Qwen3-Reranker-0.6B", da=_reranker_da,
+         ziel=lambda: _ziel("sortieren", _INSTALL / "Models" / "reranker") / "Qwen3-Reranker-0.6B", da=_reranker_da,
          dateien=(Datei(*_RR, "qwen3-reranker-0.6b-q8_0.gguf", 639153184,
                         "22c9979ce4fbcdc5acdc310c6641c32797eff1aa980b8f7a2db8a8ea23429a48"),)),
     Teil("sehen", "👁 Bildbeschreiber", "beschreibt Bilder für Modelle, die selbst nicht sehen", *_APACHE,
-         ziel=lambda: _INSTALL / "Vision" / "Qwen3-VL-4B", da=_sehen_da,
+         ziel=lambda: _ziel("sehen", _INSTALL / "Vision") / "Qwen3-VL-4B", da=_sehen_da,
          dateien=(Datei(*_VL, "Qwen3VL-4B-Instruct-Q4_K_M.gguf", 2497281664,
                         "66358cb18bb6b3b1b6675aa412c7a88ef01d228f481184d13668e5201c730a0a"),
                   Datei(*_VL, "mmproj-Qwen3VL-4B-Instruct-F16.gguf", 836180256,
                         "256f3a43bd4205ffef48d6b92715e1e70b5b0e9aef06522584967513a9985331"))),
     Teil("stimme", "🔊 Stimme", "liest vor, eigene Stimme je Persönlichkeit", *_APACHE,
-         ziel=lambda: _INSTALL / "Vision" / "Qwen3-TTS", da=_stimme_da,
+         ziel=lambda: _ziel("stimme", _INSTALL / "Vision") / "Qwen3-TTS", da=_stimme_da,
          dateien=(Datei(*_TTS, "qwen-talker-1.7b-voicedesign-Q8_0.gguf", 2042833824,
                         "575610ab1ddcca4dca6bd9a64bcd859d93bbad8764f9cab24e1dbc0c51f62276"),
                   Datei(*_TTS, "qwen-tokenizer-12hz-Q8_0.gguf", 291150624,
                         "1883beeed99348fc35e23dd225e9082f93f6f8c109330a33d935baa8acdbfd94"))),
     Teil("musik", "🎵 Musik", "komponiert Lieder mit Gesang (ACE-Step 1.5 Turbo)", *_MIT,
-         ziel=lambda: _erster(_MUSIK, _INSTALL / "Models" / "Music") / "ACE-Step-1.5", da=_musik_da,
+         ziel=lambda: _ziel("musik", _INSTALL / "Models" / "Music") / "ACE-Step-1.5", da=_musik_da,
          dateien=(Datei(*_ACE, "acestep-v15-turbo-Q8_0.gguf", 2549528000,
                         "288f708a61cfc241013a98a62f98ba331f83fe34d0d3559acdd9b0f6a2f7cd6b"),
                   Datei(*_ACE, "Qwen3-Embedding-0.6B-Q8_0.gguf", 784144960,
@@ -233,18 +253,9 @@ KATALOG: tuple[Teil, ...] = (
                         "0599862ac5d15cd308e1d2e368373aea6c02e25ebd1737ad4a4562a0901b0ef8"),
                   Datei(*_ACE, "acestep-5Hz-lm-1.7B-Q8_0.gguf", 1975837568,
                         "726f99a82f050b32ebc5c5e36acaa9d7acd06bfe5e579a62b00e0d0d6d0b7ec6"))),
-    Teil("video", "🎬 Video", "Videos bis 20 s aus Text oder Startbild (Wan 2.2 TI2V 5B)", *_APACHE,
-         ziel=lambda: _erster(_VIDEO, _INSTALL / "VideoGen") / "WAN-GGUF", da=_video_da,
-         dateien=(Datei(*_WAN, "Wan2.2-TI2V-5B-Q4_K_M.gguf", 3433116000,
-                        "95b19697b7f98e65b0a543640e9ca7b4dfec32e2a6e3731e8e10708be52655e2"),
-                  Datei(*_WAN, "VAE/Wan2.2_VAE.safetensors", 1409400960,
-                        "e40321bd36b9709991dae2530eb4ac303dd168276980d3e9bc4b6e2b75fed156", "vae"),
-                  Datei(*_UMT5, "umt5-xxl-encoder-Q8_0.gguf", 6043068256,
-                        "2521d4de0bf9e1cc6549866463ceae85e4ec3239bc6063f7488810be39033bbc", "text_encoders"),
-                  Datei(*_UMT5_TOK, "google/umt5-xxl/tokenizer.json", 16837417,
-                        "6e197b4d3dbd71da14b4eb255f4fa91c9c1f2068b20a2de2472967ca3d22602b", "tokenizer"))),
     Teil("portraet", "🎭 Porträt", "bewegte, sprechende Porträts (LivePortrait)", *_MIT,
-         ziel=lambda: _erster(_PORTRAET, _INSTALL / "Models" / "LivePortrait"), da=_portraet_da,
+         ziel=lambda: (_neu("portraet", _MO.PORTRAET) if _MO else [_INSTALL / "Models" / "LivePortrait"])[0],
+         da=_portraet_da,
          dateien=tuple(Datei(*_LP, f"liveportrait/{p}", g, s) for p, g, s in (
              ("base_models/appearance_feature_extractor.pth", 3387959,
               "5279bb8654293dbdf327030b397f107237dd9212fb11dd75b83dfb635211ceb5"),
@@ -261,8 +272,18 @@ KATALOG: tuple[Teil, ...] = (
          "Text chattet, VL sieht, Audio und Omni warten auf Hören und Sprechen, d1 auf Entscheidungen; geladen "
          "wird nur, wer gebraucht wird. Danach /model → Lokal → LFM3Familie",
          "LFM Open License v1.0 (privat frei, gewerblich bis 10 Mio. $ Jahresumsatz)", _LFM3_LIZENZ,
-         ziel=lambda: _INSTALL / "ModelGGUF" / "LFM3Familie", da=_lfm3_da,
+         ziel=lambda: _ziel("chat", _INSTALL / "ModelGGUF") / "LFM3Familie", da=_lfm3_da,
          dateien=tuple(Datei(repo, rev, pfad, g, s, unter) for repo, rev, unter, pfad, g, s in _LFM3_DATEIEN)),
+    Teil("vorpruefer", "🛡 Wache-Vorprüfer", "sieht Alarme der Wache vor dem Weckruf: schließt einfache Fehlalarme "
+         "selbst, schreibt der Cloud-KI zu allen anderen einen Brief (IBM Granite 4.0 H 350M, 690 MB)", *_APACHE,
+         ziel=_vorpruefer_ordner, da=_vorpruefer_da,
+         dateien=tuple(Datei(*_GRANITE, n, g, h) for n, g, h in (
+             ("config.json", 1715, "c11be93f2e5f83096042b19c3df3b0d982819b63c5378e0b6a82c4fdbe017fac"),
+             ("generation_config.json", 147, "7c04cb9d2ba771f7528fba5a7104999cdaf7566d02b5fbd58472829f62716177"),
+             ("special_tokens_map.json", 579, "c08676c49fd7969a3130f72be6d4bf34da66aa484a6e21dffe359893a1bd5f2e"),
+             ("tokenizer_config.json", 17659, "a5ec5daab12ba090a90f3dd169c8f9c275557013a87b9c1258dc7cb497a35c86"),
+             ("tokenizer.json", 7153421, "e2bad66439538cb4d5a7580680932432ed9ece9d3b8577e675512bdf11599253"),
+             ("model.safetensors", 680704864, "5e8e1b9957216467f080a186b13ef8886f23a6da273f55b8287f41de54faafc7")))),
     Teil("krea", "🎨 Krea 2 (Bilder malen)", "Diffusionsmodell im ComfyUI-Format, NVFP4 oder bf16, dazu "
          "text_encoders/ (Qwen3-VL-4B), vae/ und tokenizer/", "eigene Lizenz von Krea – vor dem Laden lesen",
          f"{HF}/krea/Krea-2-Turbo", ziel=_krea_ordner, da=_krea_da, link=f"{HF}/krea/Krea-2-Turbo"),
@@ -277,16 +298,20 @@ _GEMMA_LIZENZ = ("Apache 2.0", "https://ai.google.dev/gemma/docs/gemma_4_license
 
 
 def _helfer_da(name: str) -> Callable[[], bool]:
-    return lambda: (_INSTALL / "Models" / "helfer" / name).is_dir() and bool(_ggufs(_INSTALL / "Models" / "helfer" / name))
+    return lambda: any(_ggufs(w / name) for w in (*_neu("helfer"), _INSTALL / "Models" / "helfer"))
+
+
+def _helfer_ziel(name: str) -> Callable[[], Path]:
+    return lambda: _ziel("helfer", _INSTALL / "Models" / "helfer") / name
 
 
 HELFER: dict[str, Teil] = {
     "gemma4-e2b": Teil("gemma4-e2b", "✨ Gemma 4 E2B", "Einrichtungs-Helfer für kleinere Grafikkarten", *_GEMMA_LIZENZ,
-                       ziel=lambda: _INSTALL / "Models" / "helfer" / "gemma4-e2b", da=_helfer_da("gemma4-e2b"),
+                       ziel=_helfer_ziel("gemma4-e2b"), da=_helfer_da("gemma4-e2b"),
                        dateien=(Datei(*_E2B, "gemma-4-E2B-it-Q4_K_M.gguf", 3106738272,
                                       "740185b21d22ceb83a11c3aa62ad5842ef32c70f6096d756bbee85a1e4ec34b8"),)),
     "gemma4-e4b": Teil("gemma4-e4b", "✨ Gemma 4 E4B", "Einrichtungs-Helfer ab etwa 8 GB Grafikspeicher", *_GEMMA_LIZENZ,
-                       ziel=lambda: _INSTALL / "Models" / "helfer" / "gemma4-e4b", da=_helfer_da("gemma4-e4b"),
+                       ziel=_helfer_ziel("gemma4-e4b"), da=_helfer_da("gemma4-e4b"),
                        dateien=(Datei(*_E4B, "gemma-4-E4B-it-Q4_K_M.gguf", 4977171584,
                                       "85a896a047553e842f25297ee5b031d64ff30147d9c4af17b1e4b394cd1fab87"),)),
 }

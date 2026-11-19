@@ -20,6 +20,7 @@ nächsten Takt wieder weg.
 
 from __future__ import annotations
 
+import copy
 import json
 import os
 import threading
@@ -42,6 +43,19 @@ DAEMPFUNG = 0.35
 def _skript_host(e: Ereignis) -> bool:
     from .speicher import _SKRIPT_HOSTS
     return os.path.basename(str(e.exe or e.prozess or "")).lower() in _SKRIPT_HOSTS
+
+
+def _stand_wie_beurteilt(exe: str, gedaempft: dict) -> bool:
+    """Ist die Datei im Stand des harmlos-Urteils? Ohne gemerkten Stand (ältere Alarme) zählt der Pfad.
+    Im Motor-Faden: kein neuer SHA-256, nur Größe/Änderungszeit oder der zwischengespeicherte Hash."""
+    stand = gedaempft.get(exe.lower())
+    if not stand:
+        return True
+    try:
+        from .herkunft import stand_gleich
+        return stand_gleich(exe, stand, rechnen=False)
+    except Exception:
+        return False
 
 
 def _log(text: str) -> None:
@@ -96,8 +110,14 @@ def messwert_gruende(namen: list[str], v: list[float], sk) -> list[str]:
 
 
 class Detektor:
+    """`siegel` (siegel.Siegel): SHA-256 der selbst geschriebenen Stände – ein fremd getauschter Stand wird
+    nicht geladen, `bei_fremd(pfad)` meldet ihn (einmal je fremdem Stand)."""
+
     def __init__(self, pfad: Path, merkmale, *, schwelle: float = 0.97,
-                 kontamination: float = 0.02, label: str = "Prozesse & Netz"):
+                 kontamination: float = 0.02, label: str = "Prozesse & Netz", siegel=None, bei_fremd=None):
+        self.siegel = siegel
+        self.bei_fremd = bei_fremd
+        self._fremd = ""                              # SHA-256 des zuletzt abgewiesenen fremden Stands
         self.pfad = Path(pfad)
         self.merkmale = merkmale                      # ProzessMerkmale oder DateiMerkmale
         self.schwelle = schwelle
@@ -114,7 +134,8 @@ class Detektor:
         self.dauer = 0.0
         self.bewertet = 0
         self.anomalien = 0
-        self.gedaempft: set[str] = set()              # Programmpfade (klein) mit „harmlos“-Urteil
+        # Programmpfade (klein) mit „harmlos“-Urteil → Stand der Datei beim Urteil (None: nur am Pfad)
+        self.gedaempft: dict[str, dict | None] = {}
         self.fehler = ""                              # letzter Speicher-/Ladefehler, für stand()
         self._geladen_mtime = 0.0
         self.laden()
@@ -137,18 +158,26 @@ class Detektor:
         if len(ereignisse) < 20:
             return {"ok": False, "grund": f"zu wenige Ereignisse ({len(ereignisse)})"}
         start = time.perf_counter()
-        # Unter dem Lock: `anpassen` ändert die Merkmale, die zum alten Wald nicht mehr passen –
-        # ein Training aus einem anderen Thread darf dazwischen nicht bewerten lassen.
+        # Gelernt wird an einer Kopie der Merkmale (Profil-Abbild von jetzt): die Bewertung läuft derweil mit
+        # dem alten Wald weiter. `anpassen` ersetzt die Normalbild-Tabellen nur in der Kopie; danach kommen
+        # neuer Zustand und neuer Wald zusammen unter dem Lock – nie ein neuer Zustand mit altem Wald.
         with self._lock:
-            if hasattr(self.merkmale, "anpassen"):
-                self.merkmale.anpassen(ereignisse)
-            X = np.array([self.merkmale.vektor(e) for e in ereignisse], dtype=np.float64)
-            sk = Skalierer().anpassen(X)
-            Xs = sk.anwenden(X)
-            wald = IsolationForest(baeume=100, stichprobe=256, zufall=42).anpassen(Xs)
-            referenz = np.sort(wald.rohwert(Xs))
-            if len(referenz) > REFERENZ_MAX:          # feste Stützpunkte statt aller Werte: gleicher Rang, kleine Datei
-                referenz = np.quantile(referenz, np.linspace(0.0, 1.0, REFERENZ_MAX))
+            arbeit = copy.copy(self.merkmale)
+        if hasattr(arbeit, "anpassen"):
+            arbeit.anpassen(ereignisse)
+        X = np.array([arbeit.vektor(e) for e in ereignisse], dtype=np.float64)
+        sk = Skalierer().anpassen(X)
+        Xs = sk.anwenden(X)
+        wald = IsolationForest(baeume=100, stichprobe=256, zufall=42).anpassen(Xs)
+        referenz = np.sort(wald.rohwert(Xs))
+        if len(referenz) > REFERENZ_MAX:              # feste Stützpunkte statt aller Werte: gleicher Rang, kleine Datei
+            referenz = np.quantile(referenz, np.linspace(0.0, 1.0, REFERENZ_MAX))
+        with self._lock:
+            if hasattr(arbeit, "anpassen"):
+                if hasattr(self.merkmale, "zustand_laden"):
+                    self.merkmale.zustand_laden(arbeit.zustand())
+                else:
+                    self.merkmale.__dict__.update(arbeit.__dict__)
             self._wald, self._skalierer, self._referenz = wald, sk, referenz
             self.trainiert = True
             self.stichprobe = len(ereignisse)
@@ -189,8 +218,9 @@ class Detektor:
         # Gedämpft wird nur dasselbe Programm (Pfad) und nur unterhalb der Ausreißer-Grenze:
         # nie Gesehenes und extreme Abweichungen melden auch nach einem „harmlos“.
         # Skript-Hosts (Shells, Python …) nie: ein „harmlos“ zu einem Skript dämpfte sonst jedes andere.
+        # Gedämpft wird nur der Stand der Datei, der beurteilt wurde: eine getauschte Datei am selben Pfad nicht.
         if (e.exe and e.exe.lower() in self.gedaempft and score < AUSREISSER
-                and not len(unbekannt) and not _skript_host(e)):
+                and not len(unbekannt) and not _skript_host(e) and _stand_wie_beurteilt(e.exe, self.gedaempft)):
             score *= DAEMPFUNG
         return score, gruende
 
@@ -202,9 +232,11 @@ class Detektor:
         s = sum(v[idx[k]] * w for k, w in self.merkmale.kaltstart.items() if k in idx)
         return float(min(s, 1.0))
 
-    def feedback(self, pfade: set[str]) -> None:
-        """Programmpfade mit „harmlos“-Urteil (Speicher.fehlalarm_pfade)."""
-        self.gedaempft = {p.lower() for p in pfade if p}
+    def feedback(self, pfade) -> None:
+        """Programmpfade mit „harmlos“-Urteil: Speicher.fehlalarm_staende() (Pfad → Stand) oder eine Menge
+        von Pfaden (nur am Pfad)."""
+        werte = pfade if isinstance(pfade, dict) else dict.fromkeys(pfade or ())
+        self.gedaempft = {p.lower(): s for p, s in werte.items() if p}
 
     # ------------------------------------------------------------ Persistenz
 
@@ -225,7 +257,11 @@ class Detektor:
                      "zuletzt": self.zuletzt, "kontamination": self.kontamination}
             self.pfad.parent.mkdir(parents=True, exist_ok=True)
             tmp = self.pfad.with_suffix(".tmp")
-            tmp.write_text(json.dumps(z), encoding="utf-8")
+            daten = json.dumps(z).encode("utf-8")
+            tmp.write_bytes(daten)
+            if self.siegel is not None:                # vor dem Einsetzen: der Hot-Reload sieht nie einen ungesiegelten Stand
+                from .siegel import sha256
+                self.siegel.merken(sha256(daten))
             if neue_version and self.pfad.exists():
                 for n in range(VERSIONEN, 1, -1):
                     if _version(self.pfad, n - 1).exists():
@@ -252,7 +288,10 @@ class Detektor:
             return False
         try:
             self._geladen_mtime = self.pfad.stat().st_mtime
-            z = json.loads(self.pfad.read_text(encoding="utf-8"))
+            daten = self.pfad.read_bytes()
+            if self.siegel is not None and not self._siegel_ok(daten):
+                return False
+            z = json.loads(daten.decode("utf-8"))
             if z.get("merkmale") != list(self.merkmale.namen):
                 self._fehler("gespeichertes Modell passt nicht zu den Merkmalen – lernt neu")
                 return False
@@ -271,6 +310,28 @@ class Detektor:
         except Exception as exc:
             self._fehler(f"Laden fehlgeschlagen ({type(exc).__name__}: {exc}) – Kaltstart")
             return False
+
+    def _siegel_ok(self, daten: bytes) -> bool:
+        """Stammt der Stand von der Wache selbst? Fremd: nicht laden (der bisherige Stand im Speicher bleibt),
+        einmal je fremdem Stand melden. Ohne gemerkten Stand wird der vorhandene übernommen."""
+        from .siegel import sha256
+        digest = sha256(daten)
+        stand = self.siegel.pruefen(digest)
+        if stand == "neu":
+            self.siegel.merken(digest)
+            return True
+        if stand == "ok":
+            self._fremd = ""
+            return True
+        self._fehler("Modelldatei von außen verändert (SHA-256 unbekannt) – nicht geladen")
+        if digest != self._fremd:
+            self._fremd = digest
+            if self.bei_fremd is not None:
+                try:
+                    self.bei_fremd(self.pfad)
+                except Exception:
+                    pass
+        return False
 
     def zuruecksetzen(self) -> None:
         with self._lock:

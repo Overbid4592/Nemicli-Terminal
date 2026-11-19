@@ -27,9 +27,8 @@ from pathlib import Path
 from . import BERICHTE, DB_PFAD, ordner_anlegen, zugang
 from .justierung import einstellungen
 from .motor import Motor
+from .speicher import UNKLAR_TAGE
 from .wecker import Wecker
-
-UNKLAR_TAGE = 7          # so lange hält ein „unklar“-Urteil die Kugel gelb
 
 
 class Dienst:
@@ -51,6 +50,8 @@ class Dienst:
         self.kugel_erlaubt = mit_kugel
         self._kugel_schalter = mit_kugel      # --ohne-kugel gilt, bis der Nutzer sie selbst zeigt
         self._ende = threading.Event()
+        self._beendet = threading.Event()     # beenden() ganz durchgelaufen (Motor gespeichert, Lock weg)
+        self._schalten = threading.Lock()     # Pausieren und Fortsetzen nacheinander, nie gleichzeitig
         self._einstellungs_stand = ""
         self._stoerung_gemeldet = ""
         self._chat = chat
@@ -176,17 +177,21 @@ class Dienst:
         elif name == "training":
             threading.Thread(target=self.motor.trainieren, args=("Nutzer",), daemon=True).start()
         elif name == "pause":
+            # start() und stop() warten auf laufende Durchläufe (Training, Sensoren): nicht im Menü-Thread.
             if self.pausiert:
-                # start() wartet auf einen noch laufenden Durchlauf (z. B. Training): nicht im Menü-Thread.
                 def _fortsetzen():
-                    self.motor.start()
-                    if self.pausiert:            # währenddessen erneut pausiert
-                        self.motor.stop()
+                    with self._schalten:
+                        if not self.pausiert and not self._ende.is_set():
+                            self.motor.start()
                 self.pausiert = False
                 threading.Thread(target=_fortsetzen, daemon=True, name="wache-fortsetzen").start()
             else:
-                self.motor.stop()
+                def _anhalten():
+                    with self._schalten:
+                        if self.pausiert:
+                            self.motor.stop()
                 self.pausiert = True
+                threading.Thread(target=_anhalten, daemon=True, name="wache-pausieren").start()
             if self.tray:
                 self.tray.aktualisieren()
         elif name == "kugel":
@@ -235,10 +240,21 @@ class Dienst:
             if self.kugel is not None:
                 self.kugel.verstecken(False)
 
+    BEENDEN_WARTEN_S = 60.0
+
     def beenden(self) -> None:
         if self._ende.is_set():
+            # Zweiter Aufruf (etwa laufen() nach dem Ende der Oberfläche): erst zurück, wenn der erste
+            # fertig ist – sonst endet der Prozess mitten im Speichern des Motors.
+            self._beendet.wait(self.BEENDEN_WARTEN_S)
             return
         self._ende.set()
+        try:
+            self._beenden_schritte()
+        finally:
+            self._beendet.set()
+
+    def _beenden_schritte(self) -> None:
         # Erst das Schild weg, dann die Datenbank zu – andersherum griff das
         # Tray-Menü noch auf die geschlossene Datenbank zu.
         if self.tray:
@@ -247,7 +263,8 @@ class Dienst:
             from . import oberflaeche
             oberflaeche.beenden()
         try:
-            self.motor.beenden()
+            with self._schalten:                 # ein laufendes Pausieren erst zu Ende
+                self.motor.beenden()
         except Exception:
             pass
         self.loop.call_soon_threadsafe(self.loop.stop)
@@ -325,7 +342,9 @@ class Dienst:
             self.loop.close()
 
     def laufen(self) -> int:
-        zugang.lock_schreiben()
+        if not zugang.lock_beanspruchen():       # gleichzeitig gestartete zweite Wache
+            print("Die Wache läuft schon.")
+            return 0
         try:
             import hintergrund
             hintergrund.BEI_FERTIG.append(self._aufgabe_fertig)

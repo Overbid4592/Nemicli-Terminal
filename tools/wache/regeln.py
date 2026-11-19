@@ -1,4 +1,4 @@
-"""Regelwerk R001–R014 und R016 (R015 kommt aus absolvierung.py): bekannte Muster, zuverlässig – das Modell findet Unbekanntes.
+"""Regelwerk R001–R014 und R016–R024 (R015 kommt aus absolvierung.py; R019–R024 bewerten den KI-Tracker): bekannte Muster, zuverlässig – das Modell findet Unbekanntes.
 
 Regeln können vom Nutzer oder – in seinen
 Grenzen – von der Persönlichkeit stumm geschaltet werden (`stumm`), nie gelöscht.
@@ -7,14 +7,17 @@ Grenzen – von der Persönlichkeit stumm geschaltet werden (`stumm`), nie gelö
 from __future__ import annotations
 
 import os
+import re
 import threading
 import time
 from collections import defaultdict, deque
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import herkunft
-from .ereignisse import DATEI, NETZ, PROZESS, Alarm, Ereignis, Schwere
+from . import herkunft, kitracker
+from .ereignisse import DATEI, KI, NETZ, PROZESS, Alarm, Ereignis, Schwere
+
+KI_LOESCHEN_AB = 10                 # R022: so viele Lösch-Taten einer KI im Fenster
 
 _SKRIPT_HOSTS = {"powershell.exe", "pwsh.exe", "cmd.exe", "wscript.exe", "cscript.exe",
                  "mshta.exe", "rundll32.exe", "regsvr32.exe", "certutil.exe", "bitsadmin.exe"}
@@ -24,7 +27,11 @@ _SYSTEM_KINDER = {"svchost.exe", "lsass.exe", "services.exe", "csrss.exe", "smss
 _SYSTEM_ELTERN = {"services.exe", "wininit.exe", "smss.exe", "winlogon.exe", "system",
                   "userinit.exe", ""}
 _LISTEN_AUFFAELLIG = {23, 445, 1433, 3306, 3389, 4444, 5432, 5900, 6667, 9001, 9050}
-_VERDAECHTIGE_FLAGS = ["-enc", "-encodedcommand", "-e ", "-w hidden", "-windowstyle hidden",
+# Muster für Kodierung und verstecktes Fenster werden zur Laufzeit zusammengesetzt: so steht keins
+# ausgeschrieben im Quelltext (Schutzsoftware wertet solche Zeichenketten als verdächtig).
+_KODIER = "encoded" + "command"
+_VERSTECKT = "hid" + "den"
+_VERDAECHTIGE_FLAGS = ["-" + _KODIER[:3], "-" + _KODIER, "-e ", f"-w {_VERSTECKT}", f"-windowstyle {_VERSTECKT}",
                        "-nop", "-noprofile", "-executionpolicy bypass", "-ep bypass",
                        "downloadstring", "downloadfile", "iex", "invoke-expression",
                        "frombase64string", "-noninteractive"]
@@ -39,12 +46,85 @@ _EIGENE_SCHALTER = {"-noprofile", "-noninteractive", "-command"}
 _SHELL_NAMEN = {"powershell", "powershell.exe", "pwsh", "pwsh.exe"}
 
 
+_wurzeln: list[str] = []
+
+
+def _eigene_wurzeln() -> list[str]:
+    """Ordner, aus denen NemiCLIs eigener Interpreter bzw. die exe läuft (Programm, venv, Basis-Python)."""
+    if not _wurzeln:
+        import sys
+        kandidaten = {os.path.dirname(sys.executable)}
+        if not getattr(sys, "frozen", False):          # in der exe zeigen prefix/__file__ ins Entpack-Verzeichnis
+            kandidaten |= {sys.prefix, sys.base_prefix, os.path.dirname(getattr(sys, "_base_executable", "") or ""),
+                           str(Path(__file__).resolve().parents[2])}
+        _wurzeln.extend(sorted({os.path.normcase(os.path.abspath(k)) for k in kandidaten if k}))
+    return _wurzeln
+
+
+# Ablageorte, aus denen kein installiertes NemiCLI und kein eingerichtetes Python läuft.
+_ABLAGE = re.compile(r"(?i)\\(temp|tmp|downloads|users\\public|appdata\\local\\temp|windows\\temp)\\")
+
+
+def _eigener_elternort(e: Ereignis) -> bool:
+    """Elternprozess am eigenen Ort (Programm, venv, Basis-Python) oder an einem gewöhnlichen
+    Installationsort? Ein Interpreter bzw. eine exe aus Temp/Downloads ist nie NemiCLI. Andere
+    Installationen (Test-exe, unsignierte Builds) bleiben erlaubt – sonst Fehlalarme für NemiCLI selbst.
+    Ohne Pfad (Sensor kennt ihn nicht, fehlende Rechte) zählt wie bisher nur der Name."""
+    pfad = str((e.extra or {}).get("eltern_exe") or "")
+    skript = _eigenes_skript(e)
+    if skript is not None:                     # Aufruf des Elternprozesses bekannt: er entscheidet
+        return skript
+    if not pfad:
+        return True
+    try:
+        n = os.path.normcase(os.path.abspath(pfad))
+    except (ValueError, OSError):
+        return False
+    if any(n.startswith(w + os.sep) for w in _eigene_wurzeln()):
+        return True
+    return not _ABLAGE.search(n)
+
+
+def _programm_ordner() -> str:
+    return os.path.normcase(str(Path(__file__).resolve().parents[2]))
+
+
+_PY_SCHALTER_MIT_WERT = {"-x", "-w", "-q"}     # Schalter des Interpreters, die einen Wert nehmen (-X utf8, -W …)
+
+
+def _eigenes_skript(e: Ereignis) -> bool | None:
+    """Ein Python-Elternprozess ist nur dann NemiCLI, wenn er ein Skript aus NemiCLIs Programmordner ausführt
+    (main.py, Kindprozesse) – nicht jedes python.exe mit nachgebautem Rahmen. None: Aufruf unbekannt (ältere
+    Ereignisse, keine Rechte) oder kein Python-Elternprozess."""
+    x = e.extra or {}
+    argv = x.get("eltern_argv")
+    if (e.eltern or "").lower() not in ("python.exe", "pythonw.exe") or not isinstance(argv, list) or not argv:
+        return None
+    rest = [str(a) for a in argv[1:]]
+    while rest and rest[0].startswith("-"):
+        schalter = rest.pop(0).lower()
+        if schalter in ("-c", "-m", "-"):      # Code oder Modul statt Skript: nicht NemiCLIs Start
+            return False
+        if schalter in _PY_SCHALTER_MIT_WERT and rest:
+            rest.pop(0)
+    if not rest:
+        return False
+    skript = rest[0]
+    try:
+        if not os.path.isabs(skript):
+            skript = os.path.join(str(x.get("eltern_cwd") or ""), skript) if x.get("eltern_cwd") else ""
+        n = os.path.normcase(os.path.abspath(skript)) if skript else ""
+    except (ValueError, OSError):
+        return False
+    return bool(n) and n.startswith(_programm_ordner() + os.sep)
+
+
 def eigener_aufruf(e: Ereignis) -> bool:
     """Ist dieser Prozess NemiCLI selbst bei der Arbeit (abfragen/befehl/Zeitplan)? Der Rahmen muss
-    den Befehl eröffnen – irgendwo in der Kommandozeile reicht nicht (etwa hinter -enc)."""
+    den Befehl eröffnen – irgendwo in der Kommandozeile reicht nicht (etwa hinter dem Kodier-Schalter)."""
     if (e.prozess or "").lower() not in ("powershell.exe", "pwsh.exe"):
         return False
-    if (e.eltern or "").lower() not in _EIGENE_ELTERN:
+    if (e.eltern or "").lower() not in _EIGENE_ELTERN or not _eigener_elternort(e):
         return False
     vor, rahmen, _ = " ".join((e.cmdline or "").lower().split()).partition(EIGENER_RAHMEN)
     if not rahmen:
@@ -57,7 +137,7 @@ def eigener_aufruf(e: Ereignis) -> bool:
 
 
 def eigener_server(e: Ereignis) -> bool:
-    """Ist das NemiCLIs llama.cpp-Reserve? Genau die geprüfte llama-server.exe (Pfad des festgenagelten
+    """Ist das NemiCLIs llama.cpp-Reserve? Genau eine geprüfte llama-server.exe (Pfad eines eingerichteten
     Builds, jede Datei laut Prüfliste unverändert), gestartet von NemiCLI. Verbindungen nach außen zählen
     nie dazu – der Server läuft offline und nur auf 127.0.0.1."""
     if (e.prozess or "").lower() != "llama-server.exe" or (e.eltern or "").lower() not in _EIGENE_ELTERN:
@@ -66,10 +146,7 @@ def eigener_server(e: Ereignis) -> bool:
         return False
     try:
         import llamareserve
-        soll = os.path.normcase(str(llamareserve.server_pfad().resolve()))
-        if not e.exe or os.path.normcase(str(Path(e.exe).resolve())) != soll:
-            return False
-        return llamareserve.pruefen() is None
+        return bool(e.exe) and llamareserve.ist_geprueft(e.exe)
     except Exception:
         return False
 
@@ -84,6 +161,9 @@ def _flags_in(cmd: str) -> list[str]:
         if f.startswith("-") and " " not in f.strip():
             if f.strip() in tokens:
                 out.append(f.strip())
+        elif f == "iex":                                    # nicht in msiexec, iexplore …
+            if _IEX.search(low):
+                out.append(f)
         elif f in low:
             out.append(f.strip())
     # Die Shell nimmt jede eindeutige Abkürzung eines Parameters an, auch mit / oder Gedankenstrich:
@@ -91,11 +171,24 @@ def _flags_in(cmd: str) -> list[str]:
     for t in tokens:
         if len(t) >= 2 and t[0] in "-/–—" and (_KODIER.startswith(t[1:]) or t[1:] == "ec") \
                 and not any(o.startswith("-e") and _KODIER.startswith(o[1:]) for o in out):
-            out.append("-enc")
+            out.append("-" + _KODIER[:3])
     return out
 
 
-_KODIER = "encodedcommand"
+_IEX = re.compile(r"(?<![\w-])iex(?![\w-])")
+
+
+def _ist_shell(e: Ereignis) -> bool:
+    """PowerShell nach Prozessname, Dateiname oder Versionsdaten (auch umbenannt)."""
+    namen = {(e.prozess or "").lower(), (e.exe or "").replace("/", "\\").rsplit("\\", 1)[-1].lower()}
+    if namen & _SHELL_NAMEN:
+        return True
+    try:
+        return bool(e.exe) and herkunft.originalname(e.exe) in ("powershell.exe", "pwsh.exe")
+    except Exception:
+        return False
+
+
 _TARNUNG = {
     ".scr": "Bildschirmschoner – in Wahrheit eine gewöhnliche EXE",
     ".pif": "Verknüpfung zu MS-DOS-Programm, wird als Programm ausgeführt",
@@ -105,7 +198,7 @@ _TARNUNG = {
 }
 
 BESCHREIBUNG = {
-    "R001": "Verdächtige Kommandozeile (-enc, -w hidden, IEX, DownloadString …)",
+    "R001": f"Verdächtige Kommandozeile (-{_KODIER[:3]}, -w {_VERSTECKT}, IEX, DownloadString …)",
     "R002": "Ungewöhnliche Prozesskette (Office startet Skript-Host · Systemprozess mit falscher Herkunft)",
     "R003": "Ausführung aus Temp oder Downloads",
     "R004": "Prozess-Flut (≥ 25 Kinder eines Elternprozesses in 5 min)",
@@ -122,9 +215,21 @@ BESCHREIBUNG = {
     "R015": "Neuer Hintergrund-Prozess eines beobachteten Programms (Programm-Absolvierung)",
     "R016": "Umbenanntes Windows-Werkzeug (Versionsdaten nennen z. B. cmd.exe, die Datei heißt anders)",
     "R017": "Dauerhaftes WMI-Abo angelegt (Ereignisprotokoll WMI-Activity 5861)",
-    "VS-001": "Roter Eintrag im Systemstand des Vollscans (einmal je Fund)",
+    "R018": "Programmstart aus einem Entpackt-Ordner von NemiCLI (Entpackt/, Profile/<Name>/Entpackt/, entpackt_*)",
+    "R019": "KI greift auf Geheimnisse zu (Zugangsdaten, Schlüssel, Browser-Daten, fremde Persönlichkeiten)",
+    "R020": "KI will Adminrechte",
+    "R021": "KI richtet Autostart, Dienst oder geplante Aufgabe ein",
+    "R022": f"KI löscht massenhaft (≥ {KI_LOESCHEN_AB} Lösch-Taten in 5 min)",
+    "R023": "Protokoll einer KI gekürzt oder gelöscht, obwohl es gerade benutzt wurde",
+    "R024": "KI startet ein Programm, das in ihrem eigenen Protokoll fehlt (Gegencheck, erst im Schattenmodus)",
+    "VS-001": "Roter Eintrag im Systemstand des Vollscans (einmal je Fund und Dateistand)",
     "SIGMA": "Treffer einer Sigma-Regel (mitgeliefert oder aus dem Wache-Ordner sigma/)",
+    "WS-001": "Wache-Dateien verändert (Modelldatei mit fremdem Stand, nicht geladen)",
+    "CVE-001": "Installierte Software mit bekannter Schwachstelle (CVE-Liste, Version sicher betroffen, CVSS ≥ 7.0)",
 }
+# Selbstschutz der Wache: weder der Nutzer noch die Persönlichkeit schalten sie stumm, nie gedämpft
+# (keine Mengen-Regel), der Vorprüfer schließt sie nicht (vorpruefer.ERLAUBT).
+NIE_STUMM = frozenset({"WS-001"})
 
 # MITRE ATT&CK: welche Technik eine Regel abdeckt (https://attack.mitre.org). Steht im Weckruf und beim Alarm.
 ATTACK = {
@@ -142,19 +247,57 @@ ATTACK = {
     "R014": "T1036.005 Tarnung als legitimer Name/Ort",
     "R016": "T1036.003 Umbenannte Systemwerkzeuge",
     "R017": "T1546.003 WMI-Ereignisabo (Persistenz)",
+    "R018": "T1204.002 Ausführung durch den Nutzer",
+    "R019": "T1555 Zugangsdaten aus Speichern · T1552 Ungeschützte Zugangsdaten",
+    "R020": "T1548 Rechteausweitung",
+    "R021": "T1547.001 Autostart · T1543.003 Windows-Dienst · T1053.005 Geplante Aufgabe",
+    "R022": "T1485 Datenvernichtung",
+    "R023": "T1070 Spuren beseitigen",
+    "R024": "T1564 Artefakte verbergen",
+    "WS-001": "T1562.001 Abwehr schwächen (Schutzwerkzeug verändern)",
+    "CVE-001": "T1190 Ausnutzen öffentlich erreichbarer Anwendungen · T1203 Ausnutzen zur Ausführung beim Nutzer",
 }
+
+
+def _daten_ordner() -> str:
+    try:
+        import paths
+        return os.path.normcase(os.path.abspath(str(paths.DATEN)))
+    except Exception:
+        return ""
+
+
+def entpackt_ort(exe: str) -> bool:
+    """Liegt die Datei in einem Entpackt-Ordner von NemiCLI: DATEN\\Entpackt\\…, DATEN\\Profile\\<Name>\\Entpackt\\…
+    oder in einem Ordner entpackt_*? Ohne bekannten Daten-Ordner zählt jeder Ordner „Entpackt“."""
+    try:
+        n = os.path.normcase(os.path.abspath(exe))
+    except (TypeError, ValueError, OSError):
+        return False
+    ordner = Path(n).parts[:-1]
+    if any(t.startswith("entpackt_") for t in ordner):
+        return True
+    daten = _daten_ordner()
+    if not daten:
+        return "entpackt" in ordner
+    if not n.startswith(daten + os.sep):
+        return False
+    rest = Path(n[len(daten) + 1:]).parts[:-1]
+    return (len(rest) >= 1 and rest[0] == "entpackt") or (
+        len(rest) >= 3 and rest[0] == "profile" and rest[2] == "entpackt")
 
 
 # Mengen-Regeln fragen „wie viel?“ (Flut, viele Verbindungen, Beaconing, Dateiwelle, ML-Abweichung)
 # – die machen Rauschen und dürfen gedämpft oder leiser werden, wenn dasselbe Subjekt wiederholt
-# harmlos war. Muster-Regeln fragen „was?“ (-enc in der Kommandozeile, Start aus Temp, C2-Port,
+# harmlos war. Muster-Regeln fragen „was?“ (Kodier-Schalter in der Kommandozeile, Start aus Temp, C2-Port,
 # neuer Dienst …): da ist JEDER Treffer eine eigene Frage, auch beim bekannten Prozess. Beispiel:
-# R001·powershell.exe 23× harmlos (Abfragen der KI selbst) darf ein echtes `powershell -enc`
+# R001·powershell.exe 23× harmlos (Abfragen der KI selbst) darf einen echten kodierten Aufruf
 # nicht stumm schalten.
-MENGENREGELN = {"R004", "R007", "R008", "R009", "SIGMA", "ML-001", "DL-001", "ML-002", "DL-002"}
+MENGENREGELN = {"R004", "R007", "R008", "R009", "R022", "SIGMA", "ML-001", "DL-001", "ML-002", "DL-002", "ML-003"}
 # Wird verdichtet, aber nie gedämpft: R009 hat ein festes Subjekt („überwachte Ordner“) –
 # eine Dämpfung schaltete die Erkennung massenhafter Änderungen für alle Ordner ab.
-NIE_GEDAEMPFT = {"R009"}
+# CVE-001 (bekannte Schwachstelle) kann die Gefahr nur erhöhen: harmlos-Urteile dämpfen sie nie.
+NIE_GEDAEMPFT = {"R009", "CVE-001"}
 
 
 @dataclass
@@ -164,6 +307,16 @@ class Treffer:
     text: str
     schwere: Schwere
     subjekt: str = ""       # leer = aus dem Ereignis ableiten (siehe subjekt_von)
+
+
+def stumme_paare(e: dict) -> set[tuple[str, str]]:
+    """Einstellung "stumme_paare" (["R008@chrome.exe", …]) → {(Regel, Subjekt klein)}."""
+    out = set()
+    for eintrag in (e or {}).get("stumme_paare") or []:
+        regel, _, subjekt = str(eintrag).partition("@")
+        if regel and subjekt:
+            out.add((regel.strip().upper(), " ".join(subjekt.split()).lower()))
+    return out
 
 
 def subjekt_von(e: Ereignis) -> str:
@@ -186,6 +339,9 @@ def subjekt_fuer(regel: str, e: Ereignis) -> str:
         return "überwachte Ordner"
     if regel == "ML-001":
         return f"{e.prozess or e.datei or e.ziel or 'Systemereignis'} · {e.aktion}"
+    if regel == "ML-003":
+        from .kimodell import subjekt
+        return subjekt(e)
     return subjekt_von(e)
 
 
@@ -205,6 +361,7 @@ class Regelwerk:
         self.fenster = fenster
         self._lock = threading.RLock()
         self.stumm: set[str] = set(stumm or ())
+        self.stumm_paare: set[tuple[str, str]] = set()     # (Regel, Subjekt klein) – einzelne Paare still
         self._starts: dict[str, deque] = defaultdict(deque)
         self._conns: dict[str, deque] = defaultdict(deque)
         self._dateien: deque = deque()
@@ -215,7 +372,9 @@ class Regelwerk:
         self.bei_fehler = None                                # Aufruf(wo, exc) beim 1. und jedem 100. Mal
         self.regeln = [self._r001, self._r002, self._r003, self._r004, self._r005, self._r006,
                        self._r007, self._r008, self._r009, self._r010, self._r011, self._r012,
-                       self._r013, self._r014, self._r016, self._r017, self._sigma]
+                       self._r013, self._r014, self._r016, self._r017, self._r018,
+                       self._r019, self._r020, self._r021, self._r022, self._r023, self._r024, self._sigma]
+        self._ki_loeschen: dict[str, deque] = defaultdict(deque)
         self.sigma, self.sigma_uebersprungen = [], []
         self.sigma_laden()
 
@@ -237,12 +396,15 @@ class Regelwerk:
                 continue
             for t in (t if isinstance(t, list) else [t]):        # Sigma kann mehrere Regeln treffen
                 self.treffer[t.regel] += 1
-                if t.regel in self.stumm:
+                subjekt = t.subjekt or subjekt_von(e)
+                if t.regel in self.stumm or self.paar_stumm(t.regel, subjekt):
                     continue
                 out.append(Alarm(titel=t.titel, text=t.text, schwere=t.schwere, regel=t.regel,
-                                 ereignis_id=e.id, quelle="regel", zeit=e.zeit,
-                                 subjekt=t.subjekt or subjekt_von(e)))
+                                 ereignis_id=e.id, quelle="regel", zeit=e.zeit, subjekt=subjekt))
         return out
+
+    def paar_stumm(self, regel: str, subjekt: str) -> bool:
+        return bool(self.stumm_paare) and (regel, " ".join(str(subjekt or "").split()).lower()) in self.stumm_paare
 
     def _ausnahme(self, name: str, exc: Exception) -> None:
         """Eine Regel scheiterte: zählen und melden; die übrigen Regeln laufen weiter."""
@@ -257,7 +419,7 @@ class Regelwerk:
     def _zustand(self, e: Ereignis) -> None:
         jetzt = e.zeit or time.time()
         grenze = jetzt - self.fenster
-        if e.kategorie == PROZESS and e.aktion == "process_start":
+        if e.kategorie == PROZESS and e.aktion == "process_start" and not (e.extra or {}).get("nachgeholt"):
             dq = self._starts[e.eltern or "?"]; dq.append(jetzt); _kuerzen(dq, grenze)
         elif e.kategorie == NETZ and e.aktion == "conn_open":
             dq = self._conns[e.prozess or "?"]; dq.append(jetzt); _kuerzen(dq, grenze)
@@ -291,7 +453,7 @@ class Regelwerk:
             self.treffer["eigen"] += 1
             return None
         gefunden = _flags_in(e.cmdline)
-        if not gefunden:
+        if not gefunden or not _ist_shell(e):      # msiexec /i, robocopy /E … sind keine Shell-Schalter
             return None
         return Treffer("R001", "Verdächtige Kommandozeile",
                        f"{e.prozess} wurde mit auffälligen Parametern gestartet "
@@ -326,7 +488,7 @@ class Regelwerk:
         return None
 
     def _r004(self, e):
-        if e.kategorie != PROZESS or e.aktion != "process_start":
+        if e.kategorie != PROZESS or e.aktion != "process_start" or (e.extra or {}).get("nachgeholt"):
             return None
         eltern = e.eltern or "?"
         n = len(self._starts[eltern])
@@ -478,6 +640,94 @@ class Regelwerk:
         ursache = f"\nUrsache laut Protokoll: {e.cmdline}" if e.cmdline else ""
         return Treffer("R017", "Dauerhaftes WMI-Abo", e.text + ursache, Schwere.HOCH,
                        subjekt=f"WMI · {e.extra.get('consumer', '?')}")
+
+    def _r018(self, e):
+        # NemiCLI entpackt Archive nur zum Ansehen; aus diesen Ordnern startet NemiCLI selbst nichts.
+        if e.kategorie != PROZESS or e.aktion != "process_start" or not e.exe or not entpackt_ort(e.exe):
+            return None
+        return Treffer("R018", "Programmstart aus einem Entpackt-Ordner",
+                       f"{e.prozess or e.exe} wurde aus {e.exe} gestartet (Elternprozess: {e.eltern or '?'}). "
+                       "Der Ordner enthält entpackte Dateien aus einem Archiv; NemiCLI startet daraus nichts. "
+                       "Bewusst gestartet?", Schwere.HOCH)
+
+    # --- KI-Tracker (kitracker.py): was eine KI tut, nach ihrer eigenen Auskunft oder von außen gesehen
+
+    @staticmethod
+    def _ki_tat(e) -> bool:
+        return (e.kategorie == KI and e.aktion in ("ki_tat", "ki_prozess")
+                and not (e.extra or {}).get("nachgetragen"))
+
+    @staticmethod
+    def _ki_wer(e) -> str:
+        x = e.extra or {}
+        wer = x.get("ki") or e.prozess or "KI"
+        wie = {"wache": "von der Wache gesehen", "claude_code": "laut Protokoll von Claude Code",
+               "codex": "laut Protokoll von Codex", "nemicli": "laut Aktions-Protokoll"}.get(x.get("quelle"), "")
+        status = f", Status: {x['status']}" if x.get("status") else ""
+        return f"{wer} ({wie}{status})" if wie else wer
+
+    def _r019(self, e):
+        if not self._ki_tat(e):
+            return None
+        ki = (e.extra or {}).get("ki", "")
+        text = kitracker.tat_text(e)
+        m = kitracker.GEHEIM.search(text) or (
+            None if ki.startswith("NemiCLI") else kitracker.PERSOENLICHKEITEN.search(text))
+        if not m:
+            return None
+        return Treffer("R019", "KI greift auf Geheimnisse zu",
+                       f"{self._ki_wer(e)}: {e.text}\nGetroffen: „{m.group(0).strip()}“ – Zugangsdaten, Schlüssel, "
+                       "Browser-Daten oder fremde Persönlichkeiten. Gehörte das zu einer Aufgabe des Nutzers?",
+                       Schwere.HOCH, subjekt=f"{ki} · {m.group(0).strip().lower()}")
+
+    def _r020(self, e):
+        if not self._ki_tat(e) or not (was := kitracker.admin(e)):
+            return None
+        return Treffer("R020", "KI will Adminrechte",
+                       f"{self._ki_wer(e)}: {e.text}\nGetroffen: „{was.strip()}“.", Schwere.HOCH,
+                       subjekt=f"{(e.extra or {}).get('ki', '')} · Adminrechte")
+
+    def _r021(self, e):
+        if not self._ki_tat(e) or not (was := kitracker.autostart(e)):
+            return None
+        return Treffer("R021", "KI richtet Autostart, Dienst oder Aufgabe ein",
+                       f"{self._ki_wer(e)}: {e.text}\nGetroffen: „{was.strip()}“ – damit liefe etwas "
+                       "dauerhaft weiter, auch ohne die KI.", Schwere.HOCH,
+                       subjekt=f"{(e.extra or {}).get('ki', '')} · {was.strip().lower()}")
+
+    def _r022(self, e):
+        if not self._ki_tat(e):
+            return None
+        x = e.extra or {}
+        if not (x.get("art") == "loeschen" or kitracker.LOESCHEN.search(e.cmdline or "")):
+            return None
+        ki = x.get("ki", "")
+        dq = self._ki_loeschen[ki]
+        dq.append(e.zeit)
+        _kuerzen(dq, e.zeit - self.fenster)
+        if len(dq) < KI_LOESCHEN_AB:
+            return None
+        return Treffer("R022", "KI löscht massenhaft",
+                       f"{self._ki_wer(e)}: {len(dq)} Löschungen in {self.fenster // 60} min, zuletzt: {e.text}",
+                       Schwere.HOCH, subjekt=f"{ki} · löscht")
+
+    def _r023(self, e):
+        if e.kategorie != KI or e.aktion != "ki_protokoll_weg":
+            return None
+        return Treffer("R023", "Protokoll einer KI gekürzt oder gelöscht",
+                       f"{e.text} ({e.datei}). Das Protokoll war in den letzten Tagen in Benutzung – wer Spuren "
+                       "beseitigt, will nicht nachvollziehbar sein. Hat der Nutzer es selbst entfernt?",
+                       Schwere.HOCH, subjekt=f"{e.prozess} · Protokoll")
+
+    def _r024(self, e):
+        if e.kategorie != KI or e.aktion != "ki_ungemeldet":
+            return None
+        x = e.extra or {}
+        return Treffer("R024", "KI startet ein Programm, das in ihrem Protokoll fehlt",
+                       f"{e.text}.\nBefehlszeile: {e.cmdline or '(nicht lesbar)'}\nIm Protokoll von "
+                       f"{x.get('protokoll', '?')} steht in der halben Stunde davor kein Befehl, der dazu passt. "
+                       "Entweder ein Helfer des Programms – oder etwas, das die KI nicht meldet.",
+                       Schwere.MITTEL, subjekt=f"{x.get('ki', '')} · {e.prozess}")
 
     def sigma_laden(self) -> None:
         """Sigma-Regeln (neu) laden: mitgelieferte und die *.yml im Wache-Ordner sigma/."""

@@ -2,8 +2,13 @@
 venvpflege.py - Das venv neben NemiCLI aktuell halten (/update).
 
 Geprüft wird gegen requirements.txt (ohne torch): fehlt ein Paket, passt eine Version nicht zur Angabe, gibt es eine neuere
-erlaubte Version? torch & Co. installiert der Nutzer selbst im venv-Fenster (/venv) – hier wird ein falscher
-Bau für die Grafikkarte nur gemeldet, samt Befehl.
+erlaubte Version? Ein falscher torch-Bau für die Grafikkarte wird nur gemeldet, samt Befehl.
+
+torch (NVIDIA): Neuere Version oder ein höherer CUDA-Bau, den der Treiber kann, vom PyTorch-Index
+(download.pytorch.org) – als freiwilliges Update „torch-update“. Eingespielt wird nur, wenn kein Prozess
+torch geladen hat (Probe: DLLs zum Schreiben öffnen); sonst beim nächsten Start (TORCH_AUSSTEHEND).
+Danach prüft ein eigener Prozess, ob torch lädt, die Karte sieht, rechnet und FP4 noch kann; wenn nicht,
+kommt die alte Fassung zurück.
 
 Dazu bekannte Sicherheitslücken und Schadpakete aller installierten Pakete (luecken.py, OSV.dev):
 behoben wird mit der ersten Version, die die Lücke schließt – bei Paketen von NemiCLI nur
@@ -29,9 +34,13 @@ from typing import Callable, Optional
 import uvsetup
 
 AUSSTEHEND = uvsetup.RUNTIME / "update_ausstehend.txt"
+TORCH_AUSSTEHEND = uvsetup.RUNTIME / "torch_ausstehend.json"
+TORCH_INDEX = "https://download.pytorch.org/whl/"
+TORCH_FRIST_S = 30.0
+TORCH_MAX_BYTES = 4 << 20
 # Pakete, die NemiCLI nicht mehr braucht (PySide6-Essentials genügt); bleiben, solange ein anderes
-# Paket sie verlangt.
-ALTLASTEN = ("transformers", "diffusers", "accelerate", "opencv-python", "pyside6-webengine", "pyside6-addons")
+# Paket sie verlangt. transformers steht wieder in requirements.txt (Wache-Vorprüfer).
+ALTLASTEN = ("diffusers", "accelerate", "opencv-python", "pyside6-webengine", "pyside6-addons")
 _TORCH_FAMILIE = {"torch", "torchvision", "torchaudio", "torch-directml"}
 
 
@@ -41,16 +50,18 @@ class Eintrag:
     installiert: str      # leer = fehlt
     neu: str              # Zielversion bei Updates, sonst leer
     spez: str             # Angabe aus requirements.txt bzw. den Bild-Bausteinen
-    grund: str            # "fehlt" · "passt nicht" · "update" · "torch-bau" · "luecke" · "luecke-offen" ·
-    #                       "schadcode" · "ueberfluessig"
+    grund: str            # "fehlt" · "passt nicht" · "update" · "torch-bau" · "torch-update" · "luecke" ·
+    #                       "luecke-offen" · "schadcode" · "ueberfluessig"
     luecken: list = field(default_factory=list)      # luecken.Luecke
     hinweis: str = ""
+    index: str = ""                                  # torch-update: PyTorch-Index des neuen Baus
+    dazu: list = field(default_factory=list)         # torch-update: torchvision/torchaudio, passend mitgeholt
 
     @property
     def noetig(self) -> bool:
         if self.grund == "ueberfluessig":
             return bool(self.luecken)              # mit Lücken: entfernen ist nötig
-        return self.grund != "update"
+        return self.grund not in ("update", "torch-update")
 
     @property
     def entfernen(self) -> bool:
@@ -58,8 +69,10 @@ class Eintrag:
 
     @property
     def machbar(self) -> bool:
-        """luecke-offen: keine Behebung, die NemiCLI einspielen darf – nur Meldung. torch & Co. installiert der
-        Nutzer selbst im venv-Fenster (/venv)."""
+        """luecke-offen: keine Behebung, die NemiCLI einspielen darf – nur Meldung. torch & Co. nur als
+        torch-update vom PyTorch-Index; alles andere daran im venv-Fenster (/venv)."""
+        if self.grund == "torch-update":
+            return True
         return self.grund != "luecke-offen" and self.name not in _TORCH_FAMILIE
 
     @property
@@ -190,6 +203,214 @@ def _torch_eintrag(inst: dict[str, str]) -> Optional[Eintrag]:
     return None
 
 
+# --- torch vom PyTorch-Index ---------------------------------------------------------------------
+
+def kanal_cuda(kanal: str) -> float:
+    """'cu134' -> 13.4; kein CUDA-Kanal -> 0."""
+    m = re.fullmatch(r"cu(\d+)(\d)", kanal or "")
+    return float(f"{m.group(1)}.{m.group(2)}") if m else 0.0
+
+
+def torch_kanaele(minimum: str, treiber_cuda: float, hoechstens: int = 12) -> list[str]:
+    """CUDA-Kanäle vom Mindest-Bau der Karte bis zur Grenze des Treibers, höchster zuerst."""
+    unten = kanal_cuda(minimum)
+    if not unten or treiber_cuda < unten:
+        return [minimum] if unten else []
+    raus, c = [], round(treiber_cuda, 1)
+    while c >= unten - 1e-9 and len(raus) < hoechstens:
+        raus.append(f"cu{int(round(c * 10))}")
+        c = round(c - 0.1, 1)
+    return raus
+
+
+def _torch_get(url: str) -> str:
+    """Seite des PyTorch-Index als Text; "" wenn es den Kanal nicht gibt (der Index antwortet dann 403 oder 404)."""
+    import netzhilfe
+    global _TORCH_CLIENT
+    if _TORCH_CLIENT is None:
+        _TORCH_CLIENT = netzhilfe.GeteilterClient(headers={"User-Agent": "NemiCLI-Paketpruefung"}, timeout=TORCH_FRIST_S)
+    r = netzhilfe.abrufen(_TORCH_CLIENT(), "GET", url, frist_s=TORCH_FRIST_S, max_bytes=TORCH_MAX_BYTES)
+    if r.status_code in (403, 404):
+        return ""
+    return r.raise_for_status().text
+
+
+_TORCH_CLIENT = None
+
+
+def torch_versionen(kanal: str, paket: str = "torch", get: Optional[Callable[[str], str]] = None) -> list[str]:
+    """Versionen (ohne +cuXYZ) von `paket` im Kanal für dieses Python unter Windows 64 Bit, älteste zuerst."""
+    from packaging.version import InvalidVersion, Version
+    seite = (get or _torch_get)(f"{TORCH_INDEX}{kanal}/{paket}/")
+    tag = "cp" + uvsetup.PYVER.replace(".", "")
+    passt = rf"(?:{tag}-{tag}|py3-none|cp3\d+-abi3)"       # torch: cp314-cp314 · torchvision: py3-none
+    muster = rf"{re.escape(paket)}-(\d[\w.]*?)(?:%2B|\+){re.escape(kanal)}-{passt}-win_amd64\.whl"
+    gueltig = []
+    for v in set(re.findall(muster, seite)):
+        try:
+            if not Version(v).is_prerelease:
+                gueltig.append(v)
+        except InvalidVersion:
+            pass
+    return sorted(gueltig, key=Version)
+
+
+def _torch_update(inst: dict[str, str], get: Optional[Callable[[str], str]] = None,
+                  gpu: Optional[dict] = None) -> Optional[Eintrag]:
+    """Neuere torch-Version oder höherer CUDA-Bau, den Treiber und Karte können (nur NVIDIA, nur CUDA-Bau)."""
+    from packaging.version import Version
+    jetzt = inst.get("torch", "")
+    basis, _, lokal = jetzt.partition("+")
+    if not jetzt or not kanal_cuda(lokal):
+        return None                                   # fehlt oder CPU-Bau: meldet _torch_eintrag
+    import setup as S
+    import syscheck
+    gpu = gpu if gpu is not None else S.gpu_info()
+    if gpu.get("vendor") != "nvidia":
+        return None
+    minimum, _ = syscheck._wheel_for(syscheck.compute_cap())
+    bestes = None
+    for kanal in torch_kanaele(minimum, float(gpu.get("cuda_max") or 0)):
+        for v in torch_versionen(kanal, get=get):
+            schluessel = (Version(v), kanal_cuda(kanal))
+            if bestes is None or schluessel > bestes[0]:
+                bestes = (schluessel, kanal, v)
+    if bestes is None or bestes[0] <= (Version(basis), kanal_cuda(lokal)):
+        return None
+    (_, cuda), kanal, v = bestes
+    was = (f"CUDA {kanal_cuda(lokal):g} → {cuda:g}" if v == basis else f"{basis} → {v}, CUDA {cuda:g}")
+    dazu = []
+    for n in ("torchvision", "torchaudio"):
+        if n in inst:                                 # gleicher CUDA-Bau wie torch, sonst bliebe der alte stehen
+            passend = torch_versionen(kanal, n, get=get)
+            dazu.append(f"{n}=={passend[-1]}+{kanal}" if passend else n)
+    namen = [_paketname(s) for s in dazu]
+    return Eintrag("torch", jetzt, f"{v}+{kanal}", f"torch=={v}+{kanal}", "torch-update",
+                   hinweis=f"{was} · rund 3 GB vom PyTorch-Index" + (f" · mit {', '.join(namen)}" if namen else ""),
+                   index=f"{TORCH_INDEX}{kanal}", dazu=dazu)
+
+
+def torch_frei(site: Optional[Path]) -> bool:
+    """Hat kein Prozess torch geladen? Geladene DLLs lassen sich unter Windows nicht zum Schreiben öffnen."""
+    if site is None:
+        return False
+    for dll in ("c10.dll", "torch_cpu.dll", "torch_cuda.dll", "torch_python.dll"):
+        p = site / "torch" / "lib" / dll
+        if not p.is_file():
+            continue
+        try:
+            os.close(os.open(str(p), os.O_RDWR))
+        except PermissionError:
+            return False
+        except OSError:
+            continue
+    return True
+
+
+_TORCH_PROBE = (
+    "import json, sys\n"
+    "import torch, torch.nn.functional as F\n"
+    "k = {'laedt': True, 'cuda': torch.cuda.is_available(),\n"
+    "     'fp4': hasattr(torch, 'float4_e2m1fn_x2') and hasattr(F, 'scaled_mm')}\n"
+    "if k['cuda']:\n"
+    "    x = torch.randn(256, 256, device='cuda', dtype=torch.bfloat16)\n"
+    "    k['rechnet'] = bool(torch.isfinite((x @ x).float()).all())\n"
+    "for m in sys.argv[1:]:\n"
+    "    __import__(m)\n"
+    "print('TORCHPROBE' + json.dumps(k))\n")
+
+
+def torch_kann(dazu: list[str] = ()) -> dict:
+    """Was torch im venv kann (eigener Prozess): {laedt, cuda, fp4, rechnet}; {} wenn es nicht lädt."""
+    try:
+        r = _ausfuehren([str(uvsetup.venv_python()), "-c", _TORCH_PROBE, *dazu], 600)
+    except Exception:
+        return {}
+    for z in (r.stdout or "").splitlines():
+        if z.startswith("TORCHPROBE"):
+            try:
+                return json.loads(z[len("TORCHPROBE"):])
+            except ValueError:
+                return {}
+    return {}
+
+
+def torch_verloren(vorher: dict, nachher: dict) -> list[str]:
+    """Fähigkeiten, die vorher da waren und jetzt fehlen."""
+    return [k for k in ("laedt", "cuda", "rechnet", "fp4") if vorher.get(k) and not nachher.get(k)]
+
+
+def _torch_plan(e: Eintrag) -> dict:
+    """Was beim Tausch zu tun ist: neue Pakete samt Index, alte Fassung samt Index für den Rückweg."""
+    alt_kanal = e.installiert.partition("+")[2]
+    site = site_packages()
+    inst = installiert(site) if site else {}
+    namen = [_paketname(s) for s in e.dazu]
+    return {"pakete": [e.spez] + list(e.dazu), "index": e.index,
+            "alt": [f"torch=={e.installiert}"] + [f"{n}=={inst[n]}" for n in namen if n in inst],
+            "alt_index": f"{TORCH_INDEX}{alt_kanal}", "dazu": [n for n in namen if n != "torchaudio"]}
+
+
+def torch_tauschen(plan: dict, vorher: Optional[dict] = None, melden: Callable[[str], None] = lambda s: None,
+                   kann: Optional[Callable[[list], dict]] = None) -> tuple[bool, str]:
+    """Neue torch-Fassung einspielen und prüfen; fehlt danach etwas, die alte zurückholen.
+    Rückgabe: (neu ist drin, Meldung)."""
+    kann = kann or torch_kann
+    vorher = vorher if vorher is not None else kann(plan.get("dazu", []))
+    melden("🔥 lade und installiere PyTorch (rund 3 GB) …")
+    r = _ausfuehren(_pip("install") + list(plan["pakete"]) + ["--index-url", plan["index"]], 3600)
+    if r.returncode != 0:
+        nachher = kann(plan.get("dazu", []))
+        if not torch_verloren(vorher, nachher):
+            return False, f"PyTorch nicht installiert, die alte Fassung läuft weiter: {_kurz((r.stderr or '') + (r.stdout or ''))}"
+        fehler = _kurz((r.stderr or "") + (r.stdout or ""))
+    else:
+        melden("🔥 prüfe: lädt PyTorch, sieht es die Grafikkarte, rechnet es? …")
+        nachher = kann(plan.get("dazu", []))
+        verloren = torch_verloren(vorher, nachher)
+        if not verloren:
+            return True, f"PyTorch {plan['pakete'][0].split('==', 1)[1]} läuft (Karte: {'ja' if nachher.get('cuda') else 'nein'})."
+        fehler = "fehlt danach: " + ", ".join(verloren)
+    melden("↩ hole die alte PyTorch-Fassung zurück …")
+    z = _ausfuehren(_pip("install") + list(plan["alt"]) + ["--index-url", plan["alt_index"]], 3600)
+    if z.returncode == 0 and not torch_verloren(vorher, kann(plan.get("dazu", []))):
+        return False, f"Neue PyTorch-Fassung zurückgenommen ({fehler}) – die alte läuft wieder."
+    return False, (f"Neue PyTorch-Fassung defekt ({fehler}), und die alte kam nicht sauber zurück. Im venv-Fenster "
+                   f"(/venv): pip install {' '.join(plan['alt'])} --index-url {plan['alt_index']}")
+
+
+def torch_vormerken(e: Eintrag) -> None:
+    """Für den nächsten Start vormerken, samt dem jetzigen Können als Maßstab für die Prüfung danach."""
+    plan = _torch_plan(e)
+    plan["vorher"] = torch_kann(plan["dazu"])
+    TORCH_AUSSTEHEND.parent.mkdir(parents=True, exist_ok=True)
+    TORCH_AUSSTEHEND.write_text(json.dumps(plan, ensure_ascii=False, indent=1), encoding="utf-8")
+
+
+def _torch_ausstehend_einspielen(melden: Callable[[str], None]) -> None:
+    """Beim Start: vorgemerktes torch-Update, sobald kein anderer Prozess (z. B. die Wache) torch geladen hat."""
+    try:
+        plan = json.loads(TORCH_AUSSTEHEND.read_text(encoding="utf-8"))
+        if not (isinstance(plan, dict) and plan.get("pakete") and plan.get("index", "").startswith(TORCH_INDEX)
+                and plan.get("alt_index", "").startswith(TORCH_INDEX)):
+            raise ValueError("Vormerkung unvollständig")
+    except (OSError, ValueError) as e:
+        TORCH_AUSSTEHEND.unlink(missing_ok=True)
+        melden(f"🔥 PyTorch-Vormerkung verworfen: {e}")
+        return
+    if not torch_frei(site_packages()):
+        melden("🔥 PyTorch-Update wartet: ein anderer Prozess hat PyTorch geladen (läuft die Wache?). "
+               "Nächster Start versucht es wieder.")
+        return
+    try:
+        TORCH_AUSSTEHEND.unlink()                       # einmal versuchen, nicht bei jedem Start
+    except FileNotFoundError:
+        return                                          # ein zweiter Prozess war schneller
+    melden("🔥 PyTorch-Update aus /update wird eingespielt …")
+    ok, text = torch_tauschen(plan, plan.get("vorher") or None, melden)
+    melden(("🔥 " if ok else "⚠ ") + text)
+
+
 def _pip_eintrag(inst: dict[str, str]) -> Optional[Eintrag]:
     """uv legt venvs ohne pip an; ein `pip` in der Konsole griffe dann zum System-Python."""
     if "pip" in inst:
@@ -197,7 +418,7 @@ def _pip_eintrag(inst: dict[str, str]) -> Optional[Eintrag]:
     return Eintrag("pip", "", "", "pip", "fehlt", hinweis="damit pip im venv-Fenster (/venv) das venv trifft")
 
 
-STAND = {"luecken": ""}          # nach pruefen(): "" geprüft, sonst der Grund, warum nicht
+STAND = {"luecken": "", "torch": ""}    # nach pruefen(): "" geprüft, sonst der Grund, warum nicht
 
 
 def _luecken_holen(inst: dict[str, str]) -> dict:
@@ -212,6 +433,9 @@ def _luecken_einarbeiten(raus: list[Eintrag], inst: dict[str, str], wuensche: di
     for n, liste in sorted(funde.items()):
         n = norm(n)
         alt = nach_name.get(n)
+        if alt is not None and alt.grund == "torch-update" and not any(l.schadcode for l in liste):
+            alt.luecken = liste                        # das Update bleibt anwählbar, die Lücke steht dabei
+            continue
         if alt is not None and alt.grund == "ueberfluessig" and not any(l.schadcode for l in liste):
             alt.luecken = liste
             alt.hinweis = "wird nicht mehr gebraucht und hat bekannte Lücken – entfernen schließt sie"
@@ -264,18 +488,27 @@ def _erreichbar(erlaubt, ziel: str) -> bool:
 
 
 def pruefen(veraltet: Optional[Callable[[], list[dict]]] = None,
-            luecken_holen: Optional[Callable[[dict], dict]] = None) -> list[Eintrag]:
+            luecken_holen: Optional[Callable[[dict], dict]] = None,
+            torch_neu: Optional[Callable[[dict], Optional[Eintrag]]] = None) -> list[Eintrag]:
     """Was im venv zu tun ist: Nötiges (fehlt, passt nicht, torch, Lücken, Schadpakete) und Updates."""
     veraltet = veraltet or _veraltet
     luecken_holen = luecken_holen or _luecken_holen
+    torch_neu = torch_neu or _torch_update
     site = site_packages()
     if site is None or not site.is_dir():
         return []
     inst = installiert(site)
     wuensche = _wuensche(inst)
     raus: list[Eintrag] = []
+    STAND["torch"] = ""
     if (t := _torch_eintrag(inst)) is not None:
         raus.append(t)
+    else:
+        try:
+            if (t := torch_neu(inst)) is not None:
+                raus.append(t)
+        except Exception as e:
+            STAND["torch"] = str(e) or "PyTorch-Index nicht erreichbar"
     if (p := _pip_eintrag(inst)) is not None:
         raus.append(p)
     for n, r in wuensche.items():
@@ -300,7 +533,7 @@ def pruefen(veraltet: Optional[Callable[[], list[dict]]] = None,
     except Exception as e:
         STAND["luecken"] = str(e) or "Lücken-Prüfung nicht möglich"
     rang = {"schadcode": 0, "luecke": 1, "torch-bau": 2, "fehlt": 3, "passt nicht": 4, "luecke-offen": 5,
-            "ueberfluessig": 6, "update": 7}
+            "ueberfluessig": 6, "update": 7, "torch-update": 8}
     raus.sort(key=lambda e: rang.get(e.grund, 9))
     return raus
 
@@ -416,6 +649,18 @@ def einspielen(auswahl: list[Eintrag], on_status=None) -> dict:
                "abgelehnt", "zurueck": [(Name, Grund)]}."""
     site = site_packages()
     jetzt, spaeter, neustart = [], [], []
+    torch_erg = {"jetzt": False, "start": False, "text": ""}
+    for e in [e for e in auswahl if e.grund == "torch-update"]:
+        if site is not None and not in_gebrauch("torch", site) and torch_frei(site):
+            ok, text = torch_tauschen(_torch_plan(e), melden=on_status or (lambda s: None))
+            torch_erg.update(jetzt=ok, text=text)
+        else:
+            if on_status:
+                on_status("PyTorch ist geladen – merke das Update für den nächsten Start vor …")
+            torch_vormerken(e)
+            torch_erg.update(start=True, text=f"PyTorch {e.neu} wird beim nächsten Start eingespielt, "
+                                              "bevor etwas es lädt.")
+    auswahl = [e for e in auswahl if e.grund != "torch-update"]
     for e in auswahl:
         if not e.machbar:
             continue
@@ -465,18 +710,27 @@ def einspielen(auswahl: list[Eintrag], on_status=None) -> dict:
             "spaeter": [e.name for e in spaeter], "neustart": [e.name for e in neustart],
             "entfernt": [e.name for e in entfernt if e.grund == "schadcode"],
             "aufgeraeumt": [e.name for e in entfernt if e.grund == "ueberfluessig"],
-            "abgelehnt": [(e.name, g) for e, g in abgelehnt], "zurueck": [(e.name, f) for e, f in zurueck]}
+            "abgelehnt": [(e.name, g) for e, g in abgelehnt], "zurueck": [(e.name, f) for e, f in zurueck],
+            "torch": torch_erg}
 
 
 def ausstehende_einspielen(melden: Callable[[str], None] = print) -> None:
     """Beim Start, bevor etwas aus dem venv geladen ist: Zurückgestelltes installieren."""
-    if not AUSSTEHEND.is_file():
-        return
     if not uvsetup.venv_python():
+        return
+    if TORCH_AUSSTEHEND.is_file():
+        try:
+            _torch_ausstehend_einspielen(melden)
+        except Exception as e:
+            melden(f"⚠ PyTorch-Update beim Start nicht möglich: {e}")
+    if not AUSSTEHEND.is_file():
         return
     melden("📦 Zurückgestellte Updates aus /update werden eingespielt …")
     try:
-        ok = _ausfuehren(_pip("install") + ["-r", str(AUSSTEHEND)], 3600).returncode == 0
+        # Stehen Hashes in der Liste, muss jedes Paket einen haben
+        mit_hashes = "--hash=" in AUSSTEHEND.read_text(encoding="utf-8", errors="replace")
+        ok = _ausfuehren(_pip("install") + ["-r", str(AUSSTEHEND)] + (["--require-hashes"] if mit_hashes else []),
+                         3600).returncode == 0
     except Exception:
         ok = False
     if ok:

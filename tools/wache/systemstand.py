@@ -49,7 +49,8 @@ PUNKTE = {
 
 _SKRIPT = {".bat", ".cmd", ".vbs", ".vbe", ".js", ".jse", ".wsf", ".ps1", ".hta", ".py", ".pyw"}
 # Programme, die eine andere Datei ausführen – maßgeblich ist dann diese.
-_WIRTE = {"rundll32.exe", "regsvr32.exe", "wscript.exe", "cscript.exe", "mshta.exe", "cmd.exe"}
+_WIRTE = {"rundll32.exe", "regsvr32.exe", "wscript.exe", "cscript.exe", "mshta.exe", "cmd.exe",
+          "powershell.exe", "pwsh.exe", "conhost.exe"}
 _ENDUNG = r"\.(?:exe|dll|sys|com|scr|cpl|ocx|bat|cmd|vbs|vbe|js|jse|wsf|hta|ps1|py|pyw|msi)"
 _PFAD_RE = re.compile(r'"([^"]+?' + _ENDUNG + r')"|([A-Za-z]:\\[^"]*?' + _ENDUNG + r')(?=[\s,"]|$)',
                       re.IGNORECASE)
@@ -100,6 +101,13 @@ def _eintrag(art: str, name: str, pfad: str = "", detail: str = "") -> dict:
     return {"art": art, "name": name, "pfad": pfad, "detail": detail}
 
 
+def verknuepfung_ziel(ziel: str, argumente: str = "") -> str:
+    """Zeigt eine Verknüpfung auf ein Wirtprogramm, zählt die Datei aus ihren Argumenten."""
+    if argumente and os.path.basename(_normieren(ziel)).lower() in _WIRTE:
+        return programmpfad(f'"{ziel}" {argumente}') or ziel
+    return ziel
+
+
 def autostart() -> list[dict]:
     from .inventar import Inventar
     raus = []
@@ -107,7 +115,7 @@ def autostart() -> list[dict]:
         if e.extra.get("herkunft") == "registry":
             pfad, detail = programmpfad(e.detail), e.detail
         elif e.extra.get("ziel"):                            # Verknüpfung: geprüft wird, worauf sie zeigt
-            pfad = e.extra["ziel"]
+            pfad = verknuepfung_ziel(e.extra["ziel"], e.extra.get("argumente") or "")
             detail = f"über Verknüpfung {e.name}" + (f" · Argumente {e.extra['argumente']}"
                                                      if e.extra.get("argumente") else "")
         else:

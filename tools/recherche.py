@@ -36,6 +36,8 @@ MAX_SEITEN = 24
 TEXT_JE_QUELLE = 12000
 TEXT_JE_QUELLE_LOKAL = 6000
 MAX_DAUER_S = 20 * 60
+SUCHEN_FRIST_S = 90.0
+LESEN_FRIST_S = 150.0             # direkt, über die Schnittstelle und notfalls über Ollama
 PARALLEL = 3
 _TIER_RANG = {1: 0, 4: 0, 3: 1, 2: 2, webfetch.FREMD_TIER: 3}
 
@@ -133,6 +135,17 @@ def _json_liste(text: str) -> list:
     return []
 
 
+def _kuerzen(text: str, grenze: int, ende: str = "…") -> str:
+    """Auf `grenze` Zeichen kürzen, am Wortende statt mitten im Wort."""
+    text = " ".join(str(text or "").split())
+    if len(text) <= grenze:
+        return text
+    schnitt = text[:grenze - len(ende)]
+    if " " in schnitt[grenze // 2:]:
+        schnitt = schnitt[:schnitt.rfind(" ")]
+    return schnitt.rstrip(" ,;:") + ende
+
+
 def _teilfragen(roh: list, grenze: int) -> list[dict]:
     raus = []
     for e in roh:
@@ -140,11 +153,11 @@ def _teilfragen(roh: list, grenze: int) -> list[dict]:
             e = {"frage": e}
         if not isinstance(e, dict):
             continue
-        frage = " ".join(str(e.get("frage") or "").split())[:300]
+        frage = _kuerzen(e.get("frage"), 300)
         if not frage:
             continue
         raus.append({"frage": frage,
-                     "suche": " ".join(str(e.get("suche") or frage).split())[:200],
+                     "suche": _kuerzen(e.get("suche") or frage, 200, ende=""),
                      "fach": fachquellen.quelle_von(str(e.get("fach") or "")) or ""})
         if len(raus) >= grenze:
             break
@@ -186,18 +199,22 @@ async def _teilfrage_suchen(stand: Stand, umg: Umgebung, idx: int, ende: float) 
         return
     umg.melde(f"🔎 Teilfrage {idx + 1}: {tf['frage']}")
     kandidaten: list[dict] = []
-    web = await asyncio.to_thread(webfetch.treffer, tf["suche"], 6)
+    web = await _im_faden(SUCHEN_FRIST_S, webfetch.treffer, tf["suche"], 6)
     if isinstance(web, list):
         kandidaten += web
     else:
         umg.melde(f"   ⚠ Web-Suche: {web}")
     if tf["fach"]:
-        fach = await asyncio.to_thread(fachquellen.treffer, tf["fach"], tf["suche"], 4)
+        fach = await _im_faden(SUCHEN_FRIST_S, fachquellen.treffer, tf["fach"], tf["suche"], 4)
         if isinstance(fach, list):
             kandidaten += fach
         else:
             umg.melde(f"   ⚠ {tf['fach']}: {fach}")
     gelesen = 0
+    # Fremdseiten auf „fragen“: die Recherche hat keine Rückfrage, liest sie also nicht. Seiten, die schon
+    # einmal versucht haben, die KI zu steuern, liest sie nie.
+    nur_fragen = webfetch.fremdseiten_modus() == "fragen"
+    fremd_aus = verdaechtig = 0
     for _, t in sorted((_rang(t, i), t) for i, t in enumerate(kandidaten)
                        if t.get("url") and t.get("tier") is not None):
         if _halt(stand, umg):
@@ -206,9 +223,15 @@ async def _teilfrage_suchen(stand: Stand, umg: Umgebung, idx: int, ende: float) 
             break
         if t["url"] in stand.gelesen:
             continue
+        if nur_fragen and t["tier"] == webfetch.FREMD_TIER:
+            fremd_aus += 1
+            continue
+        if webfetch.verdaechtig(t["url"]):
+            verdaechtig += 1
+            continue
         stand.gelesen.add(t["url"])
         _fortschritt(stand, umg, "suchen")
-        geholt = await asyncio.to_thread(webfetch.text_holen, t["url"])
+        geholt = await _im_faden(LESEN_FRIST_S, webfetch.text_holen, t["url"])
         if isinstance(geholt, str):
             if not t.get("text"):
                 continue
@@ -222,6 +245,18 @@ async def _teilfrage_suchen(stand: Stand, umg: Umgebung, idx: int, ende: float) 
         stand.quellen.append(Quelle(len(stand.quellen) + 1, t.get("titel") or t["url"], t["url"],
                                     tier, idx + 1, notiz))
         gelesen += 1
+    if fremd_aus:
+        umg.melde(f"   ⏭ {fremd_aus} unbekannte Seite(n) nicht gelesen – Fremdseiten stehen auf „fragen“.")
+    if verdaechtig:
+        umg.melde(f"   ⏭ {verdaechtig} Seite(n) übersprungen – sie haben schon einmal versucht, die KI zu steuern.")
+
+
+async def _im_faden(frist_s: float, funktion, *argumente):
+    """Blockierenden Abruf im Faden, höchstens `frist_s` lang; danach eine Fehlermeldung statt Warten."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(funktion, *argumente), frist_s)
+    except asyncio.TimeoutError:
+        return f"❌ keine Antwort in {frist_s:.0f} s – übersprungen."
 
 
 async def _runde(stand: Stand, umg: Umgebung, indizes: list[int], ende: float) -> None:
@@ -259,6 +294,21 @@ def _quellenliste(stand: Stand) -> str:
     return "\n".join(zeilen)
 
 
+_ABGESCHNITTEN = re.compile(r"\s*\[System\] Antwort abgeschnitten[^\n]*\s*$")
+BERICHT_ABGESCHNITTEN = "Bericht am Tokenbudget abgeschnitten – Notizen aus den Quellen angehängt"
+
+
+def _bericht(antwort: str, stand: Stand) -> str:
+    """Bericht des Modells. Bricht er am Tokenbudget ab oder bleibt leer, folgen die Notizen
+    aus den Quellen – sonst gingen sie mit dem Lauf verloren."""
+    text = re.sub(r"(?s)<think>.*?</think>", "", antwort or "").strip()
+    rumpf = _ABGESCHNITTEN.sub("", text).rstrip()
+    if rumpf and rumpf == text:
+        return rumpf
+    stand.abgebrochen = "; ".join(t for t in (stand.abgebrochen, BERICHT_ABGESCHNITTEN) if t)
+    return "\n\n".join(t for t in (rumpf, "## Notizen aus den Quellen", _notizen_text(stand)) if t)
+
+
 def _verweise_pruefen(text: str, anzahl: int) -> str:
     """Verweise auf Quellen, die es nicht gibt, werden zu [?]."""
     return re.sub(r"\[(\d+)\]", lambda m: m.group(0) if 1 <= int(m.group(1)) <= anzahl else "[?]", text)
@@ -271,8 +321,12 @@ def dateiname(frage: str, jetzt: float | None = None) -> str:
 
 def speichern(stand: Stand, ordner: Path) -> Path:
     ordner.mkdir(parents=True, exist_ok=True)
-    pfad = ordner / dateiname(stand.frage)
-    kopf = (f"# Recherche: {stand.frage}\n\n"
+    pfad = stand.pfad or ordner / dateiname(stand.frage)       # derselbe Lauf schreibt seine Datei fort
+    n = 1
+    while not stand.pfad and pfad.exists():  # gleiche Frage in derselben Minute: nicht überschreiben
+        n += 1
+        pfad = ordner / dateiname(stand.frage).replace(".md", f"_{n}.md")
+    kopf =(f"# Recherche: {stand.frage}\n\n"
             f"Stand: {time.strftime('%d.%m.%Y %H:%M')} · {len(stand.teilfragen)} Teilfragen · "
             f"{len(stand.quellen)} Quellen · {stand.runden} Runde(n)"
             + (f" · ⚠ {stand.abgebrochen}" if stand.abgebrochen else "") + "\n\n")
@@ -318,8 +372,7 @@ async def lauf(frage: str, umg: Umgebung, ordner: Path, tiefe: int = 1) -> Stand
             umg.melde("📝 Schreibe den Bericht …")
             bericht = await umg.ask(f"Frage: {stand.frage}\n\nNotizen aus den Quellen:\n\n{_notizen_text(stand)}",
                                     BERICHT_SYSTEM)
-            bericht = re.sub(r"(?s)<think>.*?</think>", "", bericht or "").strip()
-            stand.bericht = _verweise_pruefen(bericht, len(stand.quellen))
+            stand.bericht = _verweise_pruefen(_bericht(bericht, stand), len(stand.quellen))
         speichern(stand, ordner)
         _fortschritt(stand, umg, "fertig")
         return stand

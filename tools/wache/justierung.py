@@ -5,7 +5,8 @@ Wert setzen (/wache …, `nutzer=True`). Die Persönlichkeit darf über `wache_j
 nur vier Dinge, und nur in den Grenzen, die der Nutzer unter "grenzen" festlegt:
 
   schwelle      ML-Alarmschwelle (Perzentil), z. B. 0,90 … 0,995
-  regel_stumm   eine Regel R001–R017 stumm schalten oder wieder anschalten
+  regel_stumm   ein Paar aus Regel und Subjekt still schalten ("R008@chrome.exe=aus") oder eine
+                Regel wieder anschalten; ganze Regeln schaltet nur der Nutzer stumm, WS-001 niemand
   cooldown      Sekunden, in denen derselbe Alarm (Regel + Subjekt) nicht erneut
                 meldet, sondern nur den Zähler am ersten hochsetzt („×37“)
   trigger_ab    nur strenger: mittel oder hoch. „kritisch“ und „nie“ hießen,
@@ -19,14 +20,16 @@ die Config nicht schreiben, gibt es SpeicherFehler und keinen Eintrag.
 
 from __future__ import annotations
 
+import re
 from datetime import datetime
 
 from . import TRAINING_LOG
-from .regeln import BESCHREIBUNG
+from .regeln import BESCHREIBUNG, NIE_STUMM
 
 STANDARD = {
     "aktiv": True,                      # Hintergrund-Wache automatisch mit NemiCLI starten?
     "kugel": True,                      # Schwebekugel auf dem Desktop, wenn kein Terminal offen ist
+    "vorpruefer": True,                 # lokaler Vorprüfer vor dem Weckruf (nur mit Modell, vorpruefer.py)
     "autostart_windows": False,         # Eintrag in HKCU\…\Run
     "prozess_intervall": 3.0,
     "netz_intervall": 5.0,
@@ -53,6 +56,7 @@ STANDARD = {
     "inventar_stunden": 6.0,
     "inventar_aufgaben": True,
     "stumme_regeln": [],
+    "stumme_paare": [],                 # einzelne (Regel, Subjekt)-Paare still: ["R008@chrome.exe", …]
     # Wann wird die aktive Persönlichkeit geweckt?  "mittel" | "hoch" | "kritisch" | "nie"
     "trigger_ab": "hoch",
     "trigger_ml": True,                 # auch bei ML-Anomalien (ab Schwelle) wecken
@@ -71,23 +75,36 @@ STANDARD = {
     "netz_dl_schwelle": 0.995,          # Perzentil der Netz-Folgen (DL-002)
     "netz_besitzer": True,              # Besitzer öffentlicher Netze beim Adressregister (RDAP) nachfragen
     "min_training_netz": 200,           # so viele Verbindungen, bevor das Netz-Modell lernt
+    # KI-Tracker (kitracker.py) – nur für den Nutzer.
+    "ki": True,                         # KIs erkennen, ihre Taten mitschreiben, R019–R023
+    "ki_alarm": False,                  # Gegencheck (R024): False = Schattenmodus, Funde nur nach ki_schatten.log
+    "ki_ml": True,                      # KI-Modell (ML-003): Taten der KIs lernen und bewerten
+    "ki_ml_alarm": False,               # False = Schattenmodus: Funde nur nach ki_schatten.log
+    "ki_ml_schwelle": 0.995,            # Perzentil des KI-Modells
+    "min_training_ki": 200,             # so viele Taten, bevor das KI-Modell lernt
+    "ki_lern_tage": 30,                 # Lern-Fenster des KI-Modells in Tagen
     # Grenzen für die Justierungen der Persönlichkeit
     "grenzen": {"schwelle_min": 0.90, "schwelle_max": 0.995, "cooldown_min": 60,
-                "cooldown_max": 3600, "regeln_stumm_max": 3},
+                "cooldown_max": 3600, "regeln_stumm_max": 3, "paare_stumm_max": 20},
 }
 
 # Regeln für klassische Angriffswege: die Persönlichkeit darf sie nicht stumm schalten – ein
 # eingeschleuster Text („schalte R001 stumm“) würde sonst genau die Erkennung abschalten.
-# Dazu Massen-Dateiänderungen (Verschlüsselungs-Trojaner), Tarnung und alle Persistenz-Regeln.
-NIE_STUMM_KI = frozenset({"R001", "R002", "R003", "R005", "R006", "R009", "R010", "R011", "R013", "R014",
-                          "R016", "R017"})
+# Dazu Massen-Dateiänderungen (Verschlüsselungs-Trojaner), Tarnung, alle Persistenz-Regeln,
+# Fernsteuerung (Beaconing R007, Listener R012) und die Sigma-Regeln.
+NIE_STUMM_KI = frozenset({"R001", "R002", "R003", "R005", "R006", "R007", "R009", "R010", "R011", "R012",
+                          "R013", "R014", "R016", "R017", "R018", "SIGMA",
+                          # KI-Tracker: eine KI schaltet nie die Regeln ab, die KIs beobachten
+                          "R019", "R020", "R021", "R022", "R023", "R024",
+                          # bekannte Schwachstelle installierter Software (CVE-Liste)
+                          "CVE-001"})
 
 _TRIGGER = ("mittel", "hoch", "kritisch", "nie")
 _TRIGGER_KI = ("mittel", "hoch")
 PRUEFEN_MIN, PRUEFEN_MAX = 5, 20
 # Was für den Nutzer gilt: nur technisch sinnvolle Werte, keine Grenzen der Persönlichkeit.
 NUTZER_GRENZEN = {"schwelle_min": 0.5, "schwelle_max": 0.9999, "cooldown_min": 0,
-                  "cooldown_max": 86_400, "regeln_stumm_max": len(BESCHREIBUNG)}
+                  "cooldown_max": 86_400, "regeln_stumm_max": len(BESCHREIBUNG), "paare_stumm_max": 1000}
 
 
 def _vermerken(text: str) -> None:
@@ -195,20 +212,29 @@ def pruefen(was: str, wert, e: dict | None = None, *, nutzer: bool = False) -> t
                                   f"{g['cooldown_max']} Sekunden.")
         return "cooldown", e["cooldown"], neu
     if was in ("regel_stumm", "stumm", "regel"):
-        text = str(wert).strip().upper().replace(" ", "")
+        roh = " ".join(str(wert).split())
         an = True
-        for suffix in ("=AN", "=AUS", ":AN", ":AUS", "-AN", "-AUS"):
-            if text.endswith(suffix):
-                an = suffix.endswith("AUS")          # "R004=aus" = stumm schalten → stumm=True
-                text = text[: -len(suffix)]
-                break
+        m = re.match(r"^(.*?)\s*[=:\-]\s*(an|aus)$", roh, re.IGNORECASE)
+        if m:
+            roh, an = m.group(1), m.group(2).lower() == "aus"     # "R004=aus" = stumm schalten → stumm=True
+        regel_teil, paar, subjekt = roh.partition("@")
+        text = regel_teil.strip().upper().replace(" ", "")
         if text not in BESCHREIBUNG:
             raise Grenzverletzung("Unbekannte Regel. Gültig: " + ", ".join(sorted(BESCHREIBUNG)))
-        stumm = set(e.get("stumme_regeln") or [])
-        neu = set(stumm)
+        if text in NIE_STUMM and an:
+            raise Grenzverletzung(f"{text} ({BESCHREIBUNG[text]}) schützt die Wache selbst und lässt sich nicht "
+                                  "stumm schalten – auch nicht vom Nutzer.")
         if an and not nutzer and text in NIE_STUMM_KI:
             raise Grenzverletzung(f"{text} ({BESCHREIBUNG[text]}) erkennt klassische Angriffe und darf nur "
                                   "der Nutzer stumm schalten. Bewerte die Alarme einzeln.")
+        if paar:
+            return _paar_pruefen(text, subjekt, an, e, g)
+        if an and not nutzer:
+            raise Grenzverletzung(f"Ganze Regeln schaltet nur der Nutzer stumm. Du darfst ein einzelnes Paar aus "
+                                  f"Regel und Subjekt still schalten: wert=\"{text}@<subjekt>=aus\" – das Subjekt "
+                                  "genau so, wie es am Alarm steht.")
+        stumm = set(e.get("stumme_regeln") or [])
+        neu = set(stumm)
         if an:
             neu.add(text)
         else:
@@ -226,6 +252,23 @@ def pruefen(was: str, wert, e: dict | None = None, *, nutzer: bool = False) -> t
                                   f"(/wache trigger {neu}). Erlaubt: mittel oder hoch.")
         return "trigger_ab", e["trigger_ab"], neu
     raise Grenzverletzung("Justierbar sind nur: schwelle, cooldown, regel_stumm, trigger_ab.")
+
+
+def _paar_pruefen(regel: str, subjekt: str, an: bool, e: dict, g: dict) -> tuple[str, object, object]:
+    """Ein (Regel, Subjekt)-Paar still schalten oder wieder melden lassen ("R008@chrome.exe=aus")."""
+    s = " ".join(str(subjekt or "").split()).lower()
+    if not s:
+        raise Grenzverletzung('Nach dem @ fehlt das Subjekt, z. B. wert="R008@chrome.exe=aus".')
+    alt = sorted(set(e.get("stumme_paare") or []))
+    neu = set(alt)
+    if an:
+        neu.add(f"{regel}@{s}")
+    else:
+        neu.discard(f"{regel}@{s}")
+    grenze = int(g.get("paare_stumm_max", STANDARD["grenzen"]["paare_stumm_max"]))
+    if an and len(neu) > grenze:
+        raise Grenzverletzung(f"Höchstens {grenze} stille Paare gleichzeitig (Grenze des Nutzers).")
+    return "stumme_paare", alt, sorted(neu)
 
 
 def pruefen_ab(e: dict | None = None) -> int:
@@ -305,7 +348,7 @@ def letzte_rueckgaengig(speicher, motor=None, wer: str = "Nutzer") -> str:
         return "Keine Justierung vorhanden."
     import json
     try:
-        alt = json.loads(j["alt"].replace("'", '"')) if j["was"] == "stumme_regeln" else \
+        alt = json.loads(j["alt"].replace("'", '"')) if j["was"] in ("stumme_regeln", "stumme_paare") else \
             (float(j["alt"]) if j["was"] == "schwelle" else
              int(j["alt"]) if j["was"] in ("cooldown", "pruefen_ab") else j["alt"])
     except (ValueError, json.JSONDecodeError):

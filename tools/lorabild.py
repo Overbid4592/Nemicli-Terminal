@@ -64,6 +64,11 @@ def ausloeser(name: str) -> str:
     return f"A photo of {name_sauber(name)}, an adult."
 
 
+def pov_ausloeser(name: str) -> str:
+    """Auslöser für die Ich-Perspektive: nennt den Namen, ohne „a photo of …“, das ein Porträt herbeiruft."""
+    return f"Seen through the eyes of {name_sauber(name)}, an adult."
+
+
 # Was sich von Bild zu Bild ändert, steht im Text; was gleich bleibt (die Person), lernt der Auslöser allein.
 BILDTEXT_FRAGE = ("Write one English sentence that describes this photo for an image-model caption. Mention only "
                   "what can change from photo to photo: clothing, pose, expression, setting, lighting and framing. "
@@ -174,10 +179,19 @@ def _satz(t: str) -> str:
 def prompt_bauen(name: str, szene: str = "", outfit: str = "", pose: str = "", stil: str = "",
                  kern: str = "", frisur: str = "") -> str:
     """Kern · Auslösewort · Frisur · Kleidung · Pose · Szene · Stil. Der Kern (das feste Aussehen eines Charakters)
-    steht immer vorne, wenn es einen gibt; die LoRA kommt dazu."""
+    steht immer vorne, wenn es einen gibt; die LoRA kommt dazu.
+    Ich-Perspektive: Szene · sichtbare Körpermerkmale · Auslöser (pov_ausloeser) · Kleidung · Pose · Stil ·
+    POV-Verstärkung – Kopf, Gesicht und Frisur fallen weg, wie bei charakter.prompt_bauen."""
+    import charakter
+    if charakter.ich_perspektive(szene):
+        szene = charakter.pov_szene(szene)
+        teile = [_satz(szene), charakter.koerper_satz(kern), pov_ausloeser(name)]
+        if outfit:
+            teile.append(_satz("Wearing " + outfit))
+        teile += [_satz(pose), _satz(stil), charakter.POV_SCHLUSS]
+        return " ".join(t for t in teile if t)
     teile = []
     if kern:
-        import charakter
         teile.append(_satz(charakter.kern_erwachsen(kern)))
     teile.append(ausloeser(name))
     if frisur:
@@ -283,8 +297,12 @@ def daten_kopieren(name: str, bilder: list[Path]) -> list[Path]:
     ziel = ordner(name, anlegen=True) / "daten"
     ziel.mkdir(parents=True, exist_ok=True)
     neu: list[Path] = []
+    schon: set[str] = set()
     for i, quelle in enumerate(bilder, 1):
         kennung = sha256(quelle)[:12]
+        if kennung + quelle.suffix.lower() in schon:    # inhaltsgleich: einmal genügt (sonst verschöbe das
+            continue                                    # zweite die schon gelistete Kopie)
+        schon.add(kennung + quelle.suffix.lower())
         k = ziel / f"{i:03d}_{kennung}{quelle.suffix.lower()}"
         vorhanden = next(iter(ziel.glob(f"*_{kennung}{quelle.suffix.lower()}")), None)
         if vorhanden is not None and vorhanden != k:

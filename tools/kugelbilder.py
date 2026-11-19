@@ -69,6 +69,32 @@ RAHMEN_SATZ = ("Head-and-shoulders portrait, centered and facing the viewer, "
 # Motive brauchen Hände und Dinge – deshalb Oberkörper statt nur Kopf
 RAHMEN_MOTIV_SATZ = ("Upper-body view of a single character, centered, "
                      "in front of a plain, flat, solid bright green background.")
+# Figur im Terminal-Fenster (ui/figur.py): ganz, sitzend auf einer Kante, die Beine hängen herab
+RAHMEN_FIGUR_SATZ = ("Full-body view of a single character sitting on the edge of a ledge, seen from the front, "
+                     "both legs hanging down, the whole figure from head to feet visible, centered, "
+                     "in front of a plain, flat, solid bright green background.")
+FIGUR_HOEHE = 768                   # Bildhöhe der Figur-Posen in px (Breite nach Inhalt)
+# Körper-Bilder für die bewegliche Figur (tools/figurrig.py): T-Haltung, gerade von vorn und von hinten –
+# Arme frei vom Rumpf, damit jedes Gelenk im Umriss zu finden ist
+RAHMEN_KOERPER_SATZ = ("Full-body view of a single character from the top of the head to the soles of the feet, the "
+                       "whole figure visible with empty space above the head and below the feet, centered, in front "
+                       "of a plain, flat, solid bright green background.")
+KOERPER = {
+    "vorne": "standing perfectly straight in a T-pose, facing the viewer directly, both arms stretched out horizontally "
+             "to the sides at shoulder height, hands relaxed with the fingers gently together, legs straight and "
+             "slightly apart, a calm, gentle expression",
+    "hinten": "standing perfectly straight in a T-pose, seen from directly behind with the back to the viewer, both "
+              "arms stretched out horizontally to the sides at shoulder height, hands relaxed with the fingers gently "
+              "together, legs straight and slightly apart",
+}
+KOERPER_HOEHE = 1024
+# je Ansicht: 2 = T-Haltung; hinten 3 = Rückansicht zuerst im Prompt; vorne 3 / hinten 4 = Hände locker, Finger
+# zusammen. Ältere Körper-Bilder werden neu gemalt
+KOERPER_VERSION = {"vorne": 3, "hinten": 4}
+# steht vor allem anderen im Prompt – sonst malt das Bildmodell bei der langen Beschreibung doch die Vorderseite
+KOERPER_VORSATZ = {"hinten": "Back view of the character, seen from directly behind: the back, the back of the head "
+                              "and the hair are visible, the face is not visible."}
+KOERPER_STAND = "koerper.json"   # {ansicht: Version} der gemalten Körper-Bilder
 
 
 def _kleid_satz(kleidung: str) -> str:
@@ -144,8 +170,9 @@ def vorhandene(name: str) -> dict[str, Path]:
         return {}
 
 
-def freistellen(quelle: Path, ziel: Path, groesse: int = GROESSE) -> Path:
-    """Hintergrund weg (rembg), auf den Inhalt beschneiden, quadratisch auffüllen, skalieren."""
+def freistellen(quelle: Path, ziel: Path, groesse: int = GROESSE, quadrat: bool = True) -> Path:
+    """Hintergrund weg (rembg), auf den Inhalt beschneiden, quadratisch auffüllen, skalieren.
+    quadrat=False: nur beschneiden und auf `groesse` Höhe bringen (Figur-Posen, unten bündig)."""
     from PIL import Image
     bild = Image.open(quelle).convert("RGBA")
     global _rembg_session
@@ -161,13 +188,16 @@ def freistellen(quelle: Path, ziel: Path, groesse: int = GROESSE) -> Path:
         l, t, r, b = box
         rand = max(4, int(min(r - l, b - t) * 0.04))
         frei = frei.crop((max(0, l - rand), max(0, t - rand), min(frei.width, r + rand), min(frei.height, b + rand)))
-    seite = max(frei.width, frei.height)
-    quadrat = Image.new("RGBA", (seite, seite), (0, 0, 0, 0))
-    quadrat.paste(frei, ((seite - frei.width) // 2, (seite - frei.height) // 2))
-    quadrat = quadrat.resize((groesse, groesse), Image.LANCZOS)
+    if quadrat:
+        seite = max(frei.width, frei.height)
+        bild = Image.new("RGBA", (seite, seite), (0, 0, 0, 0))
+        bild.paste(frei, ((seite - frei.width) // 2, (seite - frei.height) // 2))
+        bild = bild.resize((groesse, groesse), Image.LANCZOS)
+    else:
+        bild = frei.resize((max(1, round(frei.width * groesse / frei.height)), groesse), Image.LANCZOS)
     ziel.parent.mkdir(parents=True, exist_ok=True)
     teil = ziel.with_suffix(".tmp")
-    quadrat.save(teil, "PNG")                         # erst ganz schreiben, dann umbenennen:
+    bild.save(teil, "PNG")                            # erst ganz schreiben, dann umbenennen:
     teil.replace(ziel)                                # ein Abbruch hinterlässt kein halbes Bild
     return ziel
 
@@ -262,6 +292,9 @@ def _motive_weg(name: str) -> int:
         return 0
     alle = [f for f in motiv_ordner(name).glob("*.png") if not _grundbild(f)]
     alle += list((motiv_ordner(name) / "Outfits").rglob("*.png"))       # Outfits zeigen dieselbe Figur
+    alle += list((motiv_ordner(name) / "Figur").glob("*.png"))          # die Figur im Terminal-Fenster auch
+    alle += list((motiv_ordner(name) / "Outfits").glob("*/Figur/*.png"))
+    _rigs_weg(motiv_ordner(name))
     for f in alle:
         try:
             if snapshot.sichern(f, "kugel_motive", verschieben=True):
@@ -269,6 +302,14 @@ def _motive_weg(name: str) -> int:
         except Exception:
             pass
     return n
+
+
+def _rigs_weg(ordner: Path) -> None:
+    """Bewegliche Figuren (aus den Körper-Bildern gebaut) unter `ordner` entfernen – sie passen nicht mehr."""
+    import shutil
+    for rig in list(ordner.glob("Figur/rig_*")) + list(ordner.glob("Outfits/*/Figur/rig_*")) + list(ordner.glob("rig_*")):
+        if rig.is_dir():
+            shutil.rmtree(rig, ignore_errors=True)
 
 
 def motive_fehlend(name: str, schluessel: list[str]) -> list[str]:
@@ -308,6 +349,158 @@ def motive_malen(name: str, schluessel: list[str], *, on_status=None, abbruch=No
     return fertig
 
 
+def figur_fehlend(name: str) -> list[str]:
+    import figur as FG
+    koerper = koerper_fehlend(FG.ordner(name)) if _koerper_noetig() else []
+    if _koerper_noetig() and not koerper and _gesichter_noetig(FG.ordner(name)):
+        koerper = ["gesichter"]                             # Körper da, die Gesichter dazu fehlen noch
+    return koerper + [k for k in FG.POSEN if not (FG.ordner(name) / f"{k}.png").exists()]
+
+
+def _gesichter_noetig(ordner: Path) -> bool:
+    """Fehlen Gesichter zum Körper, und kann der Porträt-Motor sie rechnen?"""
+    try:
+        import figurgesicht
+        return figurgesicht.fehlen(ordner) and figurgesicht.bereit()
+    except Exception:
+        return False
+
+
+def _gesichter_malen(ordner: Path, on_status=None) -> list[Path]:
+    """Die Gesichter zum Körper (tools/figurgesicht.py) – geht es nicht, bleibt die Figur ohne sie."""
+    if not _gesichter_noetig(ordner):
+        return []
+    import figurgesicht
+    try:
+        return figurgesicht.malen(ordner, on_status=on_status)
+    except Exception as exc:
+        if on_status:
+            on_status(f"Gesichter · übersprungen: {exc}")
+        return []
+
+
+def _koerper_stand(ordner: Path) -> dict:
+    try:
+        d = json.loads((ordner / KOERPER_STAND).read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else {}
+    except Exception:
+        return {}
+
+
+def koerper_fehlend(ordner: Path) -> list[str]:
+    """Körper-Bilder, die fehlen oder in einer älteren Form gemalt sind (KOERPER_VERSION)."""
+    stand = _koerper_stand(ordner)
+    return [f"koerper_{a}" for a in KOERPER
+            if not (ordner / f"koerper_{a}.png").exists() or stand.get(a) != KOERPER_VERSION[a]]
+
+
+def _koerper_noetig() -> bool:
+    """Körper-Bilder lohnen nur, wenn sich die Figur bewegen kann (SprongMotion eingerichtet)."""
+    try:
+        import bewegung
+        return bewegung.stand()["bereit"]
+    except Exception:
+        return False
+
+
+def koerper_bauen(ordner: Path) -> list[Path]:
+    """Aus koerper_vorne/hinten.png die bewegliche Figur (rig_vorne/, rig_hinten/) – was fehlt, älter als das Bild
+    oder in einer älteren Form gebaut ist."""
+    import figurrig
+    fertig = []
+    for ansicht in KOERPER:
+        bild, ziel = ordner / f"koerper_{ansicht}.png", ordner / f"rig_{ansicht}"
+        rig = ziel / "rig.json"
+        neuer = [p.stat().st_mtime for p in ordner.glob("gesicht_*.png")] if ansicht == "vorne" else []
+        if bild.is_file() and (not rig.is_file() or rig.stat().st_mtime < max([bild.stat().st_mtime] + neuer)
+                               or not figurrig.aktuell(rig)):
+            fertig.append(figurrig.bauen(bild, ziel, ansicht))
+    return fertig
+
+
+def _koerper_malen(ordner: Path, figur_text: str, kleidung: str, seed: int, paint, mit_lora: dict, *,
+                   on_status=None, abbruch=None, kopf: str = "") -> list[Path]:
+    """Die Körper-Bilder malen, die fehlen oder veraltet sind (alte in den Papierkorb), und daraus die bewegliche
+    Figur bauen."""
+    fertig = []
+    offen = koerper_fehlend(ordner)
+    for ansicht, satz in KOERPER.items():
+        ziel = ordner / f"koerper_{ansicht}.png"
+        if f"koerper_{ansicht}" not in offen:
+            continue
+        if abbruch and abbruch():
+            break
+        if ziel.exists():
+            try:
+                import snapshot
+                gesichert = snapshot.sichern(ziel, "kugel_figur", verschieben=True)
+            except Exception:
+                gesichert = None
+            if gesichert is None and ziel.exists():    # nicht im Papierkorb: altes Bild behalten, nicht neu malen
+                if on_status:
+                    on_status(f"{kopf}Körper {ansicht}: altes Bild ließ sich nicht sichern – bleibt")
+                continue
+            ziel.unlink(missing_ok=True)
+            import shutil
+            shutil.rmtree(ordner / f"rig_{ansicht}", ignore_errors=True)
+        titel = f"{kopf}Körper {'von vorn' if ansicht == 'vorne' else 'von hinten'}"
+        if on_status:
+            on_status(f"{titel} · male …")
+        prompt = (f"{KOERPER_VORSATZ.get(ansicht, '')} {figur_text.strip().rstrip(',.')}.{_kleid_satz(kleidung)} "
+                  f"The character is {satz}. {RAHMEN_KOERPER_SATZ}").strip()
+        roh = paint(prompt, size=(1024, 1024), seed=int(seed), steps=SCHRITTE, **mit_lora,
+                    on_status=(lambda m, titel=titel: on_status(f"{titel} · {m}")) if on_status else None)
+        if on_status:
+            on_status(f"{titel} · stelle frei …")
+        fertig.append(freistellen(Path(roh), ziel, KOERPER_HOEHE, quadrat=False))
+        stand = _koerper_stand(ordner)
+        stand[ansicht] = KOERPER_VERSION[ansicht]
+        (ordner / KOERPER_STAND).write_text(json.dumps(stand), encoding="utf-8")
+    if on_status and fertig:
+        on_status("bewegliche Figur · lege das Skelett auf …")
+    _gesichter_malen(ordner, on_status)
+    koerper_bauen(ordner)
+    return fertig
+
+
+def figur_malen(name: str, *, on_status=None, abbruch=None) -> list[Path]:
+    """Fehlende Ganzkörper-Posen für die Figur im Terminal-Fenster – gleiche Figur (figur.json, Seed, LoRA)
+    wie Kugel und Motive. `abbruch()` -> True beendet nach dem laufenden Bild."""
+    import figur as FG
+    f = figur(name)
+    if not f:
+        raise RuntimeError("Noch keine Figur – erst /kugel malen (Grundbilder).")
+    if veraltet(name):
+        raise RuntimeError("Das Aussehen in der Charakter-Datei hat sich geändert – erst /kugel malen "
+                           "(neue Grundbilder), dann passt auch die Figur.")
+    offen = figur_fehlend(name)
+    paint = _maler()
+    figur_text, mit_lora = _mit_lora(name, f["beschreibung"])
+    fertig: list[Path] = []
+    if any(k.startswith("koerper_") for k in offen):       # zuerst der bewegliche Körper (mit Gesichtern)
+        fertig += _koerper_malen(FG.ordner(name), figur_text, str(f.get("kleidung") or ""), int(f["seed"]), paint,
+                                 mit_lora, on_status=on_status, abbruch=abbruch)
+    elif "gesichter" in offen:                             # nur die Gesichter zum vorhandenen Körper
+        _gesichter_malen(FG.ordner(name), on_status)
+        koerper_bauen(FG.ordner(name))
+    offen = [k for k in offen if k in FG.POSEN]
+    for i, k in enumerate(offen, 1):
+        if abbruch and abbruch():
+            break
+        wort, satz = FG.POSEN[k][0], FG.POSEN[k][1]
+        kopf = f"Pose {i}/{len(offen)} · {wort}"
+        prompt = (f"{figur_text.strip().rstrip(',.')}.{_kleid_satz(str(f.get('kleidung') or ''))} "
+                  f"The character is {satz}. {RAHMEN_FIGUR_SATZ}")
+        if on_status:
+            on_status(f"{kopf} · male …")
+        roh = paint(prompt, size=(1024, 1024), seed=int(f["seed"]), steps=SCHRITTE, **mit_lora,
+                    on_status=(lambda m, kopf=kopf: on_status(f"{kopf} · {m}")) if on_status else None)
+        if on_status:
+            on_status(f"{kopf} · stelle frei …")
+        fertig.append(freistellen(Path(roh), FG.ordner(name) / f"{k}.png", FIGUR_HOEHE, quadrat=False))
+    return fertig
+
+
 # --- Outfits: die Persönlichkeit wählt selbst, was ihre Figur trägt. Beschreibung, Seed und
 # Ausdruck bleiben die des Motivs, nur ein Satz zur Kleidung kommt dazu. Ablage unter
 # Outfits/<outfit>/<motiv>.png, das aktive Outfit steht in outfit.json. Fehlt einem Outfit
@@ -327,11 +520,15 @@ def outfit_ordner(name: str, key: str) -> Path:
     return motiv_ordner(name) / "Outfits" / key
 
 
-def outfits(name: str) -> dict:
-    """{"aktiv": Schlüssel oder "", "liste": {Schlüssel: Kleidung (englisch)}}."""
+def outfits(name: str, streng: bool = False) -> dict:
+    """{"aktiv": Schlüssel oder "", "liste": {Schlüssel: Kleidung (englisch)}}. Kaputte Datei wird
+    beiseitegelegt; `streng`: Lesefehler weitergeben (vor dem Schreiben, sonst wäre die Liste weg)."""
+    from atomar import json_lesen
     try:
-        d = json.loads((motiv_ordner(name) / OUTFIT_DATEI).read_text(encoding="utf-8"))
-    except Exception:
+        d = json_lesen(motiv_ordner(name) / OUTFIT_DATEI, {}, dict)
+    except OSError:
+        if streng:
+            raise
         d = {}
     liste = d.get("liste") if isinstance(d.get("liste"), dict) else {}
     return {"aktiv": str(d.get("aktiv") or ""), "liste": {str(k): str(v) for k, v in liste.items()}}
@@ -347,7 +544,7 @@ def _outfits_schreiben(name: str, d: dict) -> None:
 
 def outfit_anziehen(name: str, key: str) -> None:
     """Outfit aktiv machen; "" oder ein unbekanntes = Grundkleidung."""
-    d = outfits(name)
+    d = outfits(name, streng=True)
     d["aktiv"] = key if key in d["liste"] else ""
     _outfits_schreiben(name, d)
 
@@ -391,14 +588,15 @@ def outfit_malen(name: str, key: str, kleidung: str, motive: list[str], *, on_st
                            "(neue Grundbilder), dann passen auch die Outfits.")
     offen = outfit_fehlend(name, key, motive, kleidung)
     ordner = outfit_ordner(name, key)
-    d = outfits(name)
+    d = outfits(name, streng=True)
     if d["liste"].get(key, kleidung) != kleidung:
         try:
             import snapshot
-            for alt in ordner.glob("*.png"):
+            for alt in list(ordner.glob("*.png")) + list(ordner.glob("Figur/*.png")):
                 snapshot.sichern(alt, "kugel_outfit", verschieben=True)
         except Exception:
             pass
+        _rigs_weg(ordner)
     d["liste"][key] = kleidung
     _outfits_schreiben(name, d)
     paint = _maler() if offen else None
@@ -415,6 +613,12 @@ def outfit_malen(name: str, key: str, kleidung: str, motive: list[str], *, on_st
         if on_status:
             on_status(f"{kopf} · stelle frei …")
         fertig.append(freistellen(Path(roh), ordner / f"{m}.png"))
+    if _koerper_noetig() and not (abbruch and abbruch()):       # die bewegliche Figur trägt das Outfit mit
+        if paint is None:
+            paint = _maler()
+            figur_text, mit_lora = _mit_lora(name, f["beschreibung"])
+        fertig += _koerper_malen(ordner / "Figur", figur_text, kleidung, int(f["seed"]), paint, mit_lora,
+                                 on_status=on_status, abbruch=abbruch, kopf=f"{key} · ")
     return fertig
 
 

@@ -44,9 +44,6 @@ from . import BERICHTE, ORDNER, ordner_anlegen
 DB = ORDNER / "vollscan.db"
 STAND = ORDNER / "vollscan.json"
 STOPP = ORDNER / "vollscan_stopp"
-STARTS = ORDNER / "vollscan_starts.json"   # Startzeiten neuer Vollscans der letzten 7 Tage
-PRO_WOCHE = 3                              # höchstens so viele neue Vollscans in 7 Tagen
-WOCHE = 7 * 86400
 
 # Stufe 2: alles, was Code ausführen kann.
 CODE_ENDUNGEN = {
@@ -562,11 +559,14 @@ def _verbinden() -> sqlite3.Connection:
 class Lauf:
     def __init__(self, c: sqlite3.Connection, wurzeln: list[str] | None = None):
         self.c = c
-        from .herkunft import _SCHUTZ_ERSATZ              # feste Einträge, falls das Sicherheitscenter schweigt
+        from .herkunft import _schutz_dienste             # eingebauter Virenschutz, falls das Sicherheitscenter schweigt
         self.ausgelassen_pfade = ausgelassene_ordner()
         bekannt = {os.path.normcase(o) for o in self.ausgelassen_pfade}
-        self.ausgelassen_pfade += [o for o in (os.path.expandvars(x) for x in _SCHUTZ_ERSATZ)
-                                   if "%" not in o and os.path.isdir(o) and os.path.normcase(o) not in bekannt]
+        try:
+            zusatz = _schutz_dienste()
+        except Exception:
+            zusatz = []
+        self.ausgelassen_pfade += [o for o in zusatz if os.path.isdir(o) and os.path.normcase(o) not in bekannt]
         if wurzeln is None:
             self.wurzeln, self.unzugaenglich = volumes()
             # Volumes, die ein Sicherheitscenter-Produkt angelegt hat (Bezeichnung
@@ -865,6 +865,9 @@ class Lauf:
         for e in eintraege:
             e["neu"] = 1 if bekannt is not None and schluessel(e["art"], e["name"], e["pfad"]) not in bekannt else 0
             e["ampel"], e["grund"] = systemstand.ampel(e)
+            if e.get("pfad") and e["ampel"] == systemstand.ROT:      # Stand der Datei für VS-001
+                k = self.c.execute("SELECT sha256 FROM code WHERE pfad=?", (e["pfad"],)).fetchone()
+                e["sha256"] = (k[0] or "") if k else ""
             zeilen.append((self.lid, e["art"], e["name"], e["pfad"], e["detail"], e["status"],
                            e["signierer"], e["ampel"], e["grund"], e["neu"]))
         self.c.execute("DELETE FROM system WHERE lauf=?", (self.lid,))
@@ -939,28 +942,68 @@ _ART_NAME = {"autostart": "Autostart", "dienst": "Dienst", "aufgabe": "Geplante 
              "port": "Offener Port", "netz": "Verbindung", "hosts": "hosts-Eintrag", "dns": "DNS", "proxy": "Proxy"}
 
 
+def _vs_stumm() -> tuple[bool, set]:
+    """VS-001 ganz stumm (nur der Nutzer) oder einzelne Paare still (justierung)."""
+    try:
+        from .justierung import einstellungen
+        from .regeln import stumme_paare
+        e = einstellungen()
+        return VS_REGEL in set(e.get("stumme_regeln") or []), stumme_paare(e)
+    except Exception:
+        return False, set()
+
+
 def funde_als_alarme(speicher, eintraege: list[dict]) -> int:
     """Rote Einträge des Systemstands werden einmal je Fund ein Alarm (Vorbild: Hayabusa/Chainsaw liefern
     Treffer statt Listen) – so bekommen sie ein Urteil und wiederholen sich nicht bei jedem Lauf. Was
-    schon einmal gemeldet wurde (egal mit welchem Urteil), kommt nicht noch einmal."""
+    schon einmal gemeldet wurde (egal mit welchem Urteil), kommt nicht noch einmal – außer die Datei hat
+    seitdem einen anderen SHA-256 (ausgetauschtes Programm am selben Ort): dann ein neuer Alarm."""
     from .ereignisse import Alarm, Schwere
     from .systemstand import ROT
-    neu = []
+    ganz_stumm, paare = _vs_stumm()
+    if ganz_stumm:
+        return 0
+    neu, staende = [], {}
     for e in eintraege:
         if e.get("ampel") != ROT:
             continue
         art, name, pfad = system_schluessel(e["art"], e["name"], e.get("pfad") or "")
         subjekt = f"{_ART_NAME.get(art, art)} · {name} · {pfad}"[:300]
-        if speicher.urteile_zu(VS_REGEL, subjekt):
+        if (VS_REGEL, subjekt.lower()) in paare:
             continue
+        sha = str(e.get("sha256") or "")
+        if not sha and e.get("pfad"):
+            try:
+                from .herkunft import sha256_datei
+                sha = sha256_datei(str(e["pfad"]))
+            except Exception:
+                sha = ""
+        stand = {"sha256": sha, "signierer": str(e.get("signierer") or "")}
+        vorher = speicher.letzter_alarm_zu(VS_REGEL, subjekt)
+        geaendert = ""
+        if vorher is not None:
+            mw = speicher.messwerte(vorher.id)
+            if "sha256" not in mw:                  # Fund von vor dem Stand-Vergleich: heutigen Stand übernehmen
+                speicher.messwerte_setzen(vorher.id, {**mw, **stand})
+                continue
+            if not sha or sha == mw.get("sha256"):
+                continue
+            geaendert = (f"\nDatei seit dem letzten Fund verändert: SHA-256 vorher {str(mw.get('sha256') or '–')[:16]}…, "
+                         f"jetzt {sha[:16]}…" + (f"; Signierer vorher {mw.get('signierer') or '–'}"
+                                                 if mw.get("signierer") != stand["signierer"] else ""))
         text = (f"{_ART_NAME.get(e['art'], e['art'])} „{e['name']}“ – {e.get('pfad') or 'ohne Pfad'}\n"
                 f"Ampel rot: {e.get('grund', '')}\n"
                 f"Signatur: {e.get('status') or '?'}" + (f" ({e['signierer']})" if e.get("signierer") else "")
-                + (f"\nDetail: {str(e.get('detail'))[:300]}" if e.get("detail") else ""))
-        neu.append(Alarm(titel=f"Vollscan: {_ART_NAME.get(e['art'], e['art'])} rot", text=text,
-                         schwere=Schwere.MITTEL, regel=VS_REGEL, quelle="vollscan", subjekt=subjekt))
+                + (f"\nDetail: {str(e.get('detail'))[:300]}" if e.get("detail") else "") + geaendert)
+        a = Alarm(titel=f"Vollscan: {_ART_NAME.get(e['art'], e['art'])} rot" + (" – Datei verändert" if geaendert else ""),
+                  text=text, schwere=Schwere.HOCH if geaendert else Schwere.MITTEL, regel=VS_REGEL,
+                  quelle="vollscan", subjekt=subjekt)
+        neu.append(a)
+        staende[a.id] = stand
     if neu:
         speicher.alarme_schreiben(neu)
+        for aid, stand in staende.items():
+            speicher.messwerte_setzen(aid, stand)
     return len(neu)
 
 
@@ -1344,7 +1387,7 @@ class Baseline:
         with self._lock:
             try:
                 d = self._c.execute("SELECT 1 FROM dateien WHERE pfad > ? AND pfad < ? LIMIT 1",
-                                    (ordner + "\\", ordner + "\\￿")).fetchone()
+                                    (ordner + "\\", ordner + "\\\uffff")).fetchone()
             except (sqlite3.Error, AttributeError):
                 return 0.0
         ergebnis = 1.0 if d else 0.0
@@ -1406,43 +1449,11 @@ def befehl(install_ordner: Path) -> list[str]:
     return [str(pythonw if pythonw.exists() else python), str(install_ordner / "main.py"), "--vollscan"]
 
 
-def starts_lesen() -> list[float]:
-    try:
-        return [float(t) for t in json.loads(STARTS.read_text(encoding="utf-8"))]
-    except (OSError, ValueError, TypeError):
-        return []
-
-
-def woche_frei(jetzt: float | None = None) -> tuple[bool, float]:
-    """(darf ein neuer Vollscan starten, ab wann wieder frei). Fortsetzen zählt nicht."""
-    jetzt = jetzt if jetzt is not None else time.time()
-    letzte = sorted(t for t in starts_lesen() if jetzt - t < WOCHE)
-    if len(letzte) < PRO_WOCHE:
-        return True, jetzt
-    return False, letzte[-PRO_WOCHE] + WOCHE
-
-
-def sperre_text(jetzt: float | None = None) -> str:
-    _frei, ab = woche_frei(jetzt)
-    return (f"Höchstens {PRO_WOCHE} Vollscans in 7 Tagen – der nächste geht ab "
-            f"{time.strftime('%d.%m. %H:%M', time.localtime(ab))}. Einen angehaltenen Scan "
-            "fortsetzen geht jederzeit.")
-
-
-def _start_merken(jetzt: float | None = None) -> None:
-    jetzt = jetzt if jetzt is not None else time.time()
-    letzte = [t for t in starts_lesen() if jetzt - t < WOCHE] + [jetzt]
-    tmp = STARTS.with_suffix(".tmp")
-    tmp.write_text(json.dumps(letzte), encoding="utf-8")
-    os.replace(tmp, STARTS)
-
-
 def starten(install_ordner: Path) -> str:
+    """Vollscan starten oder einen angehaltenen fortsetzen – ohne Grenze: wann und wie oft, entscheidet der Nutzer
+    (/wache fullscan von Hand, /wache termin nach Zeitplan)."""
     if laeuft():
         return "Der Vollscan läuft schon."
-    neu = stand_lesen().get("phase") != "abgebrochen"       # Fortsetzen zählt nicht als neue Prüfung
-    if neu and not woche_frei()[0]:
-        return sperre_text()
     ordner_anlegen()
     STOPP.unlink(missing_ok=True)
     b = befehl(install_ordner)
@@ -1453,11 +1464,6 @@ def starten(install_ordner: Path) -> str:
                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     except OSError as exc:
         return f"Start fehlgeschlagen: {exc}"
-    if neu:
-        try:
-            _start_merken()
-        except OSError:
-            pass
     for _ in range(50):
         time.sleep(0.2)
         if laeuft():

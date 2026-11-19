@@ -435,7 +435,8 @@ class Bridge:
                         pass
 
         try:
-            self.httpd = ThreadingHTTPServer((HOST, self.port), Handler)
+            import lokalserver
+            self.httpd = lokalserver.Server((HOST, self.port), Handler)
         except OSError as e:
             self.letzter_fehler = f"Port {self.port} nicht nutzbar: {e}"
             self.httpd = None

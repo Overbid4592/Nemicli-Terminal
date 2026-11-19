@@ -3,8 +3,8 @@
 Jede Verbindung beginnt mit einer Namensauflösung (`socket.getaddrinfo`). Ein dünner Haken davor
 merkt sich Name → Adressen und schreibt sie nach `Wache/eigene_namen.jsonl`. Taucht eine Adresse
 später in einer Firewall-Meldung auf, kann die Wache sagen, welcher Dienst das war und wofür
-NemiCLI ihn nutzt (netzauskunft.ZWECK). Gespeichert werden nur Name, Adressen, Zeit und Programm –
-keine Inhalte, keine Pfade.
+NemiCLI ihn nutzt (netzauskunft.ZWECK). Gespeichert werden nur Name, Adressen, Zeit, Programm und
+Prozessnummer – keine Inhalte, keine Pfade.
 """
 
 from __future__ import annotations
@@ -63,7 +63,7 @@ def merken(host, ergebnis, datei: Path | None = None) -> bool:
                 os.replace(datei, datei.with_suffix(".jsonl.1"))
             with open(datei, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"zeit": round(jetzt, 1), "name": host, "ips": ips,
-                                    "programm": _programm}, ensure_ascii=False) + "\n")
+                                    "programm": _programm, "pid": os.getpid()}, ensure_ascii=False) + "\n")
         except OSError:
             return False
     return True

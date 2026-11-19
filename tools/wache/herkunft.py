@@ -24,6 +24,7 @@ from __future__ import annotations
 import os
 import threading
 import time
+from pathlib import Path
 
 _WINDOWS = os.environ.get("SystemRoot") or r"C:\Windows"
 _PROGRAMME = os.environ.get("ProgramFiles") or r"C:\Program Files"
@@ -215,15 +216,87 @@ def _kennung(pfad: str) -> tuple | None:
 
 
 # Ordner der Schutzsoftware betritt die Wache nicht – auch nicht für eine Signatur (Revier des Virenschutzes).
-# Die Liste kommt aus dem Windows-Sicherheitscenter; die festen Einträge gelten, falls dort nichts steht.
+# Die Liste kommt aus dem Windows-Sicherheitscenter; der eingebaute Virenschutz steht dort oft nicht und
+# wird über die Dienstverwaltung gefunden (_schutz_dienste).
 SCHUTZ_STATUS = "Schutzsoftware"
-_SCHUTZ_ERSATZ = (r"%ProgramFiles%\Windows Defender", r"%ProgramFiles(x86)%\Windows Defender",
-                  r"%ProgramFiles%\Windows Defender Advanced Threat Protection",
-                  r"%ProgramData%\Microsoft\Windows Defender",
-                  r"%ProgramData%\Microsoft\Windows Defender Advanced Threat Protection",
-                  r"%SystemRoot%\System32\drivers\wd")
 _SCHUTZ_TTL = 600.0
 _schutz: dict = {"t": -1e9, "ordner": []}
+_LAUNCH_ANTIMALWARE = 3                      # SERVICE_LAUNCH_PROTECTED_ANTIMALWARE_LIGHT
+_FILTER_GRUPPE = "fsfilter anti-virus"
+_ALLGEMEIN = {"microsoft", "common files", "windowsapps", "windows nt"}   # zu grob für einen Produktordner
+
+
+def _dienst_pfade() -> list[str]:
+    """Programmpfade geschützter Antimalware-Dienste und der Virenschutz-Dateisystemfilter."""
+    try:
+        import winreg
+    except ImportError:
+        return []
+    pfade = []
+    try:
+        dienste = winreg.OpenKey(winreg.HKEY_LOCAL_MACHINE, r"SYSTEM\CurrentControlSet\Services")
+    except OSError:
+        return []
+    with dienste:
+        i = 0
+        while True:
+            try:
+                name = winreg.EnumKey(dienste, i)
+            except OSError:
+                break
+            i += 1
+            try:
+                with winreg.OpenKey(dienste, name) as d:
+                    def wert(feld):
+                        try:
+                            return winreg.QueryValueEx(d, feld)[0]
+                        except OSError:
+                            return None
+                    if wert("LaunchProtected") == _LAUNCH_ANTIMALWARE or \
+                            str(wert("Group") or "").lower() == _FILTER_GRUPPE:
+                        pfade.append(str(wert("ImagePath") or ""))
+            except OSError:
+                continue
+    return pfade
+
+
+def _schutz_dienste() -> list[str]:
+    """Produktordner aus `_dienst_pfade` samt gleichnamiger Ordner (und „<Name> …“) unter Programme
+    und ProgramData. Treiber zählen nur mit eigenem Unterordner von drivers."""
+    win = os.path.normcase(_WINDOWS)
+    daten = os.environ.get("ProgramData") or r"C:\ProgramData"
+    basen = [b for b in (_PROGRAMME, _PROGRAMME_X86, daten, os.path.join(daten, "Microsoft")) if b]
+    namen, raus = set(), set()
+    for roh in _dienst_pfade():
+        roh = os.path.expandvars(roh.strip())
+        exe = roh[1:].split('"', 1)[0] if roh.startswith('"') else roh.split(" ", 1)[0]
+        low = exe.lower()
+        if low.startswith("\\systemroot\\"):
+            exe = _WINDOWS + exe[len("\\systemroot"):]
+        elif low.startswith("system32\\"):
+            exe = os.path.join(_WINDOWS, exe)
+        verz = os.path.normcase(os.path.dirname(exe))
+        treiber = os.path.join(win, "system32", "drivers")
+        if verz.startswith(treiber + os.sep):
+            raus.add(verz)
+            continue
+        for b in sorted(basen, key=len, reverse=True):
+            nb = os.path.normcase(b)
+            if verz.startswith(nb + os.sep):
+                name = verz[len(nb) + 1:].split(os.sep)[0]
+                if name and name not in _ALLGEMEIN:
+                    namen.add(name)
+                break
+    for b in basen:
+        try:
+            eintraege = os.listdir(b)
+        except OSError:
+            continue
+        for e in eintraege:
+            el = e.lower()
+            if any(el == n or el.startswith(n + " ") for n in namen):
+                raus.add(os.path.join(b, e))
+    return sorted(raus)
 
 
 def schutz_ordner() -> list[str]:
@@ -236,12 +309,40 @@ def schutz_ordner() -> list[str]:
         ordner = list(ausgelassene_ordner())
     except Exception:
         ordner = []
-    for o in _SCHUTZ_ERSATZ:
-        o = os.path.expandvars(o)
-        if "%" not in o:
-            ordner.append(o)
+    try:
+        ordner += _schutz_dienste()
+    except Exception:
+        pass
     _schutz.update(t=jetzt, ordner=sorted({os.path.normcase(os.path.abspath(o)) for o in ordner}))
     return _schutz["ordner"]
+
+
+def _im_ordner(n: str, ordner: list[str]) -> bool:
+    return any(n == o or n.startswith(o + os.sep) for o in ordner)
+
+
+def _lang_bis_schutz(n: str, ordner: list[str]) -> str:
+    """8.3-Kurznamen Teil für Teil auflösen. Hält an, sobald der Pfad ein Schutz-Ordner ist: nachgeschlagen wird
+    nur im jeweils übergeordneten Ordner, nie darin."""
+    try:
+        import ctypes
+        lang = ctypes.WinDLL("kernel32", use_last_error=True).GetLongPathNameW
+        lang.argtypes = [ctypes.c_wchar_p, ctypes.c_wchar_p, ctypes.c_uint32]
+        lang.restype = ctypes.c_uint32
+    except (OSError, AttributeError):
+        return n
+    laufwerk, rest = os.path.splitdrive(n)
+    weg = laufwerk + os.sep
+    for teil in (t for t in rest.split(os.sep) if t):
+        kandidat = os.path.join(weg, teil)
+        if "~" in teil:
+            puffer = ctypes.create_unicode_buffer(1024)
+            if 0 < lang(kandidat, puffer, 1024) < 1024:
+                kandidat = puffer.value
+        weg = os.path.normcase(kandidat)
+        if _im_ordner(weg, ordner):
+            break
+    return weg
 
 
 def im_schutzrevier(pfad: str) -> bool:
@@ -251,7 +352,10 @@ def im_schutzrevier(pfad: str) -> bool:
         n = os.path.normcase(os.path.abspath(str(pfad).strip('"')))
     except (ValueError, OSError):
         return False
-    return any(n == o or n.startswith(o + os.sep) for o in schutz_ordner())
+    ordner = schutz_ordner()
+    if _im_ordner(n, ordner):
+        return True
+    return "~" in n and _im_ordner(_lang_bis_schutz(n, ordner), ordner)
 
 
 def signatur(exe: str, timeout: float = 12.0) -> dict:
@@ -457,6 +561,75 @@ def _pruefen(exe: str, timeout: float) -> dict:
     return {"status": status, "signierer": name, "gueltig": status == "Valid"}
 
 
+# ---------------------------------------------------------------------------
+# Stand einer Datei (SHA-256) – für „bekannt“, Dämpfung und Vollscan-Funde
+# ---------------------------------------------------------------------------
+
+HASH_MAX_BYTES = 256 * 1024 * 1024      # größere Dateien werden nicht gehasht (kein Stand, gilt als unbekannt)
+_NICHT_LOKAL = 0x00001000 | 0x00040000 | 0x00400000   # Cloud-Platzhalter: Lesen löste einen Download aus
+_hash_cache: dict[tuple, str] = {}
+
+
+def sha256_datei(pfad: str, rechnen: bool = True) -> str:
+    """SHA-256 einer Datei, zwischengespeichert je (Pfad, Änderungszeit, Größe). `rechnen=False`: nur
+    aus dem Zwischenspeicher. '' wenn nicht lesbar, zu groß, Netzwerkpfad, Cloud-Platzhalter oder Schutzsoftware."""
+    if not pfad or str(pfad).replace("/", "\\").startswith("\\\\"):
+        return ""
+    kennung = _kennung(pfad)
+    if kennung is None:
+        return ""
+    with _cache_lock:
+        if kennung in _hash_cache:
+            return _hash_cache[kennung]
+    if not rechnen or kennung[2] > HASH_MAX_BYTES:
+        return ""
+    try:
+        if getattr(os.stat(pfad), "st_file_attributes", 0) & _NICHT_LOKAL or im_schutzrevier(pfad):
+            return ""
+        import hashlib
+        h = hashlib.sha256()
+        with open(pfad, "rb") as f:
+            for block in iter(lambda: f.read(1 << 20), b""):
+                h.update(block)
+    except OSError:
+        return ""
+    digest = h.hexdigest()
+    with _cache_lock:
+        if len(_hash_cache) > _CACHE_GRENZE * 5:
+            _hash_cache.clear()
+        _hash_cache[kennung] = digest
+    return digest
+
+
+def fingerabdruck(pfad: str, rechnen: bool = True) -> dict:
+    """{sha256, signierer, groesse, mtime} – leer, wenn die Datei nicht lesbar ist."""
+    kennung = _kennung(pfad) if pfad else None
+    if kennung is None:
+        return {}
+    sha = sha256_datei(pfad, rechnen=rechnen)
+    if not sha:
+        return {}
+    try:
+        s = signatur(pfad) if rechnen else {}
+    except Exception:
+        s = {}
+    return {"sha256": sha, "signierer": str(s.get("signierer") or ""), "groesse": kennung[2], "mtime": kennung[1]}
+
+
+def stand_gleich(pfad: str, stand: dict, rechnen: bool = True) -> bool:
+    """Ist die Datei noch im gemerkten Stand? Gleiche Größe und Änderungszeit genügen (wie beim Signatur-
+    Zwischenspeicher); sonst entscheidet der SHA-256. Fehlt die Datei, gilt der Stand nicht."""
+    kennung = _kennung(pfad)
+    if kennung is None or not stand.get("sha256"):
+        return False
+    try:
+        if int(stand.get("groesse") or -1) == kennung[2] and int(float(stand.get("mtime") or -1)) == kennung[1]:
+            return True
+    except (TypeError, ValueError):
+        pass
+    return sha256_datei(pfad, rechnen=rechnen) == stand["sha256"]
+
+
 def signatur_zeile(exe: str) -> str:
     """Eine Zeile für den Alarm – das, was die Persönlichkeit lesen soll."""
     if not exe:
@@ -468,6 +641,13 @@ def signatur_zeile(exe: str) -> str:
         return "liegt im Ordner der Schutzsoftware – nicht geprüft (Revier des Virenschutzes)"
     ort = "geschützter Systemordner" if ist_systemort(exe) else "kein Systemordner"
     if s["gueltig"]:
+        if (s["signierer"] or "").strip().lower() == "nemicli":
+            # selbst erstelltes Zertifikat auf diesem PC: beglaubigt nur NemiCLIs eigene Dateien
+            eigen = Path(str(exe)).name.lower() in ("nemicli.exe", "nemiclic.exe", "nemicli-setup.exe") or \
+                Path(str(exe)).name.lower().startswith("nemicli-setup-")
+            return ("signiert: NemiCLI (selbst erstellt) · " + ort if eigen else
+                    "VORSICHT: fremde Datei mit dem selbst erstellten NemiCLI-Zertifikat signiert – "
+                    f"das darf nur NemiCLI selbst tragen · {ort}")
         return f"signiert: {s['signierer'] or 'gültig, Aussteller unbekannt'} · {ort}"
     if s["status"] == "NotSigned":
         return f"NICHT signiert · {ort}"

@@ -41,6 +41,7 @@ QUELLEN = {
     "skill": (("skill",), None), "skills": (("skill",), None),
     "code": (("code",), None),
     "wissen": (("wissen",), None), "dokument": (("wissen",), None), "dokumente": (("wissen",), None),
+    "export": (("export",), None), "exporte": (("export",), None),
     "aktuell": (("chat",), ("<laufender Chat>",)), "hier": (("chat",), ("<laufender Chat>",)),
 }
 _LAUFEND = "<laufender Chat>"          # wird beim Suchen durch den ref des laufenden Chats ersetzt
@@ -54,7 +55,7 @@ def _laufender_ref() -> str:
     except Exception:
         return ""
 _ART_NAME = {"chat": "Chat", "chatmd": "Chat-Mitschrift", "note": "Notiz", "bericht": "Bericht",
-             "skill": "Skill", "code": "Code", "wissen": "Wissen"}
+             "skill": "Skill", "code": "Code", "wissen": "Wissen", "export": "Export-Chat"}
 
 
 def datum_lesen(text: str, heute: date | None = None) -> str:
@@ -120,7 +121,12 @@ def _kopf(h: dict) -> str:
             datum = datetime.strptime(datum, "%Y-%m-%d").strftime("%d.%m.%Y")
         except ValueError:
             pass
-    return f"{art} · ref={h.get('ref', '')}" + (f" · {datum}" if datum else "")
+    herkunft = h.get("herkunft")
+    woher = _HERKUNFT_NAME.get(herkunft, "") if isinstance(herkunft, str) else ""
+    return f"{art} · ref={h.get('ref', '')}" + (f" · {datum}" if datum else "") + (f" · {woher}" if woher else "")
+
+
+_HERKUNFT_NAME = {"werkzeug": "Werkzeug-Ergebnis", "netz": "aus dem Netz", "export": "aus einem Export-Archiv"}
 
 
 def _fragen(a: dict) -> list[str]:
@@ -191,7 +197,7 @@ def suchen(a: dict) -> str:
         f"Quelle {a.get('quelle')}" if arten else "", f"seit {seit}" if seit else "",
         f"bis {bis}" if bis else "", "mit Vermutung" if vermutung else "") if x)
     hinweis = (f"Unbekannte Quelle(n) ignoriert: {', '.join(unbekannt)} – möglich: "
-               "chat, notiz, bericht, wache, vollscan, skill, code, wissen, aktuell.\n" if unbekannt else "")
+               "chat, notiz, bericht, wache, vollscan, skill, code, wissen, export, aktuell.\n" if unbekannt else "")
     if not treffer:
         return (hinweis + f"Nichts gefunden zu „{titel}“" + (f" ({filter_text})" if filter_text else "")
                 + ". " + _WEITER_SUCHEN)
@@ -210,14 +216,20 @@ def suchen(a: dict) -> str:
             + ". ↑/↓ = Text davor/danach in derselben Quelle. Ganze Quelle: gedaechtnis_lesen mit ref.")
     if _schwach(treffer):
         kopf += "\n⚠ Die Treffer sind schwach – wohl nicht das Gesuchte. " + _WEITER_SUCHEN
-    netz = any(_von_aussen(h.get("ref")) for h in treffer)
+    netz = any([_von_aussen(h) for h in treffer])
     return kopf + "\n" + fremddaten.rahmen("\n\n".join(zeilen), "suche", titel, netz=netz)
 
 
-def _von_aussen(ref) -> bool:
-    """Berichte (Recherche, Zeitplan-Aufträge, Wache) sind aus Fremdinhalt entstanden: sie behalten die
-    Netz-Marke, auch wenn sie nur noch im Gedächtnis liegen – und die Runde gilt dann als „von außen“."""
-    if str(ref or "").startswith("bericht:"):
+def _von_aussen(quelle) -> bool:
+    """Inhalt von außen behält die Netz-Marke, auch wenn er nur noch im Gedächtnis liegt – und die Runde gilt
+    dann als „von außen“ (Netz-Sperre): Berichte (Recherche, Zeitplan-Aufträge, Wache) und Brocken, deren
+    Herkunft (indexdb.HERKUNFT_FREMD) Netz oder ein Export-Archiv ist. `quelle`: Treffer, Quelle oder ref."""
+    if isinstance(quelle, dict):
+        ref, herkunft = quelle.get("ref"), quelle.get("herkunft")
+        werte = set(herkunft) if isinstance(herkunft, (list, tuple, set, frozenset)) else {herkunft}
+    else:
+        ref, werte = quelle, set()
+    if str(ref or "").startswith("bericht:") or werte & set(indexdb.HERKUNFT_FREMD):
         try:
             import actions
             actions.fremdinhalt()
@@ -270,4 +282,4 @@ def lesen(a: dict) -> str:
         kopf += f" · weiter mit ab={q['weiter']}"
     elif q["gekuerzt"]:
         kopf += " · gekürzt"
-    return kopf + "\n" + fremddaten.rahmen(q["text"], "datei", ref, netz=_von_aussen(ref))
+    return kopf + "\n" + fremddaten.rahmen(q["text"], "datei", ref, netz=_von_aussen(q))

@@ -11,9 +11,11 @@ Was mitläuft, wird WÄHREND des Gesprächs gesammelt – nicht hinterher aus
 drin; er entsteht beim Streamen und ist danach weg. Deshalb meldet `main.py`
 jede Runde hier an.
 
-Gespeichert wird nach `Gespraeche/` neben NemiCLI:
+Gespeichert wird in den Ordner der aktiven Persönlichkeit:
 
-    Gespraeche/Chat-093_20260914-1204.md
+    Profile/<Name>/Gespraeche/Chat-093_20260914-1204.md
+
+Ältere Mitschriften liegen im gemeinsamen `Gespraeche/` neben NemiCLI und bleiben dort.
 
 Nichts davon geht ins Netz. Die Datei liegt neben dem Programm wie Chats,
 Bilder und Gedächtnis auch.
@@ -29,7 +31,8 @@ try:                                     # exe-Modus: Daten liegen neben der exe
 except Exception:                        # Selbsttest ohne Bootstrap
     _ROOT = Path(__file__).resolve().parent.parent
 
-ORDNER = _ROOT / "Gespraeche"
+ORDNER = _ROOT / "Gespraeche"          # gemeinsam (ältere Mitschriften); neue: standard_ordner()
+_STANDARD_ORDNER = ORDNER
 
 # Der Mitschnitt dieser Sitzung: eine Liste von Einträgen.
 #   {"art": "nutzer",    "text": …, "zeit": …}
@@ -208,6 +211,19 @@ def als_markdown(kopf: dict | None = None) -> str:
 # Speichern
 # ---------------------------------------------------------------------------
 
+def standard_ordner() -> Path:
+    """Wohin F12 sichert: Profile/<Persönlichkeit>/Gespraeche/ – jede Persönlichkeit hat ihre Mitschriften für
+    sich. Ist ORDNER umgelenkt oder die Persönlichkeit nicht bestimmbar: ORDNER. Ältere Mitschriften im
+    gemeinsamen Gespraeche/ bleiben dort liegen."""
+    if ORDNER != _STANDARD_ORDNER:
+        return ORDNER
+    try:
+        import profilordner
+        return profilordner.ordner("Gespraeche", anlegen=False)
+    except Exception:
+        return ORDNER
+
+
 def dateiname(kopf: dict | None = None) -> str:
     k = dict(_kopfdaten())
     k.update(kopf or {})
@@ -224,7 +240,7 @@ def speichern(kopf: dict | None = None, ordner: Path | None = None) -> Path:
     Oberfläche das sagen und keine leere Datei anlegen."""
     if not _eintraege:
         raise ValueError("Noch nichts zu sichern – das Gespräch ist leer.")
-    ziel_ordner = Path(ordner) if ordner else ORDNER
+    ziel_ordner = Path(ordner) if ordner else standard_ordner()
     ziel_ordner.mkdir(parents=True, exist_ok=True)
     ziel = ziel_ordner / dateiname(kopf)
     ziel.write_text(als_markdown(kopf), encoding="utf-8")

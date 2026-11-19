@@ -178,18 +178,43 @@ def _schreiben(eid: str, d: dict) -> None:
     tmp.replace(ORDNER / f"{eid}.json")
 
 
-def loeschen(eid: str) -> bool:
+def sichtbar(wer: str) -> list[dict]:
+    """Offene Erinnerungen, die eine Persönlichkeit sehen darf: ihre eigenen und die ohne Besitzer."""
+    return [d for d in offen() if (d.get("wer") or "") in ("", wer)]
+
+
+def loeschen(eid: str, wer: str | None = None) -> bool:
+    """`wer`: nur eine eigene oder eine ohne Besitzer (für die KI); None = jede (Nutzer)."""
     eid = "".join(c for c in str(eid or "").lower() if c in "0123456789abcdef")
     if not eid:
         return False
     treffer = [p for p in ORDNER.glob(f"{eid}*.json")] if ORDNER.is_dir() else []
     if len(treffer) != 1:
         return False
+    if wer is not None and ((_lesen(treffer[0]) or {}).get("wer") or "") not in ("", wer):
+        return False
     try:
         treffer[0].unlink()
         return True
     except OSError:
         return False
+
+
+def naechstes_mal(zeit: float, alle: int, jetzt: float) -> float:
+    """Nächster Zeitpunkt nach `jetzt`. Ganze Tage zählen in Ortszeit – über die Zeitumstellung
+    bleibt die Uhrzeit gleich."""
+    verpasst = int((jetzt - zeit) // alle) + 1
+    if alle % 86400:
+        return zeit + verpasst * alle
+    basis = datetime.fromtimestamp(zeit)                # ohne Zeitzone = Ortszeit samt Sommerzeit
+
+    def mal(n: int) -> float:
+        return (basis + timedelta(seconds=n * alle)).timestamp()
+    while mal(verpasst) <= jetzt:
+        verpasst += 1
+    while verpasst > 1 and mal(verpasst - 1) > jetzt:
+        verpasst -= 1
+    return mal(verpasst)
 
 
 def abholen(jetzt: float | None = None, *, terminal: bool = False, wer: str | None = None) -> list[dict]:
@@ -218,8 +243,7 @@ def abholen(jetzt: float | None = None, *, terminal: bool = False, wer: str | No
         try:
             alle = int(d.get("alle") or 0)
             if alle >= ALLE_MIN_S:
-                verpasst = int((jetzt - float(d["zeit"])) // alle) + 1
-                _schreiben(d["id"], {**d, "zeit": float(d["zeit"]) + verpasst * alle, "gemeldet": False})
+                _schreiben(d["id"], {**d, "zeit": naechstes_mal(float(d["zeit"]), alle, jetzt), "gemeldet": False})
             else:
                 (ORDNER / f"{d['id']}.json").unlink()
         except OSError:

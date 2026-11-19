@@ -31,6 +31,7 @@ Jede Steuerung steht im Aktions-Protokoll.
 from __future__ import annotations
 
 import json
+import os
 import threading
 import time
 from datetime import datetime
@@ -73,11 +74,19 @@ def lesen() -> dict:
 
 
 def schreiben(z: dict) -> None:
+    # Wache und NemiCLI schreiben beide: erst daneben, dann ersetzen – kein Leser sieht eine halbe Datei.
+    text = json.dumps(z, ensure_ascii=False, indent=1)
+    tmp = ZUSTAND.with_name(f"{ZUSTAND.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
         ZUSTAND.parent.mkdir(parents=True, exist_ok=True)
-        ZUSTAND.write_text(json.dumps(z, ensure_ascii=False, indent=1), encoding="utf-8")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, ZUSTAND)
     except OSError:
-        pass
+        try:
+            tmp.unlink(missing_ok=True)
+            ZUSTAND.write_text(text, encoding="utf-8")
+        except OSError:
+            pass
 
 
 def _slug(name: str) -> str:

@@ -20,11 +20,17 @@ das Protokoll, nicht das Umschreiben der Datei.
 
 from __future__ import annotations
 
+import os
 import re
 import secrets
+import sys
+import threading
 import unicodedata
+from pathlib import Path
 
-_MUSTER = re.compile(
+# Anreden an die KI: Programm- und Modellnamen fest, die Namen der Persönlichkeiten kommen zur Laufzeit dazu
+# (_muster) – an der Stelle __NAMEN__.
+_MUSTER_TEXT = (
     r"(?i)("
     # Anweisungen überschreiben (de/en)
     r"ignor(e|iere|ier)\s+(all\s+|alle\s+|deine\s+|your\s+|the\s+|die\s+)*"
@@ -44,7 +50,7 @@ _MUSTER = re.compile(
     r"\b(new\s+instructions?|neue\s+anweisungen?|updated\s+instructions?)\s*:|"
     r"^\s*#*\s*\[?(system|developer)\s*(message|prompt|nachricht)?\]?\s*:\s*(you\s|du\s|ab\s+jetzt|from\s+now)|"
     # an die KI adressierte Aufforderungen zu Werkzeugen
-    r"\b(assistant|assistent|ai|ki|agent|llm|chatbot|nemi\w*|claude|gpt)\s*[,:]\s*"
+    r"\b(assistant|assistent|ai|ki|agent|llm|chatbot|nemi\w*|claude|gpt__NAMEN__)\s*[,:]\s*"
     r"(please\s+|bitte\s+)?(delete|remove|run|execute|write|send|download|install|upload|open|visit|"
     r"lösch|führe|schreib|sende|starte|lade|installier|öffne|besuche)|"
     r"\bif\s+you\s+are\s+(an?\s+)?(ai|llm|language\s+model|assistant|agent|chatbot)\b|"
@@ -58,8 +64,43 @@ _MUSTER = re.compile(
     r"\"tool\"\s*:\s*\"(befehl|loeschen|datei_schreiben|datei_bearbeiten|verschieben|datei_kopieren|"
     r"merken|skill_merken|skill_schreiben|skill_ausbessern|tagebuch|zeitplan|abfragen|code_ausfuehren|"
     r"pakete_installieren|einstellung_aendern|charakter_aendern|web_lesen)\""
-    r")",
-    re.M)
+    r")")
+
+_muster_stand: dict = {"namen": None, "muster": None}
+_muster_lock = threading.Lock()
+
+
+def _persona_namen() -> tuple[str, ...]:
+    """Namen aller Persönlichkeiten und ihr erstes Wort (so werden sie angesprochen), längste zuerst. Gelesen
+    wird nur, wenn der Prozess die Liste schon kennt (persoenlichkeiten.list_all lief) – das Prüfen von
+    Fremdtext lädt keine Persönlichkeiten nach; ohne Liste bleiben die festen Anreden."""
+    ps = sys.modules.get("persoenlichkeiten")
+    try:
+        if ps is None or not (getattr(ps, "_liste", None) or {}).get("werte"):
+            return ()
+        alle = ps.list_all().values()
+    except Exception:
+        return ()
+    namen: set[str] = set()
+    for p in alle:
+        name = " ".join(str(getattr(p, "name", "") or "").split())
+        for n in (name, name.split(" ", 1)[0] if name else ""):
+            if len(n) >= 2:
+                namen.add(n.lower())
+    return tuple(sorted(namen, key=lambda n: (-len(n), n)))
+
+
+def _muster() -> re.Pattern:
+    """Das Befehlsmuster mit den Namen der aktuellen Persönlichkeiten (neu gebaut, wenn sie sich ändern)."""
+    namen = _persona_namen()
+    with _muster_lock:
+        if _muster_stand["namen"] == namen and _muster_stand["muster"] is not None:
+            return _muster_stand["muster"]
+    teil = "".join("|" + re.escape(n) for n in namen)
+    muster = re.compile(_MUSTER_TEXT.replace("__NAMEN__", teil), re.M)
+    with _muster_lock:
+        _muster_stand.update(namen=namen, muster=muster)
+    return muster
 
 # Unsichtbare Zeichen, mit denen sich Befehle tarnen lassen (Nullbreite, Richtungssteuerung,
 # Unicode-Tags, Variantenwähler außer der Emoji-Darstellung U+FE0F, weiches Trennzeichen).
@@ -142,7 +183,7 @@ def reinigen(text: str) -> tuple[str, int]:
 
 
 def _fundstellen(text: str) -> list[tuple[int, int]]:
-    return [m.span() for m in _MUSTER.finditer(text.translate(_SKELETT))]
+    return [m.span() for m in _muster().finditer(text.translate(_SKELETT))]
 
 
 def finde(text: str) -> list[str]:
@@ -176,9 +217,40 @@ def markiere_muster(text: str, entfernen: bool = False) -> tuple[str, int]:
     return "".join(teile), len(stellen)
 
 
+def _im_entpackt(pfad) -> bool:
+    """Liegt der Pfad in einem entpackten Archiv (Profile/<Persönlichkeit>/Entpackt/…)? Archive kommen von außen."""
+    try:
+        kandidaten = {os.path.abspath(str(pfad))}
+        try:
+            kandidaten.add(str(Path(pfad).resolve()))
+        except OSError:
+            pass
+    except (TypeError, ValueError):
+        return False
+    for ort in kandidaten:
+        teile = [t.lower() for t in Path(ort).parts]
+        if any(t == "entpackt" and i >= 2 and teile[i - 2] == "profile" for i, t in enumerate(teile)):
+            return True
+    try:
+        import profilordner
+        wurzel = os.path.normcase(os.path.abspath(str(profilordner.wurzel())))
+    except Exception:
+        return False
+    for ort in kandidaten:
+        rel = os.path.normcase(ort)
+        if rel.startswith(wurzel + os.sep):
+            teile = rel[len(wurzel) + 1:].split(os.sep)
+            if len(teile) >= 3 and teile[1] == "entpackt":
+                return True
+    return False
+
+
 def aus_dem_netz(pfad) -> bool:
     """Hat Windows die Datei als heruntergeladen markiert (Zone.Identifier, Zone 3 = Internet,
-    4 = gesperrte Seiten)? Bilder und Dokumente aus dem Netz zählen dann wie eine Webseite."""
+    4 = gesperrte Seiten)? Bilder und Dokumente aus dem Netz zählen dann wie eine Webseite.
+    Alles aus einem entpackten Archiv (Profile/<Persönlichkeit>/Entpackt/) gilt immer als aus dem Netz."""
+    if _im_entpackt(pfad):
+        return True
     try:
         with open(f"{pfad}:Zone.Identifier", encoding="utf-8", errors="replace") as f:
             m = re.search(r"(?im)^\s*ZoneId\s*=\s*(\d+)", f.read(4096))

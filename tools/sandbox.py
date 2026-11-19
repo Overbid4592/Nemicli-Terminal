@@ -134,6 +134,22 @@ if _WIN:
     _adv.SetNamedSecurityInfoW.argtypes = [w.LPWSTR, ctypes.c_int, w.DWORD, ctypes.c_void_p,
                                            ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
     _adv.SetNamedSecurityInfoW.restype = w.DWORD
+
+    class _ACL(ctypes.Structure):
+        _fields_ = [("AclRevision", ctypes.c_ubyte), ("Sbz1", ctypes.c_ubyte), ("AclSize", w.WORD),
+                    ("AceCount", w.WORD), ("Sbz2", w.WORD)]
+
+    class _ACE_HEADER(ctypes.Structure):
+        _fields_ = [("AceType", ctypes.c_ubyte), ("AceFlags", ctypes.c_ubyte), ("AceSize", w.WORD)]
+
+    class _ACCESS_ALLOWED_ACE(ctypes.Structure):
+        _fields_ = [("Header", _ACE_HEADER), ("Mask", w.DWORD), ("SidStart", w.DWORD)]
+
+    _ACCESS_ALLOWED_ACE_TYPE = 0
+    _adv.GetAce.argtypes = [ctypes.c_void_p, w.DWORD, ctypes.POINTER(ctypes.c_void_p)]
+    _adv.GetAce.restype = w.BOOL
+    _adv.EqualSid.argtypes = [ctypes.c_void_p, ctypes.c_void_p]
+    _adv.EqualSid.restype = w.BOOL
     _k32.LocalFree.argtypes = [ctypes.c_void_p]
     _k32.LocalFree.restype = ctypes.c_void_p
     _k32.CreatePipe.argtypes = [ctypes.POINTER(w.HANDLE), ctypes.POINTER(w.HANDLE),
@@ -212,40 +228,116 @@ def _container_sid():
     return sid
 
 
-def _freigabe_vorhanden(zeile: str, marke: Path) -> bool:
+# Vermerke über Freigaben und Projekte liegen außerhalb der Sandbox (im Schlüsselordner von NemiCLI, den weder
+# der Container noch die Datei-Werkzeuge der KI erreichen): Code in der Sandbox darf seine Freigaben nicht selbst
+# eintragen. Ob eine Freigabe wirklich besteht, entscheidet die echte Rechteliste, nicht der Vermerk.
+_ALT_FREIGABEN, _ALT_PROJEKTE = ".freigaben", ".projekte"          # frühere Orte in ARBEIT
+
+
+def _vermerk_ordner() -> Path:
     try:
-        return zeile.lower() in marke.read_text(encoding="utf-8").lower().splitlines()
+        import eigenbereich
+        return eigenbereich.schluessel_datei().parent
+    except Exception:
+        return Path(os.environ.get("LOCALAPPDATA") or Path.home() / "AppData" / "Local") / "NemiCLI"
+
+
+def _freigaben_datei() -> Path:
+    return _vermerk_ordner() / "sandbox-freigaben.txt"
+
+
+def _vermerk_schreiben(datei: Path, zeilen: list[str]) -> None:
+    from atomar import text_schreiben
+    datei.parent.mkdir(parents=True, exist_ok=True)
+    text_schreiben(datei, "".join(z + "\n" for z in zeilen))
+
+
+def _rechte_reichen(pfad: Path, schreiben: bool) -> bool:
+    rechte = _AENDERN if schreiben else _LESEN_AUSFUEHREN
+    return (_acl_rechte(pfad) & rechte) == rechte
+
+
+def _vermerk_zeilen(datei: Path, alt: str) -> list[str]:
+    """Zeilen 'r|pfad' bzw. 'rw|pfad'. Fehlt der neue Vermerk, werden die alten Zeilen aus ARBEIT übernommen –
+    nur die, deren Freigabe die Rechteliste bestätigt (die alte Datei war für die Sandbox beschreibbar)."""
+    try:
+        return [z for z in datei.read_text(encoding="utf-8").splitlines() if z.strip()]
+    except FileNotFoundError:
+        pass
     except OSError:
-        return False
+        return []
+    try:
+        roh = [z.strip() for z in (ARBEIT / alt).read_text(encoding="utf-8").splitlines() if z.strip()]
+    except OSError:
+        roh = []
+    zeilen = []
+    for z in roh:
+        modus, _, pfad = z.rpartition("|") if "|" in z else ("r", "", z)
+        try:
+            if pfad and _rechte_reichen(Path(pfad), modus == "rw") and z not in zeilen:
+                zeilen.append(z)
+        except Exception:
+            continue
+    try:
+        _vermerk_schreiben(datei, zeilen)
+    except OSError:
+        pass
+    return zeilen
 
 
 def freigeben(pfad: Path, schreiben: bool = False) -> None:
     """Gibt dem Container Zugriff auf einen Ordner (samt Inhalt, vererbbar).
 
     Nur ein zusätzlicher Eintrag für die Container-Kennung; bestehende Rechte
-    bleiben unverändert. Einmal gesetzt, wird er in `.freigaben` vermerkt."""
+    bleiben unverändert. Gesetzt wird, wenn die Rechteliste ihn noch nicht trägt."""
     pfad = Path(pfad).resolve()
-    marke = ARBEIT / ".freigaben"
+    if not _rechte_reichen(pfad, schreiben):
+        _acl_setzen(pfad, _GRANT_ACCESS, _AENDERN if schreiben else _LESEN_AUSFUEHREN)
     zeile = f"{'rw' if schreiben else 'r'}|{pfad}"
-    if _freigabe_vorhanden(zeile, marke):
-        return
-    _acl_setzen(pfad, _GRANT_ACCESS, _AENDERN if schreiben else _LESEN_AUSFUEHREN)
-    ARBEIT.mkdir(parents=True, exist_ok=True)
-    with open(marke, "a", encoding="utf-8") as f:
-        f.write(zeile + "\n")
+    datei = _freigaben_datei()
+    zeilen = _vermerk_zeilen(datei, _ALT_FREIGABEN)
+    if zeile.lower() not in (z.lower() for z in zeilen):
+        try:
+            _vermerk_schreiben(datei, zeilen + [zeile])
+        except OSError:
+            pass
 
 
 def entziehen(pfad: Path) -> None:
     """Nimmt dem Container jeden Zugriff auf den Ordner wieder weg."""
     pfad = Path(pfad).resolve()
     _acl_setzen(pfad, _REVOKE_ACCESS, 0)
-    marke = ARBEIT / ".freigaben"
+    datei = _freigaben_datei()
+    rest = [z for z in _vermerk_zeilen(datei, _ALT_FREIGABEN) if z.split("|", 1)[-1].lower() != str(pfad).lower()]
     try:
-        rest = [z for z in marke.read_text(encoding="utf-8").splitlines()
-                if z.split("|", 1)[-1].lower() != str(pfad).lower()]
-        marke.write_text("".join(z + "\n" for z in rest), encoding="utf-8")
+        _vermerk_schreiben(datei, rest)
     except OSError:
         pass
+
+
+def _acl_rechte(pfad: Path) -> int:
+    """Rechte, die die Rechteliste von `pfad` der Container-Kennung erlaubt (0 = keine oder nicht lesbar)."""
+    dacl, sd = ctypes.c_void_p(), ctypes.c_void_p()
+    if _adv.GetNamedSecurityInfoW(str(pfad), _SE_FILE_OBJECT, _DACL_SECURITY_INFORMATION,
+                                  None, None, ctypes.byref(dacl), None, ctypes.byref(sd)):
+        return 0
+    try:
+        if not dacl.value:
+            return 0
+        sid = _container_sid().value
+        rechte = 0
+        for i in range(ctypes.cast(dacl, ctypes.POINTER(_ACL)).contents.AceCount):
+            ace = ctypes.c_void_p()
+            if not _adv.GetAce(dacl, i, ctypes.byref(ace)) or not ace.value:
+                continue
+            eintrag = ctypes.cast(ace, ctypes.POINTER(_ACCESS_ALLOWED_ACE)).contents
+            if eintrag.Header.AceType != _ACCESS_ALLOWED_ACE_TYPE:
+                continue
+            if _adv.EqualSid(sid, ace.value + _ACCESS_ALLOWED_ACE.SidStart.offset):
+                rechte |= eintrag.Mask
+        return rechte
+    finally:
+        _k32.LocalFree(sd)
 
 
 def _acl_setzen(pfad: Path, modus: int, rechte: int) -> None:
@@ -282,15 +374,12 @@ def _acl_setzen(pfad: Path, modus: int, rechte: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _projektliste() -> Path:
-    return ARBEIT / ".projekte"
+    return _vermerk_ordner() / "sandbox-projekte.txt"
 
 
 def _projekt_eintraege() -> list[tuple[Path, bool]]:
     """[(Ordner, schreibbar)] – Zeilen 'r|pfad' oder 'rw|pfad'."""
-    try:
-        zeilen = _projektliste().read_text(encoding="utf-8").splitlines()
-    except OSError:
-        return []
+    zeilen = _vermerk_zeilen(_projektliste(), _ALT_PROJEKTE)
     raus = []
     for z in zeilen:
         modus, _, pfad = z.strip().rpartition("|") if "|" in z else ("r", "", z.strip())
@@ -331,8 +420,7 @@ def _projekt_verboten(pfad: Path) -> str | None:
 
 
 def _projekte_speichern(eintraege: list[tuple[Path, bool]]) -> None:
-    from atomar import text_schreiben                  # halb geschrieben fehlten Freigaben
-    text_schreiben(_projektliste(), "".join(f"{'rw' if rw else 'r'}|{p}\n" for p, rw in eintraege))
+    _vermerk_schreiben(_projektliste(), [f"{'rw' if rw else 'r'}|{p}" for p, rw in eintraege])   # atomar
 
 
 def projekt_freigeben(pfad: Path, schreiben: bool = False) -> Path:
@@ -385,10 +473,20 @@ def _venv_python() -> Path | None:
 
 def _installiertes_python() -> Path | None:
     """Ein regulär installiertes Python laut Registry (PEP 514), neueste Version zuerst."""
+    funde = _registrierte_pythons()
+    return max(funde)[1] if funde else None
+
+
+def installierte_pythons() -> list[Path]:
+    """Alle regulär installierten Interpreter laut Registry (PEP 514)."""
+    return [exe for _, exe in _registrierte_pythons()]
+
+
+def _registrierte_pythons() -> list[tuple[tuple, Path]]:
     try:
         import winreg
     except ImportError:
-        return None
+        return []
     funde: list[tuple[tuple, Path]] = []
     for wurzel in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
         try:
@@ -409,9 +507,9 @@ def _installiertes_python() -> Path | None:
                 except OSError:
                     continue
                 nummern = tuple(int(x) for x in "".join(c if c.isdigit() else " " for c in tag).split()[:2])
-                if exe.is_file() and not tag.endswith("-32"):
+                if not str(exe).startswith(("\\\\", "//")) and exe.is_file() and not tag.endswith("-32"):
                     funde.append((nummern, exe))
-    return max(funde)[1] if funde else None
+    return funde
 
 
 def interpreter() -> tuple[Path, list[Path]]:
@@ -444,11 +542,27 @@ _mkdir = _os.mkdir
 def _mkdir_geerbt(path, mode=0o777, *, dir_fd=None):
     return _mkdir(path, 0o777 if mode == 0o700 else mode, dir_fd=dir_fd)
 _os.mkdir = _mkdir_geerbt
+try:                                    # Netz-Zwang wie in jedem Python-Programm, das NemiCLI startet
+    import netzzwang as _nz
+    _nz.installieren()
+except Exception:
+    pass
 '''
 
 
 def _start_ordner() -> Path:
     return ARBEIT / "_start"
+
+
+def _netzzwang_text() -> str | None:
+    """Quelltext von netzzwang.py für den Startordner der Sandbox (vor jedem Lauf neu geschrieben)."""
+    try:
+        import netzzwang
+        if (ordner := netzzwang.kind_ordner()) is not None:
+            return (ordner / "netzzwang.py").read_text(encoding="utf-8")
+    except Exception:
+        pass
+    return None
 
 
 def vorbereiten() -> Path:
@@ -458,9 +572,11 @@ def vorbereiten() -> Path:
     ARBEIT.mkdir(parents=True, exist_ok=True)
     start = _start_ordner()
     start.mkdir(exist_ok=True)
-    datei = start / "sitecustomize.py"
-    if not datei.is_file() or datei.read_text(encoding="utf-8") != _SITECUSTOMIZE:
-        datei.write_text(_SITECUSTOMIZE, encoding="utf-8")
+    # Der Startordner liegt in ARBEIT, den der Container beschreiben kann: vor jedem Lauf zurücksetzen.
+    for name, inhalt in (("sitecustomize.py", _SITECUSTOMIZE), ("netzzwang.py", _netzzwang_text())):
+        datei = start / name
+        if inhalt is not None and (not datei.is_file() or datei.read_text(encoding="utf-8") != inhalt):
+            datei.write_text(inhalt, encoding="utf-8")
     py, ordner = interpreter()
     freigeben(ARBEIT, schreiben=True)
     for o in ordner:

@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import hashlib
 import re
+import stat
+from collections.abc import Callable
 from pathlib import Path
 
 ORDNER = "Wissen"
@@ -34,8 +36,9 @@ def ordner() -> Path:
     return Path(indexdb._ROOT) / ORDNER
 
 
-def dateien(basis: Path | None = None) -> list[Path]:
-    """Lesbare Dateien unter Wissen/, älteste zuerst (sie behalten doppelte Sätze)."""
+def dateien_stand(basis: Path | None = None) -> list[tuple[Path, str, int, int]]:
+    """(Pfad, Name relativ zu Wissen/, Änderungszeit in ns, Größe) aller lesbaren Dateien, älteste zuerst –
+    ein stat je Datei."""
     basis = basis or ordner()
     if not basis.is_dir():
         return []
@@ -47,9 +50,20 @@ def dateien(basis: Path | None = None) -> list[Path]:
             continue
         if any(t.startswith(".") for t in rel.parts) or p.name.upper().startswith("LIES-MICH"):
             continue
-        if p.suffix.lower() in ENDUNGEN and p.is_file():
-            gefunden.append(p)
-    return sorted(gefunden, key=lambda p: (p.stat().st_mtime_ns, name(p, basis).casefold()))
+        if p.suffix.lower() not in ENDUNGEN:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            gefunden.append((p, rel.as_posix(), st.st_mtime_ns, st.st_size))
+    return sorted(gefunden, key=lambda x: (x[2], x[1].casefold()))
+
+
+def dateien(basis: Path | None = None) -> list[Path]:
+    """Lesbare Dateien unter Wissen/, älteste zuerst (sie behalten doppelte Sätze)."""
+    return [p for p, _rel, _m, _g in dateien_stand(basis)]
 
 
 def name(p: Path, basis: Path | None = None) -> str:
@@ -141,6 +155,40 @@ def entdoppeln(texte: list[str]) -> tuple[list[list[str]], list[int]]:
         alle.append(absaetze)
         entfernt.append(weg)
     return alle, entfernt
+
+
+def satz_hash(satz: str) -> str:
+    """Fingerabdruck eines Satzes fürs Entdoppeln (bleibt in memory.db, statt alle Sätze im Speicher)."""
+    return hashlib.sha1(satz.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+
+
+def satz_hashes(text: str) -> list[str]:
+    """Fingerabdrücke aller vergleichbaren Sätze, in Reihenfolge, jeder einmal."""
+    raus, gesehen = [], set()
+    for saetze in _absaetze(text):
+        for s in saetze:
+            if _vergleichbar(s) and (h := satz_hash(s)) not in gesehen:
+                gesehen.add(h)
+                raus.append(h)
+    return raus
+
+
+def entdoppeln_eine(text: str, frueher: Callable[[str], bool]) -> list[str]:
+    """Wie entdoppeln für eine Datei: ohne Sätze, die laut `frueher(fingerabdruck)` schon in einer älteren
+    Datei stehen, und ohne Wiederholungen in der Datei selbst."""
+    absaetze, gesehen = [], set()
+    for saetze in _absaetze(text):
+        bleibt = []
+        for s in saetze:
+            if _vergleichbar(s):
+                h = satz_hash(s)
+                if h in gesehen or frueher(h):
+                    continue
+                gesehen.add(h)
+            bleibt.append(s)
+        if bleibt:
+            absaetze.append(" ".join(bleibt))
+    return absaetze
 
 
 def brocken(kopf: str, absaetze: list[str], groesse: int) -> list[str]:

@@ -20,6 +20,7 @@ import xml.etree.ElementTree as ET
 
 import httpx
 
+import netzhilfe
 import webfetch
 
 QUELLEN = {
@@ -39,9 +40,14 @@ def _kurz(t: str, n: int = 400) -> str:
     return t if len(t) <= n else t[:n].rsplit(" ", 1)[0] + " …"
 
 
+FRIST_S = 30.0
+MAX_BYTES = 8 * 1024 * 1024
+_client = netzhilfe.GeteilterClient(timeout=20.0, headers=webfetch._UA, follow_redirects=False)
+
+
 def _get(url: str, params: dict, headers: dict | None = None) -> httpx.Response:
-    with httpx.Client(timeout=20.0, headers={**webfetch._UA, **(headers or {})}) as c:
-        r = c.get(url, params=params)
+    r = netzhilfe.abrufen(_client(), "GET", url, params=params, headers=headers or None,
+                          frist_s=FRIST_S, max_bytes=MAX_BYTES)
     r.raise_for_status()
     return r
 

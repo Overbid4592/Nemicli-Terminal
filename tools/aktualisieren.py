@@ -15,6 +15,8 @@ LISTE_TIMEOUT_S = 180
 UPDATE_TIMEOUT_S = 1800              # je Paket
 MAX_PAKETE = 15
 _ID = re.compile(r"^[A-Za-z0-9][\w.+-]{1,120}$")
+_QUELLE = re.compile(r"^[A-Za-z0-9][\w.-]{0,40}$")
+_QUELLEN: dict[str, str] = {}        # Id -> Quelle (winget, msstore …) aus der letzten Liste
 _GRUNDFLAGS = ["--accept-source-agreements", "--disable-interactivity"]
 ABGEBROCHEN = {1223, -2147023673, 0x800704C7}            # ERROR_CANCELLED, auch als HRESULT
 KEIN_UPDATE = {-1978335189, 0x8A15002B}                  # APPINSTALLER_CLI_ERROR_UPDATE_NOT_APPLICABLE
@@ -28,13 +30,13 @@ class WingetFehlt(RuntimeError):
 
 def _winget(argumente: list[str], timeout: float) -> tuple[int, str]:
     """(Exitcode, Ausgabe). subprocess.TimeoutExpired nach `timeout` (winget ist dann beendet)."""
+    import prozesslauf
     try:
-        r = subprocess.run(["winget", *argumente, *_GRUNDFLAGS], capture_output=True, timeout=timeout,
-                           creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        code, aus, fehler = prozesslauf.laufen(["winget", *argumente, *_GRUNDFLAGS], timeout)
     except FileNotFoundError as exc:
         raise WingetFehlt("winget ist nicht installiert (App-Installer aus dem Microsoft Store).") from exc
-    roh = (r.stdout or b"") + (b"\n" + r.stderr if r.stderr else b"")
-    return r.returncode, saeubern(roh.decode("utf-8", errors="replace"))
+    roh = (aus or b"") + (b"\n" + fehler if fehler else b"")
+    return code, saeubern(roh.decode("utf-8", errors="replace"))
 
 
 def saeubern(text: str) -> str:
@@ -74,7 +76,11 @@ def tabelle(text: str) -> list[dict]:
 def liste() -> tuple[list[dict], str]:
     """Verfügbare Updates: (Einträge, winget-Ausgabe)."""
     _, text = _winget(["upgrade", "--include-unknown"], LISTE_TIMEOUT_S)
-    return tabelle(text), text
+    eintraege = tabelle(text)
+    for e in eintraege:
+        if _QUELLE.match(e.get("quelle") or ""):
+            _QUELLEN[e["id"]] = e["quelle"]
+    return eintraege, text
 
 
 def gueltige_ids(ids) -> list[str]:
@@ -94,11 +100,15 @@ def gueltige_ids(ids) -> list[str]:
     return raus
 
 
-def installieren(paket_id: str) -> tuple[str, str]:
-    """Ein Paket aktualisieren: (Zustand ok|kein_update|abgebrochen|fehler|zeit, letzte Zeilen der Ausgabe)."""
+def installieren(paket_id: str, quelle: str | None = None) -> tuple[str, str]:
+    """Ein Paket aktualisieren: (Zustand ok|kein_update|abgebrochen|fehler|zeit, letzte Zeilen der Ausgabe).
+    `quelle`: winget-Quelle aus der Liste (Vorgabe: wie zuletzt von liste() gemeldet) – so kommt das Update
+    aus derselben Quelle wie das installierte Paket."""
+    quelle = quelle if quelle is not None else _QUELLEN.get(paket_id, "")
+    extra = ["--source", quelle] if quelle and _QUELLE.match(quelle) else []
     try:
-        code, text = _winget(["upgrade", "--id", paket_id, "--exact", "--silent", "--accept-package-agreements"],
-                             UPDATE_TIMEOUT_S)
+        code, text = _winget(["upgrade", "--id", paket_id, "--exact", "--silent", "--accept-package-agreements",
+                              *extra], UPDATE_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         return "zeit", (f"nach {UPDATE_TIMEOUT_S // 60} Minuten nicht fertig – winget wurde beendet, ein schon "
                         "gestarteter Installer kann noch weiterlaufen")

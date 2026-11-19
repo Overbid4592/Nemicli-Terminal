@@ -28,13 +28,14 @@ import asyncio
 import json
 import queue
 import secrets
-import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
+import lokalserver
 
 FRAGE_ZEIT_S = 600            # so lange wartet eine Rückfrage im Browser, dann gilt die sichere Option
+MAX_BODY = 8_000_000          # Bytes je POST: Text plus einige im Browser verkleinerte Bilder
 
 
 class WebBridge:
@@ -167,12 +168,15 @@ def _make_handler(bridge: WebBridge, handlers: dict):
             self._send(code, json.dumps(obj, ensure_ascii=False).encode("utf-8"),
                        "application/json; charset=utf-8")
 
-        def _body(self) -> dict:
+        def _body(self) -> dict | None:
+            """None = zu groß (oder unbekannte Länge): der Rest liegt ungelesen im Socket."""
             try:
                 n = int(self.headers.get("Content-Length", 0) or 0)
             except ValueError:
-                return {}
-            if n <= 0 or n > 2_000_000:              # Anfragen sind kurze Texte
+                return None
+            if n > MAX_BODY:                         # Texte und verkleinerte Bilder
+                return None
+            if n <= 0:
                 return {}
             try:
                 return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
@@ -184,7 +188,8 @@ def _make_handler(bridge: WebBridge, handlers: dict):
             parsed = urlparse(self.path)
             path = parsed.path
             if path == "/" or path == "/index.html":
-                self._send(200, PAGE.encode("utf-8"), "text/html; charset=utf-8")
+                self._send(200, seite().encode("utf-8"), "text/html; charset=utf-8",
+                           {"Referrer-Policy": "no-referrer"})
                 return
             if path == "/events":
                 if not token_ok(parsed, self.headers):
@@ -243,6 +248,10 @@ def _make_handler(bridge: WebBridge, handlers: dict):
                 self._send(403); return
             path = parsed.path
             data = self._body()
+            if data is None:                         # Verbindung schließen, sonst liest sie den Rest als neue Anfrage
+                self.close_connection = True
+                self._send(413, "Anfrage zu groß".encode("utf-8"), extra={"Connection": "close"})
+                return
             if path == "/send":
                 handlers["send"](data.get("text", ""), data.get("images") or [])
                 self._send(204); return
@@ -271,16 +280,8 @@ def _sse_line(data: str) -> bytes:
     return out.encode("utf-8")
 
 
-class _QuietServer(ThreadingHTTPServer):
-    """Wie ThreadingHTTPServer, aber abgebrochene Verbindungen (Tab geschlossen /
-    neu geladen) werden geschluckt statt als Traceback ins Terminal zu poltern."""
-    daemon_threads = True
-
-    def handle_error(self, request, client_address):
-        et = sys.exc_info()[0]
-        if et is not None and issubclass(et, (ConnectionError, BrokenPipeError, TimeoutError)):
-            return
-        super().handle_error(request, client_address)
+# Port exklusiv, nur 127.0.0.1; abgebrochene Verbindungen (Tab geschlossen / neu geladen) ohne Traceback
+_QuietServer = lokalserver.LeiserServer
 
 
 def start(bridge: WebBridge, handlers: dict, host: str = "127.0.0.1", port: int = 0) -> str:
@@ -296,18 +297,47 @@ def start(bridge: WebBridge, handlers: dict, host: str = "127.0.0.1", port: int 
 
 
 # --- Die Seite (eine Datei, keine externen Pflicht-Assets) ------------------
-# Schriften kommen optional von einem CDN; offline fällt der Browser sauber auf
-# System-Schriften zurück.
+# Vorgabe: Atkinson Hyperlegible und OpenDyslexic (gut lesbar) von einem CDN; offline fällt der Browser
+# auf System-Schriften zurück. SCHRIFTEN_SCHALTER = false: nur installierte Schriften, nichts von fremden Servern.
+SCHRIFTEN_SCHALTER = "webui_fremde_schriften"     # nemicli.config.json, Vorgabe an
+
+_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'{stil}; "
+        "font-src 'self'{schrift}; img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; "
+        "form-action 'self'")
+_CSP_LOKAL = _CSP.format(stil="", schrift="")
+_CSP_FREMD = _CSP.format(stil=" https://fonts.googleapis.com https://fonts.cdnfonts.com",
+                         schrift=" https://fonts.gstatic.com https://fonts.cdnfonts.com")
+_SCHRIFT_LINKS = (
+    '<link rel="preconnect" href="https://fonts.googleapis.com">\n'
+    '<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" '
+    'rel="stylesheet">\n'
+    '<link href="https://fonts.cdnfonts.com/css/opendyslexic" rel="stylesheet">')
+
+
+def fremde_schriften() -> bool:
+    try:
+        import config
+        return config.load().get(SCHRIFTEN_SCHALTER, True) is not False
+    except Exception:
+        return True
+
+
+def seite(fremd: bool | None = None) -> str:
+    """Die Seite; Schriften von fremden Servern nur mit eingeschaltetem Schalter."""
+    fremd = fremde_schriften() if fremd is None else fremd
+    return (PAGE.replace("@@CSP@@", _CSP_FREMD if fremd else _CSP_LOKAL)
+            .replace("@@SCHRIFTEN@@", _SCHRIFT_LINKS if fremd else ""))
+
+
 PAGE = r"""<!DOCTYPE html>
 <html lang="de">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline' https://fonts.googleapis.com https://fonts.cdnfonts.com; font-src 'self' https://fonts.gstatic.com https://fonts.cdnfonts.com; img-src 'self' data: blob:; connect-src 'self'; base-uri 'none'; form-action 'self'">
+<meta http-equiv="Content-Security-Policy" content="@@CSP@@">
+<meta name="referrer" content="no-referrer">
 <title>NemiCLI · WebUI</title>
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link href="https://fonts.googleapis.com/css2?family=Atkinson+Hyperlegible:wght@400;700&display=swap" rel="stylesheet">
-<link href="https://fonts.cdnfonts.com/css/opendyslexic" rel="stylesheet">
+@@SCHRIFTEN@@
 <style>
 :root{
   --bg:#0b0d14; --panel:#141824; --panel2:#1c2130; --text:#e8eaf2; --muted:#8b93a7;
@@ -594,7 +624,7 @@ function md(src){
   h = h.replace(/`([^`]+)`/g,(m,c)=>'<code>'+c+'</code>');
   h = h.replace(/\*\*([^*]+)\*\*/g,'<strong>$1</strong>');
   h = h.replace(/(^|[^*])\*([^*]+)\*/g,'$1<em>$2</em>');
-  h = h.replace(/\[([^\]]+)\]\((https:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener">$1</a>');
+  h = h.replace(/\[([^\]]+)\]\((https:\/\/[^)\s]+)\)/g,'<a href="$2" target="_blank" rel="noopener noreferrer">$1</a>');
   h = h.replace(/^### (.*)$/gm,'<h4>$1</h4>').replace(/^## (.*)$/gm,'<h3>$1</h3>').replace(/^# (.*)$/gm,'<h3>$1</h3>');
   h = h.replace(/^[-*] (.*)$/gm,'<li>$1</li>');
   h = h.replace(/(<li>[\s\S]*?<\/li>)/g, m=>'<ul>'+m+'</ul>');
@@ -748,11 +778,25 @@ $('#attachBtn').onclick=()=>$('#file').click();
 $('#file').onchange=e=>{
   [...e.target.files].forEach(f=>{
     const rd=new FileReader();
-    rd.onload=()=>{ pendImgs.push(rd.result); drawImgs(); };
+    rd.onload=()=>shrink(rd.result, s=>{ pendImgs.push(s); drawImgs(); });
     rd.readAsDataURL(f);
   });
   e.target.value='';
 };
+/* Handyfotos sind mehrere MB groß: auf höchstens 1600 px Kantenlänge als JPEG verkleinern */
+function shrink(src, fertig){
+  const im=new Image();
+  im.onload=()=>{
+    const s=Math.min(1, 1600/Math.max(im.width, im.height));
+    if(s>=1 && src.length<1500000){ fertig(src); return; }
+    const c=document.createElement('canvas');
+    c.width=Math.max(1, Math.round(im.width*s)); c.height=Math.max(1, Math.round(im.height*s));
+    c.getContext('2d').drawImage(im, 0, 0, c.width, c.height);
+    fertig(c.toDataURL('image/jpeg', 0.85));
+  };
+  im.onerror=()=>fertig(src);
+  im.src=src;
+}
 function drawImgs(){
   const box=$('#imgs'); box.innerHTML='';
   pendImgs.forEach((src,i)=>{
@@ -772,7 +816,10 @@ function setBusy(b){ busy=b; $('#send').disabled=b; $('#hint').textContent=b?'Ne
 function setHelfer(n){ n=n|0; const h=$('#helfer'); if(!h) return; h.classList.toggle('on',n>0); $('#helferN').textContent='Subagenten aktiv: '+n; }
 function doSend(){
   const t=box.value.trim(); if((!t && !pendImgs.length)||busy) return;
-  addUser(t || '(Bild)'); api('/send',{text:t,images:pendImgs});
+  addUser(t || '(Bild)');
+  api('/send',{text:t,images:pendImgs}).then(r=>{
+    if(r.status===413){ setBusy(false); $('#hint').textContent='Nicht gesendet: zu groß – weniger Bilder anhängen.'; }
+  }).catch(()=>{});
   box.value=''; box.style.height='auto'; pendImgs=[]; drawImgs(); setBusy(true);
 }
 

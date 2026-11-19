@@ -28,9 +28,8 @@ import json
 import random
 import re
 import secrets
-import sys
 import threading
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from http.server import BaseHTTPRequestHandler
 from urllib.parse import urlparse, parse_qs
 
 SPIELE = {
@@ -250,16 +249,8 @@ class SpieleServer:
                     return
                 self._send(404)
 
-        class Quiet(ThreadingHTTPServer):
-            daemon_threads = True
-
-            def handle_error(self, request, client_address):
-                et = sys.exc_info()[0]
-                if et is not None and issubclass(et, (ConnectionError, BrokenPipeError, TimeoutError)):
-                    return
-                super().handle_error(request, client_address)
-
-        self.httpd = Quiet((host, port), Handler)
+        import lokalserver
+        self.httpd = lokalserver.LeiserServer((host, port), Handler)
         real_port = self.httpd.server_address[1]
         threading.Thread(target=self.httpd.serve_forever, daemon=True, name="nemicli-spiele").start()
         self.url = f"http://{host}:{real_port}/?token={self.token}"

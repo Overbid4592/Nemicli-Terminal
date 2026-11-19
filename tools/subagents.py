@@ -112,9 +112,11 @@ def label(idx: int, helfer: dict) -> str:
 async def run_one(helfer: dict, backend, execute: Executor, idx: int = 1) -> str:
     """Ein Helfer: eigener Verlauf, Aktionsschleife, am Ende der Bericht.
     Zählt sich für die Anzeige an und – egal wie er endet – wieder ab."""
+    import sicherheit
     _set_aktiv(_AKTIV + 1)
     try:
-        return await _run_one(helfer, backend, execute, idx)
+        with sicherheit.als_helfer():         # Werkzeuge nur für den Vordergrund lehnen Helfer ab
+            return await _run_one(helfer, backend, execute, idx)
     finally:
         _set_aktiv(_AKTIV - 1)
 

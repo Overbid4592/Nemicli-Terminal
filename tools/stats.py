@@ -65,7 +65,11 @@ def _load() -> dict:
     if _data is not None:
         return _data
     try:
-        _data = json.loads(_FILE.read_text(encoding="utf-8"))
+        from atomar import json_lesen
+        try:
+            _data = json_lesen(_FILE, None, dict) or _fresh()       # kaputte Datei liegt danach beiseite
+        except OSError:
+            return _fresh()             # gesperrt: nicht merken, sonst überschriebe flush() die Datei
         # Fehlende Felder aus einer älteren Version ergänzen
         base = _fresh()
         for k, v in base.items():

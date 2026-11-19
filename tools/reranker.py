@@ -5,7 +5,7 @@ Frage und Treffer gehen zusammen durch das Reranker-Modell, das ihre Relevanz 0.
 schätzt. Die besten RERANK_KANDIDATEN der Fusion werden danach sortiert; die Fusion
 zählt mit (RERANK_ANTEIL), damit ein knapper Wert sie nicht ganz überstimmt.
 
-Modell: ein Ordner je Modell unter Models/reranker/<Name> im Programm-Ordner mit genau
+Modell: ein Ordner je Modell unter KI-Modelle/KI-Gedaechtnis/Sortiermodell/<Name> (früher Models/reranker/) mit genau
 einer .gguf (z. B. Qwen3-Reranker-0.6B). Config `reranker_modell` (Ordnername), sonst
 der erste; `reranker` = False schaltet aus. Gerät: GPU, wenn dort genug frei ist und
 gerade kein Bild entsteht, sonst CPU. Nach NACHLAUF_S Ruhe und beim Bildermalen wird
@@ -23,7 +23,12 @@ try:
 except Exception:                                    # Selbsttest ohne Bootstrap
     _INSTALL = Path(__file__).resolve().parent.parent
 
-ORDNER = _INSTALL / "Models" / "reranker"
+try:
+    import modellorte as _MO
+    ORDNER = _MO.ordner("sortieren")                  # KI-Modelle/KI-Gedaechtnis/Sortiermodell
+    ALTE_ORDNER = _MO.alte("sortieren")               # frühere Orte, nur lesen
+except Exception:                                    # Selbsttest ohne Bootstrap
+    ORDNER, ALTE_ORDNER = _INSTALL / "Models" / "reranker", []
 RERANK_KANDIDATEN = 16
 RERANK_BUDGET_S = 4.0              # danach bleiben die übrigen Kandidaten in der Reihenfolge der Fusion
 RERANK_SCHRITT = 2                 # Kandidaten je Aufruf, zwischen den Aufrufen wird die Zeit geprüft
@@ -52,11 +57,16 @@ def an() -> bool:
 
 
 def modelle() -> list[Path]:
-    """Ordner mit genau einer .gguf unter Models/reranker."""
-    try:
-        return [d for d in sorted(ORDNER.iterdir()) if d.is_dir() and len(list(d.glob("*.gguf"))) == 1]
-    except OSError:
-        return []
+    """Modellordner mit genau einer .gguf; bei gleichem Namen gilt der erste Ort."""
+    raus: dict[str, Path] = {}
+    for w in dict.fromkeys([ORDNER, *ALTE_ORDNER]):
+        try:
+            for d in sorted(w.iterdir()) if w.is_dir() else []:
+                if d.is_dir() and len(list(d.glob("*.gguf"))) == 1:
+                    raus.setdefault(d.name, d)
+        except OSError:
+            pass
+    return list(raus.values())
 
 
 def datei() -> Path | None:

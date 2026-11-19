@@ -10,7 +10,9 @@ letzten 7 Tage, nur aus Ereignissen älter als `ml_karenz_h` und ohne
 Ereignisse mit offenem, unklarem oder echtem Alarm samt ihrer Prozess-Kette
 (Speicher.lern_ereignisse). Vor jedem Lauf werden die Profile in die Merkmale
 gespiegelt und das „harmlos“-Feedback übernommen. Jeder Lauf steht in
-Wache/training.log und im Aktions-Protokoll. Nach einem Zurückdrehen
+Wache/training.log und im Aktions-Protokoll. Das automatische Training läuft in einem eigenen
+Faden; bewertet wird derweil mit den bisherigen Modellen. Modelldateien tragen ein Siegel
+(siegel.py): ein fremd getauschter Stand wird nicht geladen und meldet WS-001. Nach einem Zurückdrehen
 (`/wache ml|dl zurueck`) lernt das jeweilige Modell erst nach einem Training
 durch den Nutzer wieder automatisch.
 
@@ -50,22 +52,103 @@ from collections import deque
 from datetime import datetime
 from queue import Empty, Queue
 
-from . import MODELL_ORDNER, TRAINING_LOG, ordner_anlegen
+from . import MODELL_ORDNER, ORDNER, TRAINING_LOG, ordner_anlegen
 from .absolvierung import REGEL as ABSOLVIERUNG_REGEL, Absolvierung
 from . import detektor as _detektor_modul
 from . import folgen as _folgen_modul
 from .detektor import Detektor
-from .ereignisse import DATEI, NETZ, PROZESS, SYSTEM, Alarm, Ereignis, Schwere
+from .ereignisse import DATEI, KI, NETZ, PROZESS, SYSTEM, Alarm, Ereignis, Schwere
 from .folgen import FolgenDetektor
 from .inventar import Inventar, PROZESS as INV_PROZESS, neue_als_ereignisse
 from .justierung import einstellungen
+from .kimodell import LERNBAR as KI_LERNBAR, KiMerkmale, subjekt as ki_subjekt
+from .kitracker import KiBaum, KiGegencheck, KiProtokollSensor, KiProzessSensor, tat_text
 from .merkmale import Burst, DateiMerkmale, ProzessMerkmale
 from .netzauskunft import Auskunft
 from .netzwaechter import SCHATTEN as NETZ_SCHATTEN, NetzFolgen, NetzMerkmale, SchattenLog, ZieleProMinute, domain_von
-from .regeln import MENGENREGELN, Regelwerk, eigener_server
+from .regeln import MENGENREGELN, Regelwerk, eigener_server, stumme_paare
 from .sensoren import DateiSensor, NetzSensor, ProzessSensor, SensorThread
 from .speicher import Speicher
 from .vollscan import Baseline
+
+
+def schnappschuss(speicher, alarme: list) -> int:
+    """Signatur und Stand (SHA-256, Größe, Änderungszeit) des Programms beim Alarm festhalten – später kann die
+    Datei fehlen oder getauscht sein; die Dämpfung nach „harmlos“ gilt nur für diesen Stand. Je Programmpfad
+    wird einmal geprüft."""
+    from .herkunft import fingerabdruck, signatur_zeile
+    n = 0
+    je_pfad: dict[str, dict] = {}
+    for a in alarme:
+        try:
+            ev = speicher.ereignis(a.ereignis_id) if a.ereignis_id else None
+            if ev is None or not ev.exe:
+                continue
+            werte = je_pfad.get(ev.exe.lower())
+            if werte is None:
+                fp = fingerabdruck(ev.exe)
+                werte = {"herkunft": signatur_zeile(ev.exe),
+                         **({k: fp[k] for k in ("sha256", "groesse", "mtime")} if fp else {})}
+                je_pfad[ev.exe.lower()] = werte
+            speicher.messwerte_setzen(a.id, {**werte, "zeit": time.time()})
+            n += 1
+        except Exception:
+            continue
+    return n
+
+
+class _Schnappschuesse:
+    """Ein dauerhafter Faden für alle Schnappschüsse: Alarm-Stapel kommen in eine begrenzte Schlange
+    (bei Flut fallen Stapel weg statt Fäden zu stapeln)."""
+
+    def __init__(self, maxsize: int = 200):
+        self.queue: Queue = Queue(maxsize=maxsize)
+        self._faden: threading.Thread | None = None
+        self._lock = threading.Lock()
+        self.verworfen = 0
+
+    def planen(self, speicher, alarme: list) -> None:
+        if not alarme:
+            return
+        try:
+            self.queue.put_nowait((speicher, list(alarme)))
+        except Exception:
+            self.verworfen += len(alarme)
+            return
+        with self._lock:
+            if self._faden is None or not self._faden.is_alive():
+                self._faden = threading.Thread(target=self._lauf, daemon=True, name="wache-schnappschuss")
+                self._faden.start()
+
+    def _lauf(self) -> None:
+        while True:
+            try:
+                speicher, alarme = self.queue.get(timeout=30)
+            except Empty:
+                with self._lock:
+                    if self.queue.empty():
+                        self._faden = None
+                        return
+                continue
+            # Was schon in der Schlange wartet, für denselben Speicher zusammennehmen (ein Pfad, eine Prüfung).
+            while True:
+                try:
+                    sp2, mehr = self.queue.get_nowait()
+                except Empty:
+                    break
+                if sp2 is speicher:
+                    alarme += mehr
+                else:
+                    schnappschuss(sp2, mehr)
+            schnappschuss(speicher, alarme)
+
+
+_SCHNAPPSCHUESSE = _Schnappschuesse()
+
+
+def schnappschuss_planen(speicher, alarme: list) -> None:
+    """Im eigenen Faden: die Signaturprüfung bremst die Ereignis-Schleife nicht."""
+    _SCHNAPPSCHUESSE.planen(speicher, alarme)
 
 
 FEHLER_GRENZE = 5           # so viele Fehler …
@@ -74,6 +157,34 @@ RUHIG_NACH = 120.0          # so lange ohne Fehler = wieder in Ordnung
 MAX_STAPEL = 5000           # nicht schreibbare Ereignisse höchstens so viele zurückhalten
 MAX_BELASTET = 5000         # so viele Prozess-Ketten mit Alarm merkt sich der Motor
 ML_LERN_MAX = 100_000       # Isolation Forest: höchstens so viele Ereignisse, gleichmäßig über das Lern-Fenster
+
+
+KI_SCHATTEN = "ki_schatten.log"
+
+
+def ki_schatten(e: Ereignis, fund: str = "R024") -> None:
+    """Schattenmodus des KI-Trackers: Funde des Gegenchecks (R024) und des KI-Modells (ML-003) nur ins
+    Protokoll (Wache/modelle/ki_schatten.log)."""
+    try:
+        pfad = MODELL_ORDNER / KI_SCHATTEN
+        pfad.parent.mkdir(parents=True, exist_ok=True)
+        if pfad.exists() and pfad.stat().st_size > 2_000_000:
+            pfad.replace(pfad.with_suffix(".log.1"))
+        x = e.extra or {}
+        was = f"{x.get('werkzeug', '?')}: {tat_text(e)}" if e.aktion == "ki_tat" else (e.cmdline or "")
+        with open(pfad, "a", encoding="utf-8") as f:
+            f.write(f"{datetime.fromtimestamp(e.zeit).strftime('%Y-%m-%d %H:%M:%S')} | {fund} | "
+                    f"{(e.extra or {}).get('ki', '?')} | {e.prozess} | {' '.join(was.split())[:300]}\n")
+    except OSError:
+        pass
+
+
+def _testlauf() -> bool:
+    try:
+        import paths
+        return paths._testlauf()
+    except Exception:
+        return False
 
 
 def _log(text: str) -> None:
@@ -105,18 +216,23 @@ class Motor:
         self.baseline.aktualisieren()
         self._baseline_geprueft = time.time()
         self.prozess_merkmale = ProzessMerkmale(self.baseline)
+        # Selbst erzeugte Alarme (WS-001: Wache-Dateien verändert) – gehen beim nächsten Takt hinaus.
+        self._selbst_alarme: deque[Alarm] = deque(maxlen=50)
         self.detektor = Detektor(MODELL_ORDNER / "prozesse.json", self.prozess_merkmale,
-                                 schwelle=self.e["schwelle"], kontamination=self.e["kontamination"])
+                                 schwelle=self.e["schwelle"], kontamination=self.e["kontamination"],
+                                 **self._siegel("prozesse"))
         self.datei_detektor = Detektor(MODELL_ORDNER / "dateien.json", DateiMerkmale(self.baseline),
                                        schwelle=self.e["schwelle"],
-                                       kontamination=self.e["kontamination"], label="Dateien")
+                                       kontamination=self.e["kontamination"], label="Dateien",
+                                       **self._siegel("dateien"))
         self.folgen = FolgenDetektor(MODELL_ORDNER / "folgen",
                                      schwelle=float(self.e.get("dl_schwelle", 0.995)))
         self._folgen_training = False
+        self._ml_training = False
         self.dl_auffaellig = 0
         self.netz_detektor = Detektor(MODELL_ORDNER / "netz.json", NetzMerkmale(),
                                       schwelle=float(self.e.get("netz_schwelle", 0.99)),
-                                      kontamination=self.e["kontamination"], label="Netz")
+                                      kontamination=self.e["kontamination"], label="Netz", **self._siegel("netz"))
         self.netz_folgen = NetzFolgen(MODELL_ORDNER / "netzfolgen",
                                       schwelle=float(self.e.get("netz_dl_schwelle", 0.995)))
         self.netz_schatten = SchattenLog(MODELL_ORDNER / NETZ_SCHATTEN)
@@ -127,6 +243,7 @@ class Motor:
         self._besitzer_offen: set[str] = set()
         self._besitzer: threading.Thread | None = None
         self.regeln = Regelwerk(stumm=set(self.e.get("stumme_regeln") or []))
+        self.regeln.stumm_paare = stumme_paare(self.e)
         self.regeln.bei_fehler = self._fehler
         self.absolvierung = Absolvierung(urteile=self.speicher.urteile_zu)   # Programme auf Anweisung (R015)
         self.burst = Burst()
@@ -140,6 +257,17 @@ class Motor:
         self.datei_sensor = DateiSensor(self.e.get("pfade"), self.e.get("endungen"))
         from .protokolle import ProtokollSensor
         self.protokoll_sensor = ProtokollSensor(float(self.e.get("protokoll_intervall", 30)))
+        # KI-Tracker: wer ist eine KI, was startet sie (schneller Takt), was schreibt sie selbst ins Protokoll
+        self.ki_baum = KiBaum()
+        self.ki_gegencheck = KiGegencheck()
+        self.ki_prozess_sensor = KiProzessSensor(self.ki_baum, float(self.e.get("ki_intervall", 0.5)),
+                                                 gegencheck=self.ki_gegencheck)
+        self.ki_protokoll_sensor = KiProtokollSensor(ORDNER / "ki_protokolle.json", gegencheck=self.ki_gegencheck)
+        self.ki_detektor = Detektor(MODELL_ORDNER / "ki.json", KiMerkmale(),
+                                    schwelle=float(self.e.get("ki_ml_schwelle", 0.995)),
+                                    kontamination=self.e["kontamination"], label="KI", **self._siegel("ki"))
+        self.ki_burst, self.ki_burst_nach = Burst(), Burst()
+        self.ki_auffaellig = 0
         self._inventar_angestossen = 0.0
         self.sensoren: list[SensorThread] = []
 
@@ -152,6 +280,7 @@ class Motor:
         self._gedaempft: dict[tuple[str, str], tuple[int, int]] = {}     # → (Anzahl harmlos, höchste Schwere)
         self._belastet: dict[tuple[int, float], float] = {}             # Ketten mit Alarm (PID, Start) → Zeit
         self._offene_pfade: set[str] = set()
+        self._gefahr_orte: tuple[str, ...] = ()       # Orte von Software mit offenem CVE-001: nicht lernen
         self.gedaempft_zaehler: dict[tuple[str, str], int] = {}
         self.verdichtet = 0
 
@@ -203,7 +332,8 @@ class Motor:
         self.start_zeit = time.time()
         self.sensoren = [SensorThread(s, self._aufnehmen, self._sensor_fehler)
                          for s in (self.prozess_sensor, self.netz_sensor, self.datei_sensor)
-                         + ((self.protokoll_sensor,) if self.e.get("protokolle", True) else ())]
+                         + ((self.protokoll_sensor,) if self.e.get("protokolle", True) else ())
+                         + ((self.ki_prozess_sensor, self.ki_protokoll_sensor) if self.e.get("ki", True) else ())]
         for t in self.sensoren:
             t.start()
         self._worker = threading.Thread(target=self._schleife, daemon=True, name="wache-motor")
@@ -212,6 +342,9 @@ class Motor:
         self._wartung.start()
         self._besitzer = threading.Thread(target=self._besitzer_schleife, daemon=True, name="wache-netzauskunft")
         self._besitzer.start()
+        if self.e.get("vollscan_plan", True) and not _testlauf():          # Auto-Vollscan nach Zeitplan des Nutzers
+            from .termin import Planer
+            Planer(self._stopp, self._sensor_fehler).start()
         _protokoll("wache", "Wache gestartet", ergebnis=f"{len(self.sensoren)} Sensoren, "
                    f"Modell {'trainiert' if self.detektor.trainiert else 'Kaltstart'}")
         if self.e["inventar_beim_start"]:
@@ -237,6 +370,7 @@ class Motor:
         self.detektor.speichern()
         self.datei_detektor.speichern()
         self.netz_detektor.speichern()
+        self.ki_detektor.speichern()
         self.speicher.schliessen()
 
     @property
@@ -249,10 +383,29 @@ class Motor:
         self.detektor.schwelle = self.datei_detektor.schwelle = float(self.e["schwelle"])
         self.folgen.schwelle = float(self.e.get("dl_schwelle", 0.995))
         self.netz_detektor.schwelle = float(self.e.get("netz_schwelle", 0.99))
+        self.ki_detektor.schwelle = float(self.e.get("ki_ml_schwelle", 0.995))
         self.netz_folgen.schwelle = float(self.e.get("netz_dl_schwelle", 0.995))
         self.auskunft.register = bool(self.e.get("netz_besitzer", True))
         self.regeln.stumm = set(self.e.get("stumme_regeln") or [])
+        self.regeln.stumm_paare = stumme_paare(self.e)
         self.daempfung_aktualisieren()
+
+    def _siegel(self, name: str) -> dict:
+        """Siegel und Meldeweg für eine Modelldatei der Wache (siegel.py)."""
+        from .siegel import Siegel
+        return {"siegel": Siegel(self.speicher, f"modell:{name}"), "bei_fremd": self._wache_datei_fremd}
+
+    def _wache_datei_fremd(self, pfad) -> None:
+        """Eine Modelldatei trägt einen Stand, den die Wache nicht geschrieben hat: Alarm WS-001."""
+        from .siegel import REGEL
+        name = getattr(pfad, "name", str(pfad))
+        self._selbst_alarme.append(Alarm(
+            titel="Wache-Dateien verändert",
+            text=(f"Die Modelldatei {name} hat einen Inhalt, den die Wache nicht selbst geschrieben hat (SHA-256 "
+                  "unbekannt). Der fremde Stand wurde nicht geladen; die Wache rechnet mit dem bisherigen Stand "
+                  "weiter oder lernt neu. Wer hat Dateien im Wache-Ordner (modelle/) geändert?"),
+            schwere=Schwere.HOCH, regel=REGEL, quelle="wache", subjekt=f"Wache-Datei · {name}"))
+        _log(f"Modelldatei {name}: fremder Stand – nicht geladen (WS-001)")
 
     def daempfung_aktualisieren(self) -> None:
         """Nach jedem Urteil (und in der Wartung): welche (Regel, Subjekt)-Paare sind oft genug
@@ -262,8 +415,9 @@ class Motor:
         except Exception:
             self._gedaempft = {}
         try:
-            self.detektor.feedback(self.speicher.fehlalarm_pfade())
+            self.detektor.feedback(self.speicher.fehlalarm_staende())
             self._offene_pfade = self.speicher.offene_pfade()
+            self._gefahr_orte = self.speicher.gefahr_orte()
         except Exception as exc:
             self._fehler("urteile", exc)
 
@@ -324,6 +478,27 @@ class Motor:
         self._profil_lernen(e, belastet)
 
     def _bewerten_in(self, e: Ereignis, alarme: list[Alarm]) -> None:
+        # Taten der KIs: feste Regeln und das eigene KI-Modell (ML-003); die übrigen Modelle kennen diese
+        # Ereignisart nicht. Nachgetragene Taten aus alten Protokollen sind Lernstoff, keine Alarme.
+        if e.kategorie == KI:
+            if e.aktion == "ki_ungemeldet" and not self.e.get("ki_alarm", False):
+                e.extra = {**(e.extra or {}), "ki_fund": True}      # Schattenmodus: nur ins Protokoll
+                ki_schatten(e)
+                return
+            lernbar = e.aktion in KI_LERNBAR
+            if lernbar:          # Tempo je KI – vor dem Speichern gestempelt, damit Lernen und Bewerten gleich rechnen
+                x = e.extra or {}
+                # Nachgetragenes kommt mit alten Zeiten und nicht sortiert – eigenes Fenster, das laufende bleibt sauber
+                b = self.ki_burst_nach if x.get("nachgetragen") else self.ki_burst
+                e.extra = {**x, "burst": round(b.beobachten(str(x.get("ki") or e.prozess), e.zeit), 4)}
+            if not (e.extra or {}).get("nachgetragen"):
+                alarme.extend(self.regeln.pruefen(e))
+                if lernbar and self.e.get("ki_ml", True):
+                    try:
+                        self._ki_bewerten(e, alarme)
+                    except Exception as exc:
+                        self._fehler("ki-modell", exc)
+            return
         # Jede Stufe einzeln abgesichert: scheitert Anreichern oder ML (z. B. Datenbank gesperrt),
         # laufen die festen Regeln trotzdem – fail-closed statt eines stillen Ereignisses.
         try:
@@ -375,7 +550,7 @@ class Motor:
                 self._fehler("programm-absolvierung", exc)
             else:
                 if ABSOLVIERUNG_REGEL not in self.regeln.stumm:
-                    alarme.extend(neu)
+                    alarme.extend(a for a in neu if not self.regeln.paar_stumm(a.regel, a.subjekt))
 
     def _folgen_bewerten(self, e: Ereignis, alarme: list[Alarm]) -> None:
         score, beschreibung = self.folgen.bewerten(e)
@@ -429,6 +604,39 @@ class Motor:
             regel=regel, ereignis_id=e.id, quelle="netz", score=round(score, 4), zeit=e.zeit,
             subjekt=f"{e.prozess or '?'} → {domain_von(e)}")
 
+    def _ki_bewerten(self, e: Ereignis, alarme: list[Alarm]) -> None:
+        """KI-Modell (ML-003): erst nach dem ersten Training. Schattenmodus = nur ki_schatten.log."""
+        d = self.ki_detektor
+        if not d.trainiert:
+            return
+        score, gruende = d.bewerten(e)
+        with d._lock:
+            d.merkmale.gesehen(e)                        # das nächste Mal ist es nicht mehr „neu“
+        e.score = round(score, 4)
+        e.extra = {**(e.extra or {}), "ki_ml": e.score}
+        if not d.ist_anomalie(score):
+            return
+        d.anomalien += 1
+        self.ki_auffaellig += 1
+        if self.e.get("ki_ml_alarm", False):
+            alarme.append(self._ki_alarm(e, score, gruende))
+        else:
+            e.extra["ki_fund"] = True                    # kein Alarm, aber auch kein Lernstoff
+            ki_schatten(e, f"ML-003 {score:.1%} {'; '.join(gruende) or 'Abweichung vom Gelernten'}")
+
+    def _ki_alarm(self, e: Ereignis, score: float, gruende: list[str]) -> Alarm:
+        x = e.extra or {}
+        ki = x.get("ki") or e.prozess or "KI"
+        was = tat_text(e) or e.text
+        return Alarm(
+            titel=f"Ungewöhnliche Tat einer KI: {ki}",
+            text=(f"KI-Modell: auffälliger als {score:.1%} der gelernten Taten. Auslöser: "
+                  f"{'; '.join(gruende) or 'Abweichung vom Gelernten'}. "
+                  f"{x.get('werkzeug') or e.prozess}: {' '.join(was.split())[:300]}"),
+            schwere=Schwere.HOCH if score >= 0.999 else Schwere.MITTEL,
+            regel="ML-003", ereignis_id=e.id, quelle="ki", score=round(score, 4), zeit=e.zeit,
+            subjekt=ki_subjekt(e))
+
     def _besitzer_schleife(self) -> None:
         """Besitzer neuer öffentlicher Netze nachfragen – eins alle 3 s, Bekanntes kommt aus dem Speicher."""
         while not self._stopp.wait(3.0):
@@ -472,8 +680,14 @@ class Motor:
                 del stapel[:-MAX_STAPEL]
             self.speicher.ereignisse_schreiben(stapel)
             stapel.clear()
+        while self._selbst_alarme:
+            alarme.append(self._selbst_alarme.popleft())
         if alarme:
+            if len(alarme) > MAX_STAPEL:                  # Datenbank länger gesperrt: nicht endlos sammeln
+                self._sensor_fehler("alarme", f"{len(alarme) - MAX_STAPEL} Alarme verworfen (nicht schreibbar)")
+                del alarme[:-MAX_STAPEL]
             self.speicher.alarme_schreiben(alarme)
+            schnappschuss_planen(self.speicher, alarme)
             self.alarme += len(alarme)
             for cb in self.bei_alarm:
                 try:
@@ -483,10 +697,29 @@ class Motor:
             alarme.clear()
         if (self.e["ml"] and self.e["lernen"] and not self.detektor.pausiert and (
                 (self._seit_training >= self.e["training_alle"] and self._training_abstand_um(jetzt))
-                or (not self.detektor.trainiert and self._seit_training >= self.e["min_training"]))):
+                or (not self.detektor.trainiert and self._seit_training >= self.e["min_training"]))
+                and not self._ml_training):
             self._seit_training = 0
-            self._vielleicht_trainieren()
+            self._training_starten()
         return zuletzt
+
+    def _training_starten(self) -> bool:
+        """Automatisches Training im eigenen Faden: die Bewertung läuft derweil mit den bisherigen Modellen
+        weiter (Detektor.trainieren setzt das neue Modell erst am Ende unter seinem Lock ein)."""
+        if self._ml_training:
+            return False
+        self._ml_training = True
+
+        def _lauf():
+            try:
+                self._vielleicht_trainieren()
+            except Exception as exc:
+                self._fehler("training", exc)
+            finally:
+                self._ml_training = False
+
+        threading.Thread(target=_lauf, daemon=True, name="wache-training").start()
+        return True
 
     def _training_abstand_um(self, jetzt: float) -> bool:
         """Automatisch höchstens alle `training_stunden` – sonst lernt der Wald alle paar Minuten aus fast
@@ -529,7 +762,7 @@ class Motor:
         if e.kategorie == NETZ and e.aktion == "conn_open" and self.e.get("netz", True):
             neu: dict = {"ziele_min": self.ziele_min.beobachten(e.prozess, e.ziel, e.zeit)}
             if x.get("extern") and e.ziel:
-                name = self.auskunft.name(e.ziel)
+                name = self.auskunft.name(e.ziel, pid=e.pid)
                 if name:
                     neu["name"] = name
                 if self.e.get("netz_besitzer", True) and len(self._besitzer_offen) < 500:
@@ -540,13 +773,18 @@ class Motor:
             e.extra = {**e.extra, "erstmals": True}
             if e.schwere < Schwere.NIEDRIG:
                 e.schwere = Schwere.NIEDRIG
+        if e.kategorie in (PROZESS, NETZ) and self.e.get("ki", True):
+            erkannt = self.ki_baum.markieren(e)          # extra["ki"]; neue KI über ihr Gespräch mit einem KI-Dienst
+            if erkannt is not None:
+                self._aufnehmen([erkannt])
 
     def _kette_belastet(self, e: Ereignis) -> bool:
         if e.pid and e.start and (e.pid, round(e.start, 3)) in self._belastet:
             return True
         if e.ppid and e.eltern_start and (e.ppid, round(e.eltern_start, 3)) in self._belastet:
             return True
-        return bool(e.exe) and e.exe.lower() in self._offene_pfade
+        return bool(e.exe) and (e.exe.lower() in self._offene_pfade
+                                or bool(self._gefahr_orte) and e.exe.lower().startswith(self._gefahr_orte))
 
     def _profil_lernen(self, e: Ereignis, belastet: bool) -> None:
         """Profil fortschreiben – nur, wenn weder das Ereignis noch seine Kette einen Alarm hat."""
@@ -656,7 +894,7 @@ class Motor:
         """Beide Detektoren nachtrainieren, danach das Folgen-Netz. Trainiert der Nutzer selbst,
         endet eine Pause nach dem Zurückdrehen."""
         if wer == "Nutzer":
-            for d in (self.detektor, self.datei_detektor, self.netz_detektor):
+            for d in (self.detektor, self.datei_detektor, self.netz_detektor, self.ki_detektor):
                 d.pause_aufheben()
             for o in (self.folgen.ordner, self.netz_folgen.ordner):
                 _folgen_modul.pause_marke(o).unlink(missing_ok=True)
@@ -666,6 +904,7 @@ class Motor:
             jetzt = time.time()
             karenz = float(self.e.get("ml_karenz_h", 24.0)) * 3600
             alle = self.speicher.lern_ereignisse(jetzt - 7 * 86400, jetzt - karenz, limit=ML_LERN_MAX)
+            alle = [x for x in alle if x.kategorie != KI]       # KI-Taten lernt ein eigenes Modell
             dateien = [x for x in alle if x.kategorie == DATEI]
             andere = [x for x in alle if x.kategorie != DATEI]
             ergebnis = self.detektor.trainieren(andere)
@@ -686,6 +925,7 @@ class Motor:
                 ergebnis["netz"] = self.netz_detektor.trainieren(netz)
             else:
                 ergebnis["netz"] = {"ok": False, "grund": f"nur {len(netz)} Verbindungen, {mindest} nötig"}
+            ergebnis["ki"] = self._ki_trainieren(wer, jetzt, karenz)
         self._training_zuletzt = time.time()
         self._training_sofort = False
         self.speicher.meta_setzen("training_zuletzt", str(self._training_zuletzt))
@@ -695,7 +935,9 @@ class Motor:
                 + (f"{ergebnis['dateien'].get('ereignisse')} Ereignisse" if ergebnis["dateien"].get("ok")
                    else ergebnis["dateien"].get("grund", "?"))
                 + " · Netz: " + (f"{ergebnis['netz'].get('ereignisse')} Verbindungen" if ergebnis["netz"].get("ok")
-                                 else ergebnis["netz"].get("grund", "?")))
+                                 else ergebnis["netz"].get("grund", "?"))
+                + " · KI: " + (f"{ergebnis['ki'].get('ereignisse')} Taten" if ergebnis["ki"].get("ok")
+                               else ergebnis["ki"].get("grund", "?")))
         _log(f"Training ({wer}) – {kurz}")
         _protokoll("wache_training", f"Modell nachtrainiert ({wer})", ergebnis=kurz)
         ergebnis["folgen"] = self.folgen_trainieren(wer, erzwingen=(wer == "Nutzer"))
@@ -706,6 +948,22 @@ class Motor:
             except Exception:
                 pass
         return ergebnis
+
+    def _ki_trainieren(self, wer: str, jetzt: float, karenz: float) -> dict:
+        """KI-Modell aus den Taten der KIs (auch nachgetragenen) – längeres Fenster, weil KIs nicht täglich
+        arbeiten; ohne Taten mit offenem oder echtem Alarm und ohne Schatten-Funde."""
+        if not (self.e.get("ki", True) and self.e.get("ki_ml", True)):
+            return {"ok": False, "grund": "KI-Modell ist aus"}
+        if self.ki_detektor.pausiert and wer != "Nutzer":
+            return {"ok": False, "grund": "zurückgedreht – lernt erst nach einem Training durch den Nutzer"}
+        tage = float(self.e.get("ki_lern_tage", 30))
+        taten = [x for x in self.speicher.lern_ereignisse(jetzt - tage * 86400, jetzt - karenz,
+                                                          limit=ML_LERN_MAX, kategorie=KI)
+                 if x.aktion in KI_LERNBAR]
+        mindest = int(self.e.get("min_training_ki", 200))
+        if len(taten) < mindest:
+            return {"ok": False, "grund": f"nur {len(taten)} Taten, {mindest} nötig"}
+        return self.ki_detektor.trainieren(taten)
 
     def folgen_trainieren(self, wer: str = "Wache", *, erzwingen: bool = False, warten: bool = False) -> str:
         """Folgen-Netz im eigenen Thread trainieren (dauert Sekunden bis Minuten).
@@ -725,7 +983,8 @@ class Motor:
             try:
                 jetzt = time.time()
                 karenz = float(self.e.get("dl_karenz_h", 24.0)) * 3600
-                ev = self.speicher.lern_ereignisse(jetzt - 7 * 86400, jetzt - karenz, limit=60_000)
+                ev = [x for x in self.speicher.lern_ereignisse(jetzt - 7 * 86400, jetzt - karenz, limit=60_000)
+                      if x.kategorie != KI]
                 r = self.folgen.trainieren(ev, abbruch=self._stopp.is_set)
                 if r.get("ok"):
                     kurz = (f"{r['version']}: {r['folgen']} Ketten aus {r['ereignisse']} Ereignissen, "
@@ -786,7 +1045,7 @@ class Motor:
     def ml_zurueckdrehen(self) -> str:
         """Alle Isolation-Forest-Modelle auf die vorige Version, automatisches Lernen pausiert."""
         with self._lock:
-            modelle = (self.detektor, self.datei_detektor, self.netz_detektor)
+            modelle = (self.detektor, self.datei_detektor, self.netz_detektor, self.ki_detektor)
             texte = [_detektor_modul.zurueckdrehen(d.pfad) for d in modelle]
             for d in modelle:
                 d.neu_laden_wenn_geaendert()
@@ -800,6 +1059,7 @@ class Motor:
             self.datei_detektor.zuruecksetzen()
             self.folgen.zuruecksetzen()
             self.netz_detektor.zuruecksetzen()
+            self.ki_detektor.zuruecksetzen()
             self.netz_folgen.zuruecksetzen()
             self.neue_profile = 0
             self._seit_training = 0
@@ -818,13 +1078,15 @@ class Motor:
         ergebnis["sekunden"] = round(self.inventar.dauer, 2)
         ergebnis["zaehlung"] = dict(self.inventar.zaehlung)
         ergebnis["fehler"] = list(self.inventar.fehler)
+        ergebnis["cve"] = self._schwachstellen_pruefen()
         stunde = datetime.now().hour
         gelernt = 0
         for e in eintraege:
             if e.art != INV_PROZESS:
                 continue
-            if e.detail and e.detail.lower() in self._offene_pfade:
-                continue                                  # unbeurteilter Alarm: nicht ins Profil
+            if e.detail and (e.detail.lower() in self._offene_pfade
+                             or bool(self._gefahr_orte) and e.detail.lower().startswith(self._gefahr_orte)):
+                continue                                  # unbeurteilter Alarm / CVE-001 offen: nicht ins Profil
             self.speicher.profil_fortschreiben(e.name, exe=e.detail, eltern=e.extra.get("eltern", ""),
                                                nutzer=e.extra.get("nutzer", ""),
                                                mem=float(e.extra.get("mem_mb", 0.0)), stunde=stunde,
@@ -850,6 +1112,7 @@ class Motor:
                 neue_alarme.extend(self.regeln.pruefen(ev))
             if neue_alarme:
                 self.speicher.alarme_schreiben(neue_alarme)
+                schnappschuss_planen(self.speicher, neue_alarme)
                 self.alarme += len(neue_alarme)
                 for cb in self.bei_alarm:
                     try:
@@ -860,6 +1123,28 @@ class Motor:
                    ergebnis=f"{ergebnis['gesamt']} Einträge, {ergebnis['neu']} neu, "
                             f"{ergebnis['verschwunden']} verschwunden, {ergebnis['sekunden']}s")
         return ergebnis
+
+    def _schwachstellen_pruefen(self) -> dict:
+        """CVE-001 nach dem Inventar: Software-Inventar gegen die CVE-Liste (ohne Liste: nichts)."""
+        try:
+            from .schwachstellen import pruefen
+            erg = pruefen(self.speicher)
+        except Exception as exc:
+            self._sensor_fehler("cve", f"{type(exc).__name__}: {exc}")
+            return {}
+        neu = erg.pop("neu", [])
+        if neu:
+            self.alarme += len(neu)
+            for cb in self.bei_alarm:
+                try:
+                    cb(list(neu))
+                except Exception as exc:
+                    self._sensor_fehler("alarm-meldung", f"{type(exc).__name__}: {exc}")
+        try:
+            self._gefahr_orte = self.speicher.gefahr_orte()
+        except Exception as exc:
+            self._fehler("cve", exc)
+        return erg
 
     def _inventar_anstossen(self, warten_s: float = 15.0) -> None:
         """Ein Dienst oder eine Aufgabe wurde laut Protokoll gerade installiert: Inventar gleich neu statt
@@ -882,7 +1167,7 @@ class Motor:
             try:
                 self.inventar_scannen()
             except Exception as exc:
-                self.sensor_fehler.append(f"inventar: {exc!r}")
+                self._sensor_fehler("inventar", repr(exc))
             finally:
                 self.inventar_laeuft = False
 
@@ -907,7 +1192,7 @@ class Motor:
                 if stunden > 0 and zuletzt and time.time() - zuletzt >= stunden * 3600:
                     self.inventar_starten()
             except Exception as exc:
-                self.sensor_fehler.append(f"wartung: {exc!r}")
+                self._sensor_fehler("wartung", repr(exc))
 
     # --------------------------------------------------------------- Zustand
 
@@ -933,7 +1218,7 @@ class Motor:
                          **{k: v for k, v in self.letztes_inventar.items() if k in ("neu", "verschwunden", "profile")}},
             "seit_training": self._seit_training, "training_alle": self.e["training_alle"],
             "fehler": list(self.sensor_fehler[-5:]), "regel_fehler": sum(self.regeln.fehler.values()),
-            "gestoert": self.gestoert, "verworfen": self.verworfen,
+            "gestoert": self.gestoert, "verworfen": self.verworfen, "ml_training_laeuft": self._ml_training,
             "dl": {**self.folgen.stand(), "an": bool(self.e.get("dl", True)),
                    "alarm": bool(self.e.get("dl_alarm", False)), "auffaellig_seit_start": self.dl_auffaellig,
                    "training_laeuft": self._folgen_training},
@@ -942,4 +1227,7 @@ class Motor:
                      "ml": self.netz_detektor.stand(), "dl": self.netz_folgen.stand(),
                      "auffaellig_seit_start": self.netz_auffaellig, "besitzer_offen": len(self._besitzer_offen),
                      "training_laeuft": self._netz_training},
+            "ki": {"an": bool(self.e.get("ki", True)), "ml_an": bool(self.e.get("ki_ml", True)),
+                   "ml_alarm": bool(self.e.get("ki_ml_alarm", False)), "ml": self.ki_detektor.stand(),
+                   "auffaellig_seit_start": self.ki_auffaellig},
         }

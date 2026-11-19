@@ -44,10 +44,81 @@ def _ohne_geheimnisse() -> dict:
 _SITE: dict[str, Path] = {}
 
 
+def _netzpfad(roh: str) -> bool:
+    """Freigabe eines fremden Rechners oder Gerätepfad? Schon der Blick darauf schickt die Windows-Anmeldung."""
+    try:
+        import actions
+        return actions.pfad_vorpruefen(roh) is not None
+    except ImportError:
+        return roh.replace("/", "\\").startswith(("\\\\", "\\??\\"))
+
+
+def _vertraute_pythons() -> set[str]:
+    """Regulär installierte Interpreter (Registry, PEP 514) und das Basis-Python von NemiCLI selbst –
+    kleingeschrieben und aufgelöst. Nur diese startet das Nachschlagen."""
+    kandidaten: list[Path] = []
+    try:
+        import sandbox
+        kandidaten += sandbox.installierte_pythons()
+    except Exception:
+        pass
+    if not getattr(sys, "frozen", False):
+        kandidaten.append(Path(sys.base_prefix) / "python.exe")
+    raus = set()
+    for k in kandidaten:
+        try:
+            raus.add(str(Path(k).resolve()).lower())
+        except (OSError, ValueError):
+            continue
+    return raus
+
+
+def fremder_ort(ordner: Path) -> str | None:
+    """Warum ein venv in diesem Ordner nicht vertrauenswürdig ist – None, wenn er es ist. Sandbox, Entpackt-Ordner
+    und Daten-Ordner füllen Code aus code_ausfuehren, Archive und Werkzeuge der KI; deren Pakete importiert
+    NemiCLI nicht."""
+    if _netzpfad(str(ordner)):
+        return "eine Netzwerkfreigabe oder ein Gerätepfad"
+    try:
+        o = Path(ordner).resolve()
+    except (OSError, ValueError):
+        return "unklarer Pfad"
+    try:
+        import sicherheit
+        if sicherheit.ist_entpackt_pfad(o):
+            return "ein Entpackt-Ordner"
+    except ImportError:
+        pass
+    orte: list[tuple[Path, str]] = []
+    try:
+        import sandbox
+        orte.append((Path(sandbox.ARBEIT), "die Sandbox"))
+    except Exception:
+        pass
+    try:
+        import paths
+        daten = Path(paths.DATEN).resolve()
+        orte.append((daten / "NemiSandbox", "die Sandbox"))
+        if daten != Path(paths.INSTALL).resolve():
+            orte.append((daten, "der Daten-Ordner"))
+        else:
+            orte += [(daten / n, "der Daten-Ordner") for n in paths.DATEN_INHALT]
+    except Exception:
+        pass
+    for basis, name in orte:
+        try:
+            b = basis.resolve()
+        except (OSError, ValueError):
+            continue
+        if o == b or b in o.parents:
+            return name
+    return None
+
+
 def _projekt_venv(ordner: Path, name: str) -> tuple[Path, Path] | None:
     """(Basis-Python, site-packages) eines venv im Projekt. Gestartet wird nie die python.exe aus dem
     Projekt (die kann jede Datei sein), sondern das Python, aus dem das venv laut pyvenv.cfg entstand –
-    und nur, wenn es außerhalb des Projekts liegt."""
+    nur, wenn es ein regulär installiertes ist (pyvenv.cfg kann auf jede python.exe zeigen)."""
     v = Path(ordner) / name
     sp = v / "Lib" / "site-packages"
     try:
@@ -55,11 +126,13 @@ def _projekt_venv(ordner: Path, name: str) -> tuple[Path, Path] | None:
     except OSError:
         return None
     home = next((z.split("=", 1)[1].strip() for z in zeilen if z.split("=", 1)[0].strip().lower() == "home"), "")
-    if not home or not sp.is_dir():
+    if not home or _netzpfad(home) or not sp.is_dir():
         return None
     basis = Path(home) / "python.exe"
     try:
         if not basis.is_file() or basis.resolve().is_relative_to(Path(ordner).resolve()):
+            return None
+        if str(basis.resolve()).lower() not in _vertraute_pythons():
             return None
     except OSError:
         return None
@@ -67,8 +140,9 @@ def _projekt_venv(ordner: Path, name: str) -> tuple[Path, Path] | None:
 
 
 def python_fuer(ordner: Path | None) -> tuple[Path | None, str]:
-    """(Python, Herkunft): das venv des Projekts (über sein Basis-Python), sonst das Python von NemiCLI."""
-    if ordner is not None:
+    """(Python, Herkunft): das venv des Projekts (über sein Basis-Python), sonst das Python von NemiCLI.
+    In einem nicht vertrauten Ort (fremder_ort) wird kein venv benutzt – dessen Pakete würden beim Import laufen."""
+    if ordner is not None and fremder_ort(Path(ordner)) is None:
         for name in ("venv", ".venv", "env"):
             if (gefunden := _projekt_venv(Path(ordner), name)) is not None:
                 basis, sp = gefunden

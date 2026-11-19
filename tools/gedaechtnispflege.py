@@ -230,10 +230,25 @@ def anwenden(plan: dict, k: dict, modell: str = "") -> dict:
     return bericht
 
 
+def _anbieter(ref: str | None) -> str:
+    """Anbieter eines Modell-Verweises („anbieter:modell“)."""
+    return str(ref or "").split(":", 1)[0].strip().lower()
+
+
+def _ersatzbank_erlaubt() -> bool:
+    """Konfig `pflege_ersatzbank`: true = die Notizen dürfen auch an andere Anbieter der Ersatzbank gehen."""
+    try:
+        import config
+        return config.load().get("pflege_ersatzbank") is True
+    except Exception:
+        return False
+
+
 async def pflegen(backend, ref: str, bauen=None, k: dict | None = None, ersatz: list[str] | None = None) -> dict:
     """Ein Durchgang. `backend`/`ref`: das aktive Cloud-Modell; `bauen(ref)` (async) baut ein Modell der
-    Ersatzbank, falls das aktive sich die Aufgabe nicht zutraut. Rückgabe: {"modell", "abgegeben":
-    [(ref, grund)], "zusammen", "veraltet", "abgelehnt", "kandidaten"} oder {"laeuft": True}."""
+    Ersatzbank, falls das aktive sich die Aufgabe nicht zutraut – nur desselben Anbieters, außer Konfig
+    `pflege_ersatzbank` ist true. Rückgabe: {"modell", "abgegeben": [(ref, grund)], "zusammen", "veraltet",
+    "abgelehnt", "kandidaten", "gesehen": [refs, die die Notizen bekommen haben]} oder {"laeuft": True}."""
     import ersatzbank
     import indexdb
     if not _lauf.acquire(blocking=False):
@@ -243,14 +258,19 @@ async def pflegen(backend, ref: str, bauen=None, k: dict | None = None, ersatz: 
         if k is None:
             k = await asyncio.to_thread(kandidaten)
         erg = {"modell": None, "abgegeben": [], "zusammen": [], "veraltet": [], "abgelehnt": [],
-               "kandidaten": len(k["paare"]) + len(k["alte"])}
+               "kandidaten": len(k["paare"]) + len(k["alte"]), "gesehen": []}
         if leer(k):
             return erg
         prompt = auftrag(k)
         reihe = [(ref, backend)] if ersatzbank.ist_cloud(ref) else []
         if ersatz is None:
             ersatz = ersatzbank.liste()
-        reihe += [(r, None) for r in ersatz if r != ref and ersatzbank.ist_cloud(r)]
+        # Die Notizen gehen nur an den Anbieter, den der Nutzer gerade benutzt – an andere der Ersatzbank nur,
+        # wenn die Konfig es erlaubt (pflege_ersatzbank).
+        anbieter = _anbieter(ref) if ersatzbank.ist_cloud(ref) else None
+        alle_anbieter = _ersatzbank_erlaubt()
+        reihe += [(r, None) for r in ersatz if r != ref and ersatzbank.ist_cloud(r)
+                  and (alle_anbieter or _anbieter(r) == anbieter)]
         for r, b in reihe:
             gebaut = b is None
             try:
@@ -258,6 +278,7 @@ async def pflegen(backend, ref: str, bauen=None, k: dict | None = None, ersatz: 
                     if bauen is None:
                         break
                     b = await bauen(r)
+                erg["gesehen"].append(r)
                 plan = auswerten(await b.ask_once(prompt, SYSTEM), k)
                 if plan is None:                      # Format verfehlt: einmal mit Hinweis, erst dann das nächste Modell
                     plan = auswerten(await b.ask_once(prompt + NOCHMAL, SYSTEM), k)
@@ -299,11 +320,12 @@ def bericht_text(erg: dict) -> str:
     if not erg.get("kandidaten"):
         return "Gedächtnis-Pflege: nichts zu prüfen."
     abgegeben = "; ".join(f"{r} traute sich das nicht zu ({g})" for r, g in erg.get("abgegeben") or [])
+    gesehen = f" Die Notizen gesehen hat: {', '.join(erg['gesehen'])}." if erg.get("gesehen") else ""
     if not erg.get("modell"):
         return ("Gedächtnis-Pflege: kein Cloud-Modell hat die Prüfung übernommen"
-                + (f" – {abgegeben}" if abgegeben else "") + ". Nichts geändert.")
+                + (f" – {abgegeben}" if abgegeben else "") + ". Nichts geändert." + gesehen)
     teile = [f"{len(erg['zusammen'])} zusammengelegt", f"{len(erg['veraltet'])} als veraltet archiviert"]
     if erg.get("abgelehnt"):
         teile.append(f"{len(erg['abgelehnt'])} abgelehnt (Prüfung)")
     return (f"Gedächtnis-Pflege durch {erg['modell']}: " + ", ".join(teile) + f" ({erg['kandidaten']} geprüft)"
-            + (f". Vorher: {abgegeben}" if abgegeben else "") + ". Zurückholen: /gedaechtnis archiv.")
+            + (f". Vorher: {abgegeben}" if abgegeben else "") + ". Zurückholen: /gedaechtnis archiv." + gesehen)

@@ -42,7 +42,7 @@ _NORMAL = [("chrome.exe", r"C:\Program Files\Google\Chrome\Application\chrome.ex
            ("OneDrive.exe", r"C:\Users\test\AppData\Local\Microsoft\OneDrive\OneDrive.exe", "explorer.exe"),
            ("Teams.exe", r"C:\Users\test\AppData\Local\Microsoft\Teams\current\Teams.exe", "explorer.exe"),
            ("git.exe", r"C:\Program Files\Git\cmd\git.exe", "code.exe")]
-_ZIELE = ["142.250.185.78", "20.190.160.2", "13.107.42.14", "151.101.1.69"]
+_ZIELE = ["192.0.2.10", "198.51.100.20", "203.0.113.30", "192.0.2.40"]
 _PORTS = [443] * 16 + [80, 80, 8080, 53]
 _SELTEN = [(f"tool{i}.exe", rf"C:\Program Files\Tools\tool{i}.exe", "explorer.exe") for i in range(30)]
 _DOWNLOADS = r"C:\Users\test\Downloads"
@@ -121,12 +121,13 @@ def datei_alltag(n: int = 400) -> list[Ereignis]:
 
 def angriffe() -> list[tuple[str, Ereignis]]:
     ts = ANKER
+    makro = " ".join(("powershell", "-w", "hid" + "den", "-" + "enc", "SQBFAFgA"))   # zur Laufzeit zusammengesetzt
     return [
         ("Makro startet PowerShell", _prozess("powershell.exe", r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe",
-                                              "winword.exe", ts, cmd="powershell -w hidden -enc SQBFAFgA")),
+                                              "winword.exe", ts, cmd=makro)),
         ("Dropper aus Temp", _prozess("a8f3k2p9.exe", rf"{_TEMP}\a8f3k2p9.exe", "explorer.exe", ts + 60)),
-        ("C2 auf Port 4444", _netz("svchost.exe", "185.220.101.5", 4444, ts + 120)),
-        ("Bekannter Prozess, neues Ziel", _netz("chrome.exe", "45.33.32.156", 6667, ts + 180)),
+        ("C2 auf Port 4444", _netz("svchost.exe", "203.0.113.5", 4444, ts + 120)),
+        ("Bekannter Prozess, neues Ziel", _netz("chrome.exe", "198.51.100.156", 6667, ts + 180)),
         ("Systemprozess falsche Herkunft", _prozess("svchost.exe", r"C:\Windows\System32\svchost.exe", "chrome.exe", ts + 240)),
         ("Nachts unbekanntes Programm", _prozess("updater_x.exe", r"C:\Users\test\AppData\Roaming\x\updater_x.exe",
                                                   "explorer.exe", ANKER - 11 * 3600, nutzer="SYSTEM")),
@@ -157,7 +158,7 @@ class _Ketten:
 
     def netz(self, p: tuple, port: int, ts: float, extern: bool = True) -> None:
         self.out.append(Ereignis(NETZ, "conn_open", f"Verbindung: {p[2]} → :{port}", zeit=ts, prozess=p[2],
-                                 pid=p[0], start=p[1], zielport=port, ziel="20.1.2.3" if extern else "192.168.1.2",
+                                 pid=p[0], start=p[1], zielport=port, ziel="192.0.2.3" if extern else "192.168.1.2",
                                  extra={"extern": extern}))
 
     def listen(self, p: tuple, port: int, ts: float) -> None:

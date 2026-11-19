@@ -39,6 +39,51 @@ _NIE_ERLAUBT = (
     # Datei-Hoster
     "mega.nz", "mediafire.com", "anonfiles.com", "gofile.io", "transfer.sh", "catbox.moe",
 )
+# Öffentliche Suffixe: eine Freigabe gälte für jede Seite darunter (Registrierung für jedermann)
+_OEFFENTLICHE_SUFFIXE = (
+    "co.uk", "org.uk", "me.uk", "ltd.uk", "plc.uk", "net.uk", "ac.uk", "gov.uk", "com.au", "net.au", "org.au",
+    "co.nz", "org.nz", "co.jp", "ne.jp", "or.jp", "co.kr", "or.kr", "com.br", "net.br", "org.br", "com.cn",
+    "net.cn", "org.cn", "com.tw", "com.hk", "com.sg", "com.my", "co.in", "net.in", "org.in", "co.za", "org.za",
+    "com.mx", "com.ar", "com.tr", "com.ua", "com.pl", "co.il", "com.es", "co.at", "or.at", "com.de", "eu.org",
+    "co.com", "us.com", "uk.com", "de.com", "eu.com", "co.de",
+)
+# Freie Hoster und Cloud-Speicher: dort kann jeder eine Seite ablegen
+_FREIE_HOSTER = (
+    "workers.dev", "pages.dev", "azurewebsites.net", "azurestaticapps.net", "azureedge.net", "blob.core.windows.net",
+    "web.core.windows.net", "cloudfront.net", "amazonaws.com", "on.aws", "appspot.com", "run.app",
+    "cloudfunctions.net", "storage.googleapis.com", "firebaseio.com", "hf.space", "gradio.live", "streamlit.app",
+    "fly.dev", "r2.dev", "codeberg.page", "deno.dev", "railway.app", "koyeb.app", "pythonanywhere.com",
+    "bitbucket.io", "sourceforge.io", "ipfs.io", "dweb.link", "translate.goog", "ngrok.app", "loca.lt",
+    "vercel.sh", "netlify.com", "render.com", "replit.dev", "w3spaces.com", "framer.website", "webflow.io",
+)
+
+
+def warnung(domain_name: str) -> str:
+    """Hinweis für das Prüffenster bei öffentlichen Suffixen und freien Hostern – keine Sperre."""
+    d = str(domain_name or "").lower().strip(".")
+    for s in _OEFFENTLICHE_SUFFIXE:
+        if d == s:
+            return (f"⚠ WARNUNG: {d} ist ein öffentliches Suffix – die Freigabe gälte für JEDE Seite unter .{d}, "
+                    "die sich jeder registrieren kann. Besser die genaue Domain eintragen.")
+    for h in _FREIE_HOSTER:
+        if d == h:
+            return (f"⚠ WARNUNG: {d} ist ein freier Hoster bzw. Cloud-Speicher – die Freigabe gälte für die Seiten "
+                    "ALLER Kunden dort. Besser die genaue Unterdomain eintragen.")
+        if d.endswith("." + h):
+            return (f"⚠ WARNUNG: {d} liegt bei {h} (freier Hoster bzw. Cloud-Speicher) – dort kann jeder eine Seite "
+                    "ablegen. Nur freigeben, wenn du dem Betreiber dieser Seite vertraust.")
+    return ""
+
+
+def nie_erlaubt(host: str) -> str | None:
+    """Der Eintrag aus _NIE_ERLAUBT, zu dem `host` gehört (Paste-Dienst, Kurz-Link, freies Hosting) – sonst None."""
+    h = str(host or "").lower().strip(".")
+    for d in _NIE_ERLAUBT:
+        if h == d or h.endswith("." + d):
+            return d
+    return None
+
+
 _DOMAIN = re.compile(r"^(?=.{4,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z][a-z0-9-]{0,61}[a-z0-9]$")
 
 
@@ -86,10 +131,9 @@ def domain(roh) -> str:
     import webfetch
     if webfetch.is_private(s):
         raise ValueError(f"{s} ist eine lokale Adresse – nicht erlaubt.")
-    for d in _NIE_ERLAUBT:
-        if s == d or s.endswith("." + d):
-            raise ValueError(f"{s} gehört zu {d} (Paste-Dienst, Kurz-Link oder freies Hosting) – "
-                             "dort kann jeder alles ablegen. Nicht erlaubt.")
+    if (d := nie_erlaubt(s)):
+        raise ValueError(f"{s} gehört zu {d} (Paste-Dienst, Kurz-Link oder freies Hosting) – "
+                         "dort kann jeder alles ablegen. Nicht erlaubt.")
     return s
 
 
@@ -135,7 +179,9 @@ def vorschau(was: str, wert, grund: str = "") -> str:
     p = datei()
     alt = p.read_text(encoding="utf-8") if p.is_file() else ""
     import actions
-    return f"Einstellung: {WAS[was]}\n{satz}\nDatei: {p}\n\n{actions.vergleich(alt, _text(neu))}"
+    hinweis = warnung(domain(wert)) if was == "internet_erlauben" else ""
+    return (f"Einstellung: {WAS[was]}\n{satz}\n" + (f"{hinweis}\n" if hinweis else "")
+            + f"Datei: {p}\n\n{actions.vergleich(alt, _text(neu))}")
 
 
 def aendern(was: str, wert, grund: str = "") -> str:
