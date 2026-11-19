@@ -95,8 +95,8 @@ class Nativ(MitConfig):
 class Erkennen(unittest.TestCase):
 
     def test_handlung(self):
-        for text in ("Ja perfekt dann zeig dich mal süße =)", "oh probier nochmal =)", "mal mir ein Bild",
-                     "Also bisher sehe ich kein bild süße =)", "lies die Datei"):
+        for text in ("Ja perfekt dann zeig dich mal =)", "oh probier nochmal =)", "mal mir ein Bild",
+                     "Also bisher sehe ich kein bild =)", "lies die Datei"):
             self.assertTrue(D.handlung(text), text)
         for text in ("Hast du mal Zeit?", "Und bist du noch wach =) <3", "Ja das sollst du entscheiden =)"):
             self.assertFalse(D.handlung(text), text)
