@@ -284,15 +284,15 @@ def _motoren_entladen() -> None:
 
 
 @_gpu_fuer_bild
-def gesicht_nachbessern(path: str, on_status=None) -> str | None:
-    """Gesichter eines Krea-2-Bildes nachmalen (nur Krea, nur wenn eingeschaltet).
-    Gibt den Pfad der nachgebesserten Kopie zurück, sonst None."""
+def gesicht_nachbessern(path: str, on_status=None, immer: bool = False) -> str | None:
+    """Gesichter eines Krea-2-Bildes nachmalen (nur Krea; nur wenn eingeschaltet, außer `immer` – etwa für den
+    Vorher-nachher-Vergleich im Kopf-Fenster). Gibt den Pfad der nachgebesserten Kopie zurück, sonst None."""
     import krea
-    if "backend=krea2" not in _params(path) or not krea.gesicht_an():
+    if "backend=krea2" not in _params(path) or not (immer or krea.gesicht_an()):
         return None
     import malkind
     if malkind.aktiv():
-        return malkind.auftrag("gesicht_nachbessern", {"path": path}, on_status)
+        return malkind.auftrag("gesicht_nachbessern", {"path": path, "immer": bool(immer)}, on_status)
     return krea.gesicht_nachbessern(path, on_status=on_status)
 
 

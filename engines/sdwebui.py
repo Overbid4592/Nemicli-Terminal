@@ -172,7 +172,9 @@ def set_chosen_model(model_name: str | None) -> None:
 
 def _client(timeout: float):
     import httpx
-    return httpx.Client(timeout=timeout, base_url=host())
+    import providers
+    adresse = host()
+    return httpx.Client(timeout=timeout, base_url=adresse, trust_env=providers.proxy_erlaubt(adresse))
 
 
 def available(timeout: float = 2.5) -> bool:

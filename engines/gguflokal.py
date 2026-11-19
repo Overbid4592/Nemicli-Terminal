@@ -2,7 +2,7 @@
 gguflokal.py - Lokale Sprachmodelle über den eigenen GGUF-Motor (ggufengine).
 
 Kein Server, kein Kindprozess: das Modell läuft im NemiCLI-Prozess auf torch.
-Referenz: `gguf:<Ordner>` – jeder Unterordner von `ModelGGUF/` im Programm-Ordner
+Referenz: `gguf:<Ordner>` – jeder Modellordner unter `KI-Modelle/KI-Chat/Chatmodell/` (früher `ModelGGUF/`)
 ist ein Modell (die .gguf darin; eine .gguf mit „mmproj“ im Namen ist der Bild-/Audio-Teil).
 Ein Ordner ohne eigene .gguf fasst eine Familie zusammen: `gguf:<Familie>-<Unterordner>`.
 
@@ -69,7 +69,12 @@ try:
 except Exception:                                    # Selbsttest ohne Bootstrap
     _INSTALL = Path(__file__).resolve().parent.parent
 
-ORDNER = _INSTALL / "ModelGGUF"
+try:
+    import modellorte as _MO
+    ORDNER = _MO.ordner("chat")                       # neue Modelle kommen hierher
+    ALTE_ORDNER = _MO.alte("chat")                    # frühere Orte, nur lesen
+except Exception:                                    # Selbsttest ohne Bootstrap
+    ORDNER, ALTE_ORDNER = _INSTALL / "ModelGGUF", []
 PROVIDER = "gguf"
 VORGABE_KONTEXT = 0                    # 0 = so viel, wie das Modell kann; wird es voll, räumen Doppelpuffer und /compact auf
 KONTEXT_UNBEKANNT = 131072             # Modell ohne Kontext-Angabe
@@ -168,7 +173,10 @@ def _kopf_werte(name: str) -> tuple[int | None, int | None, int | None, int | No
     datei = modelle().get(name)
     if datei is None:
         return None, None, None, None
-    schluessel = (str(datei), datei.stat().st_mtime)
+    try:
+        schluessel = (str(datei), datei.stat().st_mtime)
+    except OSError:                                  # Datei inzwischen weg oder gesperrt
+        return None, None, None, None
     if schluessel not in _kennwerte:
         try:
             from ggufengine.gguf import GGUFFile
@@ -401,14 +409,28 @@ def _gguf_in(ordner: Path) -> Path | None:
     return dateien[0] if dateien else None
 
 
+def wurzeln() -> list[Path]:
+    """Alle Orte mit Modellordnern: der neue zuerst, dann die früheren."""
+    return list(dict.fromkeys([ORDNER, *ALTE_ORDNER]))
+
+
+def _modellordner() -> list[Path]:
+    """Unterordner aller Wurzeln; bei gleichem Namen gilt der erste Ort."""
+    raus: dict[str, Path] = {}
+    for w in wurzeln():
+        if w.is_dir():
+            for d in sorted(w.iterdir()):
+                if d.is_dir():
+                    raus.setdefault(d.name, d)
+    return list(raus.values())
+
+
 def familien() -> dict[str, dict[str, Path]]:
-    """{Familie: {Mitglied: .gguf}} – Ordner unter ModelGGUF/ ohne eigene Modelldatei, deren Unterordner
+    """{Familie: {Mitglied: .gguf}} – Modellordner ohne eigene Modelldatei, deren Unterordner
     je ein Modell halten (eine Ebene tiefer wird nicht gesucht – dort liegt, was keine Chat-Modelle sind)."""
-    if not ORDNER.is_dir():
-        return {}
     raus = {}
-    for d in sorted(ORDNER.iterdir()):
-        if not d.is_dir() or _gguf_in(d) is not None:
+    for d in _modellordner():
+        if _gguf_in(d) is not None:
             continue
         mitglieder = {u.name: datei for u in sorted(d.iterdir()) if u.is_dir() and (datei := _gguf_in(u)) is not None}
         if mitglieder:
@@ -424,13 +446,11 @@ def _kopf(mitglieder: dict[str, Path]) -> Path:
 
 
 def modelle() -> dict[str, Path]:
-    """{Name: .gguf} für alle Unterordner von ModelGGUF/ mit einer Modelldatei. Eine Familie erscheint
+    """{Name: .gguf} für alle Modellordner mit einer Modelldatei. Eine Familie erscheint
     als ganzes Team (ihr Name, gerechnet wird mit dem Kopf) und mit jedem Mitglied als „Familie-Mitglied“."""
-    if not ORDNER.is_dir():
-        return {}
     raus = {}
-    for d in sorted(ORDNER.iterdir()):
-        if d.is_dir() and (datei := _gguf_in(d)) is not None:
+    for d in _modellordner():
+        if (datei := _gguf_in(d)) is not None:
             raus[d.name] = datei
     for name, mitglieder in familien().items():
         raus.setdefault(name, _kopf(mitglieder))
@@ -735,27 +755,60 @@ def ist_fremd(engine) -> bool:
     return bool(getattr(engine, "fremd", False))
 
 
+LLAMA_KV = ("auto", "f16", "q8_0", "q4_0")
+
+
+def llama_kv() -> str:
+    """Gesprächsspeicher des llama-servers (`llama_kv`: auto, f16, q8_0, q4_0; Vorgabe auto – feste Regel
+    aus Kontext und freiem Grafikspeicher, siehe llamareserve.kv_stufe)."""
+    wert = str(_config().get("llama_kv", "auto")).lower()
+    return wert if wert in LLAMA_KV else "auto"
+
+
 def _schluessel(name: str) -> tuple:
     """Einstellungen, mit denen eine geladene Engine weiterverwendet werden kann."""
+    wahl = motor_wahl(name)
     return (kontext(name), str(_config().get("gguf_experten", "auto")).lower(), schichten_modus(),
-            motor_wahl(name))
+            wahl, llama_kv() if wahl == LLAMACPP else "")
+
+
+def _reserve_kv(name: str, datei: Path, ctx: int, mindest: int) -> str:
+    """KV-Typ für den llama-server: Gewichte etwa in Dateigröße samt Bildteil, dazu RESERVE."""
+    import llamareserve
+    frei = _frei_vram()
+    try:
+        platz = None if frei is None else frei - datei.stat().st_size - _sehen_bytes(name) - RESERVE
+    except OSError:
+        platz = None
+    return llamareserve.kv_stufe(llama_kv(), kv_bytes_pro_token(name, 16), ctx, platz, mindest)
 
 
 def _reserve_laden(name: str, datei: Path, ctx: int):
-    """Das Modell über die festgenagelte llama.cpp-Reserve (llamamotor) laden; mit mmproj im Ordner sieht es."""
+    """Das Modell über die festgenagelte llama.cpp-Reserve (llamamotor) laden; mit mmproj im Ordner sieht es.
+    Kontext „max“ (nicht eingestellt): llama.cpp kürzt ihn selbst, bis Modell und Kontext in den Grafikspeicher
+    passen (--fit), statt Schichten auf die CPU zu legen; ein eingestellter Kontext gilt genau."""
     import llamamotor
+    import llamareserve
     bildteil = _mmproj(name) if sieht(name) else None
+    voll = kontext_einstellung() <= 0
+    kv = _reserve_kv(name, datei, ctx, min(llamareserve.FIT_CTX, ctx))
     _DBG.motor_log()
-    _DBG.ereignis(f"Modell laden über {llamamotor.LlamaCppEngine.motor_name}: {name} (Kontext {ctx}"
+    _DBG.ereignis(f"Modell laden über {llamamotor.LlamaCppEngine.motor_name}: {name} (Kontext "
+                  f"{'max ' + str(ctx) if voll else ctx}, KV {kv}"
                   + (f", Bildteil {bildteil.name})" if bildteil else ")"))
     meldung = None
     try:
-        engine = llamamotor.LlamaCppEngine(str(datei), n_ctx=ctx, bildteil=str(bildteil) if bildteil else None)
+        engine = llamamotor.LlamaCppEngine(str(datei), n_ctx=0 if voll else ctx,
+                                           bildteil=str(bildteil) if bildteil else None, kv=kv, n_ctx_max=ctx)
     except Exception as e:
         meldung = str(e) or type(e).__name__
     if meldung is not None:
         raise RuntimeError(meldung)
-    _DBG.ereignis(f"Modell geladen über llama.cpp: {name} (Kontext {engine.n_ctx})")
+    server = getattr(engine, "server", None)
+    _DBG.ereignis(f"Modell geladen über llama.cpp: {name} (Kontext {engine.n_ctx}, KV "
+                  f"{getattr(server, 'kv_wirksam', 'f16')}"
+                  + (", Rückfall auf f16 nach Flash-Attention-Fehler)" if getattr(server, "kv_rueckfall", False)
+                     else ")"))
     return engine
 
 
@@ -811,7 +864,7 @@ def _motor_laden(name: str):
             import llamareserve
             if llamareserve.bereit():
                 raise llamareserve.ReserveFrage(name, meldung)
-            meldung += (f" – die Reserve llama.cpp {llamareserve.BUILD} könnte es laden "
+            meldung += (f" – die Reserve llama.cpp {llamareserve.aktiv()} könnte es laden "
                         "(/llamacpp zeigt, wie man sie einrichtet)")
         raise (art if art in (RuntimeError, ValueError, MemoryError, OSError) else RuntimeError)(meldung)
     engine.kv_im_vram = v.kv_vram
@@ -892,6 +945,7 @@ _entladen_laeuft = False
 _zuletzt = time.monotonic()                          # letzte Leihe (fürs Entladen im Leerlauf)
 _runden = 0                                          # laufende Runden: zwischen zwei Leihen kein Leerlauf
 LEIHE_WARTEN_S = 5.0                                 # so lange wartet entladen() auf laufende Arbeit
+FADEN_WARTEN_S = 5.0                                 # so lange wartet eine abgebrochene Antwort auf ihren Faden
 LEERLAUF_PRUEFEN_S = 30.0
 
 
@@ -913,6 +967,32 @@ def _nach_fehlschlag_aufraeumen() -> None:
             torch.cuda.empty_cache()
     except Exception:
         pass
+
+
+OOM_MELDUNG = "Kontext voll für den Grafikspeicher – /kontext senken oder /compact"
+
+
+def ist_oom(exc: BaseException) -> bool:
+    """torch.OutOfMemoryError (Grafikspeicher voll), ohne torch dafür zu laden."""
+    import sys
+    torch = sys.modules.get("torch")
+    art = getattr(torch, "OutOfMemoryError", None) or getattr(getattr(torch, "cuda", None), "OutOfMemoryError", None)
+    return isinstance(art, type) and isinstance(exc, art)
+
+
+def _nach_oom(engine) -> None:
+    """Nach vollem Grafikspeicher mitten in einer Rechnung: Zwischenspeicher frei, Gesprächsstand der Engine
+    verwerfen (der KV-Cache ist halb beschrieben; die nächste Antwort liest neu ein)."""
+    try:
+        if gpuzustand.kaputt() or ist_fremd(engine) or getattr(engine, "geleert", False):
+            return
+        with _lock:
+            if hasattr(engine, "reset"):
+                engine.reset()
+            if hasattr(engine, "_release_scratch"):
+                engine._release_scratch()
+    except Exception as exc:
+        _DBG.fehler("Nach vollem Grafikspeicher aufräumen", exc)
 
 
 @contextlib.contextmanager
@@ -1015,14 +1095,16 @@ def entladen(grund: str = "") -> None:
             except Exception as exc:
                 _DBG.fehler("Entladen: leeren", exc)
             gg = getattr(engine, "gg", None)
+            bild_gg = getattr(getattr(engine, "vision", None), "gg", None)
             del engine
             import gc
             gc.collect()                             # erst ohne die Tensoren lässt sich die Datei schließen
-            try:
-                if gg is not None:
-                    gg.close()
-            except Exception as exc:                 # noch eine Sicht auf die Datei: sie bleibt offen
-                _DBG.fehler("Entladen: Modelldatei schließen", exc)
+            for datei_gg, was in ((gg, "Modelldatei"), (bild_gg, "Bildteil")):
+                try:
+                    if datei_gg is not None:
+                        datei_gg.close()
+                except Exception as exc:             # noch eine Sicht auf die Datei: sie bleibt offen
+                    _DBG.fehler(f"Entladen: {was} schließen", exc)
     finally:
         _stopp.clear()
         with _leih:
@@ -1665,6 +1747,15 @@ class GgufChat:
         schlange: asyncio.Queue = asyncio.Queue()
         ENDE = object()
 
+        def senden(x):
+            try:
+                loop.call_soon_threadsafe(schlange.put_nowait, x)
+            except RuntimeError:                         # Schleife schon zu: niemand wartet mehr
+                pass
+
+        def gestoppt() -> bool:
+            return abbruch.is_set() or (hintergrund and _stopp.is_set())
+
         def arbeiten():
             try:
                 gpuzustand.sicherstellen()
@@ -1675,24 +1766,27 @@ class GgufChat:
                 with geliehen(engine), _lock:
                     if hintergrund and _stopp.is_set():
                         raise MotorWeg("Modell wird entladen")
+                    if abbruch.is_set():                 # Esc, während auf die Sperre gewartet wurde
+                        return
                     if not hintergrund and _motor is not None and _motor[2] is engine:
                         _lora_abgleich(engine, _motor[0])
                     engine.chat_format.thinking = (False if denken_aus else
                                                    self._denken_vorgabe(engine) if denkt is None else denkt)
                     engine.denk_budget = denk_budget(self.strength)
                     engine.dry_frei = _dry_marken(sprache)
-                    gen = engine.chat(nachrichten, max_tokens=max_tokens, sampler=self._sampler(engine))
+                    gen = engine.chat(nachrichten, max_tokens=max_tokens, sampler=self._sampler(engine),
+                                      abbruch=gestoppt)
                     bisher = ""
                     import werkzeugsprache
                     strom = werkzeugsprache.Strom(sprache) if sprache is not None else None
                     try:
                         for stueck in gen:
-                            if abbruch.is_set() or (hintergrund and _stopp.is_set()):
+                            if gestoppt():
                                 break
                             if strom is not None:
                                 stueck = strom(stueck)
                             if stueck:
-                                loop.call_soon_threadsafe(schlange.put_nowait, stueck)
+                                senden(stueck)
                             # Nach einem fertigen Werkzeug-Block ist Schluss: was danach käme,
                             # wären vorweggenommene oder erfundene Ergebnisse.
                             bisher += stueck
@@ -1703,13 +1797,17 @@ class GgufChat:
                     finally:
                         gen.close()
                         if strom is not None and (rest := strom.ende()):
-                            loop.call_soon_threadsafe(schlange.put_nowait, rest)
+                            senden(rest)
             except BaseException as exc:                     # an den Aufrufer weiterreichen
                 _DBG.fehler("Erzeugen", exc)
-                if gpuzustand.pruefen(exc):                  # statt der CUDA-Meldung: was jetzt zu tun ist
+                if ist_oom(exc):                             # Grafikspeicher voll: aufräumen, sagen, was hilft
+                    _nach_oom(engine)
+                    exc = RuntimeError(OOM_MELDUNG)
+                elif gpuzustand.pruefen(exc):                # statt der CUDA-Meldung: was jetzt zu tun ist
                     exc = gpuzustand.GpuKaputt()
-                loop.call_soon_threadsafe(schlange.put_nowait, exc)
-            loop.call_soon_threadsafe(schlange.put_nowait, ENDE)
+                senden(exc)
+            finally:
+                senden(ENDE)
 
         faden = threading.Thread(target=arbeiten, daemon=True)
         faden.start()
@@ -1723,7 +1821,9 @@ class GgufChat:
                 yield stueck
         finally:
             abbruch.set()
-            await asyncio.to_thread(faden.join)
+            # begrenzt: ein Stück, das gerade rechnet, hält sonst Anzeige und Not-Stopp fest;
+            # der Faden endet danach von selbst und gibt die Sperre frei
+            await asyncio.to_thread(faden.join, FADEN_WARTEN_S)
 
     async def _einmal(self, system: str, verlauf: list[dict], max_tokens: int = 2048,
                       denken_aus: bool = False, hintergrund: bool = False) -> str:
@@ -2080,7 +2180,7 @@ def motorvergleich(name: str, frage: str = "", n: int = VERGLEICH_TOKEN) -> dict
         "fremd_lesen_tok_s": float(zeiten.get("prompt_per_second") or 0.0),
         "eigen_token_dort": (tok.decode([eigen_ids[stelle]], skip_special=False)
                              if stelle is not None and stelle < len(eigen_ids) else None),
-        "kandidaten": kandidaten, "build": llamareserve.BUILD,
+        "kandidaten": kandidaten, "build": llamareserve.aktiv(),
     }
     _vergleich_ablegen(ergebnis)
     return ergebnis

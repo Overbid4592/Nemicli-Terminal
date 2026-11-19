@@ -13,9 +13,21 @@ from pathlib import Path
 from . import nemicss
 from .laufzeit import AppLaufzeit
 from .layout import Layout
+from .nemijs import intern
 from .nemijs_parser import SyntaxFehler, parsen
 
 NICHT_DA = {"iframe", "video", "audio", "canvas", "object", "embed", "frame", "frameset", "dialog", "portal"}
+
+
+def _ausserhalb(ziel: str) -> bool:
+    """Freigabe (\\\\rechner\\x, auch %5C%5C), Laufwerk, Adresse mit Schema oder Pfad ab der Wurzel – roh und
+    entschlüsselt. Wird nie im Dateisystem nachgesehen: der Blick auf eine Freigabe schickt die Windows-Anmeldung."""
+    from urllib.parse import unquote
+    for t in (ziel, unquote(ziel)):
+        t = t.strip().replace("/", "\\")
+        if t.startswith("\\") or re.match(r"^[a-z][a-z0-9+.-]*:", t, re.I):
+            return True
+    return False
 
 
 def pruefen(ordner: Path) -> tuple[bool, str]:
@@ -28,12 +40,18 @@ def pruefen(ordner: Path) -> tuple[bool, str]:
             parsen(js.read_text(encoding="utf-8", errors="replace"))
         except SyntaxFehler as e:
             funde.append(f"❌ {js.name}: {e}")
+        except Exception as e:
+            funde.append(f"❌ {js.name}: {intern(e)}")
     roh = (ordner / "index.html").read_text(encoding="utf-8", errors="replace")
     for m in re.finditer(r"""(?:src|href)\s*=\s*["']([^"']+)["']""", roh, re.I):
         ziel = m.group(1)
         if re.match(r"^(https?:)?//", ziel, re.I):
             funde.append(f"⚠ Adresse ins Internet: {ziel} – gibt es in NemiView nicht (Datei in den App-Ordner legen)")
-        elif not ziel.startswith(("#", "data:", "javascript:")) and not (ordner / ziel.split("?")[0]).is_file():
+        elif ziel.startswith(("#", "data:", "javascript:")):
+            continue
+        elif _ausserhalb(ziel):
+            funde.append(f"⚠ Verweis aus dem App-Ordner hinaus: {ziel} – NemiView lädt nur Dateien im App-Ordner")
+        elif not (ordner / ziel.split("?")[0]).is_file():
             funde.append(f"❌ Datei fehlt: {ziel}")
     for css in [roh] + [p.read_text(encoding="utf-8", errors="replace") for p in sorted(ordner.rglob("*.css"))]:
         for m in re.finditer(r"([a-z-]+)\s*:", re.sub(r"/\*.*?\*/", "", css, flags=re.S)):
@@ -62,6 +80,8 @@ def pruefen(ordner: Path) -> tuple[bool, str]:
         funktionen = ", ".join(lz.funktionen) or "keine"
     except (OSError, RecursionError) as e:
         return False, f"❌ Die App lässt sich nicht laden: {e}"
+    except Exception as e:                             # läuft im Sitzungsprozess: nie bis zum Aufrufer
+        return False, f"❌ Die App lässt sich nicht laden: {intern(e)}"
     funde = list(dict.fromkeys(funde))[:40]
     fehler = [f for f in funde if f.startswith("❌")]
     kopf = (f"App {ordner.name}: {'✓ läuft in NemiView' if not fehler else f'{len(fehler)} Fehler'}"

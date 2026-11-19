@@ -21,12 +21,22 @@ from datetime import datetime, timedelta
 
 from .nemijs_parser import SyntaxFehler, _zahl_text, parsen
 
+try:
+    import regex as _rx                # kennt timeout= (re nicht): Schutz vor katastrophalem Backtracking
+except ImportError:                    # pragma: no cover
+    _rx = None
+
 MAX_SCHRITTE = 5_000_000         # je Einstieg (Skript, Ereignis, Aufruf)
 MAX_TIEFE = 150                  # JS-Aufrufe ineinander
 MAX_TEXT = 5_000_000             # Zeichen
 MAX_LISTE = 1_000_000            # Einträge
 MAX_ZEITGEBER = 10_000
 REGEX_MAX_EINGABE = 200_000
+REGEX_ZEIT_S = 1.0               # Wanduhr je Regex-Aufruf
+ZEITGEBER_ZEIT_S = 5.0           # Wanduhr für alle Zeitgeber eines Headless-Laufs
+TAKT_ZEIT_S = 0.05               # Viewer: danach warten fällige Zeitgeber auf den nächsten Takt
+# Interne Felder in props: für JS weder les- noch schreibbar.
+INTERN = frozenset({"__daten", "__re", "__zeit", "__pruefe"})
 
 sys.setrecursionlimit(max(sys.getrecursionlimit(), 30_000))
 
@@ -46,6 +56,12 @@ UNDEF = _Undef()
 
 class Grenze(Exception):
     """Rechenbremse, Tiefe oder Größe überschritten – JS kann das nicht abfangen."""
+
+
+def intern(e: BaseException) -> str:
+    """Python-Fehler aus Skript, CSS oder Layout als Konsolentext – Einstiege fangen ihn, statt ihn an den
+    Gastgeber (Qt-Ereignisschleife, Sitzung) durchzureichen."""
+    return f"interner Fehler ({type(e).__name__}: {str(e)[:200]})"
 
 
 class JSFehler(Exception):
@@ -74,6 +90,48 @@ class _Continue(Exception):
 class _Return(Exception):
     def __init__(self, wert):
         self.wert = wert
+
+
+class JSMuster:
+    """Kompilierter regulärer Ausdruck; jeder Aufruf mit Längen- und Zeitgrenze."""
+    __slots__ = ("komp",)
+
+    def __init__(self, komp):
+        self.komp = komp
+
+    @staticmethod
+    def _text(s: str) -> str:
+        if len(s) > REGEX_MAX_EINGABE:
+            raise Grenze("Text zu lang für einen regulären Ausdruck")
+        return s
+
+    def _mit_frist(self, art: str, *args):
+        fn = getattr(self.komp, art)
+        try:
+            if _rx is None:
+                erg = fn(*args)
+            else:
+                erg = fn(*args, timeout=REGEX_ZEIT_S)
+            if art != "finditer":
+                return erg
+            out = []                             # Frist gilt für alle Treffer zusammen
+            for m in erg:
+                out.append(m)
+                if len(out) > MAX_LISTE:
+                    raise Grenze("Liste zu groß")
+            return out
+        except TimeoutError:
+            raise Grenze("Regulärer Ausdruck rechnet zu lange (katastrophales Backtracking?)") from None
+
+    def search(self, s: str, pos: int = 0):
+        return self._mit_frist("search", self._text(s), pos)
+
+    def finditer(self, s: str) -> list:
+        """Alle Treffer – vollständig gesammelt, bevor JS-Rückrufe laufen (deren Zeit zählt nicht mit)."""
+        return self._mit_frist("finditer", self._text(s))
+
+    def split(self, s: str) -> list:
+        return self._mit_frist("split", self._text(s))
 
 
 # ---------------------------------------------------------------------------
@@ -577,21 +635,30 @@ class NemiJS:
             return True
         return False
 
-    def zeitgeber_laufen(self, bis_ms: float = 10_000, max_anzahl: int = 10_000) -> None:
-        """Headless: alle Zeitgeber bis bis_ms (virtuelle Zeit) abarbeiten."""
+    def zeitgeber_laufen(self, bis_ms: float = 10_000, max_anzahl: int = 10_000, frist: float | None = None) -> None:
+        """Headless: alle Zeitgeber bis bis_ms (virtuelle Zeit) abarbeiten.
+
+        frist (time.monotonic): Wanduhr-Grenze für den ganzen Lauf – die Rechenbremse gilt je Zeitgeber, ohne
+        Gesamtgrenze würden viele schwere Zeitgeber den Aufrufer beliebig lange blockieren."""
         ende = self.jetzt() + bis_ms
+        if frist is None:
+            frist = time.monotonic() + ZEITGEBER_ZEIT_S
         for _ in range(max_anzahl):
             if not self.zeitgeber or self.zeitgeber[0][0] > ende:
                 break
+            if time.monotonic() > frist:
+                raise Grenze("Zeitgeber: Zeitbudget aufgebraucht")
             self.einstieg()
             if not self.naechster_zeitgeber(springen=True):
                 break
 
     def faellige_ausfuehren(self) -> None:
-        """Viewer: alles ausführen, was jetzt (echte Zeit) fällig ist."""
+        """Viewer: ausführen, was jetzt (echte Zeit) fällig ist – höchstens TAKT_ZEIT_S lang, der Rest im
+        nächsten Takt (sonst sperren viele schwere Zeitgeber die Oberfläche)."""
+        frist = time.monotonic() + TAKT_ZEIT_S
         for _ in range(1000):
             self.einstieg()
-            if not self.naechster_zeitgeber():
+            if not self.naechster_zeitgeber() or time.monotonic() > frist:
                 break
 
     # -- Eigenschaften ------------------------------------------------------------
@@ -603,9 +670,11 @@ class NemiJS:
             k = schluessel(key)
             if k == "length":
                 return float(len(obj.items))
-            return obj.suchen(k)
+            return UNDEF if k in INTERN else obj.suchen(k)
         if isinstance(obj, JSObject):
             k = schluessel(key)
+            if k in INTERN:
+                return UNDEF
             if isinstance(obj, (JSFunktion, Nativ)) and k == "name":
                 return obj.props.get("name", obj.name or "")
             if isinstance(obj, JSFunktion) and k == "prototype" and "prototype" not in obj.props:
@@ -656,12 +725,12 @@ class NemiJS:
                 del obj.items[n:]
                 obj.items.extend([UNDEF] * (n - len(obj.items)))
                 return
-            if not obj.eingefroren:
+            if not obj.eingefroren and k not in INTERN:
                 obj.props[k] = wert
             return
         if isinstance(obj, JSObject):
             k = schluessel(key)
-            if k == "__proto__" or obj.eingefroren:
+            if k == "__proto__" or k in INTERN or obj.eingefroren:
                 return                                        # keine Prototyp-Verschmutzung
             obj.props[k] = wert
             return
@@ -1292,7 +1361,7 @@ class NemiJS:
                     i = _index(key)
                     if i < len(obj.items):
                         obj.items[i] = UNDEF
-                elif isinstance(obj, JSObject) and not obj.eingefroren:
+                elif isinstance(obj, JSObject) and not obj.eingefroren and key not in INTERN:
                     obj.props.pop(key, None)
             return True
         v = self.wert(e["e"], scope)
@@ -1426,7 +1495,7 @@ class NemiJS:
                 self.werfen("SyntaxError", "„=“ im Objekt nur beim Zerlegen")
             name, berechnet = k
             key = schluessel(self.wert(name, scope)) if berechnet else name
-            if key == "__proto__":
+            if key == "__proto__" or key in INTERN:
                 continue
             v = self.wert(wert, scope)
             if isinstance(v, JSFunktion) and not v.name:
@@ -1508,21 +1577,23 @@ class NemiJS:
     # -- Regulärer Ausdruck ------------------------------------------------------------------
     def regex(self, muster: str, flags: str) -> JSObject:
         py = muster.replace("(?<", "(?P<").replace("(?P<=", "(?<=").replace("(?P<!", "(?<!").replace("[^]", r"[\s\S]")
-        py = re.sub(r"\\u\{([0-9a-fA-F]+)\}", lambda m: chr(int(m.group(1), 16)), py)
+        py = re.sub(r"\\u\{([0-9a-fA-F]{1,6})\}",
+                    lambda m: re.escape(chr(n)) if (n := int(m.group(1), 16)) <= 0x10FFFF else m.group(0), py)
         py = re.sub(r"\\k<(\w+)>", r"(?P=\1)", py)
+        modul = _rx if _rx is not None else re
         f = 0
         if "i" in flags:
-            f |= re.I
+            f |= modul.I
         if "m" in flags:
-            f |= re.M
+            f |= modul.M
         if "s" in flags:
-            f |= re.S
+            f |= modul.S
         try:
-            komp = re.compile(py, f)
-        except re.error as e:
+            komp = modul.compile(py, f)
+        except (modul.error, ValueError, OverflowError) as e:
             self.werfen("SyntaxError", f"Ungültiger regulärer Ausdruck /{muster}/: {e}")
         return JSObject(self.protos["RegExp"], "RegExp", {"source": muster, "flags": flags, "global": "g" in flags,
-                                                          "lastIndex": 0.0, "__re": komp})
+                                                          "lastIndex": 0.0, "__re": JSMuster(komp)})
 
     # -- Aufbau der Umgebung -------------------------------------------------------------------
     def _aufbauen(self):

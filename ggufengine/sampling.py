@@ -1,6 +1,6 @@
-"""Token sampling: temperature, top-k, top-p, min-p, repetition / presence penalty,
-DRY ("don't repeat yourself") against phrases the model copies from its own earlier answers;
-the recommended values per model (`empfohlen`)."""
+"""Token-Sampling: Temperature, top-k, top-p, min-p, Repetition-/Presence-Penalty,
+DRY („don't repeat yourself“) gegen Phrasen, die das Modell aus seinen eigenen früheren Antworten kopiert;
+die empfohlenen Werte je Modell (`empfohlen`)."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,9 +18,9 @@ class SamplerConfig:
     repeat_penalty: float = 1.0
     presence_penalty: float = 0.0
     repeat_last_n: int = 64
-    # DRY: if the tokens just generated repeat an earlier stretch of the model's own
-    # output, the token that followed there is penalised by
-    # multiplier * base ** (match_length - allowed_length); 0 = off
+    # DRY: Wiederholen die gerade erzeugten Tokens einen früheren Abschnitt der eigenen Ausgabe
+    # des Modells, erhält das Token, das dort folgte, die Penalty
+    # multiplier * base ** (match_length - allowed_length); 0 = aus
     dry_multiplier: float = 0.0
     dry_base: float = 1.75
     dry_allowed_length: int = 2
@@ -92,14 +92,15 @@ def empfohlen(metadata: dict, fmt: str, arch: str, denken: bool, eigene=None, **
 
 
 def dry_penalties(history, own, breaker, cfg: SamplerConfig, max_match: int = 64, word_start=None) -> dict:
-    """{token: penalty} for the next token.
+    """{token: penalty} für das nächste Token.
 
-    history: token ids (context so far); own: per position, True if the model generated
-    it; breaker: bool array over the vocabulary – such tokens end a match (newlines,
-    ':', '"', '*', special tokens).  Only stretches of the model's own output count:
-    copying from the prompt, the user or a tool result is never penalised.
-    word_start: bool array over the vocabulary; if given, only tokens that begin a word
-    are penalised – a penalty inside a word only makes the model misspell it."""
+    history: Token-ids (bisheriger Kontext); own: je Position True, wenn das Modell sie
+    erzeugt hat; breaker: bool-Array über das Vokabular – solche Tokens beenden einen Treffer
+    (Zeilenumbrüche, ':', '"', '*', Spezial-Tokens).  Nur Abschnitte der eigenen Ausgabe des
+    Modells zählen: Kopieren aus dem Prompt, vom Nutzer oder aus einem Tool-Ergebnis wird nie
+    bestraft.
+    word_start: bool-Array über das Vokabular; wenn angegeben, werden nur Tokens bestraft, die ein
+    Wort beginnen – eine Penalty mitten im Wort bringt das Modell nur dazu, es falsch zu schreiben."""
     import numpy as np
     n = len(history)
     if n < 2 or cfg.dry_multiplier <= 0:
@@ -111,7 +112,7 @@ def dry_penalties(history, own, breaker, cfg: SamplerConfig, max_match: int = 64
     brk = breaker[h]
     if not o[-1] or brk[-1]:
         return {}
-    # earlier positions j whose predecessor equals the last token; h[j] followed there
+    # frühere Positionen j, deren Vorgänger dem letzten Token gleicht; h[j] folgte dort
     j = np.nonzero(h[:-1] == h[-1])[0] + 1
     j = j[o[j - 1] & o[j] & ~brk[j - 1]]
     if j.size == 0:
@@ -119,10 +120,10 @@ def dry_penalties(history, own, breaker, cfg: SamplerConfig, max_match: int = 64
     laenge = np.ones(j.size, dtype=np.int64)
     aktiv = np.arange(j.size)
     for k in range(1, max_match):
-        b = m - 1 - k                                 # position in the current tail
+        b = m - 1 - k                                 # Position im aktuellen Ende
         if b < 0 or not o[b] or brk[b] or aktiv.size == 0:
             break
-        a = j[aktiv] - 1 - k                          # same offset in the earlier stretch
+        a = j[aktiv] - 1 - k                          # gleicher Abstand im früheren Abschnitt
         ok = (a >= 0) & (a < b)
         ok[ok] &= (h[a[ok]] == h[b]) & o[a[ok]] & ~brk[a[ok]]
         aktiv = aktiv[ok]
@@ -141,7 +142,7 @@ def dry_penalties(history, own, breaker, cfg: SamplerConfig, max_match: int = 64
 
 class Sampler:
     def __init__(self, cfg: SamplerConfig, device, n_vocab: Optional[int] = None):
-        """n_vocab: tokens the tokenizer knows – output rows beyond it (padding) are never chosen."""
+        """n_vocab: Tokens, die der Tokenizer kennt – Ausgabezeilen darüber hinaus (Padding) werden nie gewählt."""
         self.cfg = cfg
         self.n_vocab = n_vocab
         self.gen = torch.Generator(device=device)
@@ -172,15 +173,19 @@ class Sampler:
                 vals = torch.where(vals > 0, vals / cfg.repeat_penalty, vals * cfg.repeat_penalty)
             logits[recent] = vals - cfg.presence_penalty
         if cfg.temperature <= 0:
-            return int(torch.argmax(logits).item())
+            bester = torch.argmax(logits)
+            # NaN gewinnt argmax: ohne Prüfung käme Müll bis max_tokens (wie unten bei T > 0)
+            if not bool(torch.isfinite(logits[bester])):
+                raise RuntimeError("model produced invalid values (NaN/Inf) – generation stopped")
+            return int(bester.item())
 
-        # work on the top-k candidates only (k = vocab size if top-k is disabled)
+        # nur mit den top-k-Kandidaten arbeiten (k = Vokabulargröße, wenn top-k aus ist)
         k = cfg.top_k if 0 < cfg.top_k < logits.numel() else logits.numel()
-        vals, idx = torch.topk(logits, k)                 # sorted descending
+        vals, idx = torch.topk(logits, k)                 # absteigend sortiert
         probs = torch.softmax(vals / cfg.temperature, dim=-1)
         if cfg.min_p > 0:
             probs = torch.where(probs < cfg.min_p * probs[0], torch.zeros_like(probs), probs)
-        if 0 < cfg.top_p < 1:
+        if cfg.top_p < 1:                                 # 0 = nur das beste Token (wie llama.cpp)
             cum = torch.cumsum(probs, dim=-1)
             probs = torch.where(cum - probs > cfg.top_p, torch.zeros_like(probs), probs)
         if not bool(torch.isfinite(probs).all()):        # multinomial bräche sonst die CUDA-Sitzung ab

@@ -14,6 +14,7 @@ from __future__ import annotations
 import codecs
 import ctypes
 import os
+import queue
 import subprocess
 import threading
 from ctypes import wintypes as w
@@ -28,6 +29,7 @@ _STD_NUMMERN = (w.DWORD(-10 & 0xFFFFFFFF).value, w.DWORD(-11 & 0xFFFFFFFF).value
                 w.DWORD(-12 & 0xFFFFFFFF).value)       # STD_INPUT/OUTPUT/ERROR_HANDLE
 _STD_LOCK = threading.Lock()
 INFINITE = 0xFFFFFFFF
+SCHREIB_STUECK = 64 * 1024                # so viel Wartendes geht höchstens in ein WriteFile
 
 
 class _COORD(ctypes.Structure):
@@ -75,6 +77,9 @@ def _signaturen() -> None:
     k.GetExitCodeProcess.argtypes = [w.HANDLE, ctypes.POINTER(w.DWORD)]
     k.TerminateProcess.argtypes = [w.HANDLE, w.UINT]
     k.CloseHandle.argtypes = [w.HANDLE]
+    k.OpenThread.argtypes = [w.DWORD, w.BOOL, w.DWORD]
+    k.OpenThread.restype = w.HANDLE
+    k.CancelSynchronousIo.argtypes = [w.HANDLE]
     k.GetStdHandle.argtypes = [w.DWORD]
     k.GetStdHandle.restype = w.HANDLE
     k.SetStdHandle.argtypes = [w.DWORD, w.HANDLE]
@@ -107,6 +112,9 @@ class Pty:
         self._aus_lesen = w.HANDLE()          # wir lesen die Ausgabe hier heraus
         self._prozess = _PROCESS_INFORMATION()
         self._zu = threading.Lock()
+        self._schreib_zu = threading.Lock()   # WriteFile und Schließen des Eingabe-Handles schließen sich aus
+        self._schlange: queue.SimpleQueue = queue.SimpleQueue()
+        self._schreiber: threading.Thread | None = None
         self._geschlossen = False
         self._handles_zu = threading.Lock()   # Prozess-Handle erst schließen, wenn niemand mehr darauf wartet
         self._handles_frei = False
@@ -140,6 +148,8 @@ class Pty:
         self.pid = self._prozess.dwProcessId
         self._leser = threading.Thread(target=self._lesen, name="nemicli-pty-lesen", daemon=True)
         self._leser.start()
+        self._schreiber = threading.Thread(target=self._schreiben_lauf, name="nemicli-pty-schreiben", daemon=True)
+        self._schreiber.start()
         threading.Thread(target=self._warten, name="nemicli-pty-warten", daemon=True).start()
 
     def _prozess_starten(self, befehl: list[str], ordner: str | None, env: dict | None) -> None:
@@ -208,15 +218,38 @@ class Pty:
                 _k32.CloseHandle(self._aus_lesen)
 
     def schreiben(self, text: str) -> None:
-        if self._geschlossen or not text:
-            return
-        daten = text.encode("utf-8")
+        """Kehrt sofort zurück: ein eigener Faden schreibt in Reihenfolge (WriteFile blockiert, solange das
+        Programm seine Eingabe nicht liest)."""
+        if text and not self._geschlossen:
+            self._schlange.put(text.encode("utf-8", "replace"))
+
+    def _schreiben_lauf(self) -> None:
         geschrieben = w.DWORD()
-        _k32.WriteFile(self._ein_schreiben, daten, len(daten), ctypes.byref(geschrieben), None)
+        while True:
+            daten = self._schlange.get()
+            if daten is None:
+                return
+            stuecke = [daten]
+            groesse = len(daten)
+            while groesse < SCHREIB_STUECK:           # Wartendes in einem Rutsch, Reihenfolge bleibt
+                try:
+                    mehr = self._schlange.get_nowait()
+                except queue.Empty:
+                    break
+                if mehr is None:
+                    self._schlange.put(None)
+                    break
+                stuecke.append(mehr)
+                groesse += len(mehr)
+            daten = b"".join(stuecke)
+            with self._schreib_zu:                # Handle nie nach dem Schließen nutzen
+                if not self._geschlossen:
+                    _k32.WriteFile(self._ein_schreiben, daten, len(daten), ctypes.byref(geschrieben), None)
 
     def groesse(self, spalten: int, zeilen: int) -> None:
-        if not self._geschlossen:
-            _k32.ResizePseudoConsole(self._hpc, _COORD(max(1, spalten), max(1, zeilen)))
+        with self._zu:
+            if not self._geschlossen:
+                _k32.ResizePseudoConsole(self._hpc, _COORD(max(1, spalten), max(1, zeilen)))
 
     def laeuft(self) -> bool:
         return self.exitcode is None
@@ -228,7 +261,20 @@ class Pty:
                 return
             self._geschlossen = True
             _k32.ClosePseudoConsole(self._hpc)
-            _k32.CloseHandle(self._ein_schreiben)
+        # Ein WriteFile, das noch hängt, endet mit der Konsole; sonst wird es abgebrochen.
+        frei = self._schreib_zu.acquire(timeout=2.0)
+        if not frei and self._schreiber is not None and self._schreiber.native_id:
+            griff = _k32.OpenThread(0x0001, False, self._schreiber.native_id)      # THREAD_TERMINATE
+            if griff:
+                _k32.CancelSynchronousIo(griff)
+                _k32.CloseHandle(griff)
+            frei = self._schreib_zu.acquire(timeout=2.0)
+        if frei:
+            try:
+                _k32.CloseHandle(self._ein_schreiben)
+            finally:
+                self._schreib_zu.release()
+        self._schlange.put(None)
 
     def beenden(self, warten_s: float = 3.0) -> None:
         """Konsole schließen (das Programm bekommt „Fenster zu“) und notfalls hart beenden."""

@@ -9,9 +9,9 @@ Die Zeit-Schichten kennen nur wenige Bilder am Stück (8 bis 32). Längere Video
 Fenstern, deren Vorhersagen je Schritt gemittelt werden. Ein Startbild (z. B. von Krea 2) hält die Figur:
 alle Bilder beginnen als verrauschtes Startbild, das erste bleibt es bis zum Schluss.
 
-Ordner je Modell unter Models/Videomodelle/: der Checkpoint (.safetensors) und das Bewegungs-Modul – dort,
-in `bewegung/` im Modellordner oder geteilt in Models/Videomodelle/bewegung/. Der CLIP-Tokenizer
-(vocab.json + merges.txt) liegt in `tokenizer_clip/` (auch der von Models/Bildmodelle gilt).
+Ordner je Modell unter KI-Modelle/KI-Video/Videomodell/: der Checkpoint (.safetensors) und das Bewegungs-Modul –
+dort, in `bewegung/` im Modellordner oder geteilt in Videomodell/bewegung/. Der CLIP-Tokenizer
+(vocab.json + merges.txt) liegt in `tokenizer_clip/` (auch der der Bildmodelle gilt).
 """
 
 from __future__ import annotations
@@ -21,6 +21,7 @@ import json
 import re
 from pathlib import Path
 
+import bildmotoren
 from bildmotoren.gemeinsam import aufraeumen, aus_ram
 from bildmotoren.gewichte import Quelle, namen, ohne_praefix
 
@@ -122,7 +123,7 @@ def teile(m: dict, wurzeln: list[Path]) -> dict:
             break
     tokenizer = None
     for o in [m["ordner"] / "tokenizer_clip", m["ordner"]] + [w / "tokenizer_clip" for w in wurzeln] \
-            + [w.parent / "Bildmodelle" / "tokenizer_clip" for w in wurzeln]:
+            + [b / "tokenizer_clip" for b in bildmotoren.ORDNER]:
         if (o / "tokenizer.json").is_file() or ((o / "vocab.json").is_file() and (o / "merges.txt").is_file()):
             tokenizer = o
             break

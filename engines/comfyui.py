@@ -118,7 +118,9 @@ def set_chosen_model(model_name: str | None) -> None:
 
 
 def _client(timeout: float):
-    return httpx.Client(base_url=host(), timeout=timeout)
+    import providers
+    adresse = host()
+    return httpx.Client(base_url=adresse, timeout=timeout, trust_env=providers.proxy_erlaubt(adresse))
 
 
 # ===========================================================================
@@ -220,7 +222,7 @@ def schedulers() -> list[str]:
 
 
 def _gpu_name(roh: str) -> str:
-    """ComfyUI meldet 'cuda:0 NVIDIA GeForce RTX 5060 Ti : cudaMallocAsync'.
+    """ComfyUI meldet 'cuda:0 <Kartenname> : cudaMallocAsync'.
     Uns interessiert der Kartenname in der Mitte, nicht der Speicher-Modus."""
     teile = [t.strip() for t in roh.split(":")]
     if len(teile) >= 3:

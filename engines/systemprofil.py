@@ -233,7 +233,7 @@ def _registry_karten() -> list[Grafikkarte]:
 
 def _nvidia_karten() -> tuple[list[Grafikkarte], float]:
     import setup as S
-    aus = S._run(["nvidia-smi", "--query-gpu=name,memory.total,compute_cap,driver_version",
+    aus = S._run([S.nvidia_smi(), "--query-gpu=name,memory.total,compute_cap,driver_version",
                   "--format=csv,noheader,nounits"])
     karten = []
     for zeile in aus.strip().splitlines():
@@ -245,7 +245,7 @@ def _nvidia_karten() -> tuple[list[Grafikkarte], float]:
         karten.append(Grafikkarte(name=teile[0], hersteller="nvidia", vram_mb=vram, cuda_cap=cap, treiber=teile[3]))
     cuda = 0.0
     if karten:
-        m = re.search(r"CUDA(?:\s+UMD)?\s+Version:\s*([\d.]+)", S._run(["nvidia-smi"]))
+        m = re.search(r"CUDA(?:\s+UMD)?\s+Version:\s*([\d.]+)", S._run([S.nvidia_smi()]))
         cuda = float(m.group(1)) if m else 0.0
     return karten, cuda
 

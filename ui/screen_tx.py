@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import re
 import threading
 import time
@@ -84,7 +85,18 @@ def _uebung_gewuenscht() -> bool:
         return bool(config.load().get("uebung", True))
     except Exception:
         return True
-from screen import terminal_safe, maus_tracking_aus, _checkpoint_menu, _persona_menu
+from screen import terminal_safe as _terminal_safe, maus_tracking_aus, _checkpoint_menu, _persona_menu
+
+
+def emoji_ganz() -> bool:
+    """Im eigenen NemiCLI-Fenster zählen Fenster (terminal_fenster) und Oberfläche (rich/Textual) Emoji als
+    Graphem-Gruppen: ❤️, 👍🏻, 👩‍💻 und 1️⃣ bleiben dort vollständig und bunt. Andere Terminals bekommen die
+    vereinfachte Form, deren Breite überall gleich ist."""
+    return os.environ.get("NEMICLI_FENSTER") == "1"
+
+
+def terminal_safe(text: str) -> str:
+    return _terminal_safe(text, emoji_ganz())
 
 _SCHIRM_BG = "#0c0d14"       # Grundfarbe; das eigene Fenster lässt Zellen in dieser Farbe frei
 _COMPOSER_BG = "#11131d"
@@ -103,6 +115,24 @@ _MAX_COMPLETIONS = 10         # sichtbare Zeilen im /-Menü, der Rest wird gebl�
 # unverändert; sie liefern (style, text)-Tupel, die wir hier übersetzen)
 # ---------------------------------------------------------------------------
 _STYLE_CACHE: dict[str, Style] = {}
+
+
+def _taetig(art: str | None) -> None:
+    """Status neben dem Bild der Persönlichkeit (startseite.taetig); Fehler stören den Zug nicht."""
+    try:
+        import startseite
+        startseite.taetig(art)
+    except Exception:
+        pass
+
+
+def _figur(tun) -> None:
+    """Figur der Persönlichkeit im eigenen Fenster (ui/figur.py); Fehler stören den Zug nicht."""
+    try:
+        import figur
+        tun(figur)
+    except Exception:
+        pass
 
 
 def pt_style(spec: str) -> Style:
@@ -159,26 +189,72 @@ _UEBERHANG = _ueberhang_muster()
 _UEBERHANG_LUECKE = re.compile("(" + _UEBERHANG.pattern + ") ")     # beim Kopieren wieder heraus
 
 
+def _emoji_muster() -> tuple[re.Pattern, re.Pattern]:
+    """Für emoji_ganz: Zeichen aus _UEBERHANG, die mit U+FE0F ein Emoji von zwei Zellen werden (bekommen den
+    Zusatz, wenn keine Variante folgt), und die übrigen (behalten die Lücke)."""
+    from rich.cells import cell_len
+    zeichen = _UEBERHANG.pattern[1:-1]
+    emoji = "".join(c for c in zeichen if cell_len(c + "\ufe0f") == 2)
+    rest = "".join(c for c in zeichen if c not in emoji)
+    return re.compile(f"[{emoji}](?![\ufe0e\ufe0f])"), re.compile(f"[{rest}]" if rest else r"(?!x)x")
+
+
+_EMOJI_BUNT, _UEBERHANG_REST = _emoji_muster()
+
+
 _PLATZHALTER = re.compile(r"[\ue000-\ue1ff]")              # Bildstellen der Startseite (terminal_fenster)
 
 
+def _zusaetze(plain: str) -> list[tuple[int, str]]:
+    """(Stelle, Zusatz) für ueberhang: Lücke hinter Symbolen, die breiter gemalt als gezählt werden; mit
+    emoji_ganz stattdessen U+FE0F, damit das Symbol bunt und mit seiner wahren Breite erscheint."""
+    if not emoji_ganz():
+        return [(m.end(), " ") for m in _UEBERHANG.finditer(plain)]
+    return sorted([(m.end(), "\ufe0f") for m in _EMOJI_BUNT.finditer(plain)]
+                  + [(m.end(), " ") for m in _UEBERHANG_REST.finditer(plain)])
+
+
 def ueberhang(text: str) -> str:
-    return _UEBERHANG.sub(lambda m: m.group(0) + " ", text) if text and not text.isascii() else text
+    if not text or text.isascii():
+        return text
+    teile, vorher = [], 0
+    for stelle, zusatz in _zusaetze(text):
+        teile += [text[vorher:stelle], zusatz]
+        vorher = stelle
+    return "".join(teile) + text[vorher:] if teile else text
 
 
 def _ueberhang_text(t: Text) -> Text:
-    """Wie ueberhang, aber für rich.Text mit Stilen: die Lücke erbt den Stil davor."""
-    stellen = [m.end() for m in _UEBERHANG.finditer(t.plain)]
-    if not stellen:
+    """Wie ueberhang, aber für rich.Text mit Stilen: der Zusatz gehört zum Abschnitt seines Zeichens. U+FE0F
+    muss im selben Abschnitt liegen – getrennt zählte ❤ eine Zelle und U+FE0F keine, zusammen sind es zwei."""
+    zusaetze = _zusaetze(t.plain) if t.plain and not t.plain.isascii() else []
+    if not zusaetze:
         return t
-    teile = t.divide(stellen)
-    out = Text(style=t.style, justify=t.justify, overflow=t.overflow, no_wrap=t.no_wrap,
-               end=t.end, tab_size=t.tab_size)
-    for i, teil in enumerate(teile):
-        out.append_text(teil)
-        if i < len(stellen):
-            out.append(" ", style=next((s.style for s in reversed(teil.spans) if s.end >= len(teil)), None))
-    return out
+    from bisect import bisect_right
+    from rich.text import Span
+    stellen = [s for s, _ in zusaetze]
+    teile, vorher = [], 0
+    for stelle, zusatz in zusaetze:
+        teile += [t.plain[vorher:stelle], zusatz]
+        vorher = stelle
+    plain = "".join(teile) + t.plain[vorher:]
+    breite = [0]
+    for _s, zusatz in zusaetze:
+        breite.append(breite[-1] + len(zusatz))
+
+    def neu(i: int) -> int:
+        """Zusätze an Stelle <= i hängen an Zeichen vor i: am Anfang eines Abschnitts davor, an seinem Ende darin."""
+        return i + breite[bisect_right(stellen, i)]
+
+    spans = [Span(neu(s.start), neu(s.end), s.style) for s in t.spans]
+    return Text(plain, style=t.style, justify=t.justify, overflow=t.overflow, no_wrap=t.no_wrap,
+                end=t.end, tab_size=t.tab_size, spans=spans)
+
+
+def _sicher(text: str) -> str:
+    """terminal_safe plus ohne Bild-Platzhalter: die gehören nur zu startseite.Bildstelle."""
+    text = terminal_safe(text)
+    return text if not text or text.isascii() else _PLATZHALTER.sub("", text)
 
 
 def fragments_to_text(fragments) -> Text:
@@ -187,7 +263,7 @@ def fragments_to_text(fragments) -> Text:
     for frag in fragments or []:
         style, text = frag[0], frag[1]
         if text:
-            out.append(ueberhang(terminal_safe(text)), style=pt_style(style))
+            out.append(ueberhang(_sicher(text)), style=pt_style(style))
     return out
 
 
@@ -199,14 +275,16 @@ def sanitize(renderable):
     Terminal und rich gleich sehen. Deckt die Typen ab, die NemiCLI druckt."""
     try:
         if isinstance(renderable, str):
-            return ueberhang(terminal_safe(renderable))
+            return ueberhang(_sicher(renderable))
         if isinstance(renderable, Text):
-            plain = terminal_safe(renderable.plain)
+            if getattr(renderable, "BILDSTELLE", False):      # echte Bildstelle der Startseite
+                return renderable
+            plain = _sicher(renderable.plain)
             if plain != renderable.plain:
                 renderable.plain = plain
             return _ueberhang_text(renderable)
         if isinstance(renderable, Markdown):
-            src = ueberhang(terminal_safe(renderable.markup))
+            src = ueberhang(_sicher(renderable.markup))
             if src != renderable.markup:
                 # type(...) statt Markdown: sonst verliert ein NemiMarkdown beim
                 # Entschaerfen der Emoji seine schoenen Code-Bloecke.
@@ -219,7 +297,7 @@ def sanitize(renderable):
         if isinstance(renderable, Panel):
             renderable.renderable = sanitize(renderable.renderable)
             if isinstance(renderable.title, str):
-                renderable.title = ueberhang(terminal_safe(renderable.title))
+                renderable.title = ueberhang(_sicher(renderable.title))
             elif isinstance(renderable.title, Text):
                 renderable.title = sanitize(renderable.title)
             return renderable
@@ -274,10 +352,11 @@ class _SelectableRich(RichVisual):
             x = 0
             segs = []
             for seg in strip:
-                meta = Style.from_meta({"offset": (x, y)})
-                segs.append(Segment(seg.text, (seg.style + meta) if seg.style else meta,
-                                    seg.control))
-                x += len(seg.text)
+                for stueck in _graphem_stuecke(seg.text):
+                    meta = Style.from_meta({"offset": (x, y)})
+                    segs.append(Segment(stueck, (seg.style + meta) if seg.style else meta,
+                                        seg.control))
+                    x += len(stueck)
             annotated.append(Strip(segs, strip.cell_length))
         strips = annotated
         sel, sel_style = options.selection, options.selection_style
@@ -298,6 +377,55 @@ class _SelectableRich(RichVisual):
             mitte = Strip([Segment(s.text, markieren(s.style), s.control) for s in strip.crop(x0, x1)])
             out.append(Strip.join([strip.crop(0, x0), mitte, strip.crop(x1)]))
         return out
+
+
+def _graphem_stuecke(text: str) -> list[str]:
+    """Text in Stücke für die Offset-Markierung: Graphem-Gruppen aus mehreren Zeichen (❤️, 👩‍💻, 👍🏻) einzeln.
+    Textual rechnet die Maus-Spalte Zeichen für Zeichen in einen Offset um und zählt dabei U+FE0F, Verbinder
+    und Hautton mit ihrer eigenen Breite – innerhalb eines Stücks aus einer Gruppe stimmt dagegen die Spalte."""
+    if not text or text.isascii():
+        return [text]
+    try:
+        from rich.cells import split_graphemes
+        spannen, _ = split_graphemes(text)
+    except Exception:
+        return [text]
+    if all(e - a == 1 for a, e, _w in spannen):
+        return [text]
+    stuecke, lauf = [], ""
+    for a, e, _w in spannen:
+        if e - a == 1:
+            lauf += text[a]
+            continue
+        if lauf:
+            stuecke.append(lauf)
+            lauf = ""
+        stuecke.append(text[a:e])
+    if lauf:
+        stuecke.append(lauf)
+    return stuecke
+
+
+def _ganze_gruppen(selection, text: str):
+    """Auswahl auf Graphem-Grenzen erweitern: Anfang und Ende mitten in ❤️ oder 👩‍💻 nehmen die ganze Gruppe."""
+    try:
+        from rich.cells import split_graphemes
+    except Exception:
+        return selection
+    zeilen = text.splitlines()
+
+    def grenze(stelle, nach_vorn: bool):
+        if stelle is None or not 0 <= stelle.y < len(zeilen):
+            return stelle
+        zeile, x = zeilen[stelle.y], stelle.x
+        if zeile.isascii() or not 0 < x < len(zeile):
+            return stelle
+        for a, e, _w in split_graphemes(zeile)[0]:
+            if a < x < e:
+                return Offset(a if nach_vorn else e, stelle.y)
+        return stelle
+
+    return Selection(grenze(selection.start, True), grenze(selection.end, False))
 
 
 def _zellen(strip, zeichen: int) -> int:
@@ -380,7 +508,8 @@ class _Block(Static):
 
     def get_selection(self, selection):
         try:
-            raw = selection.extract(self._plain_lines())
+            plain = self._plain_lines()
+            raw = _ganze_gruppen(selection, plain).extract(plain)
         except Exception:
             return None
         # Kopiert wird nur der geschriebene Text: Panel-Ränder und Nachlauf-
@@ -623,7 +752,7 @@ def _modus_text() -> Text:
     p = ui.THEMES[ui.current_theme()]
     t = Text(no_wrap=True, overflow="crop")
     t.append("  Shift+Tab", style=f"{p['accent']}")
-    t.append(f" Modus: {modes.label()}", style="#7d8590")
+    t.append(f" Modus: {modes.anzeige()}", style=ui.leise())
     return t
 
 
@@ -672,8 +801,8 @@ class _SelectScreen(_NemiModal):
         with Vertical():
             yield Static(Text(terminal_safe(self.question), style="bold"), id="q")
             for i, (_val, label) in enumerate(self.options):
-                yield Button(f"  {i + 1}. {terminal_safe(str(label))}", id=f"opt{i}",
-                             compact=True)          # eine Zeile, ohne 3D-Rand
+                yield Button(Text(f"  {i + 1}. {terminal_safe(str(label))}"), id=f"opt{i}",
+                             compact=True)          # Text statt str: kein Markup; eine Zeile, ohne 3D-Rand
             yield Static(id="hint")
             yield Static(id="modus")
 
@@ -760,7 +889,7 @@ class _PaletteScreen(_NemiModal):
         p = ui.THEMES[ui.current_theme()]
         zeilen = []
         if not self.treffer:
-            zeilen.append(Text("  nichts gefunden – anders schreiben oder Esc", style="#7d8590"))
+            zeilen.append(Text("  nichts gefunden – anders schreiben oder Esc", style=ui.leise()))
         for i, e in enumerate(self.treffer):
             aktiv = i == self.sel
             klick = Style(meta={"@click": f"screen.waehlen({i})"})
@@ -769,7 +898,7 @@ class _PaletteScreen(_NemiModal):
             t.append(f"{e.zeile:<26}", style=(Style(color=p["accent"], bold=True) if aktiv
                                               else Style(color="#e4e7f2")) + klick)
             t.append("  " + terminal_safe(e.beschreibung),
-                     style=Style(color="#9298ac" if aktiv else "#6b7085") + klick)
+                     style=Style(color="#c3c8d4" if aktiv else ui.leise()) + klick)
             zeilen.append(t)
         self.query_one("#treffer", Static).update(Group(*zeilen))
 
@@ -976,7 +1105,7 @@ class _InlineSelect(Vertical, can_focus=True):
     def compose(self) -> ComposeResult:
         yield Static(Text(terminal_safe(self.question), style="bold"), id="q")
         for i, (_val, label) in enumerate(self.options):
-            yield Button(f"  {i + 1}. {terminal_safe(str(label))}", id=f"opt{i}", compact=True)
+            yield Button(Text(f"  {i + 1}. {terminal_safe(str(label))}"), id=f"opt{i}", compact=True)
 
     def on_mount(self) -> None:
         self._draw()
@@ -1251,7 +1380,7 @@ class _NemiApp(App):
     #suchzeile {{ height: 1; display: none; background: {_COMPOSER_BG}; }}
     #verlaufsuche {{ width: 1fr; height: 1; border: none; padding: 0 1; background: #1c1f30; }}
     #verlaufsuche:focus {{ border: none; }}
-    #suchzahl {{ width: auto; min-width: 14; height: 1; padding: 0 1; color: #7d8590; background: {_COMPOSER_BG}; }}
+    #suchzahl {{ width: auto; min-width: 14; height: 1; padding: 0 1; color: {ui.LEISE}; background: {_COMPOSER_BG}; }}
     #live {{ width: 1fr; }}
     #header {{ height: 1; background: {_COMPOSER_BG}; }}
     #frame {{ height: auto; background: {_COMPOSER_BG}; border-left: round #5b54a8;
@@ -1444,7 +1573,7 @@ class _NemiApp(App):
     def action_mode(self) -> None:
         import modes
         key = modes.cycle()
-        ui.info(f"Modus: {modes.label()}" + (
+        ui.info(f"Modus: {modes.anzeige()}" + (
             f"  ·  Zünder: nach {modes.AUTO_FUSE_S // 60} min zurück in Chatten"
             if key == "auto" else ""))
         self.nemi._refresh_chrome()
@@ -1531,6 +1660,7 @@ class Screen:
         self._such_nr = -1
         self._such_kennung = 0                # eine neue Suche löst die laufende ab
         self._puls_gemeldet = None            # dem eigenen Fenster zuletzt gemeldet: arbeitet / ruht
+        self._sitz_gemeldet = 0               # dem eigenen Fenster zuletzt gemeldet: Zeile der Figur
         self._wecker: list = []               # fällige Erinnerungen der KI an sich selbst, noch nicht abgearbeitet
         self._kopie_zeichen = 0               # kurze Meldung „📋 n kopiert“ im Rahmen …
         self._kopie_bis = 0.0                 # … bis zu diesem Zeitpunkt
@@ -2016,6 +2146,16 @@ class Screen:
                 self._submit()
         self.app.push_screen(_PaletteScreen(liste), callback=fertig)
 
+    def _figur_sitz(self) -> int:
+        """Zeilen vom unteren Rand bis zur Kopfzeile der Eingabe (0 = unbekannt oder noch nicht angeordnet)."""
+        try:
+            region = self._header.region
+            if region.height <= 0 or region.y <= 0:
+                return 0
+            return max(0, int(self.app.size.height - region.y))
+        except Exception:
+            return 0
+
     def _refresh_chrome(self) -> None:
         if self._header is None or self.app is None:
             return
@@ -2046,6 +2186,10 @@ class Screen:
             if self.busy != self._puls_gemeldet:        # eigenes Fenster: Hintergrund atmet beim Arbeiten
                 self._puls_gemeldet = self.busy
                 _fenster_melden("puls=1" if self.busy else "puls=0")
+            sitz = self._figur_sitz()
+            if sitz and sitz != self._sitz_gemeldet:     # Figur sitzt auf der Kopfzeile der Eingabe
+                self._sitz_gemeldet = sitz
+                _figur(lambda F: F.sitz(sitz))
         except Exception as e:                   # sonst stünden Kopf und Leiste still, ohne jede Spur
             art = type(e).__name__
             gemeldet = getattr(self, "_chrome_fehler", set())
@@ -2063,7 +2207,7 @@ class Screen:
         p = ui.THEMES[ui.current_theme()]
         color = p["accent_dim"] if self.busy else p["brand_dim"]
         border = Style(color=color, bgcolor=_COMPOSER_BG)
-        muted = Style(color="#9298ac", bgcolor=_COMPOSER_BG)
+        muted = Style(color=ui.leise(), bgcolor=_COMPOSER_BG)
         accent = Style(color=p["accent"], bgcolor=_COMPOSER_BG)
         status = "● bereit"
         if self._modal is not None:
@@ -2194,6 +2338,19 @@ class Screen:
         except Exception:
             pass
         self._update_completions()
+        try:                                        # 🧭 Kompass: Befehle neben dem Terminal
+            import kompass
+            kompass.getippt(self._input.text, self.eingabe_setzen)
+        except Exception:
+            pass
+
+    def eingabe_setzen(self, text: str) -> None:
+        """Text in die Eingabe (Kompass-Klick) – abgeschickt wird erst mit Enter."""
+        if self._input is None or self._modal is not None:
+            return
+        self._input.load_text(text)
+        self._input.move_cursor(self._input.document.end)
+        self._input.focus()
 
     def _candidates(self, text: str) -> list:
         if not text.startswith("/") or "\n" in text:
@@ -2224,17 +2381,17 @@ class Screen:
         ende = min(len(items), start + _MAX_COMPLETIONS)
         t = Text(no_wrap=True, overflow="ellipsis")
         if start:
-            t.append(f"  ▲ {start} weitere\n", style="#7d8590")
+            t.append(f"  ▲ {start} weitere\n", style=ui.leise())
         for i in range(start, ende):
             c = items[i]
             st = f"bold {p['accent']}" if i == sel else "#c8c4ff"
             t.append(f"{c.text:<22}", style=st)
             meta = getattr(c, "display_meta_text", "") or ""
-            t.append(f" {meta}", style="#7d8590")
+            t.append(f" {meta}", style=ui.leise())
             if i < ende - 1:
                 t.append("\n")
         if ende < len(items):
-            t.append(f"\n  ▼ {len(items) - ende} weitere · ↑↓ blättern", style="#7d8590")
+            t.append(f"\n  ▼ {len(items) - ende} weitere · ↑↓ blättern", style=ui.leise())
         self._complete.update(t)
         self._complete.display = True
 
@@ -2275,6 +2432,8 @@ class Screen:
             if hasattr(ui, "leiste_renderable"):
                 self._leiste.update(_ReflowRenderable(ui.leiste_renderable))
                 self._leiste.display = True
+            import startseite
+            startseite.bild_abmelden(0)                     # das große Bild der Startseite ist weg
         except Exception:
             pass
 
@@ -2333,6 +2492,8 @@ class Screen:
         self.busy = True
         self._refresh_chrome()
         self.app.call_after_refresh(self._scroll_bottom)
+        _figur(lambda F: F.nutzer(text))
+        _taetig("denkt")
 
         async def _runner():
             result = None
@@ -2341,6 +2502,8 @@ class Screen:
             except Exception as e:
                 ui.error(f"Fehler: {e}")
             finally:
+                _taetig(None)
+                _figur(lambda F: F.fertig())
                 self.busy = self._practicing
                 self._last_input = time.monotonic()
                 self.force_repaint()
@@ -2434,7 +2597,9 @@ class Screen:
                 if text:
                     ui.warn("📥 Nachricht aus der Inbox verworfen (zu alt, zu lang oder ein /befehl).")
                 return
-            ui.info("📥 Auftrag aus dem Kontextmenü")
+            # Nur Aufträge in der Form des Kontextmenüs gehen unverändert durch, alles andere gerahmt.
+            text, geprueft = K.inbox_auftrag(text)
+            ui.info("📥 Auftrag aus dem Kontextmenü" + ("" if geprueft else " (Herkunft ungeprüft)"))
             self._input.load_text(text)
             self._submit()
 

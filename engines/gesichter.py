@@ -1,7 +1,8 @@
 """
 gesichter.py - Gesichter in einem fertigen Bild finden und Ausschnitte weich einsetzen.
 
-Finder: das Seh-Modell des Bildbeschreibers (Vision/, bildbeschreiber.py) nennt die Gesichter
+Finder: das gewählte Seh-Modell des Bildbeschreibers (KI-Modelle/KI-Vision/Sehmodell/, bildbeschreiber.py) – passt es
+gerade nicht neben den Bild-Motor in den Grafikspeicher, das kleinste – nennt die Gesichter
 als Kästen (ganze Zahlen 0–1000 relativ zum Bild). Nur sichere Funde zählen: plausible Größe
 und Form, und eine Gegenfrage am Ausschnitt („ein Gesicht mit beiden Augen?“) muss Ja sagen –
 im Zweifel bleibt das Original. Ohne Seh-Modell wird nicht nachgebessert (grund()).
@@ -41,7 +42,7 @@ def grund() -> str | None:
     """Warum nicht nachgebessert werden kann – oder None."""
     if verfuegbar():
         return None
-    return ("Gesicht nachmalen braucht ein Seh-Modell im Ordner Vision/ (eine .gguf und eine "
+    return ("Gesicht nachmalen braucht ein Sehmodell im Ordner KI-Modelle/KI-Vision/Sehmodell/ (eine .gguf und eine "
             "mmproj-*.gguf, z. B. der Bildbeschreiber)")
 
 
@@ -95,7 +96,8 @@ def finden(arr) -> list[tuple[int, int, int, int]]:
     from PIL import Image
     bild = Image.fromarray(arr)
     W, H = bild.size
-    kandidaten = [k for k in kaesten_lesen(bildbeschreiber.fragen_roh(bild, FINDEN, 200), W, H)
+    klein = bildbeschreiber.klein_noetig()             # das gewählte Sehmodell, außer es passt nicht neben den Bild-Motor
+    kandidaten = [k for k in kaesten_lesen(bildbeschreiber.fragen_roh(bild, FINDEN, 200, klein=klein), W, H)
                   if _plausibel(k, W)]
     kandidaten.sort(key=lambda k: (k[2] - k[0]) * (k[3] - k[1]), reverse=True)
     boxen: list[tuple[int, int, int, int]] = []
@@ -105,7 +107,7 @@ def finden(arr) -> list[tuple[int, int, int, int]]:
         box = _mit_rand(k, W, H)
         if box[2] - box[0] < 32 or box[3] - box[1] < 32:
             continue
-        if _ja(bildbeschreiber.fragen_roh(bild.crop(box), PRUEFEN, 4)):
+        if _ja(bildbeschreiber.fragen_roh(bild.crop(box), PRUEFEN, 4, klein=klein)):
             boxen.append(box)
     return boxen
 

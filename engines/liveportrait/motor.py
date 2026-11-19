@@ -375,7 +375,7 @@ def fehlt() -> str | None:
     """Grund, warum es nicht geht – oder None."""
     weg = gewichte.fehlt()
     if weg:
-        return "Es fehlen in Models/LivePortrait: " + ", ".join(weg)
+        return "Es fehlen in KI-Modelle/KI-Portraet/Portraetmodell/LivePortrait: " + ", ".join(weg)
     try:
         import onnxruntime  # noqa: F401
     except Exception:

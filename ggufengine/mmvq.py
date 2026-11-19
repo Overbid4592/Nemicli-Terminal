@@ -1,14 +1,14 @@
 """
-Block-format matrices (Q4_K, Q6_K) on their own kernels, after the MMVQ idea of llama.cpp (MIT):
+Matrizen im Blockformat (Q4_K, Q6_K) auf eigenen Kerneln, nach der MMVQ-Idee von llama.cpp (MIT):
 
-* up to MMVQ_BIS tokens: the input quantised to two int8 stages per 32 values (about 15 bits),
-  each weight byte read once, four values per dp4a, one warp per output row
-* up to MMQ_BIS tokens: weight blocks unpacked once to fp16 in shared memory, tensor cores (MMQ)
-* more tokens: unpacked to bf16 for cuBLAS
-* one token per step: fused small steps (norm, activation, RoPE + KV cache, attention) that hand
-  their int8 input straight to the matrices
+* bis MMVQ_BIS Tokens: die Eingabe in zwei int8-Stufen je 32 Werte quantisiert (etwa 15 Bit),
+  jedes Gewichtsbyte einmal gelesen, vier Werte je dp4a, ein Warp je Ausgabezeile
+* bis MMQ_BIS Tokens: Gewichtsblöcke einmal nach fp16 in Shared Memory entpackt, Tensor Cores (MMQ)
+* mehr Tokens: nach bf16 entpackt für cuBLAS
+* ein Token je Schritt: fusionierte kleine Schritte (Norm, Aktivierung, RoPE + KV-Cache, Attention), die
+  ihre int8-Eingabe direkt an die Matrizen weitergeben
 
-Compiled with NVRTC like cudakern.py, launched on torch's current stream (CUDA-graph safe).
+Mit NVRTC kompiliert wie cudakern.py, auf dem aktuellen Stream von torch gestartet (CUDA-Graph-sicher).
 """
 from __future__ import annotations
 
@@ -23,12 +23,12 @@ from . import cudakern
 from . import debuglog as dbg
 
 FORMATE = {"Q4_K": (256, 144), "Q6_K": (256, 210)}
-WARPS = 4                     # rows per block (one warp each)
-SPALTEN = 9                   # input rows (tokens) per kernel call, weights read once for all
-# weight rows per warp by input rows (each loaded input value serves them all; measured)
+WARPS = 4                     # Zeilen je Block (je ein Warp)
+SPALTEN = 9                   # Eingabezeilen (Tokens) je Kernel-Aufruf, Gewichte einmal für alle gelesen
+# Gewichtszeilen je Warp nach Eingabezeilen (jeder geladene Eingabewert dient allen; gemessen)
 ZEILEN_JE_WARP = {"Q4_K": lambda nc: 1 if nc == 1 else 2, "Q6_K": lambda nc: 1 if nc == 1 else 2}
-# tokens per call: up to MMVQ_BIS int8 kernels in groups of SPALTEN, up to MMQ_BIS the tensor-core kernel
-# (in groups of 8 * MMQ_NT), more: unpack to bf16 + cuBLAS (measured in a whole 8B model, short inputs)
+# Tokens je Aufruf: bis MMVQ_BIS int8-Kernel in Gruppen zu SPALTEN, bis MMQ_BIS der Tensor-Core-Kernel
+# (in Gruppen zu 8 * MMQ_NT), darüber: nach bf16 entpacken + cuBLAS (gemessen an einem ganzen 8B-Modell, kurze Eingaben)
 MMVQ_BIS = {"Q4_K": 16, "Q6_K": 16}
 MMQ_BIS = {"Q4_K": 112, "Q6_K": 112}
 SCHRITT_KERNE = ("quant_q8", "norm_q8", "akt_q8", "rope_kv", "attn1_teil", "attn1_summe", "mmq_eingang")

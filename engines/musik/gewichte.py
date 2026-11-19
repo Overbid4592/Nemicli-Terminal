@@ -1,6 +1,6 @@
 """gewichte.py – die vier ACE-Step-GGUFs finden, gegen ihre SHA-256 prüfen und Tensoren laden.
 
-Erwartet unter Models/Musik/ oder Models/Music/ (Daten- oder Programmordner, Unterordner egal):
+Erwartet unter KI-Modelle/KI-Musik/Musikmodell/ (früher Models/Musik/ oder Models/Music/; Unterordner egal):
   acestep-v15-turbo-*.gguf (Musik-Erzeuger) · Qwen3-Embedding-0.6B-*.gguf (Textleser) ·
   vae-*.gguf (Ton) · optional acestep-5Hz-lm-*.gguf (Song-Planer)
 Nur Dateien aus der Liste werden gelesen. Das Prüfergebnis merkt sich der Motor je Dateistand
@@ -19,7 +19,11 @@ try:
 except Exception:
     _ROOT = _INSTALL = Path(__file__).resolve().parents[2]
 
-ORDNER = [b / "Models" / n for b in (_ROOT, _INSTALL) for n in ("Musik", "Music")]
+try:
+    import modellorte as _MO
+    ORDNER = _MO.orte("musik")                         # KI-Modelle/KI-Musik/Musikmodell, dann frühere Orte
+except Exception:                                      # Selbsttest ohne Bootstrap
+    ORDNER = [b / "Models" / n for b in (_ROOT, _INSTALL) for n in ("Musik", "Music")]
 TEILE = {"dit": "acestep-v15-", "text": "Qwen3-Embedding-", "vae": "vae-", "lm": "acestep-5Hz-lm-"}
 PFLICHT = ("dit", "text", "vae")
 GEPRUEFT = ".geprueft.json"
@@ -59,7 +63,7 @@ def fehlt() -> str | None:
     if weg:
         namen = {"dit": "acestep-v15-turbo-Q8_0.gguf", "text": "Qwen3-Embedding-0.6B-Q8_0.gguf",
                  "vae": "vae-BF16.gguf"}
-        return "Es fehlen unter Models/Musik: " + ", ".join(namen[t] for t in weg)
+        return f"Es fehlen unter {ORDNER[0]}: " + ", ".join(namen[t] for t in weg)
     return None
 
 

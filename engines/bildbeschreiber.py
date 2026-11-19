@@ -2,10 +2,10 @@
 bildbeschreiber.py - Augen für lokale Sprachmodelle ohne Bild-Eingang.
 
 Ein kleines Modell mit Bild-Encoder beschreibt Bilder als Text; das aktive Modell
-bekommt die Beschreibung. Ordner: `Vision/<Name>/` im Programm-Ordner mit einer
-.gguf und einer mmproj-*.gguf (Encoder wie bei `ModelGGUF/` automatisch erkannt).
+bekommt die Beschreibung. Ordner: `KI-Modelle/KI-Vision/Sehmodell/<Name>/` (früher `Vision/`) mit
+einer .gguf und einer mmproj-*.gguf (Encoder wie beim Chat-Motor automatisch erkannt).
 Mehrere Ordner: Config `vision_ordner` (`/vision <name>`) wählt, sonst der erste. Ist eine
-Modell-Familie das Chat-Modell (ModelGGUF/<Familie>/), sieht ihr eigenes Mitglied mit Bild-Teil.
+Modell-Familie das Chat-Modell, sieht ihr eigenes Mitglied mit Bild-Teil.
 
 Gilt für jedes Chat-Modell, das selbst nichts sieht – eigener Motor, Ollama oder
 Cloud. Ans Modell geht nur der Text, nie das Bild.
@@ -54,11 +54,19 @@ try:
 except Exception:                                    # Selbsttest ohne Bootstrap
     _INSTALL = Path(__file__).resolve().parent.parent
 
-ORDNER = _INSTALL / "Vision"
-BILD_TOKEN = 280               # mehr Bild-Token lesen im Test nicht besser
+try:
+    import modellorte as _MO
+    ORDNER = _MO.ordner("sehen")                      # neue Sehmodelle kommen hierher
+    ALTE_ORDNER = _MO.alte("sehen")                   # frühere Orte, nur lesen
+except Exception:                                    # Selbsttest ohne Bootstrap
+    ORDNER, ALTE_ORDNER = _INSTALL / "Vision", []
+BILD_TOKEN = 280               # Vorgabe, wenn der Bild-Encoder keine eigenen beschreiber_tokens nennt
 KONTEXT = 4096
 MAX_BESCHREIBUNG = 700
 MAX_ANTWORT = 200
+# Temperatur 0 (gleiches Bild, gleiche Antwort – Seh-Protokoll, Gesichter) mit der Wiederholungs-Strafe, die Qwen
+# für Qwen3-VL empfiehlt; reines Greedy wiederholte auf Screenshots Textstücke bis zum Limit.
+PRESENCE = 1.5
 NACHLAUF_S = 120               # so lange ohne Bild, dann ganz entladen (RAM frei)
 
 BESCHREIBEN = """Du bist die Augen für ein Sprachmodell, das selbst keine Bilder sehen kann. Beschreibe das Bild so, dass es jede Frage dazu beantworten kann.
@@ -94,13 +102,21 @@ def _merken(was: str) -> None:
     _verlauf.append((time.strftime("%H:%M:%S"), was))
 
 
+def _modellordner() -> list[Path]:
+    """Unterordner des neuen und der früheren Orte; bei gleichem Namen gilt der erste Ort."""
+    raus: dict[str, Path] = {}
+    for w in dict.fromkeys([ORDNER, *ALTE_ORDNER]):
+        if w.is_dir():
+            for d in sorted(p for p in w.iterdir() if p.is_dir()):
+                raus.setdefault(d.name, d)
+    return list(raus.values())
+
+
 def kandidaten() -> list[tuple[str, Path, Path]]:
-    """(Ordnername, Modell, mmproj) aller Vision-Ordner mit bekanntem Bild-Encoder.
-    Ordner ohne mmproj (z. B. die Stimme) zählen nicht."""
-    if not ORDNER.is_dir():
-        return []
+    """(Ordnername, Modell, mmproj) aller Sehmodell-Ordner mit bekanntem Bild-Encoder.
+    Ordner ohne mmproj (z. B. eine Stimme am alten Ort) zählen nicht."""
     raus = []
-    for d in sorted(p for p in ORDNER.iterdir() if p.is_dir()):
+    for d in _modellordner():
         modell = gguflokal._gguf_in(d)
         mm = sorted(p for p in d.glob("*.gguf") if gguflokal._ist_mmproj(p))
         try:
@@ -116,17 +132,51 @@ def gewaehlt() -> str:
     return str(gguflokal._config().get("vision_ordner") or "").strip()
 
 
-def finden() -> tuple[Path, Path] | None:
+def finden(klein: bool = False) -> tuple[Path, Path] | None:
     """(Modell, mmproj): Ist eine Modell-Familie das Chat-Modell, sieht ihr eigener Seher; sonst der
-    gewählte Vision-Ordner – fehlt er, der erste passende."""
+    gewählte Vision-Ordner – fehlt er, der erste passende. `klein`: das kleinste Sehmodell (Dateigröße),
+    für Aufgaben neben dem Bild-Motor (Gesichter nachmalen), unabhängig von der Wahl."""
     if (familie := gguflokal.aktive_familie()) and (augen := gguflokal.familien_augen(familie)):
         return augen
     alle = kandidaten()
     if not alle:
         return None
+    if klein:
+        def groesse(k) -> int:
+            try:
+                return k[1].stat().st_size + k[2].stat().st_size
+            except OSError:
+                return 1 << 62
+        _, modell, mm = min(alle, key=groesse)
+        return modell, mm
     wahl = gewaehlt().lower()
     _, modell, mm = next((k for k in alle if k[0].lower() == wahl), alle[0])
     return modell, mm
+
+
+VRAM_FAKTOR = 1.15             # gemessen: Qwen3-VL-8B Q4_K_M + mmproj F16 (6,2 GB Dateien) braucht 7,2 GB
+VRAM_RESERVE_MB = 512
+
+
+def _vram_mb(teile: tuple[Path, Path]) -> int:
+    try:
+        return int(sum(p.stat().st_size for p in teile) * VRAM_FAKTOR / 2 ** 20) + VRAM_RESERVE_MB
+    except OSError:
+        return 0
+
+
+def klein_noetig() -> bool:
+    """Für Aufgaben neben dem Bild-Motor (Gesichter nachmalen): True, wenn das gewählte Sehmodell gerade nicht in
+    den freien Grafikspeicher passt – dann nimmt fragen_roh(klein=True) das kleinste. Nicht messbar: das gewählte."""
+    gewaehltes, kleinstes = finden(), finden(klein=True)
+    if gewaehltes is None or kleinstes is None or gewaehltes == kleinstes:
+        return False
+    try:
+        import vonsichaus
+        frei = vonsichaus.vram_frei_mb()
+    except Exception:
+        frei = None
+    return frei is not None and frei < _vram_mb(gewaehltes)
 
 
 def aktiv() -> str | None:
@@ -135,7 +185,7 @@ def aktiv() -> str | None:
     if not teile:
         return None
     ordner = teile[0].parent
-    if ordner.parent.parent.resolve() == gguflokal.ORDNER.resolve():      # Mitglied einer Familie
+    if ordner.parent.parent.resolve() in {w.resolve() for w in gguflokal.wurzeln()}:   # Mitglied einer Familie
         return f"{ordner.parent.name}-{ordner.name}"
     return ordner.name
 
@@ -160,7 +210,7 @@ def waehlen(name: str) -> str | None:
 
 def zustaendig(model: str | None) -> bool:
     """Springt der Beschreiber für dieses Chat-Modell ein? Für jedes Modell ohne eigenes Sehen,
-    sofern unter Vision/ ein Seh-Modell liegt. Ob Ollama-/Cloud-Modelle selbst sehen, prüfen die
+    sofern ein Sehmodell da ist. Ob Ollama-/Cloud-Modelle selbst sehen, prüfen die
     Aufrufer vorher (main._modell_sieht); hier nur der eigene Motor."""
     if not model:
         return False
@@ -169,10 +219,10 @@ def zustaendig(model: str | None) -> bool:
     return finden() is not None
 
 
-def _engine():
+def _engine(klein: bool = False):
     """Den Beschreiber laden oder den geladenen zurückgeben. Nur mit gehaltener `_lock` aufrufen."""
     global _helfer
-    teile = finden()
+    teile = finden(klein)
     if teile is None:
         raise RuntimeError(f"Kein Bildbeschreiber in {ORDNER} (Ordner mit .gguf und mmproj-*.gguf).")
     if _helfer is not None and _helfer[0] == teile[0]:
@@ -200,7 +250,7 @@ def beschreiben(pfad, frage: str | None = None) -> str:
         sha = ""
     if (alt := SP.nachschlagen(sha, frage, modell)) is not None:
         _merken(f"aus dem Protokoll: {Path(pfad).name}")
-        return str(alt["text"])
+        return schleife_kuerzen(str(alt["text"]))          # ältere Einträge können noch eine Schleife tragen
     from PIL import Image
     import vision
     text = FRAGE.format(frage=frage.strip()) if frage else BESCHREIBEN
@@ -217,23 +267,28 @@ def beschreiben(pfad, frage: str | None = None) -> str:
     return antwort
 
 
-def fragen_roh(bild, text: str, max_tokens: int = MAX_ANTWORT) -> str:
+def fragen_roh(bild, text: str, max_tokens: int = MAX_ANTWORT, klein: bool = False) -> str:
     """`text` wörtlich zu einem PIL-Bild fragen (ohne Vorlage), temperatur 0. Blockiert.
-    Auch für Aufgaben ohne Chat-Modell, z. B. Gesichter finden (gesichter.py)."""
+    Auch für Aufgaben ohne Chat-Modell, z. B. Gesichter finden (gesichter.py, `klein`: kleinstes Sehmodell)."""
     global _letzter_fehler
     from ggufengine import Message, SamplerConfig
     t0 = time.monotonic()
     try:
         with gguflokal.gpu_fuer_bild(), _lock:
-            engine = _engine()
+            engine = _engine(klein)
             engine.restore()
             _DBG.ereignis("Bildbeschreiber auf der GPU")
             try:
                 emb = engine.encode_image(bild, getattr(engine.vision, "beschreiber_tokens", BILD_TOKEN))
                 engine.reset()
-                antwort = "".join(engine.chat(
-                    [Message("user", text, images=[emb])], checkpoint_system=False,
-                    max_tokens=max_tokens, sampler=SamplerConfig(temperature=0.0)))
+                teile: list[str] = []
+                for stueck in engine.chat(
+                        [Message("user", text, images=[emb])], checkpoint_system=False,
+                        max_tokens=max_tokens, sampler=SamplerConfig(temperature=0.0, presence_penalty=PRESENCE)):
+                    teile.append(stueck)
+                    if _schleife("".join(teile)) is not None:
+                        break
+                antwort = schleife_kuerzen("".join(teile))
             finally:
                 engine.offload()
                 _DBG.ereignis("Bildbeschreiber in den RAM")
@@ -244,6 +299,37 @@ def fragen_roh(bild, text: str, max_tokens: int = MAX_ANTWORT) -> str:
         raise
     _merken(f"angesehen in {time.monotonic() - t0:.1f} s, {len(antwort)} Zeichen")
     return antwort.strip()
+
+
+WIEDERHOLUNG = 4               # so oft hintereinander dasselbe Stück = Schleife
+SCHLEIFE_LAENGE = 300          # längstes Stück (Zeichen), das als Wiederholung erkannt wird
+SCHLEIFE_HINWEIS = "[… Wiederholung abgebrochen]"
+
+
+def _schleife(text: str) -> int | None:
+    """Endet `text` mit WIEDERHOLUNG gleichen Stücken (bis SCHLEIFE_LAENGE Zeichen, mindestens 4 sichtbare) –
+    Zeilen ebenso wie Teile einer Zeile („0:00“; „0:00“; …)? Dann die Länge bis einschließlich des ersten
+    Stücks der Schleife, sonst None."""
+    n = len(text)
+    for p in range(4, min(SCHLEIFE_LAENGE, n // WIEDERHOLUNG) + 1):
+        stueck = text[n - p:]
+        if len(stueck.strip()) < 4:
+            continue
+        if all(text[n - (i + 1) * p:n - i * p] == stueck for i in range(1, WIEDERHOLUNG)):
+            start = n - WIEDERHOLUNG * p
+            while start >= p and text[start - p:start] == stueck:      # die ganze Schleife, nicht nur ihr Ende
+                start -= p
+            return start + p
+    return None
+
+
+def schleife_kuerzen(text: str) -> str:
+    """Schleife am Ende auf ein Vorkommen kürzen, mit Hinweis; sonst Text unverändert."""
+    rumpf = text.rstrip()
+    ende = _schleife(rumpf)
+    if ende is None:
+        return text
+    return rumpf[:ende].rstrip(" ;,") + "\n" + SCHLEIFE_HINWEIS
 
 
 def neustart() -> tuple[str, float]:
@@ -346,12 +432,13 @@ def bericht_text(model: str | None = None, sieht: bool | None = None) -> str:
         z.append(f"NemiCLI {VERSION}")
     except Exception:
         pass
-    z.append(f"Vision-Ordner: {ORDNER} ({'vorhanden' if ORDNER.is_dir() else 'fehlt'})")
+    for w in dict.fromkeys([ORDNER, *ALTE_ORDNER]):
+        z.append(f"Sehmodell-Ordner: {w} ({'vorhanden' if w.is_dir() else 'fehlt'})")
     z.append(f"Config vision_ordner: {gewaehlt() or '(leer = erster passender)'} · aktiv: {aktiv() or '–'}")
     z.append(f"Nachlauf: {NACHLAUF_S} s · Bild-Token {BILD_TOKEN} · Kontext {KONTEXT}")
     z.append("")
     try:
-        ordner = sorted(p for p in ORDNER.iterdir() if p.is_dir()) if ORDNER.is_dir() else []
+        ordner = _modellordner()
     except OSError as e:
         ordner = []
         z.append(f"Ordner nicht lesbar: {e!r}")

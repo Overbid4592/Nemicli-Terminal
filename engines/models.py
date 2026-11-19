@@ -6,9 +6,9 @@ Modell-Referenzen ("refs") sind einheitlich `<anbieter>:<modell>`:
     openai:gpt-4o                   -> Cloud (siehe providers.py)
     ollama:gemma3                   -> Ollama auf diesem PC
     gguf:Gemma4                     -> eigener GGUF-Motor (engines/gguflokal.py,
-                                       Modelle in ModelGGUF/<Name>/ im Programm-Ordner)
+                                       Modelle in KI-Modelle/KI-Chat/Chatmodell/<Name>/)
 
-`Models/` bleibt: dort liegen die Krea-2-Dateien (Models/Krea2) und die Embeddings fürs Gedächtnis.
+Modellordner: core/modellorte.py (KI-Modelle/); `Models/` ist ein früherer Ort.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ try:                                     # exe-Modus: Daten liegen neben der exe
     from paths import ROOT as _ROOT
 except Exception:                        # Selbsttest ohne Bootstrap
     _ROOT = Path(__file__).resolve().parent.parent      # Projekt-Wurzel
-MODELS_DIR = _ROOT / "Models"            # Bild-Modelle, Embeddings
+MODELS_DIR = _ROOT / "Models"            # früherer Modell-Ort (Altcode-kompatibel)
 
 LLM_DIR = MODELS_DIR                     # Alias (Altcode-kompatibel)
 

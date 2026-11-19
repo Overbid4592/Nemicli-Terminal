@@ -34,6 +34,7 @@ _ERGEBNIS = re.compile(r"(?m)^(?=Ergebnis von ')")
 _WERKZEUG = re.compile(r"^Ergebnis von '(\w+)'")
 _PLATZ = re.compile(r"%\{(\w+)\}")              # Platzhalter in den Vorlagen der Datenbank
 _JSON_WERT = re.compile(r"^(?:[\[{].*|true|false|null|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$", re.DOTALL)
+MAX_TIEFE = 64                                 # Verschachtelung von Werten (Listen, Objekte) beim Lesen und Schreiben
 
 
 def als_text(teile: Teile) -> str:
@@ -75,7 +76,7 @@ def _wert_lesen(text: str):
     if _JSON_WERT.match(text.strip()):
         try:
             return json.loads(text.strip())
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             pass
     return text
 
@@ -181,7 +182,7 @@ class Dialekt:
             if art == "gemma":
                 try:
                     felder = _GemmaLeser(m.group(2) + "}").felder("}")
-                except ValueError:
+                except (ValueError, RecursionError):
                     continue
             else:
                 als_text = _text_felder(m.group(1).strip())
@@ -200,7 +201,7 @@ class Dialekt:
             start += 1
         try:
             felder, ende = json.JSONDecoder().raw_decode(text, start)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
             return None
         return (m.group(1), felder, ende) if isinstance(felder, dict) else None
 
@@ -275,14 +276,20 @@ def aktion_teile(dialekt: Dialekt, text: str) -> Teile:
     for m in _AKTION.finditer(text):
         try:
             obj = json.loads(m.group(1))
+        except RecursionError:
+            continue
         except json.JSONDecodeError:                 # Muster: ein Modell schrieb „<name>“ sonst wörtlich ab
             if not re.match(r'\{+\s*"tool"\s*:', m.group(1)):
                 continue                             # anderer Code-Block: bleibt Text
             obj = {"tool": "werkzeug_name", "feld_1": "wert_1"}
         if not isinstance(obj, dict) or "tool" not in obj:
             continue
+        try:
+            aufruf = dialekt.aufruf_teile(str(obj["tool"]), {k: v for k, v in obj.items() if k != "tool"})
+        except (ValueError, RecursionError):         # zu tief verschachtelt: der Block bleibt Text
+            continue
         raus.append((text[pos:m.start()], False))
-        raus += dialekt.aufruf_teile(str(obj["tool"]), {k: v for k, v in obj.items() if k != "tool"})
+        raus += aufruf
         pos = m.end()
     raus.append((text[pos:], False))
     return [t for t in raus if t[0]]
@@ -353,8 +360,11 @@ class Strom:
 _Q = '<|"|>'                                         # Gemmas Anführungszeichen (ein Sonder-Token)
 
 
-def _gemma_wert(wert) -> Teile:
-    """format_argument der Gemma-Vorlage (Schlüssel ohne Anführung): Text in <|"|>, Rest wie gesehen."""
+def _gemma_wert(wert, tiefe: int = 0) -> Teile:
+    """format_argument der Gemma-Vorlage (Schlüssel ohne Anführung): Text in <|"|>, Rest wie gesehen.
+    Tiefer als MAX_TIEFE verschachtelt: ValueError."""
+    if tiefe > MAX_TIEFE:
+        raise ValueError("Wert zu tief verschachtelt")
     if wert is None:
         return [("null", False)]
     if isinstance(wert, bool):
@@ -364,22 +374,27 @@ def _gemma_wert(wert) -> Teile:
     if isinstance(wert, dict):
         raus: Teile = [("{", False)]
         for i, k in enumerate(sorted(wert)):
-            raus += ([(",", False)] if i else []) + [(f"{k}:", False)] + _gemma_wert(wert[k])
+            raus += ([(",", False)] if i else []) + [(f"{k}:", False)] + _gemma_wert(wert[k], tiefe + 1)
         return raus + [("}", False)]
     if isinstance(wert, (list, tuple)):
         raus = [("[", False)]
         for i, x in enumerate(wert):
-            raus += ([(",", False)] if i else []) + _gemma_wert(x)
+            raus += ([(",", False)] if i else []) + _gemma_wert(x, tiefe + 1)
         return raus + [("]", False)]
     return [(str(wert), False)]
 
 
 class _GemmaLeser:
     """Liest die Argumente eines Gemma-Aufrufs: schluessel:wert, … mit <|"|>Text<|"|>, {…}, […],
-    Zahlen, true/false/null."""
+    Zahlen, true/false/null. Tiefer als MAX_TIEFE verschachtelt: ValueError."""
 
     def __init__(self, text: str):
-        self.t, self.i = text, 0
+        self.t, self.i, self.tiefe = text, 0, 0
+
+    def _hinein(self):
+        self.tiefe += 1
+        if self.tiefe > MAX_TIEFE:
+            raise ValueError("Wert zu tief verschachtelt")
 
     def _leer(self):
         while self.i < len(self.t) and self.t[self.i] in " \n\t":
@@ -396,9 +411,14 @@ class _GemmaLeser:
             return wert
         if t.startswith("{", self.i):
             self.i += 1
-            return self.felder("}")
+            self._hinein()
+            try:
+                return self.felder("}")
+            finally:
+                self.tiefe -= 1
         if t.startswith("[", self.i):
             self.i += 1
+            self._hinein()
             raus = []
             self._leer()
             while not t.startswith("]", self.i):
@@ -410,6 +430,7 @@ class _GemmaLeser:
                 elif not t.startswith("]", self.i):
                     raise ValueError("Liste ohne ] oder Komma")
             self.i += 1
+            self.tiefe -= 1
             return raus
         m = re.compile(r"[^,}\]]*").match(t, self.i)
         roh, self.i = m.group(0).strip(), m.end()

@@ -2,7 +2,7 @@
 videomotoren - Video-Modelle neben Wan 2.2 5B, je Bauart ein eigener Motor: LTX-2.5 (mit Ton) und
 SD-Video (Stable Diffusion 1.5 oder SDXL mit Zeit-Schichten, ohne Ton).
 
-Ordner `Models/Videomodelle/` (Daten- und Programmordner): je Modell ein Unterordner mit dem Transformer
+Ordner `KI-Modelle/KI-Video/Videomodell/` (früher `Models/Videomodelle/`): je Modell ein Unterordner mit dem Transformer
 (.safetensors oder .gguf), Zubehör geteilt in `text_encoders/` und `vae/` oder im Modellordner.
 Die Bauart wird an den Tensornamen erkannt, Text-Encoder, Video-VAE und Ton-VAE an ihren Namen und Formen.
 
@@ -25,7 +25,11 @@ except Exception:
     _ROOT = _INSTALL = Path(__file__).resolve().parents[2]
 
 BAUARTEN = {"ltx2": ltx2, "sdvideo": sdvideo}
-ORDNER = [_ROOT / "Models" / "Videomodelle", _INSTALL / "Models" / "Videomodelle"]
+try:
+    import modellorte as _MO
+    ORDNER = _MO.orte("video")                         # KI-Modelle/KI-Video/Videomodell, dann frühere Orte
+except Exception:                                      # Selbsttest ohne Bootstrap
+    ORDNER = [_ROOT / "Models" / "Videomodelle", _INSTALL / "Models" / "Videomodelle"]
 GETEILT = ("text_encoders", "vae", "bewegung", "tokenizer_clip")
 BACKEND = "motor"
 MAX_SEKUNDEN = 20
@@ -390,7 +394,7 @@ def ordner_anlegen() -> Path:
     o = ordner()
     for unter in GETEILT:
         (o / unter).mkdir(parents=True, exist_ok=True)
-    zettel = o / "LIES-MICH.txt"
+    zettel = o / "Anleitung.txt"
     if not zettel.exists():
         try:
             zettel.write_text(LIES_MICH, encoding="utf-8")

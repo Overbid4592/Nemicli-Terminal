@@ -23,6 +23,13 @@ KLASSEN = {"qwen35": Qwen35Model, "qwen3vl": Qwen3VLModel, "gemma4": Gemma4Model
 SUPPORTED_ARCHS = tuple(ausfuellen.bauarten())
 
 
+def klasse(arch: str):
+    """Die Modellklasse einer Bauart – oder None."""
+    eintrag = ausfuellen.bauart(arch)
+    cls = KLASSEN.get(eintrag["klasse"]) if eintrag else None
+    return cls if cls is not None and arch in cls.arch_names else None
+
+
 def build_model(gg: GGUFFile, device, dtype, n_ctx: int, progress=None, quant: bool = True, kv_bits: int = 16,
                 experten_vram: Optional[int] = None):
     arch = gg.architecture

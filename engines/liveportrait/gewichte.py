@@ -1,6 +1,6 @@
 """gewichte.py – Gewichte finden, prüfen, einmal in safetensors umwandeln und laden.
 
-Erwartet unter Models/LivePortrait/ (Daten- oder Programmordner, Unterordner egal):
+Erwartet unter KI-Modelle/KI-Portraet/Portraetmodell/LivePortrait/ (früher Models/LivePortrait/; Unterordner egal):
   appearance_feature_extractor.pth · motion_extractor.pth · warping_module.pth ·
   spade_generator.pth · stitching_retargeting_module.pth · landmark.onnx
 Die .pth-Dateien sind Pickle. Sie werden nur gelesen, wenn ihre SHA-256 zur Liste passt, und
@@ -19,7 +19,12 @@ try:
 except Exception:
     _ROOT = _INSTALL = Path(__file__).resolve().parents[2]
 
-ORDNER = [_ROOT / "Models" / "LivePortrait", _INSTALL / "Models" / "LivePortrait"]
+try:
+    import modellorte as _MO
+    # KI-Modelle/KI-Portraet/Portraetmodell/LivePortrait, dann die früheren Orte
+    ORDNER = list(dict.fromkeys([_MO.ordner("portraet") / _MO.PORTRAET, *_MO.alte("portraet")]))
+except Exception:                                      # Selbsttest ohne Bootstrap
+    ORDNER = [_ROOT / "Models" / "LivePortrait", _INSTALL / "Models" / "LivePortrait"]
 DATEIEN = {"F": "appearance_feature_extractor", "M": "motion_extractor", "W": "warping_module",
            "G": "spade_generator", "S": "stitching_retargeting_module"}
 LANDMARK = "landmark.onnx"
@@ -43,7 +48,7 @@ def _hat_gewichte(o: Path) -> bool:
 
 
 def ordner() -> Path | None:
-    """Models/LivePortrait – sonst der Ordner unter Models/, in dem die Dateien liegen (Name egal)."""
+    """Der erste Ort aus ORDNER mit Gewichten – sonst ein Nachbarordner mit den Dateien (Name egal)."""
     for o in ORDNER:
         if _hat_gewichte(o):
             return o
@@ -132,7 +137,7 @@ def laden(basis: Path | None = None) -> dict[str, dict[str, torch.Tensor]]:
     from safetensors.torch import load_file
     basis = basis or ordner()
     if basis is None:
-        raise RuntimeError("Kein Ordner Models/LivePortrait.")
+        raise RuntimeError(f"Kein LivePortrait-Ordner ({ORDNER[0]}).")
     umwandeln(basis)
     sds = {}
     for teil, stamm in DATEIEN.items():

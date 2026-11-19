@@ -1,9 +1,11 @@
 """
 krea.py - NemiCLIs eigene Pipeline für Krea 2.
 
-Erwarteter Ordner `Models/Krea2/`:
+Erwarteter Ordner `KI-Modelle/KI-Bild/BildgenKI/Krea2/` (früher `Models/Krea2/`):
 
-    *.safetensors                 Diffusionsmodell (ComfyUI-Format, NVFP4 oder bf16)
+    *.safetensors / *.gguf        Diffusionsmodelle (mehrere möglich, /bildmodel wählt): bf16, fp16,
+                                  FP8, MXFP8, NVFP4, INT8 (auch ConvRot), GGUF; mit oder ohne
+                                  ComfyUI-Vorsatz, auch geteilt (…-00001-of-0000N)
     text_encoders/*.safetensors   Qwen3-VL-4B (FP8 skaliert oder bf16)
     vae/*.safetensors             Qwen-Image-VAE
     tokenizer/                    Qwen-Tokenizer (vocab.json + merges.txt oder tokenizer.json)
@@ -13,8 +15,9 @@ Ablauf:
     Prompt -> Qwen3-VL (12 abgegriffene Schichten) -> Single-Stream-DiT
     (Flow-Matching, eigener Sampler) -> VAE-Decoder -> PNG
 
-Krea 2 kennt keinen Negativ-Prompt und läuft mit CFG 1: ein Modelldurchlauf
-pro Schritt. Speicher wie ComfyUI mit --disable-smart-memory: jedes Teil ist
+Krea 2 Turbo kennt keinen Negativ-Prompt und läuft mit CFG 1: ein Modelldurchlauf
+pro Schritt. Krea 2 Raw (Name enthält „raw“) rechnet wie das offizielle sampling.py
+mit 52 Euler-Schritten, CFG 3,5 gegen den leeren Prompt und größenabhängiger Verschiebung. Speicher wie ComfyUI mit --disable-smart-memory: jedes Teil ist
 nur während seines Rechenschritts im VRAM und wartet sonst im Arbeitsspeicher.
 Nach 5 Minuten Ruhe (Config: `bild_krea_entladen`; keine Runde, keine
 Hintergrund-Aufgabe) wird auch der Arbeitsspeicher geräumt.
@@ -26,6 +29,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import struct
 import sys
 import threading
@@ -57,8 +61,12 @@ try:
 except Exception:
     _ROOT = _INSTALL = Path(__file__).resolve().parent.parent
 
-# Datenordner zuerst, danach der Programmordner (als exe: der Ordner der exe)
-KREA_DIRS = [_ROOT / "Models" / "Krea2", _INSTALL / "Models" / "Krea2"]
+# KI-Modelle/KI-Bild/BildgenKI/Krea2 zuerst, danach die früheren Orte (Daten-, dann Programmordner)
+try:
+    import modellorte as _MO
+    KREA_DIRS = list(dict.fromkeys([_MO.ordner("bild") / _MO.KREA, *_MO.alte("krea")]))
+except Exception:                                    # Selbsttest ohne Bootstrap
+    KREA_DIRS = [_ROOT / "Models" / "Krea2", _INSTALL / "Models" / "Krea2"]
 OUT_DIR = _ROOT / "Bilder"
 MAX_EDGE = 2048
 
@@ -116,9 +124,38 @@ def _kopf(path: Path) -> dict:
         return {}
 
 
+_ERKANNT: dict = {}                   # Pfad -> ((mtime, Größe), ist Krea 2)
+
+
 def ist_krea2(path: Path) -> bool:
-    keys = _kopf(path)
-    return any(k.startswith("model.diffusion_model.txtfusion.") for k in keys)
+    """Krea-2-Diffusionsmodell? safetensors (auch geteilt, mit oder ohne ComfyUI-Vorsatz) oder GGUF.
+    Liest nur die Köpfe; das Ergebnis gilt, bis sich die Datei ändert."""
+    path = Path(path)
+    try:
+        st = path.stat()
+        stand = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False
+    alt = _ERKANNT.get(str(path))
+    if alt is not None and alt[0] == stand:
+        return alt[1]
+    try:
+        from bildmotoren import gewichte as G
+        if G.ist_folgeteil(path):
+            ja = False
+        else:
+            namen, _ = G.ohne_praefix(G.namen(path))
+            ja = any(k.startswith("txtfusion.") for k in namen)
+    except Exception:
+        ja = any(k.startswith("model.diffusion_model.txtfusion.") for k in _kopf(path))
+    _ERKANNT[str(path)] = (stand, ja)
+    return ja
+
+
+def _kandidaten(d: Path) -> list[Path]:
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix.lower() in (".safetensors", ".gguf"))
 
 
 def _erste(d: Path) -> Path | None:
@@ -127,19 +164,27 @@ def _erste(d: Path) -> Path | None:
 
 
 def krea_dir() -> Path:
-    """Der erste Krea2-Ordner, der ein Modell enthält (sonst der Datenordner)."""
+    """Der erste Krea2-Ordner, der ein Modell enthält (sonst der neue Ort)."""
     for d in KREA_DIRS:
-        if d.is_dir() and any(ist_krea2(f) for f in d.glob("*.safetensors")):
+        if any(ist_krea2(f) for f in _kandidaten(d)):
             return d
     return KREA_DIRS[0]
 
 
 def discover() -> dict[str, Path]:
-    """ref -> Pfad aller Krea-2-Diffusionsmodelle."""
-    d = krea_dir()
-    if not d.is_dir():
-        return {}
-    return {f.stem: f for f in sorted(d.glob("*.safetensors")) if ist_krea2(f)}
+    """ref -> Pfad aller Krea-2-Diffusionsmodelle (ref = Dateiname ohne Endung; bei gleichem Namen
+    in zwei Formaten bekommt die zweite Datei ihren vollen Namen)."""
+    aus: dict[str, Path] = {}
+    for f in _kandidaten(krea_dir()):
+        if ist_krea2(f):
+            ref = re.sub(r"-00001-of-\d{5}$", "", f.stem)
+            aus[f.name if ref in aus else ref] = f
+    return aus
+
+
+def ist_raw(ref: str | None) -> bool:
+    """Krea 2 Raw (Grundmodell ohne Destillation) am Namen erkennen: braucht viele Schritte und CFG."""
+    return bool(ref) and re.search(r"(?i)(?:^|[^a-z])raw(?:[^a-z]|$)", str(ref)) is not None
 
 
 def teile() -> dict[str, Path | None]:
@@ -175,6 +220,36 @@ def schritte() -> int:
     except Exception:
         n = DEFAULTS["steps"]
     return min(max(n, SCHRITTE_MIN), SCHRITTE_MAX)
+
+
+# Krea 2 Raw wie im offiziellen sampling.py: Euler, CFG v = c + g·(c − u) mit leerem Gegen-Prompt,
+# Zeitverschiebung mu linear in der Bildgröße (256 px -> 0,5 · 1280 px -> 1,15, gemessen in 16er-Feldern).
+RAW_SCHRITTE, RAW_SCHRITTE_MIN, RAW_SCHRITTE_MAX = 52, 20, 80
+RAW_CFG = 3.5
+_RAW_MU = ((256 // 16) ** 2, 0.5, (1280 // 16) ** 2, 1.15)
+
+
+def raw_schritte() -> int:
+    """Schritte für Raw (Config `bild_krea_raw_schritte`, 20–80; Vorgabe 52)."""
+    try:
+        n = int(_cfg("bild_krea_raw_schritte", RAW_SCHRITTE))
+    except (TypeError, ValueError):
+        n = RAW_SCHRITTE
+    return min(max(n, RAW_SCHRITTE_MIN), RAW_SCHRITTE_MAX)
+
+
+def raw_cfg() -> float:
+    """CFG-Stärke für Raw (Config `bild_krea_raw_cfg`, 0–10; Vorgabe 3,5)."""
+    try:
+        g = float(_cfg("bild_krea_raw_cfg", RAW_CFG))
+    except (TypeError, ValueError):
+        g = RAW_CFG
+    return min(max(g, 0.0), 10.0)
+
+
+def raw_mu(W: int, H: int) -> float:
+    x1, y1, x2, y2 = _RAW_MU
+    return y1 + (y2 - y1) / (x2 - x1) * ((W // 16) * (H // 16) - x1)
 
 
 def set_schritte(n: int) -> int:
@@ -284,6 +359,77 @@ def _lade(path: Path, device, prefix: str = "", skip: tuple = ()) -> dict:
     return out
 
 
+_ALTE_FORMATE = {"nvfp4", "float8_e4m3fn", "float8_e5m2"}
+_SKALEN = (".comfy_quant", ".weight_scale", ".weight_scale_2", ".scale_weight", ".input_scale", ".scale_input",
+           ".pre_quant_scale")
+
+
+def _bisheriger_weg(path: Path) -> bool:
+    """Eine einzelne ComfyUI-safetensors mit Vorsatz in bf16, FP8 oder NVFP4: der bewährte Lader.
+    Alles andere (GGUF, geteilt, ohne Vorsatz, MXFP8, INT8 …) liest der gemeinsame Bild-Lader."""
+    if path.suffix.lower() != ".safetensors":
+        return False
+    from bildmotoren import gewichte as G
+    if G.teile_von(path) != [path]:
+        return False
+    kopf = _kopf(path)
+    if not any(k.startswith("model.diffusion_model.") for k in kopf):
+        return False
+    if any(isinstance(v, dict) and v.get("dtype") in ("I8", "F8_E8M0") for v in kopf.values()):
+        return False
+    try:
+        schichten = json.loads((kopf.get("__metadata__") or {}).get("_quantization_metadata") or "{}").get("layers", {})
+    except ValueError:
+        schichten = {}
+    if any(str(v.get("format", "")) not in _ALTE_FORMATE for v in schichten.values() if isinstance(v, dict)):
+        return False
+    quant = [k for k in kopf if k.endswith(".comfy_quant")]
+    if quant:
+        from safetensors import safe_open
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            for k in quant:
+                try:
+                    fmt = json.loads(bytes(f.get_tensor(k).tolist())).get("format")
+                except ValueError:
+                    return False
+                if fmt not in _ALTE_FORMATE:
+                    return False
+    return True
+
+
+def _lade_dit(path: Path, device) -> dict:
+    """Gewichte des Diffusionsmodells, Namen ohne Vorsatz. Matrizen in neuen Formaten kommen als
+    bildmotoren.gewichte.Lin (rechnet gepackt), alles andere als dichter Tensor."""
+    if _bisheriger_weg(path):
+        return _lade(path, device, prefix="model.diffusion_model.")
+    import torch
+    from bildmotoren import gewichte as G
+    namen, vorsatz = G.ohne_praefix(G.namen(path))
+    dicht = {"txtfusion.projector.weight"}             # wird als Matrix direkt gelesen, nicht als Linear
+    sd: dict = {}
+    with G.Quelle(path, vorsatz) as q:
+        gguf_typ = {}
+        if q.gguf:
+            from ggufengine.gguf import GGML_TYPES
+            gguf_typ = {k[len(vorsatz):]: GGML_TYPES[ti.ggml_type][0] for k, ti in q._gg.tensors.items()}
+        for k, form in namen.items():
+            if k.endswith(_SKALEN):
+                continue
+            if k.endswith(".weight") and k not in dicht and len(form) == 2:
+                if q.gguf:
+                    gepackt = gguf_typ.get(k, "F32") not in ("F32", "F16", "BF16")
+                else:                                  # Datentyp aus dem Kopf, ohne die Matrix zu lesen
+                    typ = q._st[q._wo[vorsatz + k]].get_slice(vorsatz + k).get_dtype()
+                    gepackt = q.hat(k[:-7] + ".comfy_quant") or typ not in ("BF16", "F16", "F32")
+                if gepackt:
+                    lin = q.lin(k[:-7])
+                    lin.bias = None                    # die Krea-Linear setzt den Bias selbst
+                    sd[k] = lin.zu(device) if str(device) != "cpu" else lin
+                    continue
+            t = q.tensor(k, torch.bfloat16 if len(form) >= 2 else None)
+            sd[k] = t.to(device)
+    return sd
+
 def _from_blocked(blocked, rows: int, cols: int):
     """cuBLAS-Kachelanordnung (128x4-Blöcke) der NVFP4-Skalen zurück in (rows, cols)."""
     nr, nc = -(-rows // 128), -(-cols // 4)
@@ -381,7 +527,7 @@ class Eingabe:
 
 
 class _Linear:
-    """Linear-Schicht für bf16-, FP8- und NVFP4-Gewichte."""
+    """Linear-Schicht für bf16-, FP8- und NVFP4-Gewichte; andere Formate über bildmotoren.gewichte.Lin."""
 
     def __init__(self, sd: dict, name: str, dtype):
         import torch
@@ -389,9 +535,15 @@ class _Linear:
         self.bias = sd.pop(name + ".bias", None)
         if self.bias is not None:
             self.bias = self.bias.to(dtype)
+        self.dtype = dtype
+        if not isinstance(w, torch.Tensor):            # bildmotoren.gewichte.Lin: MXFP8, INT8, GGUF …
+            self.lin, self.art = w, "lin"
+            self.out_f, self.in_f = w.n_out, w.n_in
+            return
         quant = sd.pop(name + ".comfy_quant", None)
         fmt = json.loads(bytes(quant.cpu().tolist())).get("format") if quant is not None else None
-        self.dtype = dtype
+        if fmt is None and w.dtype == torch.uint8 and (name + ".weight_scale_2") in sd:
+            fmt = "nvfp4"                                   # Datei ohne comfy_quant-Angabe: Bytes + zweite Skala
         if fmt == "nvfp4":
             ts = sd.pop(name + ".weight_scale_2").float()
             bs = sd.pop(name + ".weight_scale")
@@ -430,6 +582,8 @@ class _Linear:
         if self.art == "fp8":
             w = self.w.to(self.dtype)
             return w * self.scale if self.scale is not None else w
+        if self.art == "lin":
+            return self.lin.gewicht(self.dtype)
         return self.w
 
     def __call__(self, x):
@@ -437,6 +591,9 @@ class _Linear:
         import torch.nn.functional as F
         ein = x if isinstance(x, Eingabe) else None
         x = ein.x if ein else x
+        if self.art == "lin":
+            y = self.lin(x)
+            return y + self.bias.to(y.dtype) if self.bias is not None else y
         if self.art != "nvfp4_mm":
             return F.linear(x, self.weight(), self.bias)
         q, bs, gs = (ein or Eingabe(x)).fp4()
@@ -697,7 +854,7 @@ class _DiT:
     PATCH, CH = 2, 16
 
     def __init__(self, path: Path, device, dtype, on_status=None):
-        sd = _lade(path, device, prefix="model.diffusion_model.")
+        sd = _lade_dit(path, device)
         self.dtype = dtype
         n = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("blocks."))
         self.first = _Linear(sd, "first", dtype)
@@ -971,7 +1128,8 @@ def _sigmas_ab(steps: int, shift: float, start: float):
     return torch.tensor(s + [0.0], dtype=torch.float32)
 
 
-def _sample(model, x, txt, sigmas, sampler, seed, on_status=None):
+def _sample(model, x, txt, sigmas, sampler, seed, on_status=None, ohne=None, cfg: float = 0.0):
+    """`ohne` + `cfg` > 0: zweiter Durchlauf mit dem leeren Prompt, v = c + cfg·(c − u) (Krea 2 Raw)."""
     import torch
     gen = torch.Generator(device=x.device).manual_seed(seed)
     n = len(sigmas) - 1
@@ -979,7 +1137,10 @@ def _sample(model, x, txt, sigmas, sampler, seed, on_status=None):
         s, s_next = float(sigmas[i]), float(sigmas[i + 1])
         t0 = time.time()
         with torch.no_grad():
-            v = model(x, torch.full((x.shape[0],), s, device=x.device), txt)
+            t = torch.full((x.shape[0],), s, device=x.device)
+            v = model(x, t, txt)
+            if ohne is not None and cfg > 0:
+                v = v + cfg * (v - model(x, t, ohne))
         den = x - s * v
         if s_next == 0.0:
             x = den
@@ -1048,6 +1209,10 @@ def _kopie(obj, device, pin: bool = False):
         return tuple(_kopie(x, device, pin) for x in obj)
     if isinstance(obj, dict):
         return {k: _kopie(v, device, pin) for k, v in obj.items()}
+    if type(obj).__name__ == "Lin" and hasattr(obj, "zu"):           # bildmotoren.gewichte.Lin
+        if device == "cpu":
+            return obj.zu("cpu", pin=pin and torch.cuda.is_available())
+        return obj.zu(device)
     if type(obj).__module__ == __name__ and hasattr(obj, "__dict__"):
         neu = object.__new__(type(obj))
         neu.__dict__.update({k: _kopie(v, device, pin) for k, v in vars(obj).items()})
@@ -1241,16 +1406,18 @@ def _trt_nach_bild(pfad: Path) -> None:
 
 
 def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype, on_status,
-          bild=None, staerke: float = 1.0, lora: Path | None = None, lora_staerke: float = 1.0):
+          bild=None, staerke: float = 1.0, lora: Path | None = None, lora_staerke: float = 1.0, cfg: float = 0.0):
     """Die eigentliche Rechnung. Gibt das Bild als uint8-Array zurück.
     Mit `bild` (uint8, H×W×3) wird es ab Rauschstärke `staerke` nachgemalt statt neu.
-    Mit `lora` rechnet sie neben den Blöcken mit (ohne TensorRT – dessen Netz kennt sie nicht)."""
+    Mit `lora` rechnet sie neben den Blöcken mit (ohne TensorRT – dessen Netz kennt sie nicht).
+    `cfg` > 0 (Krea 2 Raw): je Schritt ein zweiter Durchlauf mit leerem Prompt."""
     import numpy as np
     import torch
 
     if on_status:
         on_status("Krea 2: Text-Encoder …")
     ctx = _text_einbetten(prompt, t["text"], device, dtype)
+    ctx_ohne = _text_einbetten("", t["text"], device, dtype) if cfg > 0 else None
 
     mean = torch.tensor(_LAT_MEAN, device=device).view(1, 16, 1, 1)
     std = torch.tensor(_LAT_STD, device=device).view(1, 16, 1, 1)
@@ -1274,7 +1441,8 @@ def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype
         lora_einsetzen(dit, lora, lora_staerke, device, dtype)        # nur in der Arbeitskopie auf der Karte
     with torch.no_grad():
         txt = dit.text(ctx)
-    del ctx
+        ohne = dit.text(ctx_ohne) if ctx_ohne is not None else None
+    del ctx, ctx_ohne
     noise = torch.randn((1, 16, H // 8, W // 8),
                         generator=torch.Generator().manual_seed(seed)).to(device)
     if start is None:
@@ -1283,8 +1451,8 @@ def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype
     else:
         sig = _sigmas_ab(steps, shift, staerke).to(device)
         x0 = (1.0 - sig[0]) * start + sig[0] * noise       # Flow-Matching: Bild + Rauschen
-    lat = _sample(dit, x0, txt, sig, sampler, seed, on_status)
-    del dit, txt, noise, sig, x0, start
+    lat = _sample(dit, x0, txt, sig, sampler, seed, on_status, ohne=ohne, cfg=cfg)
+    del dit, txt, ohne, noise, sig, x0, start
     if lora is None:
         _trt_nach_bild(pfad)
     _frei()
@@ -1334,12 +1502,19 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
     ref = _modell(model, modelle)
     t = teile()
 
-    steps = int(steps or schritte())
-    sampler = (sampler or DEFAULTS["sampler"]).lower()
-    shift = DEFAULTS["shift"] if shift is None else float(shift)
     W, H = size or DEFAULTS["size"]
     W = (min(max(int(W), 256), MAX_EDGE) // 16) * 16
     H = (min(max(int(H), 256), MAX_EDGE) // 16) * 16
+    raw = ist_raw(ref)
+    if raw:                                  # Grundmodell: wenige Schritte ohne CFG ergäben nur Rauschen
+        steps = int(steps) if steps and int(steps) >= RAW_SCHRITTE_MIN else raw_schritte()
+        sampler = (sampler or "euler").lower()
+        shift = raw_mu(W, H) if shift is None else float(shift)
+    else:
+        steps = int(steps or schritte())
+        sampler = (sampler or DEFAULTS["sampler"]).lower()
+        shift = DEFAULTS["shift"] if shift is None else float(shift)
+    cfg = raw_cfg() if raw else 0.0
     if seed is None:
         seed = int(time.time() * 1000) & 0x7FFFFFFF
 
@@ -1362,7 +1537,7 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
                     bild = np.asarray(ImageOps.fit(im.convert("RGB"), (W, H), Image.LANCZOS))
             arr = _male(prompt, ref, modelle[ref], t, steps, sampler, shift, W, H, seed,
                         device, dtype, on_status, bild=bild, staerke=float(staerke), lora=lora,
-                        lora_staerke=lora_staerke)
+                        lora_staerke=lora_staerke, cfg=cfg)
         except Exception as e:
             # Nur den Text behalten: der Traceback hielte sonst alle Tensoren fest.
             fehler = f"{type(e).__name__}: {e}"
@@ -1379,8 +1554,9 @@ def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
     meta = PngImagePlugin.PngInfo()
     meta.add_text("prompt", prompt)
     meta.add_text("model", ref)
-    meta.add_text("params", f"steps={steps}, cfg=1, size={W}x{H}, seed={seed}, "
-                            f"sampler={sampler}, shift={shift}, backend=krea2"
+    # cfg wie ComfyUI gezählt: 1 = ohne Gegen-Prompt; Krea-Raw-Stärke g entspricht 1 + g
+    meta.add_text("params", f"steps={steps}, cfg={1 + cfg:g}, size={W}x{H}, seed={seed}, "
+                            f"sampler={sampler}, shift={shift:g}, backend=krea2"
                             + (f", lora={lora.stem}:{lora_staerke:g}" if lora else ""))
     if lora:
         meta.add_text("lora_datei", str(lora))       # das Gesicht-Nachmalen nimmt dieselbe LoRA
@@ -1409,6 +1585,13 @@ def _cfg(key: str, standard):
 def gesicht_an() -> bool:
     """Gesichts-Nachbesserung eingeschaltet (Config `bild_krea_gesicht`)?"""
     return bool(_cfg("bild_krea_gesicht", DEFAULTS["gesicht"]))
+
+
+def set_gesicht(an: bool) -> bool:
+    """Gesichts-Nachbesserung dauerhaft ein- oder ausschalten."""
+    import config
+    config.update(bild_krea_gesicht=bool(an))
+    return bool(an)
 
 
 def _arbeitsgroesse(cw: int, ch: int, kante: int) -> tuple[int, int, float]:
@@ -1484,6 +1667,9 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
     ref = _modell(meta.get("model"), modelle)
     t = teile()
     device, dtype = _geraet()
+    raw = ist_raw(ref)
+    if raw:                                 # Raw braucht auch im kurzen Nachmal-Abschnitt mehr Schritte
+        steps = max(steps * 2, RAW_SCHRITTE_MIN)
 
     fertig, fehler = 0, None
     with _LOCK:
@@ -1499,9 +1685,10 @@ def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None
                 melde = None
                 if on_status:
                     melde = (lambda s, i=i: on_status(f"Gesicht {i + 1}/{len(boxen)} · {s}"))
-                neu = _male(prompt, ref, modelle[ref], t, steps, sampler, DEFAULTS["shift"],
+                neu = _male(prompt, ref, modelle[ref], t, steps, sampler,
+                            raw_mu(W, H) if raw else DEFAULTS["shift"],
                             W, H, seed + i, device, dtype, melde, bild=ausschnitt, staerke=staerke,
-                            lora=lora, lora_staerke=lora_staerke)
+                            lora=lora, lora_staerke=lora_staerke, cfg=raw_cfg() if raw else 0.0)
                 arr = gesichter.einsetzen(arr, box, neu)
                 fertig += 1
         except Exception as e:

@@ -219,7 +219,7 @@ def folder_badge(compact: bool = False) -> FormattedText:
     theme = ui.THEMES[ui.current_theme()]
     accent = f"fg:{theme['accent']}"
     dim = f"fg:{theme['accent_dim']}"
-    muted = "fg:#9298ac"
+    muted = f"fg:{ui.leise()}"
     try:
         result = foldersense.current()
     except Exception:

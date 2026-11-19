@@ -1,7 +1,7 @@
 """
 stimme.py – Sprechen mit Qwen3-TTS (eigener GGUF-Motor, `ggufengine/models/qwen3tts.py`).
 
-Modell: ein Ordner unter `Vision/` oder `Sinne/` im Programm-Ordner mit dem GGUF-Paar
+Modell: ein Ordner unter `KI-Modelle/KI-Stimme/Stimmmodell/` (früher `Vision/` oder `Sinne/`) mit dem GGUF-Paar
 arch "qwen3-tts" (Talker) und "qwen3-tts-tokenizer" (Klang-Decoder).  Geladen wird erst beim
 ersten Sprechen; nach FREIGABE_S ohne Nutzung und beim Bildermalen wird die GPU wieder frei.
 
@@ -51,7 +51,7 @@ try:
 except Exception:
     _INSTALL = Path(__file__).resolve().parent.parent
 
-ORDNER = ("Vision", "Sinne")
+ORDNER = ("Vision", "Sinne")       # frühere Orte unter `basis` (Tests, Selbsttest)
 FREIGABE_S = 90                    # Modus „an“: so lange bleibt die Stimme nach dem letzten Satz warm
 MODI = ("aus", "knopf", "an")
 ABTASTRATE = 24000
@@ -82,13 +82,28 @@ _zustand = {"spricht": False, "fehler": ""}
 # Modell finden, laden, freigeben
 # ---------------------------------------------------------------------------
 
+def _wurzeln(basis: Optional[Path] = None) -> list[Path]:
+    """Mit `basis`: deren frühere Ordner. Sonst KI-Modelle/KI-Stimme/Stimmmodell und die früheren Orte."""
+    if basis is not None:
+        return [basis / name for name in ORDNER]
+    try:
+        import modellorte
+        return modellorte.orte("stimme")
+    except Exception:
+        return [_INSTALL / name for name in ORDNER]
+
+
+def ordner() -> Path:
+    """Wohin neue Stimmmodelle gehören."""
+    return _wurzeln()[0]
+
+
 def finden(basis: Optional[Path] = None) -> Optional[tuple[Path, Path]]:
     """(Talker, Klang-Decoder) aus dem ersten passenden Ordner – oder None."""
     import config
     eigen = str(config.load().get("stimme_ordner") or "").strip()
     kandidaten = [Path(eigen)] if eigen else []
-    for name in ORDNER:
-        o = (basis or _INSTALL) / name
+    for o in _wurzeln(basis):
         if o.is_dir():
             kandidaten += sorted(p for p in o.iterdir() if p.is_dir())
     for d in kandidaten:
@@ -133,8 +148,8 @@ def _laden():
         if (zustand := sys.modules.get("gpuzustand")) is not None:
             zustand.sicherstellen()
         if not verfuegbar():
-            raise RuntimeError("Kein Stimm-Modell gefunden – ein Ordner unter Vision/ mit dem "
-                               "Qwen3-TTS-Talker und dem 12-Hz-Tokenizer (GGUF) fehlt.")
+            raise RuntimeError("Kein Stimm-Modell gefunden – ein Ordner unter KI-Modelle/KI-Stimme/Stimmmodell/ "
+                               "mit dem Qwen3-TTS-Talker und dem 12-Hz-Tokenizer (GGUF) fehlt.")
         try:
             import hintergrund
             belegt = hintergrund.gpu_belegt()

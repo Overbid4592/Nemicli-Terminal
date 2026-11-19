@@ -192,6 +192,231 @@ def _probe(plat, schreiber, strom: int, daten: bytes, zeit: int, dauer: int) -> 
         _frei(puffer)
 
 
+# ---------------------------------------------------------------------------
+# Lesen: Einzelbilder (Source Reader mit Videoverarbeitung -> RGB32)
+# ---------------------------------------------------------------------------
+
+MFVideoFormat_RGB32 = _guid("00000016-0000-0010-8000-00aa00389b71")
+MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING = _guid("fb394f3d-ccf1-42ee-bbb3-f9b845d5681d")
+MF_PD_DURATION = _guid("6c990d33-bb8e-477a-8598-0d5d96fcd88a")
+_ERSTES_BILD = 0xFFFFFFFC                 # MF_SOURCE_READER_FIRST_VIDEO_STREAM
+_MEDIENQUELLE = 0xFFFFFFFF                # MF_SOURCE_READER_MEDIASOURCE
+_ALLE_STROEME = 0xFFFFFFFE
+_ENDE = 0x2                               # MF_SOURCE_READERF_ENDOFSTREAM
+_GET_UINT32, _GET_UINT64 = 7, 8
+_SR_SELECT, _SR_GET_CURRENT, _SR_SET_CURRENT, _SR_READ, _SR_ATTRIBUT = 4, 6, 7, 9, 12
+_SMP_ZUSAMMEN = 41
+
+
+class _PROPVARIANT(ctypes.Structure):
+    _fields_ = [("vt", ctypes.c_uint16), ("r1", ctypes.c_uint16), ("r2", ctypes.c_uint16), ("r3", ctypes.c_uint16),
+                ("wert", c_uint64), ("rest", c_uint64)]
+
+
+def _get_u64(attr, schluessel: _GUID) -> int:
+    wert = c_uint64()
+    _ruf(attr, _GET_UINT64, (POINTER(_GUID), POINTER(c_uint64)), byref(schluessel), byref(wert), was="GetUINT64")
+    return wert.value
+
+
+def _get_u32(attr, schluessel: _GUID) -> int | None:
+    wert = c_uint32()
+    try:
+        _ruf(attr, _GET_UINT32, (POINTER(_GUID), POINTER(c_uint32)), byref(schluessel), byref(wert), was="GetUINT32")
+    except OSError:
+        return None
+    return wert.value
+
+
+MAX_DAUER_S = 24 * 3600                   # längere Angaben gelten als unbekannt (präparierte Datei)
+MAX_PUNKTE = 40_000_000                    # Bildpunkte je Einzelbild (8K = 33 Mio.)
+MAX_KANTE = 1536                           # längere Kante danach (der Bild-Encoder verkleinert ohnehin)
+MAX_LESEN = 600                            # Proben je Sprung, bis die Zielzeit erreicht ist
+MAX_FOLGE = 200_000                        # Proben ohne Dauer (der Reihe nach), dann Schluss
+_FEHLER, _TYP_NEU = 0x1, 0x20              # MF_SOURCE_READERF_ERROR, _CURRENTMEDIATYPECHANGED
+_SR_POSITION = 8
+_VT_I8 = 20
+
+
+def auswahl(dauer_s: float, fps: float, n_bilder: int, ziel_fps: float = 1.0, max_bilder: int = 32) -> list[int]:
+    """Nummern der Bilder, die gelesen werden: `ziel_fps` je Sekunde (Bild int(i · fps / ziel_fps)), bei mehr als
+    `max_bilder` gleichmäßig verteilt – wie transformers' EmbeddingGemma2VideoProcessor.sample_frames. Rechnet nur
+    die höchstens `max_bilder` Stellen aus (keine Liste über die ganze Dauer)."""
+    import numpy as np
+    if n_bilder <= 0:
+        return []
+    if fps > 0 and dauer_s > 0:
+        schritt = fps / ziel_fps
+        n = max(1, int(dauer_s * ziel_fps))
+        stellen = range(n) if n <= max_bilder else np.linspace(0, n - 1, max_bilder, dtype=int)
+        return [min(n_bilder - 1, int(int(i) * schritt)) for i in stellen]
+    if n_bilder <= max_bilder:
+        return list(range(n_bilder))
+    return [int(i) for i in np.linspace(0, n_bilder - 1, max_bilder, dtype=int)]
+
+
+def _ziel_zeiten(dauer_s: float, ziel_fps: float, max_bilder: int) -> list[float]:
+    """Sekunden, an denen ein Bild genommen wird (i / ziel_fps, bei Überlänge gleichmäßig verteilt)."""
+    import numpy as np
+    n = max(1, int(dauer_s * ziel_fps))
+    stellen = range(n) if n <= max_bilder else np.linspace(0, n - 1, max_bilder, dtype=int)
+    return [int(i) / ziel_fps for i in stellen]
+
+
+def bilder_lesen(pfad: Path, ziel_fps: float = 1.0, max_bilder: int = 32) -> list:
+    """Video -> ausgewählte Einzelbilder als (H, W, 3) uint8 RGB (längere Kante höchstens MAX_KANTE).
+
+    Mit bekannter Dauer springt der Leser zu jeder Zielzeit (höchstens `max_bilder` Sprünge) statt das ganze Video
+    zu dekodieren. Ohne Dauer liest er der Reihe nach, behält 1 Bild je Zielabstand und dünnt aus, sobald es mehr
+    als `max_bilder` werden (höchstens MAX_FOLGE Proben). Unplausible Angaben (Dauer, Bildgröße) gelten als Fehler
+    bzw. als unbekannt."""
+    plat, rw = _dlls()
+    rw.MFCreateSourceReaderFromURL.restype = c_long
+    plat.MFCreateAttributes.restype = c_long
+    pfad = Path(pfad).resolve()
+    if not pfad.is_file():
+        raise FileNotFoundError(f"Video nicht gefunden: {pfad}")
+    ole = ctypes.WinDLL("ole32")
+    com = ole.CoInitializeEx(None, 0)
+    try:
+        _pruefen(plat.MFStartup(MF_VERSION, 0), "MFStartup")
+    except Exception:
+        if com in (0, 1):
+            ole.CoUninitialize()
+        raise
+    attr, leser, typ = c_void_p(), c_void_p(), c_void_p()
+    try:
+        _pruefen(plat.MFCreateAttributes(byref(attr), 1), "MFCreateAttributes")
+        _setzen(attr, MF_SOURCE_READER_ENABLE_VIDEO_PROCESSING, 1, "u32")
+        _pruefen(rw.MFCreateSourceReaderFromURL(ctypes.c_wchar_p(str(pfad)), attr, byref(leser)), "Video öffnen")
+        _ruf(leser, _SR_SELECT, (c_uint32, ctypes.c_int), _ALLE_STROEME, 0, was="SetStreamSelection")
+        _ruf(leser, _SR_SELECT, (c_uint32, ctypes.c_int), _ERSTES_BILD, 1, was="SetStreamSelection (Bild)")
+        _pruefen(plat.MFCreateMediaType(byref(typ)), "MFCreateMediaType")
+        _setzen(typ, MF_MT_MAJOR_TYPE, MFMediaType_Video, "guid")
+        _setzen(typ, MF_MT_SUBTYPE, MFVideoFormat_RGB32, "guid")
+        _ruf(leser, _SR_SET_CURRENT, (c_uint32, c_void_p, c_void_p), _ERSTES_BILD, None, typ,
+             was="SetCurrentMediaType")
+        form = _form(leser)
+        pv = _PROPVARIANT()
+        try:
+            _ruf(leser, _SR_ATTRIBUT, (c_uint32, POINTER(_GUID), POINTER(_PROPVARIANT)), _MEDIENQUELLE,
+                 byref(MF_PD_DURATION), byref(pv), was="GetPresentationAttribute")
+            dauer_s = pv.wert / 10_000_000
+        except OSError:
+            dauer_s = 0.0
+        if not 0 < dauer_s <= MAX_DAUER_S:
+            dauer_s = 0.0
+
+        def lesen_eins():
+            """(Zeit in s, Bild oder None, Ende?) der nächsten Probe."""
+            nonlocal form
+            probe, flaggen, strom, zeit = c_void_p(), c_uint32(), c_uint32(), c_int64()
+            _ruf(leser, _SR_READ, (c_uint32, c_uint32, POINTER(c_uint32), POINTER(c_uint32), POINTER(c_int64),
+                                   POINTER(c_void_p)),
+                 _ERSTES_BILD, 0, byref(strom), byref(flaggen), byref(zeit), byref(probe), was="ReadSample")
+            if flaggen.value & _TYP_NEU:
+                form = _form(leser)
+            bild = None
+            if probe:
+                try:
+                    bild = _rgb_aus_probe(probe, *form)
+                finally:
+                    _frei(probe)
+            return zeit.value / 10_000_000, bild, bool(flaggen.value & (_ENDE | _FEHLER))
+
+        raus = []
+        if dauer_s:
+            # Zeiten zählen ab dem ersten Bild (sein Zeitstempel ist nicht immer 0)
+            start, erstes = None, None
+            for _ in range(MAX_LESEN):
+                zeit, erstes, ende = lesen_eins()
+                if erstes is not None or ende:
+                    start = zeit
+                    break
+            if erstes is None:
+                return raus
+            for t in _ziel_zeiten(dauer_s, ziel_fps, max_bilder):
+                if t == 0:
+                    raus.append(erstes)
+                    continue
+                pos = _PROPVARIANT(vt=_VT_I8, wert=int((start + t) * 10_000_000))
+                _ruf(leser, _SR_POSITION, (POINTER(_GUID), POINTER(_PROPVARIANT)), byref(_GUID()), byref(pos),
+                     was="SetCurrentPosition")
+                for _ in range(MAX_LESEN):
+                    zeit, bild, ende = lesen_eins()
+                    if bild is not None and zeit - start >= t - 1e-3:      # erstes Bild ab der Zielzeit
+                        raus.append(bild)
+                        break
+                    if ende:
+                        break
+            return raus
+        abstand, naechste = 1.0 / max(ziel_fps, 1e-6), 0.0
+        for _ in range(MAX_FOLGE):
+            zeit, bild, ende = lesen_eins()
+            if bild is not None and zeit >= naechste:
+                raus.append(bild)
+                naechste = zeit + abstand
+                if len(raus) > max_bilder:                # ausdünnen: jedes zweite behalten, Abstand verdoppeln
+                    raus, abstand = raus[::2], abstand * 2
+            if ende:
+                break
+        return raus
+    finally:
+        for o in (typ, leser, attr):
+            _frei(o)
+        plat.MFShutdown()
+        if com in (0, 1):
+            ole.CoUninitialize()
+
+
+def _form(leser) -> tuple[int, int, int]:
+    """(Breite, Höhe, Zeilenschritt) des aktuellen Bildformats; zu große Bilder sind ein Fehler."""
+    aktuell = c_void_p()
+    _ruf(leser, _SR_GET_CURRENT, (c_uint32, POINTER(c_void_p)), _ERSTES_BILD, byref(aktuell),
+         was="GetCurrentMediaType")
+    try:
+        groesse = _get_u64(aktuell, MF_MT_FRAME_SIZE)
+        W, H = groesse >> 32, groesse & 0xFFFFFFFF
+        if not (0 < W and 0 < H and W * H <= MAX_PUNKTE):
+            raise ValueError(f"unplausible Bildgröße {W}×{H}")
+        schritt = _get_u32(aktuell, MF_MT_DEFAULT_STRIDE)
+        schritt = W * 4 if schritt is None else ctypes.c_int32(schritt).value
+        if abs(schritt) < W * 4:
+            raise ValueError("Zeilenschritt kleiner als die Bildbreite")
+        return W, H, schritt
+    finally:
+        _frei(aktuell)
+
+
+def _rgb_aus_probe(probe, W: int, H: int, schritt: int):
+    import numpy as np
+    puffer = c_void_p()
+    _ruf(probe, _SMP_ZUSAMMEN, (POINTER(c_void_p),), byref(puffer), was="ConvertToContiguousBuffer")
+    try:
+        zeiger, maximal, laenge = ctypes.POINTER(ctypes.c_ubyte)(), c_uint32(), c_uint32()
+        _ruf(puffer, _BUF_LOCK, (POINTER(POINTER(ctypes.c_ubyte)), POINTER(c_uint32), POINTER(c_uint32)),
+             byref(zeiger), byref(maximal), byref(laenge), was="Lock")
+        try:
+            zeile = abs(schritt)
+            if laenge.value < zeile * H:
+                raise ValueError("Bildpuffer kürzer als das Bildformat")
+            roh = np.frombuffer(ctypes.string_at(zeiger, zeile * H), np.uint8)
+        finally:
+            _ruf(puffer, _BUF_UNLOCK, (), was="Unlock")
+    finally:
+        _frei(puffer)
+    bild = roh.reshape(H, zeile)[:, :W * 4].reshape(H, W, 4)
+    if schritt < 0:                                       # von unten nach oben gespeichert
+        bild = bild[::-1]
+    bild = bild[..., 2::-1]                               # BGRA -> RGB
+    if max(W, H) > MAX_KANTE:
+        from PIL import Image
+        img = Image.fromarray(np.ascontiguousarray(bild))
+        img.thumbnail((MAX_KANTE, MAX_KANTE), Image.BICUBIC)
+        return np.asarray(img)
+    return np.ascontiguousarray(bild)
+
+
 def nv12(rgb):
     """(H, W, 3) uint8 RGB -> NV12-Bytes (Y-Ebene, dann U/V abwechselnd je 2×2 Bildpunkte), BT.709 16–235."""
     import numpy as np

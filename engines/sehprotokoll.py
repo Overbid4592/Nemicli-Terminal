@@ -1,7 +1,7 @@
 """sehprotokoll.py - Protokoll des Bildbeschreibers, je Persönlichkeit getrennt.
 
 `Profile/<Name>/Vision/protokoll.jsonl`, je Zeile: Zeit, Pfad, Fingerabdruck (SHA-256 des
-Inhalts), Frage (leer = Beschreibung), Text, Dauer und Seh-Modell (Ordnername unter Vision/).
+Inhalts), Frage (leer = Beschreibung), Text, Dauer und Seh-Modell (Name seines Modellordners).
 Dasselbe Bild mit derselben Frage und demselben Seh-Modell wird aus dem Protokoll beantwortet –
 das Seh-Modell lädt dafür nicht.
 """

@@ -13,7 +13,7 @@ import re
 import time
 from datetime import datetime, timedelta
 
-from .nemijs import (MAX_LISTE, REGEX_MAX_EINGABE, UNDEF, Grenze, JSArray, JSFehler, JSObject, Nativ,
+from .nemijs import (INTERN, MAX_LISTE, MAX_TEXT, REGEX_MAX_EINGABE, UNDEF, Grenze, JSArray, JSFehler, JSObject, Nativ,
                      Promise, Wirt, _index, _versatz_s, ist_aufrufbar, lokale_zeit, lose_gleich, schluessel,
                      streng_gleich, typ_von, utc_zeit, zeit_klemmen, zeit_von, zu_bool, zu_ganz, zu_int32, zu_text,
                      zu_uint32, zu_zahl)
@@ -349,37 +349,68 @@ def einrichten(js) -> None:
             return zu_text(t)
         return t
 
+    def _rx_text(js_, s):
+        if len(s) > REGEX_MAX_EINGABE:
+            js_.werfen("RangeError", "Text zu lang für einen regulären Ausdruck")
+        return s
+
+    def _als_regex(js_, r, flags=""):
+        if isinstance(r, JSObject) and r.klasse == "RegExp":
+            return r
+        return js_.regex(re.escape(zu_text(r)), flags)
+
+    def _zusammen(js_, s, stellen):
+        """stellen: (start, ende, rufen) – Ersatz erst beim Zusammensetzen erzeugen, Länge laufend prüfen."""
+        out, laenge, pos = [], 0, 0
+        for start, ende, ersatz_fn in stellen:
+            for teil in (s[pos:start], ersatz_fn()):
+                laenge += len(teil)
+                if laenge > MAX_TEXT:
+                    raise Grenze("Text zu lang")
+                out.append(teil)
+            pos = ende
+        laenge += len(s) - pos
+        if laenge > MAX_TEXT:
+            raise Grenze("Text zu lang")
+        out.append(s[pos:])
+        return "".join(out)
+
     def _replace(js_, t, a, alle=False):
         s = _s(t, js_)
         muster, ersatz = _arg(a, 0), _arg(a, 1)
         if isinstance(muster, JSObject) and muster.klasse == "RegExp":
             komp = muster.props["__re"]
-            if len(s) > REGEX_MAX_EINGABE:
-                js_.werfen("RangeError", "Text zu lang für einen regulären Ausdruck")
-            anzahl = 0 if (muster.props.get("global") or alle) else 1
+            _rx_text(js_, s)
+            if muster.props.get("global") or alle:
+                treffer = komp.finditer(s)
+            else:
+                treffer = [m] if (m := komp.search(s)) else []
 
             def ers(m):
                 if ist_aufrufbar(ersatz):
                     return zu_text(js_.rufen(ersatz, UNDEF, [m.group(0), *[g if g is not None else UNDEF
                                                                          for g in m.groups()], float(m.start()), s]))
                 return _ersatz_text(zu_text(ersatz), m)
-            return js_.text_pruefen(komp.sub(ers, s, count=anzahl))
+            return _zusammen(js_, s, [(m.start(), m.end(), lambda m=m: ers(m)) for m in treffer])
         such = zu_text(muster)
         if ist_aufrufbar(ersatz):
             def eins(pos):
                 return zu_text(js_.rufen(ersatz, UNDEF, [such, float(pos), s]))
-            if alle:
-                teile, i, out = s.split(such), 0, []
-                for n, teil in enumerate(teile):
-                    out.append(teil)
-                    if n < len(teile) - 1:
-                        out.append(eins(i + len(teil)))
-                    i += len(teil) + len(such)
-                return "".join(out)
-            pos = s.find(such)
-            return s if pos < 0 else s[:pos] + eins(pos) + s[pos + len(such):]
+            if alle and such == "":                    # wie JS: vor jedem Zeichen und am Ende
+                stellen = range(len(s) + 1)
+            elif alle:
+                stellen, pos = [], s.find(such)
+                while pos >= 0:
+                    stellen.append(pos)
+                    pos = s.find(such, pos + len(such))
+            else:
+                stellen = [p] if (p := s.find(such)) >= 0 else []
+            return _zusammen(js_, s, [(p, p + len(such), lambda p=p: eins(p)) for p in stellen])
         e = zu_text(ersatz).replace("$&", such)
-        return js_.text_pruefen(s.replace(such, e) if alle else s.replace(such, e, 1))
+        anzahl = (len(s) + 1 if such == "" else s.count(such)) if alle else (1 if such in s else 0)
+        if len(s) + anzahl * (len(e) - len(such)) > MAX_TEXT:
+            raise Grenze("Text zu lang")
+        return s.replace(such, e) if alle else s.replace(such, e, 1)
 
     def _split(js_, t, a):
         s = _s(t, js_)
@@ -388,7 +419,7 @@ def einrichten(js) -> None:
         if sep is UNDEF:
             teile = [s]
         elif isinstance(sep, JSObject) and sep.klasse == "RegExp":
-            teile = sep.props["__re"].split(s)
+            teile = sep.props["__re"].split(_rx_text(js_, s))
             teile = [x if x is not None else UNDEF for x in teile]
         else:
             sep = zu_text(sep)
@@ -398,21 +429,22 @@ def einrichten(js) -> None:
         return js_.liste(teile)
 
     def _match(js_, t, a):
-        s = _s(t, js_)
-        r = _arg(a, 0)
-        if not (isinstance(r, JSObject) and r.klasse == "RegExp"):
-            r = js_.regex(re.escape(zu_text(r)), "")
+        s = _rx_text(js_, _s(t, js_))
+        r = _als_regex(js_, _arg(a, 0))
         if r.props.get("global"):
             treffer = [m.group(0) for m in r.props["__re"].finditer(s)]
             return js_.liste(treffer) if treffer else None
         return _exec_ergebnis(js_, r.props["__re"].search(s), s)
 
     def _match_all(js_, t, a):
-        s = _s(t, js_)
-        r = _arg(a, 0)
-        if not (isinstance(r, JSObject) and r.klasse == "RegExp"):
-            r = js_.regex(re.escape(zu_text(r)), "g")
+        s = _rx_text(js_, _s(t, js_))
+        r = _als_regex(js_, _arg(a, 0), "g")
         return js_.liste([_exec_ergebnis(js_, m, s) for m in r.props["__re"].finditer(s)])
+
+    def _search(js_, t, a):
+        s = _rx_text(js_, _s(t, js_))
+        m = _als_regex(js_, _arg(a, 0)).props["__re"].search(s)
+        return float(m.start()) if m else -1.0
 
     def _pad(js_, t, a, vorn):
         s = _s(t, js_)
@@ -470,8 +502,7 @@ def einrichten(js) -> None:
                                                                      else max(0, zu_ganz(a[1]))],
         "replace": _replace, "replaceAll": lambda js_, t, a: _replace(js_, t, a, True),
         "split": _split, "match": _match, "matchAll": _match_all,
-        "search": lambda js_, t, a: float(m.start()) if (m := (_arg(a, 0).props["__re"] if isinstance(_arg(a, 0), JSObject)
-                                                                else re.compile(re.escape(zu_text(_arg(a, 0))))).search(_s(t, js_))) else -1.0,
+        "search": _search,
         "padStart": lambda js_, t, a: _pad(js_, t, a, True), "padEnd": lambda js_, t, a: _pad(js_, t, a, False),
         "repeat": _repeat,
         "charAt": lambda js_, t, a: (lambda s, i: s[i] if 0 <= i < len(s) else "")(_s(t, js_), zu_ganz(_arg(a, 0))),
@@ -709,7 +740,7 @@ def einrichten(js) -> None:
 
     def _von_py(js_, v):
         if isinstance(v, dict):
-            return js_.objekt({str(k): _von_py(js_, x) for k, x in v.items() if k != "__proto__"})
+            return js_.objekt({str(k): _von_py(js_, x) for k, x in v.items() if k != "__proto__" and k not in INTERN})
         if isinstance(v, list):
             return js_.liste([_von_py(js_, x) for x in v])
         if isinstance(v, bool) or v is None or isinstance(v, str):
@@ -1149,8 +1180,9 @@ def _ersatz_text(e: str, m) -> str:
                 out.append(m.group(0))
                 i += 2
                 continue
-            if n.isdigit():
-                j = i + 2 if not (i + 2 < len(e) and e[i + 2].isdigit() and int(e[i + 1:i + 3]) <= (m.re.groups or 0)) \
+            if n in "0123456789":                       # nur ASCII: isdigit() gilt auch für „²“
+                j = i + 2 if not (i + 2 < len(e) and e[i + 2] in "0123456789"
+                                  and int(e[i + 1:i + 3]) <= (m.re.groups or 0)) \
                     else i + 3
                 nr = int(e[i + 1:j])
                 if 0 < nr <= (m.re.groups or 0):

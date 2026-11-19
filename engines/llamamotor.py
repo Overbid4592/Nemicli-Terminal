@@ -7,6 +7,10 @@ Chat-Format kommen ebenfalls von dort. llama-server bekommt nur fertige Token-Fo
 Präfix-Cache: cache_prompt im Server. Auslagern beim Bildermalen beendet den Server, danach
 startet er neu (das Gespräch wird dann einmal neu gelesen).
 
+Abbrechen (`abbruch()`): mit Abbruch liest ein Faden die Antwort, geprüft wird alle ABBRUCH_TAKT_S – auch
+während der Server den Prompt noch einliest und nichts schickt (return_progress liefert dabei Zwischenstände).
+Bei Abbruch wird die Verbindung geschlossen; der Server bricht die Aufgabe dann selbst ab.
+
 Bilder (mmproj im Modell-Ordner): llama-server nimmt sie nur mit einem Text-Prompt. Der entsteht aus den
 eigenen Token (Platzhalter MEDIEN je Bild); vorher wird geprüft, dass jede Sondermarke im Text ein echtes
 Sondertoken ist und jeder Platzhalter ein Bild – sonst wird die Anfrage abgelehnt.
@@ -18,7 +22,9 @@ from __future__ import annotations
 
 import contextlib
 import json
+import queue
 import re
+import threading
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -26,6 +32,7 @@ from types import SimpleNamespace
 import llamareserve as R
 
 LESE_ZEIT_S = 3600.0                   # eine Antwort darf so lange dauern
+ABBRUCH_TAKT_S = 0.2                   # so oft wird abbruch() beim Lesen geprüft
 MEDIEN = "<__media__>"                 # Platzhalter für ein Bild im Text-Prompt (mtmd_default_marker)
 
 
@@ -35,7 +42,7 @@ class _Bild:
 
     def __init__(self, b64: str):
         self.b64 = b64
-LADE_PHASEN = {"file": "Datei", "tokenizer": "Tokenizer", "llamacpp": f"llama.cpp {R.BUILD}"}
+LADE_PHASEN = {"file": "Datei", "tokenizer": "Tokenizer", "llamacpp": "llama.cpp"}
 
 
 def _sampler_werte(cfg) -> dict:
@@ -56,12 +63,16 @@ class LlamaCppEngine:
     """Die Teile der ggufengine.Engine, die gguflokal braucht – gerechnet von llama-server."""
 
     fremd = True
-    motor_name = f"llama.cpp {R.BUILD}"
+    motor_name = "llama.cpp"
 
-    def __init__(self, path: str, n_ctx: int = 0, bildteil: str | None = None):
+    def __init__(self, path: str, n_ctx: int = 0, bildteil: str | None = None, kv: str = "f16",
+                 n_ctx_max: int = 0):
+        """n_ctx 0: Kontext „max“ – llama.cpp passt ihn an den Grafikspeicher an (Wert danach aus /props);
+        `n_ctx_max` ist die Modelllänge. `kv`: Typ des Gesprächsspeichers (f16, q8_0, q4_0)."""
         from ggufengine.chat import ChatFormatter, detect_format
         from ggufengine.gguf import GGUFFile
         from ggufengine.tokenizer import Tokenizer
+        self.motor_name = f"llama.cpp {R.aktiv()}"
         self.load_phases: dict = {}
         t = time.time()
         self.gg = GGUFFile(path)                     # Türsteher: Kopf, Tensor-Grenzen, Metadaten-Budget
@@ -74,15 +85,16 @@ class LlamaCppEngine:
                                          thinking=False, template=vorlage)
         if bildteil:
             GGUFFile(bildteil).close()               # auch der Bildteil geht durch den Türsteher
-        self.server = R.Server(Path(path), n_ctx, Path(bildteil) if bildteil else None)
+        self.server = R.Server(Path(path), n_ctx, Path(bildteil) if bildteil else None, kv=kv,
+                               mindest=min(R.FIT_CTX, n_ctx_max) if n_ctx_max else R.FIT_CTX, n_ctx_max=n_ctx_max)
         self.load_phases["llamacpp"] = self.server.starten()
-        self.n_ctx = self.server.n_ctx or n_ctx
+        self.n_ctx = self.server.n_ctx or n_ctx or n_ctx_max or R.FIT_CTX
         self.vision = "llama.cpp" if bildteil else None
         self._marken_re = None
         self.dtype = "llamacpp"
         self.device = SimpleNamespace(type="llamacpp")
         self.kv_im_vram = None
-        self.kv_bits_wahl = 16
+        self.kv_bits_wahl = R.KV_BITS.get(self.server.kv_wirksam, 16)
         self.dry_frei: tuple = ()
         self.denk_budget = None
         self.checkpoint_new = False
@@ -131,15 +143,21 @@ class LlamaCppEngine:
         self.server.stoppen()
         self.reset()
 
-    def _sicher_laufend(self) -> float:
+    def _sicher_laufend(self, abbruch=None) -> float:
+        """Server bereit (startet oder hängt sich an); `abbruch()` beendet jedes Warten. Läuft noch der Server
+        eines anderen Builds (/llamacpp wechseln), endet er hier – vor der Anfrage, also im Leerlauf."""
         if self._geleert:
             raise RuntimeError("llama.cpp-Motor wurde entladen")
         if self.server.laeuft():
-            self.server.benutzt()
-            return 0.0
+            if not self.server.wechsel_faellig():
+                self.server.benutzt()
+                return 0.0
+            self.server.stoppen()
         self.reset()                                 # neuer Prozess: sein Cache ist leer
-        sekunden = self.server.starten()
+        sekunden = self.server.starten(abbruch)
         self.n_ctx = self.server.n_ctx or self.n_ctx
+        self.kv_bits_wahl = R.KV_BITS.get(self.server.kv_wirksam, 16)
+        self.motor_name = f"llama.cpp {self.server.build or R.aktiv()}"
         return sekunden
 
     # nichts auf der Platte: der Server hält den Präfix selbst
@@ -221,13 +239,59 @@ class LlamaCppEngine:
                 raise RuntimeError(f"llama-server lieferte ein ungültiges Token: {t!r}")
         return tokens
 
-    def _anfrage(self, ids: list[int], n: int, werte: dict, extra: dict | None = None):
+    def _zeilen(self, r, abbruch=None):
+        """Zeilen der Antwort `r`. Mit `abbruch` liest ein Faden, abbruch() wird alle ABBRUCH_TAKT_S geprüft;
+        bei Abbruch endet der Strom sofort (self._abgebrochen) und die Antwort wird geschlossen."""
+        self._abgebrochen = False
+        if abbruch is None:
+            yield from r.iter_lines()
+            return
+        if abbruch():
+            self._abgebrochen = True
+            return
+        schlange: queue.Queue = queue.Queue()
+        ende, stopp = object(), threading.Event()
+
+        def lesen():
+            try:
+                for zeile in r.iter_lines():
+                    schlange.put(zeile)
+                    if stopp.is_set():
+                        break
+            except BaseException as exc:             # nach dem Schließen erwartet: dann nicht melden
+                if not stopp.is_set():
+                    schlange.put(exc)
+            finally:
+                schlange.put(ende)
+        faden = threading.Thread(target=lesen, name="llamacpp-lesen", daemon=True)
+        faden.start()
+        try:
+            while True:
+                if abbruch():
+                    self._abgebrochen = True
+                    return
+                try:
+                    x = schlange.get(timeout=ABBRUCH_TAKT_S)
+                except queue.Empty:
+                    continue
+                if x is ende:
+                    return
+                if isinstance(x, BaseException):
+                    raise x
+                yield x
+        finally:
+            stopp.set()
+            if self._abgebrochen:
+                with contextlib.suppress(Exception):
+                    r.close()                        # der Server bricht die Aufgabe ab, der Faden endet
+
+    def _anfrage(self, ids: list[int], n: int, werte: dict, extra: dict | None = None, abbruch=None):
         """Strom der erzeugten Token-IDs für den Prompt `ids` (höchstens n). Am Ende steht in
-        self._timings, was der Server gemessen hat."""
+        self._timings, was der Server gemessen hat. `abbruch()` True beendet den Strom (auch beim Einlesen)."""
         import httpx
         self._timings = {}
-        koerper = {"prompt": ids if isinstance(ids, dict) else list(ids), "n_predict": int(n), "stream": True, "cache_prompt": True,
-                   "return_tokens": True, **werte, **(extra or {})}
+        koerper = {"prompt": ids if isinstance(ids, dict) else list(ids), "n_predict": int(n), "stream": True,
+                   "cache_prompt": True, "return_tokens": True, "return_progress": True, **werte, **(extra or {})}
         zeit = httpx.Timeout(LESE_ZEIT_S, connect=10.0)
         with httpx.Client(timeout=zeit, trust_env=False) as c, contextlib.ExitStack() as stapel:
             try:
@@ -235,13 +299,13 @@ class LlamaCppEngine:
                                                   headers=self.server.kopf))
             except httpx.ConnectError:
                 # geteilter Server inzwischen weg (der andere Prozess malt oder hat aufgehört): einmal neu verbinden
-                self._sicher_laufend()
+                self._sicher_laufend(abbruch)
                 r = stapel.enter_context(c.stream("POST", self.server.basis + "/completion", json=koerper,
                                                   headers=self.server.kopf))
             if r.status_code != 200:
                 r.read()
                 raise RuntimeError(f"llama-server: HTTP {r.status_code} {r.text[:300]}")
-            for zeile in r.iter_lines():
+            for zeile in self._zeilen(r, abbruch):
                 if not zeile.startswith("data:"):
                     continue
                 daten = json.loads(zeile[5:].strip() or "{}")
@@ -253,7 +317,7 @@ class LlamaCppEngine:
                     self._timings = daten.get("timings") or {}
                     return
 
-    def _strom(self, ids: list[int], max_tokens: int, sampler=None, denk_budget=None, prompt=None):
+    def _strom(self, ids: list[int], max_tokens: int, sampler=None, denk_budget=None, prompt=None, abbruch=None):
         """Token-IDs wie Engine.generate_tokens: Stopp-Token, Kontextgrenze, Denk-Budget
         (nach `grenze` Denk-Token wird der Schluss eingefügt und weitergeschrieben)."""
         werte = _sampler_werte(sampler)
@@ -271,7 +335,8 @@ class LlamaCppEngine:
             if rest <= 0:
                 break
             budget_voll = False
-            for tid, _ in self._anfrage(prompt if prompt is not None else ids + erzeugt, rest, werte):
+            ab = {} if abbruch is None else {"abbruch": abbruch}
+            for tid, _ in self._anfrage(prompt if prompt is not None else ids + erzeugt, rest, werte, **ab):
                 if self._erstes is None:
                     self._erstes = time.time() - t0
                 if tid in stop:
@@ -290,7 +355,7 @@ class LlamaCppEngine:
                         if gedacht >= grenze:
                             budget_voll = True
                             break
-            if not budget_voll:
+            if not budget_voll or (abbruch is not None and abbruch()):
                 break
             for t in zu:                             # Denken schließen, dann geht die Antwort weiter
                 erzeugt.append(t)
@@ -298,13 +363,14 @@ class LlamaCppEngine:
             denk_budget = None
         return erzeugt
 
-    def chat(self, messages, max_tokens: int = 512, sampler=None, **kw):
-        """Wie Engine.chat: Textstücke; danach stehen die erzeugten IDs in last_ids."""
+    def chat(self, messages, max_tokens: int = 512, sampler=None, abbruch=None, **kw):
+        """Wie Engine.chat: Textstücke; danach stehen die erzeugten IDs in last_ids. `abbruch()` True beendet
+        Start, Einlesen und Antwort (ohne Fehler, wie im eigenen Motor)."""
         from ggufengine.tokenizer import StreamDecoder
         bild = any(getattr(m, "images", None) for m in messages)
         if bild and not self.vision:
             raise RuntimeError("Dieses Modell sieht über llama.cpp keine Bilder (keine mmproj-Datei im Ordner)")
-        self._sicher_laufend()
+        self._sicher_laufend(abbruch)
         if bild:
             ids, prompt = self._bild_prompt(messages)
         else:
@@ -319,7 +385,7 @@ class LlamaCppEngine:
         self._keys = list(ids)
         t0 = time.time()
         try:
-            for tid in self._strom(ids, max_tokens, sampler, budget, prompt):
+            for tid in self._strom(ids, max_tokens, sampler, budget, prompt, abbruch):
                 self.last_ids.append(tid)
                 if s := dec.push(tid):
                     yield s
@@ -345,10 +411,13 @@ class LlamaCppEngine:
         ids = self.chat_format.encode(messages, add_generation_prompt=False)
         if not ids or (abbruch is not None and abbruch()) or self._aus:
             return 0
-        self._sicher_laufend()
+        self._sicher_laufend(abbruch)
         vorher = self._gemeinsam(ids)
-        for _ in self._anfrage(ids, 0, {}):
+        for _ in self._anfrage(ids, 0, {}, abbruch=abbruch):
             pass
+        if getattr(self, "_abgebrochen", False):     # wie weit der Server kam, ist unbekannt
+            self._keys, self._pos = list(ids[:vorher]), vorher
+            return 0
         self._keys, self._pos = list(ids), len(ids)
         return len(ids) - vorher
 

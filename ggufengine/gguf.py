@@ -1,23 +1,23 @@
 """
-Hardened GGUF reader.
+Gehärteter GGUF-Leser.
 
-Design goals (derived from the CVE history of llama.cpp / ollama):
+Entwurfsziele (abgeleitet aus der CVE-Historie von llama.cpp / ollama):
 
-* Every integer read from the file is bounds-checked BEFORE it is used for
-  an allocation, a slice or a seek.  (CVE-2024-23605, CVE-2024-21836,
+* Jede aus der Datei gelesene Ganzzahl wird auf Grenzen geprüft, BEVOR sie für
+  eine Allokation, einen Slice oder einen Seek verwendet wird.  (CVE-2024-23605, CVE-2024-21836,
   CVE-2026-27940, CVE-2026-52131, "Bleeding Llama" CVE-2026-7482)
-* Tensor extents are validated against the real file size using exact
-  Python integers, so an integer overflow is impossible by construction.
-* `general.alignment` must be a power of two within a sane range
-  (the unbounded-alignment / GGML_PAD overflow flaw, V-01).
-* Strings and arrays have hard length caps to prevent memory exhaustion (V-02), and
-  the metadata as a whole has a budget: a small file must not unfold into gigabytes
-  of Python objects.
-* Tensors start at aligned offsets and do not overlap (as llama.cpp requires).
-* Nothing in the file is ever executed or evaluated (no Jinja, no eval).
+* Die Ausdehnung der Tensoren wird mit exakten Python-Ganzzahlen gegen die echte Dateigröße
+  geprüft, ein Integer-Überlauf ist damit von vornherein unmöglich.
+* `general.alignment` muss eine Zweierpotenz in einem vernünftigen Bereich sein
+  (die Lücke unbegrenztes Alignment / GGML_PAD-Überlauf, V-01).
+* Strings und Arrays haben harte Längengrenzen gegen Speichererschöpfung (V-02), und
+  die Metadaten insgesamt haben ein Budget: Eine kleine Datei darf sich nicht zu Gigabytes
+  an Python-Objekten entfalten.
+* Tensoren beginnen an ausgerichteten Offsets und überlappen nicht (wie llama.cpp es verlangt).
+* Nichts aus der Datei wird je ausgeführt oder ausgewertet (kein Jinja, kein eval).
 
-The reader maps the file read-only and returns lightweight tensor
-descriptors; tensor bytes are sliced lazily and zero-copy.
+Der Leser bildet die Datei schreibgeschützt ab und liefert schlanke Tensor-Deskriptoren;
+Tensor-Bytes werden erst bei Bedarf und ohne Kopie ausgeschnitten.
 """
 from __future__ import annotations
 
@@ -31,25 +31,25 @@ from typing import Any, Dict, List, Tuple
 GGUF_MAGIC = b"GGUF"
 SUPPORTED_VERSIONS = (2, 3)
 
-# --- hard limits ------------------------------------------------------------
+# --- harte Grenzen ----------------------------------------------------------
 MAX_TENSORS = 1 << 18          # 262144 tensors
-MAX_KV = 1 << 16               # 65536 metadata entries
-MAX_STRING = 16 << 20          # 16 MiB per string
-MAX_ARRAY = 1 << 24            # 16M elements per array
-MAX_NAME = 512                 # tensor / key name length
-MAX_DIMS = 5                   # GGML_MAX_DIMS is 4; Conv3d weights in video DiT GGUFs use 5
-MAX_ELEMENTS = 1 << 40         # per tensor
-MAX_META_ELEMENTS = 1 << 23    # all array elements of all metadata values together (8M; real models ~0.3M)
-MAX_META_BYTES = 512 << 20      # all string bytes of all metadata values together
+MAX_KV = 1 << 16               # 65536 Metadaten-Einträge
+MAX_STRING = 16 << 20          # 16 MiB je String
+MAX_ARRAY = 1 << 24            # 16M Elemente je Array
+MAX_NAME = 512                 # Länge von Tensor- und Schlüsselnamen
+MAX_DIMS = 5                   # GGML_MAX_DIMS ist 4; Conv3d-Gewichte in Video-DiT-GGUFs nutzen 5
+MAX_ELEMENTS = 1 << 40         # je Tensor
+MAX_META_ELEMENTS = 1 << 23    # alle Array-Elemente aller Metadatenwerte zusammen (8M; echte Modelle ~0.3M)
+MAX_META_BYTES = 512 << 20      # alle String-Bytes aller Metadatenwerte zusammen
 MIN_ALIGNMENT, MAX_ALIGNMENT = 8, 1 << 16
 DEFAULT_ALIGNMENT = 32
 
 
 class GGUFError(ValueError):
-    """Raised for any malformed / hostile file content."""
+    """Wird bei jedem fehlerhaften / feindseligen Dateiinhalt ausgelöst."""
 
 
-# --- GGUF metadata value types ---------------------------------------------
+# --- Werttypen der GGUF-Metadaten ------------------------------------------
 (T_UINT8, T_INT8, T_UINT16, T_INT16, T_UINT32, T_INT32, T_FLOAT32, T_BOOL,
  T_STRING, T_ARRAY, T_UINT64, T_INT64, T_FLOAT64) = range(13)
 
@@ -60,7 +60,7 @@ _SCALAR_FMT = {
 }
 
 
-# --- GGML tensor types: id -> (name, block_size, type_size_bytes) -----------
+# --- GGML-Tensortypen: id -> (name, block_size, type_size_bytes) ------------
 GGML_TYPES: Dict[int, Tuple[str, int, int]] = {
     0: ("F32", 1, 4), 1: ("F16", 1, 2), 2: ("Q4_0", 32, 18), 3: ("Q4_1", 32, 20),
     6: ("Q5_0", 32, 22), 7: ("Q5_1", 32, 24), 8: ("Q8_0", 32, 34), 9: ("Q8_1", 32, 36),
@@ -72,7 +72,7 @@ GGML_TYPES: Dict[int, Tuple[str, int, int]] = {
     25: ("I16", 1, 2), 26: ("I32", 1, 4), 27: ("I64", 1, 8), 28: ("F64", 1, 8),
     29: ("IQ1_M", 256, 56), 30: ("BF16", 1, 2), 34: ("TQ1_0", 256, 54),
     35: ("TQ2_0", 256, 66), 39: ("MXFP4", 32, 17), 41: ("Q1_0", 128, 18), 42: ("Q2_0", 64, 18),
-    # PrismML fork: Q2_0 and TQ1_0 with one scale per 128 values
+    # PrismML-Fork: Q2_0 und TQ1_0 mit einer Scale je 128 Werte
     142: ("PQ2_0", 128, 34), 143: ("PTQ1_0", 128, 28),
 }
 Q2_0, PQ2_0 = 42, 142
@@ -81,9 +81,9 @@ Q2_0, PQ2_0 = 42, 142
 @dataclass(frozen=True)
 class TensorInfo:
     name: str
-    dims: Tuple[int, ...]      # GGUF order: dims[0] is the fastest-varying (ne0)
+    dims: Tuple[int, ...]      # GGUF-Reihenfolge: dims[0] ändert sich am schnellsten (ne0)
     ggml_type: int
-    offset: int                # relative to data section start
+    offset: int                # relativ zum Beginn des Datenabschnitts
     n_elements: int
     n_bytes: int
 
@@ -93,18 +93,18 @@ class TensorInfo:
 
     @property
     def shape(self) -> Tuple[int, ...]:
-        """Row-major (numpy / torch) shape."""
+        """Form in Zeilen-Reihenfolge (row-major, wie numpy / torch)."""
         return tuple(reversed(self.dims))
 
 
 class _Cursor:
-    """Bounds-checked little-endian reader over a read-only buffer."""
+    """Grenzgeprüfter Little-Endian-Leser über einem schreibgeschützten Puffer."""
 
     __slots__ = ("buf", "pos", "end", "elements", "string_bytes")
 
     def __init__(self, buf, start: int, end: int):
         self.buf, self.pos, self.end = buf, start, end
-        self.elements = 0            # metadata budget, see MAX_META_*
+        self.elements = 0            # Budget der Metadaten, siehe MAX_META_*
         self.string_bytes = 0
 
     def need(self, n: int) -> None:
@@ -155,7 +155,7 @@ class _Cursor:
             if etype in _SCALAR_FMT:
                 fmt = _SCALAR_FMT[etype]
                 size = struct.calcsize("<" + fmt)
-                raw = self.raw(n * size)   # bounds-checked by need()
+                raw = self.raw(n * size)   # Grenzen durch need() geprüft
                 return list(struct.unpack(f"<{n}{fmt}", raw))
             if etype == T_STRING:
                 return [self.string() for _ in range(n)]
@@ -169,17 +169,21 @@ class _Cursor:
 
 
 class GGUFFile:
-    """A validated, read-only view of a GGUF file."""
+    """Eine geprüfte, schreibgeschützte Sicht auf eine GGUF-Datei."""
 
     def __init__(self, path: str | os.PathLike):
         self.path = os.fspath(path)
         self._fh = open(self.path, "rb")
-        self._lesen = threading.Lock()   # read_into: seek + read on the shared handle
+        self._lesen = threading.Lock()   # read_into: Seek + Read auf dem gemeinsamen Handle
         self.file_size = os.fstat(self._fh.fileno()).st_size
         if self.file_size < 24:
             self._fh.close()
             raise GGUFError("file too small to be GGUF")
-        self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        try:
+            self._mm = mmap.mmap(self._fh.fileno(), 0, access=mmap.ACCESS_READ)
+        except BaseException:
+            self._fh.close()
+            raise
         self.metadata: Dict[str, Any] = {}
         self.tensors: Dict[str, TensorInfo] = {}
         self.tensor_list: List[TensorInfo] = []
@@ -188,7 +192,7 @@ class GGUFFile:
         self.data_offset = 0
         try:
             self._parse()
-        except struct.error as e:  # defensive: should already be caught by need()
+        except struct.error as e:  # defensiv: sollte schon von need() abgefangen sein
             self.close()
             raise GGUFError(f"corrupt header: {e}") from None
         except Exception:
@@ -239,7 +243,7 @@ class GGUFFile:
             offset = c.u64()
             infos.append(self._make_tensor_info(name, dims, ggml_type, offset))
 
-        # data section starts at the next aligned position after the header
+        # der Datenabschnitt beginnt an der nächsten ausgerichteten Position nach dem Header
         header_end = c.pos
         self.data_offset = (header_end + self.alignment - 1) // self.alignment * self.alignment
         if self.data_offset > self.file_size:
@@ -252,7 +256,7 @@ class GGUFFile:
                 raise GGUFError(f"duplicate tensor name {ti.name!r}")
             if ti.offset % self.alignment:
                 raise GGUFError(f"tensor {ti.name!r}: offset {ti.offset} not aligned to {self.alignment}")
-            # exact-integer range check: offset + n_bytes <= data_size
+            # Bereichsprüfung mit exakten Ganzzahlen: offset + n_bytes <= data_size
             if ti.offset > data_size or ti.n_bytes > data_size - ti.offset:
                 raise GGUFError(
                     f"tensor {ti.name!r} extends beyond file: offset={ti.offset} "
@@ -267,9 +271,10 @@ class GGUFFile:
 
     @classmethod
     def _q2_0_gruppe(cls, infos: List[TensorInfo], data_size: int) -> List[TensorInfo]:
-        """Q2_0 has 64 values per block; older PrismML files use the same type id with 128 values
-        (today PQ2_0).  A tensor whose 64-block size does not fit up to the next tensor, while the
-        128-block size does, is read as PQ2_0 (the size difference, n/64 bytes, exceeds the padding)."""
+        """Q2_0 hat 64 Werte je Block; ältere PrismML-Dateien nutzen dieselbe Typ-ID mit 128 Werten
+        (heute PQ2_0).  Ein Tensor, dessen Größe bei 64er-Blöcken nicht bis zum nächsten Tensor passt,
+        bei 128er-Blöcken aber schon, wird als PQ2_0 gelesen (der Größenunterschied, n/64 Bytes,
+        übersteigt das Padding)."""
         if not any(ti.ggml_type == Q2_0 for ti in infos):
             return infos
         folge = sorted(infos, key=lambda t: t.offset)
@@ -319,23 +324,23 @@ class GGUFFile:
         return self.metadata[key]
 
     def tensor_bytes(self, ti: TensorInfo) -> memoryview:
-        """Zero-copy read-only view of the raw tensor bytes."""
+        """Schreibgeschützte Sicht ohne Kopie auf die rohen Tensor-Bytes."""
         start = self.data_offset + ti.offset
         end = start + ti.n_bytes
-        if end > self.file_size:  # cannot happen after validation; belt and braces
+        if end > self.file_size:  # kann nach der Prüfung nicht vorkommen; doppelt gesichert
             raise GGUFError("tensor out of bounds")
         return memoryview(self._mm)[start:end]
 
     def read_into(self, ti: TensorInfo, out, start: int = 0) -> int:
-        """Copies tensor bytes [start, start + len(out)) into the writable buffer `out` with
-        plain file reads (large sequential requests instead of page faults on the mapping);
-        stops at the tensor end and returns the number of bytes read."""
+        """Kopiert die Tensor-Bytes [start, start + len(out)) in den beschreibbaren Puffer `out`, mit
+        einfachen Datei-Reads (große sequenzielle Anfragen statt Page Faults auf dem Mapping);
+        hört am Tensor-Ende auf und gibt die Anzahl gelesener Bytes zurück."""
         view = memoryview(out).cast("B")
         if not 0 <= start <= ti.n_bytes:
             raise GGUFError("read outside the tensor")
         n = min(view.nbytes, ti.n_bytes - start)
         pos = self.data_offset + ti.offset + start
-        if pos + n > self.file_size:  # cannot happen after validation; belt and braces
+        if pos + n > self.file_size:  # kann nach der Prüfung nicht vorkommen; doppelt gesichert
             raise GGUFError("tensor out of bounds")
         with self._lesen:
             self._fh.seek(pos)
@@ -352,6 +357,8 @@ class GGUFFile:
         try:
             if mm is not None:
                 mm.close()
+        except BufferError:              # noch eine Sicht (Tensor) in Benutzung: das Abbild schließt mit ihr
+            pass
         finally:
             self._fh.close()
 

@@ -80,7 +80,11 @@ class CloudChat:
         prov = P.get(provider_id)
         if prov is None:
             raise RuntimeError(f"Unbekannter Anbieter: {provider_id}")
-        key = prov.key()
+        if getattr(prov, "kind", "") == "chatgpt":   # die eigentliche Meldung (Anmeldung, Netz) statt „.env“
+            import chatgpt_login
+            key = chatgpt_login.zugang()
+        else:
+            key = prov.key()
         if not key:
             if prov.keyless:
                 key = "nemicli"   # lokales Ollama ignoriert den Key, braucht aber einen
@@ -133,8 +137,12 @@ class CloudChat:
         headers = {}
         if provider_id == "openrouter":     # OpenRouter mag eine Kennung (optional)
             headers = {"HTTP-Referer": "https://localhost/nemicli", "X-Title": "NemiCLI"}
+        extra = {}
+        if prov.keyless and base_url and not P.proxy_erlaubt(base_url):   # lokaler Server: am System-Proxy vorbei
+            from openai import DefaultAsyncHttpxClient
+            extra["http_client"] = DefaultAsyncHttpxClient(trust_env=False)
         self.client = AsyncOpenAI(base_url=base_url, api_key=key,
-                                  default_headers=headers or None)
+                                  default_headers=headers or None, **extra)
 
     def reset(self) -> None:
         self.messages = []
@@ -388,6 +396,9 @@ class CloudChat:
                 yield {"type": "thinking", "text": think}
             if d.content:
                 yield {"type": "text", "text": d.content}
+            refusal = getattr(d, "refusal", None)        # Ablehnung: als Text, sonst „(keine Antwort)“ ohne Grund
+            if isinstance(refusal, str) and refusal:
+                yield {"type": "text", "text": refusal}
 
     async def _ist_schwer(self, user_text: str) -> bool:
         """Fragt das LEICHTE Modell selbst, ob die Anfrage schwer ist. Ein kurzer

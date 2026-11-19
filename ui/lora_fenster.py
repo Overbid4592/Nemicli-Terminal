@@ -307,7 +307,7 @@ class LoraFenster(QWidget):
         self._zaehlen()
         teile = [f"✔️ {zaehl['✔️']} passen", f"⚠ {zaehl['⚠']} prüfen", f"🛑 {zaehl['🛑']} abgewählt"]
         self.pruef_text.setText("  ·  ".join(teile) + ("" if gesichter else
-                                "  ·  Gesichter nicht geprüft (kein Seh-Modell unter Vision/)")
+                                "  ·  Gesichter nicht geprüft (kein Sehmodell unter KI-Modelle/KI-Vision/Sehmodell/)")
                                 + "  –  Maus über ein Bild zeigt den Grund.")
 
     # -- Training ------------------------------------------------------------------------------------

@@ -1,13 +1,14 @@
 """
-Chat prompt formatting with templates that live in *this* code, not in the
-model file.  llama-cpp-python's CVE-2024-34359 was an SSTI through the Jinja
-template stored in GGUF metadata; we never evaluate that template.  The
-metadata template is only *inspected* (substring checks) to pick a format.
+Chat-Prompt-Formatierung mit Templates, die in *diesem* Code liegen, nicht in der
+Modelldatei.  CVE-2024-34359 in llama-cpp-python war eine SSTI über das Jinja-Template
+in den GGUF-Metadaten; dieses Template wird nie ausgewertet.  Das Metadaten-Template
+wird nur *untersucht* (Teilstring-Prüfungen), um ein Format zu wählen.
 """
 from __future__ import annotations
 
+import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import List, Optional, Tuple
 
 from .tokenizer import Tokenizer
@@ -17,25 +18,25 @@ from .tokenizer import Tokenizer
 class Message:
     role: str      # system | user | assistant
     content: str
-    # assistant turns this engine generated: the exact token ids (after the generation
-    # prompt, without the stop token).  Re-used verbatim so the next prompt starts with
-    # exactly the tokens already in the KV cache (prefix cache).
+    # Assistant-Turns, die dieser Motor erzeugt hat: die exakten Token-IDs (nach dem Generation-
+    # Prompt, ohne Stop-Token).  Unverändert wiederverwendet, damit der nächste Prompt mit genau
+    # den Tokens beginnt, die schon im KV-Cache liegen (Prefix-Cache).
     ids: Optional[List[int]] = None
-    # user turns: image embeddings (one (n_tokens, n_embd) tensor per image, from
-    # Engine.encode_image); rendered as begin mark + n placeholders + end mark
+    # User-Turns: Bild-Embeddings (ein (n_tokens, n_embd)-Tensor je Bild, aus
+    # Engine.encode_image); dargestellt als Anfangsmarke + n Platzhalter + Endmarke
     images: Optional[list] = None
-    # content as pieces (text, special): a special piece becomes its special token, every other
-    # piece plain text – for the marks of the model's own tool format, which only the caller sets
-    # (tool results, web pages and files stay plain text and can never turn into a mark)
+    # Inhalt als Stücke (text, special): ein Spezial-Stück wird zu seinem Spezial-Token, jedes andere
+    # Stück zu reinem Text – für die Marken des modelleigenen Tool-Formats, die nur der Aufrufer setzt
+    # (Tool-Ergebnisse, Webseiten und Dateien bleiben reiner Text und werden nie zu einer Marke)
     teile: Optional[List[Tuple[str, bool]]] = None
-    # a tool result in the model's own format: Gemma 4 answers it inside its open turn, Ling reads it
-    # as OBSERVATION, Mistral without [INST]
+    # ein Tool-Ergebnis im modelleigenen Format: Gemma 4 beantwortet es im offenen Turn, Ling liest es
+    # als OBSERVATION, Mistral ohne [INST]
     werkzeug_antwort: bool = False
-    # pieces right after the turn's closing mark (Mistral: [AVAILABLE_TOOLS] after the system prompt)
+    # Stücke direkt nach der Schlussmarke des Turns (Mistral: [AVAILABLE_TOOLS] nach dem System-Prompt)
     danach: Optional[List[Tuple[str, bool]]] = None
 
 
-IMAGE_MARKS = {                                   # begin, placeholder, end
+IMAGE_MARKS = {                                   # Anfang, Platzhalter, Ende
     "gemma4": ("<|image>", "<|image|>", "<image|>"),
     "qwen": ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>"),
     "pixtral": ("[IMG_BREAK]", "[IMG]", "[IMG_END]"),   # Zeilenende, Platzhalter, Bildende
@@ -45,8 +46,22 @@ IMAGE_BEGIN, IMAGE_TOKEN, IMAGE_END = IMAGE_MARKS["gemma4"]
 ZEILEN_MARKEN = IMAGE_MARKS["pixtral"]            # Bild zeilenweise, braucht `grid` (Zeilen, Spalten)
 
 
+_STANDARD_SYSTEM = re.compile(r"set\s+default_system_message\s*=\s*(['\"])(.*?)(?<!\\)\1", re.S)
+_DENK_MARKEN = ("[THINK]", "[/THINK]")
+
+
+def denk_anleitung(template: Optional[str]) -> Optional[str]:
+    """Standard-Systemprompt der Vorlage, wenn er das Denken in [THINK]…[/THINK] anleitet (Ministral 3
+    Reasoning, Magistral).  Nur als Zeichenkette herausgelesen, das Template wird nicht ausgewertet."""
+    m = _STANDARD_SYSTEM.search(template or "")
+    if not m or not all(marke in m.group(2) for marke in _DENK_MARKEN):
+        return None
+    text = m.group(2).replace("\\n", "\n").replace("\\'", "'").replace('\\"', '"')
+    return text.strip() or None
+
+
 def detect_image_marks(tok: Tokenizer) -> Optional[tuple]:
-    """The image marks the tokenizer knows (None: no image tokens)."""
+    """Die Bildmarken, die der Tokenizer kennt (None: keine Bild-Tokens)."""
     for marks in IMAGE_MARKS.values():
         if all(m in tok.special for m in marks):
             return marks
@@ -54,27 +69,27 @@ def detect_image_marks(tok: Tokenizer) -> Optional[tuple]:
 
 
 def detect_format(template: Optional[str], arch: str) -> str:
-    """Chat format from substrings of the template (never executed) and the architecture; the rules
-    live in the model database (daten/chatformate.json)."""
+    """Chat-Format aus Teilstrings des Templates (nie ausgeführt) und der Architektur; die Regeln
+    stehen in der Modell-Datenbank (daten/chatformate.json)."""
     from . import ausfuellen
     return ausfuellen.chatformat(template or "", arch)
 
 
-# Formats that are only "role header + content + end mark" (llama.cpp llm_chat_apply_template).
-# Pieces: a string that is a special token of the model is inserted as that token, everything
-# else is encoded as text; "{role}" is the role name.  strip = content is trimmed.
+# Formate, die nur aus „Rollen-Kopf + Inhalt + Endmarke“ bestehen (llama.cpp llm_chat_apply_template).
+# Stücke: ein String, der ein Spezial-Token des Modells ist, wird als dieses Token eingefügt, alles
+# andere als Text kodiert; „{role}“ ist der Rollenname.  strip = Inhalt wird beschnitten.
 def _rollen_formate() -> dict:
-    """Pieces per format (daten/chatformate.json, 'rollen_formate'): pre/post/gen, optional strip,
-    namen (role names), post per role."""
+    """Stücke je Format (daten/chatformate.json, 'rollen_formate'): pre/post/gen, optional strip,
+    namen (Rollennamen), post je Rolle."""
     from . import ausfuellen
     return ausfuellen.rollen_formate()
 
 
-# gpt-oss: identity line of the model's own template; end of the thinking and start of the
-# final answer as the detokenised stream shows them
+# gpt-oss: Identitätszeile aus dem modelleigenen Template; Ende des Denkens und Beginn der
+# endgültigen Antwort, wie sie im detokenisierten Strom erscheinen
 HARMONY_IDENTITAET = "You are ChatGPT, a large language model trained by OpenAI."
 HARMONY_FINAL = "<|end|><|start|>assistant<|channel|>final<|message|>"
-# SmolLM3: "Today Date" as strftime("%d %B %Y") in the C locale
+# SmolLM3: „Today Date“ als strftime("%d %B %Y") in der C-Locale
 _MONATE_EN = ("January", "February", "March", "April", "May", "June", "July", "August", "September",
               "October", "November", "December")
 
@@ -85,9 +100,13 @@ class ChatFormatter:
         self.fmt = fmt
         self.thinking = thinking
         self.image_marks = detect_image_marks(tok)
-        # ChatML with a think block only when the model's template uses one: Qwen3-VL Instruct
-        # shares the Qwen3 vocabulary (<think> included) but was never trained on the block
+        # ChatML mit Think-Block nur, wenn das Template des Modells einen nutzt: Qwen3-VL Instruct
+        # teilt das Qwen3-Vokabular (<think> eingeschlossen), wurde aber nie auf den Block trainiert
         self.chatml_denkt = "<think>" in tok.special and (template is None or "<think>" in template)
+        # Mistral-Reasoning: die Denk-Anleitung steht im Standard-Systemprompt der Vorlage. Ein eigener
+        # Systemprompt ersetzt ihn, ohne die Anleitung antwortet das Modell ohne Denkblock.
+        self.denk_anleitung = (denk_anleitung(template) if fmt.startswith("mistral")
+                               and all(m in tok.special for m in _DENK_MARKEN) else None)
 
     def _image_ids(self, images) -> List[int]:
         if not self.image_marks:
@@ -107,18 +126,20 @@ class ChatFormatter:
 
     @property
     def opens_thinking(self) -> bool:
-        """Does the generation prompt open a thinking block (the reply starts inside it)?"""
+        """Öffnet der Generation-Prompt einen Denkblock (die Antwort beginnt darin)?"""
         if not self.thinking:
             return False
         return self.fmt in ("k2", "bailing", "granite4", "lfm3", "harmony") or             (self.fmt == "chatml" and self.chatml_denkt)
 
     @property
     def denken_schaltbar(self) -> bool:
-        """Does `thinking` change what the model does (its template switches thinking on and off)?"""
+        """Ändert `thinking` das Verhalten des Modells (sein Template schaltet das Denken ein und aus)?"""
         if self.fmt == "chatml":
             return self.chatml_denkt
         if self.fmt == "gemma4":
             return "<|think|>" in self.tok.special
+        if getattr(self, "denk_anleitung", None):
+            return True
         return self.fmt in ("bailing", "harmony", "granite4", "lfm3", "k2", "smollm3")
 
     @property
@@ -129,27 +150,27 @@ class ChatFormatter:
 
     @property
     def hintergrund_getrennt(self) -> bool:
-        """Did the model learn context from the harness as turns of their own (LFM3: agent harnesses, tool results
-        in the "tool" role)?  Then background for a message comes as a system turn in front of it – inside
-        the user turn the model takes it for the request."""
+        """Hat das Modell Kontext vom Harness als eigene Turns gelernt (LFM3: Agent-Harnesses, Tool-Ergebnisse
+        in der Rolle „tool“)?  Dann kommt Hintergrund zu einer Nachricht als System-Turn davor – im
+        User-Turn hielte das Modell ihn für die Anfrage."""
         return self.fmt == "lfm3"
 
     @property
     def denken_im_system(self) -> bool:
-        """Is the switch part of the system turn?  Then changing it re-reads the whole prompt."""
-        return self.fmt in ("bailing", "harmony", "smollm3", "gemma4")
+        """Gehört der Schalter zum System-Turn?  Dann liest eine Änderung den ganzen Prompt neu ein."""
+        return self.fmt in ("bailing", "harmony", "smollm3", "gemma4") or bool(getattr(self, "denk_anleitung", None))
 
     @property
     def drops_old_thinking(self) -> bool:
-        """Does the model's own template leave the thinking of earlier answers out?  Then
-        such answers are passed as text (Message.ids = None) and rendered without it.
-        Ling keeps it (preserved_thinking)."""
+        """Lässt das modelleigene Template das Denken früherer Antworten weg?  Dann werden
+        solche Antworten als Text übergeben (Message.ids = None) und ohne es dargestellt.
+        Ling behält es (preserved_thinking)."""
         return self.fmt in ("chatml", "granite4", "lfm3", "gemma4", "deepseek", "harmony")
 
     def denk_marken(self):
-        """(open, close) token ids of the thinking block in the generated text, or None.
-        `close` is inserted when the thinking budget runs out; its first token also marks
-        the model's own end of thinking."""
+        """(open, close)-Token-IDs des Denkblocks im erzeugten Text oder None.
+        `close` wird eingefügt, wenn das Denkbudget aufgebraucht ist; sein erstes Token markiert
+        auch das modelleigene Ende des Denkens."""
         if self.fmt == "harmony":
             return (self._stuecke(("<|channel|>", "analysis", "<|message|>")),
                     self._stuecke(("<|end|>", "<|start|>", "assistant", "<|channel|>", "final", "<|message|>")))
@@ -165,17 +186,17 @@ class ChatFormatter:
             return self._stuecke(("<think>",)), self._stuecke(("</think>", "\n\n"))
         return None
 
-    # Each formatter returns token ids; special tokens are inserted by id and
-    # user-supplied text goes through the plain encoder (no special parsing).
+    # Jeder Formatierer liefert Token-IDs; Spezial-Tokens werden per ID eingefügt und
+    # vom Nutzer gelieferter Text läuft durch den einfachen Encoder (keine Spezial-Erkennung).
     def encode(self, messages: List[Message], add_generation_prompt: bool = True) -> List[int]:
         if self.fmt in _rollen_formate():
             return self._rollen(messages, add_generation_prompt)
         if self.fmt.startswith("mistral") or self.fmt == "llama2":
-            return self._mistral_art(messages, add_generation_prompt)
+            return self._mistral_art(self._anleitung_davor(messages), add_generation_prompt)
         fn = getattr(self, f"_{self.fmt}")
         return fn(messages, add_generation_prompt)
 
-    # -- pieces: special token if the model has it, text otherwise ---------------------
+    # -- Stücke: Spezial-Token, wenn das Modell es hat, sonst Text ---------------------
     def _stuecke(self, stuecke, role: str = "") -> List[int]:
         tok = self.tok
         ids: List[int] = []
@@ -194,13 +215,13 @@ class ChatFormatter:
         return ids
 
     def _inhalt(self, m: Message, text: Optional[str] = None, strip: bool = True) -> List[int]:
-        """Content ids: from `m.teile` (special pieces as special tokens, the rest plain), otherwise
-        `text` (default: the content) through the plain encoder."""
+        """Inhalts-IDs: aus `m.teile` (Spezial-Stücke als Spezial-Tokens, der Rest einfach), sonst
+        `text` (Standard: der Inhalt) durch den einfachen Encoder."""
         if not m.teile:
             t = m.content if text is None else text
             return self.tok.encode(t.strip() if strip else t)
         teile = list(m.teile)
-        if strip:                         # only the ends of the message; text next to a marker stays
+        if strip:                         # nur die Enden der Nachricht; Text neben einer Marke bleibt
             if not teile[0][1]:
                 teile[0] = (teile[0][0].lstrip(), False)
             if not teile[-1][1]:
@@ -239,9 +260,22 @@ class ChatFormatter:
             ids += self._stuecke(f["gen"])
         return ids
 
+    def _anleitung_davor(self, messages):
+        """Bei eingeschaltetem Denken steht die Denk-Anleitung der Vorlage vor dem eigenen Systemprompt
+        (ohne einen als eigener System-Turn); [THINK] und [/THINK] darin bleiben Spezial-Tokens."""
+        anleitung = getattr(self, "denk_anleitung", None)
+        if not (self.thinking and anleitung):
+            return messages
+        teile = [(s, s in _DENK_MARKEN) for s in re.split(r"(\[/?THINK\])", anleitung) if s]
+        if messages and messages[0].role == "system":
+            m = messages[0]
+            eigen = list(m.teile) if m.teile else [(m.content.strip(), False)]
+            return [replace(m, teile=teile + [("\n\n", False)] + eigen)] + list(messages[1:])
+        return [Message("system", anleitung, teile=teile)] + list(messages)
+
     def _mistral_art(self, messages, gen):
-        """Mistral v1/v3/v3-tekken/v7/v7-tekken and Llama 2 as in llama.cpp; [INST] etc. are
-        special tokens when the model has them."""
+        """Mistral v1/v3/v3-tekken/v7/v7-tekken und Llama 2 wie in llama.cpp; [INST] usw. sind
+        Spezial-Tokens, wenn das Modell sie hat."""
         fmt, tok = self.fmt, self.tok
         eos = self._stuecke(("</s>",))
         ids = self._bos()
@@ -297,8 +331,8 @@ class ChatFormatter:
         return ids
 
     def _bailing(self, messages, gen):
-        """Ling / Bailing V3: <role>NAME</role> ... <|role_end|>; the first system turn ends with
-        "detailed thinking on|off", earlier answers carry an empty think block."""
+        """Ling / Bailing V3: <role>NAME</role> ... <|role_end|>; der erste System-Turn endet mit
+        "detailed thinking on|off", frühere Antworten tragen einen leeren Think-Block."""
         denken = "detailed thinking " + ("on" if self.thinking else "off")
         oeffnen = ("\n", "<think>") if self.thinking else ("\n", "<think>", "</think>")
         ende = self._stuecke(("<|role_end|>",))
@@ -334,9 +368,9 @@ class ChatFormatter:
         return ids
 
     def _glm4(self, messages, gen):
-        """GLM-4 / GLM-4.5 as llama.cpp's chatglm4: [gMASK]<sop>, then "<|role|>" + newline +
-        content per message, the reply after "<|assistant|>" + newline. Tool results as in the
-        GLM-4.5 template: "<|observation|>", the pieces start with their own newline."""
+        """GLM-4 / GLM-4.5 wie chatglm4 in llama.cpp: [gMASK]<sop>, dann "<|role|>" + Zeilenumbruch +
+        Inhalt je Nachricht, die Antwort nach "<|assistant|>" + Zeilenumbruch. Tool-Ergebnisse wie im
+        GLM-4.5-Template: "<|observation|>", die Stücke beginnen mit eigenem Zeilenumbruch."""
         ids = self._stuecke(("[gMASK]", "<sop>"))
         for m in messages:
             if m.role not in ("system", "user", "assistant"):
@@ -355,8 +389,8 @@ class ChatFormatter:
         return ids
 
     def _ernie4_5(self, messages, gen):
-        """ERNIE 4.5: <|begin_of_sentence|>, system text + newline, "User: ...\n",
-        "Assistant: ...<|end_of_sentence|>", the reply after "Assistant: "."""
+        """ERNIE 4.5: <|begin_of_sentence|>, System-Text + Zeilenumbruch, "User: ...\n",
+        "Assistant: ...<|end_of_sentence|>", die Antwort nach "Assistant: "."""
         tok = self.tok
         ids = self._stuecke(("<|begin_of_sentence|>",))
         ende = self._stuecke(("<|end_of_sentence|>",))
@@ -374,10 +408,10 @@ class ChatFormatter:
         return ids
 
     def _harmony(self, messages, gen):
-        """gpt-oss (Harmony): system turn with date, reasoning level and channels as in the
-        model's template; our system prompt becomes the developer instructions.  Answers live
-        in channels: thinking opens "analysis", otherwise the reply starts directly in "final";
-        earlier answers are rendered as "final" only."""
+        """gpt-oss (Harmony): System-Turn mit Datum, Reasoning-Stufe und Kanälen wie im
+        Template des Modells; der eigene System-Prompt wird zu den Developer-Anweisungen.  Antworten
+        liegen in Kanälen: Denken öffnet "analysis", sonst beginnt die Antwort direkt in "final";
+        frühere Antworten werden nur als "final" dargestellt."""
         import datetime
         tok = self.tok
 
@@ -410,8 +444,8 @@ class ChatFormatter:
         return ids
 
     def _granite4(self, messages, gen):
-        """Granite 4.x: ChatML with "<think></think>" (no line breaks) for answers without
-        thinking; earlier answers carry an empty think block (truncate_history_thinking)."""
+        """Granite 4.x: ChatML mit "<think></think>" (ohne Zeilenumbrüche) für Antworten ohne
+        Denken; frühere Antworten tragen einen leeren Think-Block (truncate_history_thinking)."""
         tok = self.tok
         s, e = tok.special_id("<|im_start|>"), tok.special_id("<|im_end|>")
         nl = tok.encode("\n")
@@ -435,9 +469,9 @@ class ChatFormatter:
         return ids
 
     def _lfm3(self, messages, gen):
-        """LFM3: BOS (the tokenizer does not add it), ChatML; the generation prompt opens "<think>"
-        or closes it at once ("<think></think>", no line breaks); earlier answers carry an empty
-        think block in front of their text; tool results are turns of the "tool" role."""
+        """LFM3: BOS (der Tokenizer fügt es nicht hinzu), ChatML; der Generation-Prompt öffnet "<think>"
+        oder schließt es sofort ("<think></think>", ohne Zeilenumbrüche); frühere Antworten tragen
+        einen leeren Think-Block vor ihrem Text; Tool-Ergebnisse sind Turns der Rolle "tool"."""
         tok = self.tok
         s, e = tok.special_id("<|im_start|>"), tok.special_id("<|im_end|>")
         nl = tok.encode("\n")
@@ -447,7 +481,7 @@ class ChatFormatter:
         for m in messages:
             if m.role not in ("system", "user", "assistant"):
                 raise ValueError(f"unsupported role {m.role!r}")
-            rolle = "tool" if m.role == "user" and m.werkzeug_antwort else m.role   # template: results as "tool"
+            rolle = "tool" if m.role == "user" and m.werkzeug_antwort else m.role   # Template: Ergebnisse als "tool"
             ids += [s] + tok.encode(rolle + "\n")
             if m.role == "assistant":
                 if m.ids is not None:
@@ -480,7 +514,7 @@ class ChatFormatter:
                 content = content.split("</think>")[-1].lstrip("\n")
             if m.role == "user" and m.images:
                 ids += self._image_ids(m.images)
-            # text after </think> keeps leading spaces; pieces: only the message ends
+            # Text nach </think> behält führende Leerzeichen; Stücke: nur die Nachrichtenenden
             ids += self._inhalt(m, content, strip=bool(m.teile)) + [e] + nl
         if gen:
             ids += [s] + tok.encode("assistant\n") + self._chatml_think(nl)
@@ -492,15 +526,15 @@ class ChatFormatter:
             return []
         if self.thinking:
             return [tok.special_id("<think>")] + nl
-        # "\n\n" as the tokenizer splits it (one token for Qwen) – two single newlines
-        # read to the model like an unclosed think block
+        # "\n\n", wie der Tokenizer es teilt (ein Token bei Qwen) – zwei einzelne Zeilenumbrüche
+        # liest das Modell wie einen nicht geschlossenen Think-Block
         nl2 = tok.encode("\n\n")
         return [tok.special_id("<think>")] + nl2 + [tok.special_id("</think>")] + nl2
 
     def _smollm3(self, messages, gen):
-        # System part with a metadata header; "/think" or "/no_think" in the system text picks the
-        # mode.  Without a tool list the model's template ends the system part WITHOUT <|im_end|>.
-        # Answers stay as generated (thinking included); in /no_think mode an empty block leads them.
+        # System-Teil mit Metadaten-Kopf; "/think" oder "/no_think" im System-Text wählt den
+        # Modus.  Ohne Tool-Liste beendet das Template des Modells den System-Teil OHNE <|im_end|>.
+        # Antworten bleiben wie erzeugt (Denken eingeschlossen); im /no_think-Modus steht ein leerer Block davor.
         tok = self.tok
         s, e = tok.special_id("<|im_start|>"), tok.special_id("<|im_end|>")
         nl = tok.encode("\n")
@@ -565,8 +599,8 @@ class ChatFormatter:
 
     def _deepseek(self, messages, gen):
         # <bos>{system}<｜User｜>{..}<｜Assistant｜>{answer}<｜end▁of▁sentence｜>...<｜Assistant｜>
-        # The system text follows <bos> without a separator; earlier answers lose their
-        # <think> part, as in the template.
+        # Der System-Text folgt <bos> ohne Trenner; frühere Antworten verlieren ihren
+        # <think>-Teil, wie im Template.
         tok = self.tok
         u, a = tok.special_id("<｜User｜>"), tok.special_id("<｜Assistant｜>")
         eos = tok.special_id("<｜end▁of▁sentence｜>")
@@ -610,8 +644,8 @@ class ChatFormatter:
 
     def _gemma4(self, messages, gen):
         # <bos>[<|turn>system\n[<|think|>\n]{system}<turn|>\n]<|turn>user\n{..}<turn|>\n<|turn>model\n
-        # Tool results in Gemma's own format (Message.werkzeug_antwort) stay inside the open model
-        # turn right after its call, and the model goes on in that turn (as in its template).
+        # Tool-Ergebnisse im Gemma-eigenen Format (Message.werkzeug_antwort) bleiben im offenen Modell-
+        # Turn direkt nach dessen Aufruf, und das Modell macht in diesem Turn weiter (wie in seinem Template).
         tok = self.tok
         sot, eot = tok.special_id("<|turn>"), tok.special_id("<turn|>")
         nl = tok.encode("\n")
@@ -625,7 +659,7 @@ class ChatFormatter:
                 ids += self._inhalt(system[0])
             ids += [eot] + nl
         rest = [m for m in messages if m.role != "system"]
-        offen = False                                    # model turn still open (call, result, …)
+        offen = False                                    # Zug des Modells noch offen (Aufruf, Ergebnis, …)
         for i, m in enumerate(rest):
             danach_antwort = i + 1 < len(rest) and rest[i + 1].werkzeug_antwort
             if offen and m.werkzeug_antwort:
@@ -641,11 +675,11 @@ class ChatFormatter:
                     ids += kopf + list(m.ids)
                 else:
                     content = m.content.strip()
-                    if "<channel|>" in content:                      # drop previous thinking
+                    if "<channel|>" in content:                      # früheres Denken weglassen
                         content = content.split("<channel|>")[-1].strip()
                     if m.teile or offen:
                         ids += kopf + self._inhalt(m, content)
-                    else:                                            # one piece
+                    else:                                            # ein Stück
                         ids += [sot] + tok.encode("model\n" + content)
                 offen = danach_antwort
                 if not offen:

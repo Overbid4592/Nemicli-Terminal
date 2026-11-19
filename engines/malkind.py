@@ -26,6 +26,7 @@ TAKT_S = 0.25
 RUHE_S = 120.0                     # höchstens so lange ohne Auftrag, dann endet das Kind
 RUHE_MIN_S = 30.0
 MAX_WARTEN_S = 300.0               # so lange wartet ein Auftrag höchstens auf die Mal-Sperre (LoRA-Training …)
+STILL_MAX_S = 900.0                # so lange ohne neue Statuszeile: das Kind hängt und wird beendet
 ENV = "NEMICLI_MALKIND"
 FUNKTIONEN = ("paint", "gesicht_nachbessern")
 
@@ -128,9 +129,14 @@ def auftrag(fn: str, kw: dict, on_status=None):
         tmp.write_text(json.dumps({"fn": fn, "kw": kw}, ensure_ascii=False), encoding="utf-8")
         tmp.replace(basis.with_suffix(".auftrag"))
         schon, neu_gestartet = 0, False
+        lebenszeichen = time.monotonic()
         try:
             while True:
-                schon = _status_lesen(basis, schon, on_status)
+                vorher, schon = schon, _status_lesen(basis, schon, on_status)
+                if schon != vorher:
+                    lebenszeichen = time.monotonic()
+                elif time.monotonic() - lebenszeichen > STILL_MAX_S:
+                    raise RuntimeError(f"Der Mal-Prozess meldet sich seit {STILL_MAX_S / 60:.0f} Minuten nicht.")
                 erg = basis.with_suffix(".ergebnis")
                 if erg.exists():
                     d = json.loads(erg.read_text(encoding="utf-8"))

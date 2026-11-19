@@ -14,6 +14,7 @@ Gesprächs, Kürzen, Bilder und Werkzeug-Protokoll bleiben dort, getauscht wird 
 """
 from __future__ import annotations
 
+import asyncio
 from typing import AsyncIterator
 
 import reasoning
@@ -112,10 +113,11 @@ class ResponsesChat(CloudChat):
         self._konto = provider_id == "chatgpt"
         self._mit_zusammenfassung = True              # Denk-Zusammenfassung, solange der Anbieter sie zulässt
 
-    def _client(self):
+    async def _client(self):
         if self._konto:
             import chatgpt_login
-            self.client.api_key = chatgpt_login.zugang()
+            # Erneuern ist eine Netzanfrage: nicht in der Ereignisschleife (Anzeige, Esc)
+            self.client.api_key = await asyncio.to_thread(chatgpt_login.zugang)
         return self.client
 
     def _anfrage(self, msgs: list[dict], model_id: str | None = None, *, helper: bool = False) -> dict:
@@ -132,7 +134,7 @@ class ResponsesChat(CloudChat):
     async def _erstellen(self, kwargs: dict):
         from openai import APIStatusError
         try:
-            return await self._client().responses.create(**kwargs)
+            return await (await self._client()).responses.create(**kwargs)
         except APIStatusError as exc:
             koerper = exc.body if isinstance(exc.body, dict) else {}
             fehler = koerper.get("error", koerper) if isinstance(koerper, dict) else {}
@@ -142,7 +144,7 @@ class ResponsesChat(CloudChat):
                     and ("summary" in text.lower() or "verif" in text.lower())):
                 self._mit_zusammenfassung = False      # z. B. Organisation nicht verifiziert: ohne Zusammenfassung
                 kwargs = dict(kwargs, reasoning={k: v for k, v in kwargs["reasoning"].items() if k != "summary"})
-                return await self._client().responses.create(**kwargs)
+                return await (await self._client()).responses.create(**kwargs)
             if code in FEHLER_TEXTE:
                 raise _fehler_aus(code, text, str(fehler.get("param") or "")) from None
             raise
@@ -155,7 +157,7 @@ class ResponsesChat(CloudChat):
         zusammenfassung = False
         async for ev in stream:
             typ = _feld(ev, "type", "")
-            if typ == "response.output_text.delta":
+            if typ in ("response.output_text.delta", "response.refusal.delta"):   # Ablehnung: als Text
                 yield {"type": "text", "text": _feld(ev, "delta", "") or ""}
             elif typ in ("response.reasoning_summary_text.delta", "response.reasoning_text.delta"):
                 zusammenfassung = True

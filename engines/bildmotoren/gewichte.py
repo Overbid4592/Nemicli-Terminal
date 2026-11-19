@@ -6,8 +6,12 @@ Formate der Matrizen (Klasse Lin):
     dicht   bf16 · fp16 · fp32
     fp8     float8_e4m3fn / e5m2, optional mit Skala (ComfyUI „scaled fp8“, „fp8_mixed“)
     nvfp4   4 Bit mit FP8-Blockskalen (ComfyUI); auf Blackwell direkt über scaled_mm
-    int8    int8 mit Skala je Zeile (ComfyUI „int8_tensorwise“ ohne Drehung)
+    mxfp8   float8_e4m3fn mit E8M0-Skala je 32 Werte (ComfyUI „mxfp8“, Skalen in cuBLAS-Kacheln)
+    int8    int8 mit Skala je Zeile (ComfyUI „int8_tensorwise“), auch mit Hadamard-Drehung („convrot“)
     gguf    Q2_K … Q8_0, bleibt gepackt und rechnet über die Kerne des GGUF-Motors
+
+Andere Formate (z. B. „convrot_w4a4“, „asym_w4a8_int8“) lehnt `Quelle.lin` mit FormatFehler ab,
+statt sie falsch zu rechnen.
 
 Alles wird zuerst in den Arbeitsspeicher gelesen; `zu(geraet)` liefert eine Kopie für die Karte.
 """
@@ -97,14 +101,43 @@ def _nvfp4_gewicht(q, bs_blocked, ts, dtype):
     return (w.view(out_f, in_f // 16, 16) * skala.to(dtype).unsqueeze(-1)).view(out_f, in_f)
 
 
+MXFP8_BLOCK = 32
+DREHGRUPPE_MAX = 4096          # ComfyUI nimmt 256; größere Werte aus einer Datei bauten riesige Matrizen
+_HADAMARD: dict = {}
+
+
+def hadamard(n: int, geraet, dtype):
+    """Normierte reguläre Hadamard-Matrix (n = 4^k) wie bei ComfyUI-ConvRot; symmetrisch und orthogonal."""
+    import torch
+    schluessel = (n, str(geraet), dtype)
+    if schluessel not in _HADAMARD:
+        if n < 4 or n > DREHGRUPPE_MAX or n & (n - 1) or (n.bit_length() - 1) % 2:
+            raise FormatFehler(f"Drehgruppe {n} ist keine Potenz von 4 bis {DREHGRUPPE_MAX}")
+        h4 = torch.tensor([[1, 1, 1, -1], [1, 1, -1, 1], [1, -1, 1, 1], [-1, 1, 1, 1]], dtype=torch.float32)
+        h = h4
+        while h.shape[0] < n:
+            h = torch.kron(h, h4)
+        _HADAMARD[schluessel] = (h / n ** 0.5).to(geraet, dtype)
+    return _HADAMARD[schluessel]
+
+
+def e8m0_skalen(roh, zeilen: int, bloecke: int):
+    """MXFP8-Blockskalen (cuBLAS-Kacheln, E8M0) -> float32 (zeilen, bloecke): 2^(e - 127), e = 0 -> 0."""
+    import torch
+    import krea as _k
+    e = _k._from_blocked(roh.reshape(-1).view(torch.uint8), zeilen, bloecke).to(torch.int32)
+    return torch.where(e == 0, torch.zeros_like(e), e << 23).view(torch.float32)
+
+
 class Lin:
-    """y = x @ W^T (+ b) für eine Matrix in ihrem gespeicherten Format."""
+    """y = x @ W^T (+ b) für eine Matrix in ihrem gespeicherten Format.
+    `gruppe`: Gruppengröße der Hadamard-Drehung (int8 „convrot“), sonst 0."""
 
-    __slots__ = ("art", "w", "skala", "skala2", "bias", "n_out", "n_in", "ggml", "_pl")
+    __slots__ = ("art", "w", "skala", "skala2", "bias", "n_out", "n_in", "ggml", "gruppe", "_pl")
 
-    def __init__(self, art: str, w, *, skala=None, skala2=None, bias=None, n_out=0, n_in=0, ggml=0):
+    def __init__(self, art: str, w, *, skala=None, skala2=None, bias=None, n_out=0, n_in=0, ggml=0, gruppe=0):
         self.art, self.w, self.skala, self.skala2, self.bias = art, w, skala, skala2, bias
-        self.n_out, self.n_in, self.ggml = int(n_out), int(n_in), int(ggml)
+        self.n_out, self.n_in, self.ggml, self.gruppe = int(n_out), int(n_in), int(ggml), int(gruppe)
         self._pl = None
 
     # --- Speicher -----------------------------------------------------------
@@ -124,7 +157,7 @@ class Lin:
                 return t.pin_memory() if pin else t
             return t.to(geraet, non_blocking=True)
         return Lin(self.art, bewegen(self.w), skala=bewegen(self.skala), skala2=bewegen(self.skala2),
-                   bias=bewegen(self.bias), n_out=self.n_out, n_in=self.n_in, ggml=self.ggml)
+                   bias=bewegen(self.bias), n_out=self.n_out, n_in=self.n_in, ggml=self.ggml, gruppe=self.gruppe)
 
     # --- Rechnen ------------------------------------------------------------
 
@@ -132,9 +165,19 @@ class Lin:
         """Die Matrix dicht in `dtype` (n_out, n_in)."""
         if self.art == "dicht":
             return self.w.to(dtype)
+        if self.art == "int8" and self.gruppe:
+            # gespeichert ist W·H (zeilenweise gedreht); H ist orthogonal: W = (W·H)·Hᵀ
+            w = self.w.float() * self.skala if self.skala is not None else self.w.float()
+            h = hadamard(self.gruppe, w.device, w.dtype)
+            w = (w.view(self.n_out, self.n_in // self.gruppe, self.gruppe) @ h.t()).view(self.n_out, self.n_in)
+            return w.to(dtype)
         if self.art in ("fp8", "int8"):
             w = self.w.to(dtype)
             return w * self.skala.to(dtype) if self.skala is not None else w
+        if self.art == "mxfp8":
+            zeilen, spalten = self.w.shape
+            w = self.w.to(dtype).view(zeilen, spalten // MXFP8_BLOCK, MXFP8_BLOCK) * self.skala.to(dtype).unsqueeze(-1)
+            return w.view(zeilen, spalten)[:self.n_out, :self.n_in]
         if self.art == "nvfp4":
             return _nvfp4_gewicht(self.w, self.skala, self.skala2, dtype)
         from ggufengine.quant import dequantize
@@ -150,7 +193,10 @@ class Lin:
         if self.art == "nvfp4" and x.is_cuda and _fp4_mm_moeglich(x.device):
             return self._nvfp4_mm(x)
         b = None if self.bias is None else self.bias.to(x.dtype)
-        return F.linear(x, self.gewicht(x.dtype), b)
+        w = self.gewicht(x.dtype)
+        if self.art == "mxfp8" and w.shape[1] > x.shape[-1]:       # auf 32 aufgefüllte Spalten
+            w = w[:, :x.shape[-1]]
+        return F.linear(x, w, b)
 
     def _nvfp4_mm(self, x):
         import torch
@@ -179,6 +225,9 @@ def _fp4_mm_moeglich(geraet) -> bool:
 # ===========================================================================
 #  Dateien öffnen
 # ===========================================================================
+
+BEKANNTE_FORMATE = frozenset({"", "nvfp4", "mxfp8", "int8_tensorwise", "float8_e4m3fn", "float8_e5m2"})
+
 
 class Quelle:
     """Eine geöffnete Modelldatei. `lin(name)` liefert eine Matrix, `tensor(name)` einen dichten Tensor.
@@ -274,18 +323,37 @@ class Quelle:
                 return Lin("dicht", w, bias=bias, n_out=n_out, n_in=n_in)
             return Lin("gguf", w, bias=bias, n_out=n_out, n_in=n_in, ggml=ti.ggml_type)
         fmt = self._format(name)
+        if not fmt and w.dtype == torch.uint8 and self.hat(name + ".weight_scale_2"):
+            fmt = "nvfp4"                                   # ohne Format-Angabe: Bytes + zweite Skala
+        if fmt not in BEKANNTE_FORMATE:
+            raise FormatFehler(f"Quantisierung „{fmt}“ ({name}) kann der Motor nicht rechnen – "
+                               "bitte die bf16-, FP8-, MXFP8-, NVFP4-, INT8- oder GGUF-Fassung nehmen")
         s = lambda endung: self.tensor(name + endung) if self.hat(name + endung) else None   # noqa: E731
         if fmt == "nvfp4":
+            if self.hat(name + ".pre_quant_scale"):
+                raise FormatFehler(f"NVFP4 mit Vorskala (pre_quant_scale, {name}) wird nicht unterstützt")
             ts = s(".weight_scale_2")
             bs, _ = self._roh(name + ".weight_scale")
             return Lin("nvfp4", w, skala=bs, skala2=ts.float(), bias=bias, n_out=w.shape[0], n_in=w.shape[1] * 2)
+        if fmt == "mxfp8":
+            if not self.hat(name + ".weight_scale"):
+                raise FormatFehler(f"MXFP8 ohne Blockskalen ({name})")
+            roh, _ = self._roh(name + ".weight_scale")
+            zeilen, spalten = w.shape
+            skala = e8m0_skalen(roh, zeilen, spalten // MXFP8_BLOCK).to(torch.bfloat16)   # Zweierpotenzen: exakt
+            n_out = bias.shape[0] if bias is not None else zeilen
+            return Lin("mxfp8", w.view(torch.float8_e4m3fn), skala=skala, bias=bias, n_out=n_out, n_in=spalten)
         if fmt.startswith("int8") or w.dtype == torch.int8:
+            gruppe = 0
             if self._convrot(name):
-                raise FormatFehler("int8 mit Drehung (convrot) wird nicht unterstützt – "
-                                   "bitte die bf16-, FP8-, NVFP4- oder GGUF-Fassung nehmen")
+                q = self._comfy_quant(name)
+                gruppe = int(q.get("convrot_groupsize", (q.get("params") or {}).get("convrot_groupsize", 256)))
+                if w.shape[1] % gruppe:
+                    raise FormatFehler(f"Drehgruppe {gruppe} teilt die Breite von {name} nicht")
+                hadamard(gruppe, "cpu", torch.float32)                          # prüft die Gruppengröße
             skala = s(".weight_scale")
             return Lin("int8", w, skala=None if skala is None else skala.float().reshape(-1, 1),
-                       bias=bias, n_out=w.shape[0], n_in=w.shape[1])
+                       bias=bias, n_out=w.shape[0], n_in=w.shape[1], gruppe=gruppe)
         if w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
             skala = s(".weight_scale")
             if skala is None:

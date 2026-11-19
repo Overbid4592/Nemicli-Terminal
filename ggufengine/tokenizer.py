@@ -1,14 +1,14 @@
 """
-Byte-level BPE tokenizer (GPT-2 family: Qwen, Llama-3, ...) built purely
-from the GGUF metadata.  No external dependencies, no `regex` module: the
-pre-tokenisation pattern is implemented as a small hand-written scanner.
+Byte-Level-BPE-Tokenizer (GPT-2-Familie: Qwen, Llama-3, ...), rein aus den
+GGUF-Metadaten aufgebaut.  Keine externen Abhängigkeiten, kein `regex`-Modul:
+das Pre-Tokenisierungsmuster ist als kleiner handgeschriebener Scanner umgesetzt.
 
-Security notes
-* Special/control tokens are NEVER parsed out of user text.  They are only
-  inserted by the chat template through `special()`.  A user cannot inject
-  `<|im_start|>` and friends.
-* Vocabulary sizes/ids come from the hardened GGUF reader, and every id is
-  range-checked before use.
+Sicherheitshinweise
+* Spezial-/Steuer-Tokens werden NIE aus Nutzertext herausgeparst.  Sie werden nur
+  von der Chat-Vorlage über `special()` eingefügt.  Ein Nutzer kann
+  `<|im_start|>` und Co. nicht einschleusen.
+* Vokabulargrößen/-ids stammen aus dem gehärteten GGUF-Leser, und jede id wird
+  vor der Verwendung auf ihren Bereich geprüft.
 """
 from __future__ import annotations
 
@@ -22,7 +22,7 @@ BPE_CACHE_MAX = 200_000
 TOKEN_NORMAL, TOKEN_UNKNOWN, TOKEN_CONTROL, TOKEN_USER_DEFINED, TOKEN_UNUSED, TOKEN_BYTE = 1, 2, 3, 4, 5, 6
 
 
-# --- byte <-> unicode mapping (GPT-2) ---------------------------------------
+# --- Zuordnung Byte <-> Unicode (GPT-2) -------------------------------------
 def _bytes_to_unicode() -> Dict[int, str]:
     bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
     cs = bs[:]
@@ -39,7 +39,7 @@ BYTE_TO_UNI = _bytes_to_unicode()
 UNI_TO_BYTE = {v: k for k, v in BYTE_TO_UNI.items()}
 
 
-# --- pre-tokenisation scanners ---------------------------------------------
+# --- Scanner für die Vor-Tokenisierung -------------------------------------
 def _cat(ch: str) -> str:
     return unicodedata.category(ch)[0]
 
@@ -56,7 +56,7 @@ _CONTRACTIONS = ("'s", "'t", "'re", "'ve", "'m", "'ll", "'d")
 def _pretokenize_qwen(text: str, letters_with_marks: bool, digits: int = 1, joiners: bool = False,
                       punct_marks: bool = False) -> List[str]:
     """
-    Implements (qwen35, letters_with_marks=True):
+    Setzt um (qwen35, letters_with_marks=True):
       (?i:'s|'t|'re|'ve|'m|'ll|'d)
       | [^\\r\\n\\p{L}\\p{N}]?[\\p{L}\\p{M}]+
       | \\p{N}
@@ -64,9 +64,9 @@ def _pretokenize_qwen(text: str, letters_with_marks: bool, digits: int = 1, join
       | \\s*[\\r\\n]+
       | \\s+(?!\\S)
       | \\s+
-    qwen2 (letters_with_marks=False) is the same without \\p{M}.
-    k2-horizon: words also take U+200C/U+200D (`joiners`), numbers \\p{N}{1,3} (`digits`),
-    and marks count as punctuation there (`punct_marks`).
+    qwen2 (letters_with_marks=False) ist dasselbe ohne \\p{M}.
+    k2-horizon: Wörter nehmen auch U+200C/U+200D auf (`joiners`), Zahlen \\p{N}{1,3} (`digits`),
+    und Marks zählen dort als Satzzeichen (`punct_marks`).
     """
     n = len(text)
     out: List[str] = []
@@ -104,14 +104,14 @@ def _pretokenize_qwen(text: str, letters_with_marks: bool, digits: int = 1, join
             out.append(text[i:k])
             i = k
             continue
-        if j != i and is_word(ch):   # backtrack: optional char not taken
+        if j != i and is_word(ch):   # zurück: optionales Zeichen nicht genommen
             k = i + 1
             while k < n and is_word(text[k]):
                 k += 1
             out.append(text[i:k])
             i = k
             continue
-        # 3. number (1..`digits` digits)
+        # 3. Zahl (1..`digits` Ziffern)
         if _is_N(ch):
             k = i + 1
             while k < n and k - i < digits and _is_N(text[k]):
@@ -130,7 +130,7 @@ def _pretokenize_qwen(text: str, letters_with_marks: bool, digits: int = 1, join
             out.append(text[i:k])
             i = k
             continue
-        # whitespace alternatives 5-7
+        # Leerraum-Alternativen 5-7
         if _is_ws(ch):
             k = i + 1
             while k < n and _is_ws(text[k]):
@@ -141,24 +141,24 @@ def _pretokenize_qwen(text: str, letters_with_marks: bool, digits: int = 1, join
                 out.append(run[:last_nl + 1])
                 i += last_nl + 1
                 continue
-            if k < n and len(run) > 1:             # 6. \s+(?!\S) -> leave one for the next token
+            if k < n and len(run) > 1:             # 6. \s+(?!\S) -> eines für das nächste Token übrig lassen
                 out.append(run[:-1])
                 i = k - 1
                 continue
             out.append(run)                        # 7. \s+
             i = k
             continue
-        # fallback (should not happen): single char
+        # Rückfall (sollte nicht vorkommen): einzelnes Zeichen
         out.append(ch)
         i += 1
     return out
 
 
-# --- regex pre-tokenisers (the other families) --------------------------------
-# Patterns per pre-tokeniser type as in llama.cpp's llm_tokenizer_bpe.  They are fixed
-# here in the code – nothing from the model file is ever compiled as a regex.  A list is
-# applied in order: each pattern splits the pieces of the previous one further, text it
-# does not match stays as its own piece (like tokenizers' Split(behavior="isolated")).
+# --- Regex-Pre-Tokenizer (die übrigen Familien) --------------------------------
+# Muster je Pre-Tokenizer-Typ wie in llm_tokenizer_bpe von llama.cpp.  Sie stehen fest
+# hier im Code – aus der Modelldatei wird nie etwas als Regex kompiliert.  Eine Liste wird
+# der Reihe nach angewendet: jedes Muster teilt die Stücke des vorigen weiter, Text, den es
+# nicht trifft, bleibt ein eigenes Stück (wie Split(behavior="isolated") in tokenizers).
 _KONTRAKTION = r"(?:'[sS]|'[tT]|'[rR][eE]|'[vV][eE]|'[mM]|'[lL][lL]|'[dD])"
 _GPT2 = r"'s|'t|'re|'ve|'m|'ll|'d| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)"
 _REGELN = {
@@ -178,7 +178,7 @@ _REGELN = {
     "default": [r"[\p{P}\$\+<=>\^~\|]+", _GPT2, r"\p{N}+", r"[0-9][0-9][0-9]"],
     "bailingmoe": [r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]++[\r\n]*"
                    r"|\s*[\r\n]|\s+(?!\S)|\s+"],
-    # Kimi K2 / Kimi-Linear (tokenization_kimi.py): Han runs apart, letter runs without Han; V1 for the set &&
+    # Kimi K2 / Kimi-Linear (tokenization_kimi.py): Han-Folgen getrennt, Buchstabenfolgen ohne Han; V1 für die Menge &&
     "kimi-k2": [r"(?V1)[\p{Han}]+|[^\r\n\p{L}\p{N}]?[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*"
                 r"[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+(?i:'s|'t|'re|'ve|'m|'ll|'d)?|[^\r\n\p{L}\p{N}]?"
                 r"[\p{Lu}\p{Lt}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]+[\p{Ll}\p{Lm}\p{Lo}\p{M}&&[^\p{Han}]]*"
@@ -203,8 +203,8 @@ def regeln_fuer(pre: str):
         return None
     try:
         import regex
-    except ImportError:
-        return None
+    except ImportError:                  # der Qwen-Scanner als Ersatz zerlegte anders: falsche Tokens
+        raise GGUFError(f"Python package 'regex' is missing – needed for pre-tokenizer {pre!r}") from None
     return [regex.compile(m) for m in _REGELN[_PRE_TYP.get(pre, "default")]]
 
 
@@ -316,8 +316,8 @@ class Tokenizer:
         model = gg.get("tokenizer.ggml.model")
         if model not in ("gpt2", "gemma4"):
             raise GGUFError(f"tokenizer model {model!r} is not supported (gpt2 byte-level BPE or gemma4 SPM-BPE)")
-        # gemma4: SentencePiece-style BPE on raw unicode characters with U+2581 for spaces,
-        # no GPT-2 byte encoding, byte fallback through <0xXX> tokens (llama.cpp PRE_TYPE_GEMMA4)
+        # gemma4: BPE im SentencePiece-Stil auf rohen Unicode-Zeichen mit U+2581 für Leerzeichen,
+        # keine GPT-2-Byte-Kodierung, Byte-Rückfall über <0xXX>-Tokens (llama.cpp PRE_TYPE_GEMMA4)
         self.spm_style = model == "gemma4"
         self.pre = gg.get("tokenizer.ggml.pre", "gemma4" if self.spm_style else "default")
         tokens = gg.require("tokenizer.ggml.tokens")
@@ -337,7 +337,7 @@ class Tokenizer:
         for r, m in enumerate(merges):
             if not isinstance(m, str):
                 raise GGUFError("merges must be strings")
-            cut = m.find(" ", 1)                      # split at the first space after position 0
+            cut = m.find(" ", 1)                      # am ersten Leerzeichen nach Position 0 teilen
             if cut < 0:
                 raise GGUFError(f"malformed merge {m!r}")
             self.ranks[(m[:cut], m[cut + 1:])] = r
@@ -356,25 +356,29 @@ class Tokenizer:
         self.bos_id = _id("tokenizer.ggml.bos_token_id")
         self.eos_id = _id("tokenizer.ggml.eos_token_id")
         self.pad_id = _id("tokenizer.ggml.padding_token_id")
+        try:
+            self.unk_id = _id("tokenizer.ggml.unknown_token_id")
+        except GGUFError:                         # nur für den Byte-Rückfall, kein Grund zum Abbruch
+            self.unk_id = None
         self.add_bos = bool(gg.get("tokenizer.ggml.add_bos_token", False))
-        # tokens that end a turn
+        # Tokens, die einen Redebeitrag beenden
         self.stop_ids = {i for i in (self.eos_id,) if i is not None}
         for name in ("<|im_end|>", "<|ifm|im_end|>", "<|endoftext|>", "<|eot_id|>", "<|end|>", "<|eot|>",
                      "<|END_OF_TURN_TOKEN|>", "[|endofturn|]", "<|end_of_text|>", "<end_of_turn>", "<turn|>", "<eos>",
                      "<|return|>", "<|call|>", "<|end_of_sentence|>", "<|user|>", "<|observation|>"):
             if name in self.special:
                 self.stop_ids.add(self.special[name])
-            elif name == "<eos>" and name in self.vocab:            # gemma4 stores <eos> as a normal token
+            elif name == "<eos>" and name in self.vocab:            # gemma4 speichert <eos> als normales Token
                 self.stop_ids.add(self.vocab[name])
         if "<|return|>" in self.special and "<|end|>" in self.special:
-            self.stop_ids.discard(self.special["<|end|>"])      # Harmony: <|end|> closes the thinking channel
+            self.stop_ids.discard(self.special["<|end|>"])      # Harmony: <|end|> schließt den Denk-Kanal
         self._bpe_cache: Dict[str, List[int]] = {}
-        self._regeln = None                       # regex pre-tokeniser, compiled on first use
+        self._regeln = None                       # Regex-Pre-Tokenizer, beim ersten Gebrauch kompiliert
 
     # -- encoding ------------------------------------------------------------
     def _pretokenize(self, text: str) -> List[str]:
         if self.spm_style:
-            # "[^\n]+|[\n]+" over text with spaces escaped to U+2581
+            # "[^\n]+|[\n]+" über Text, dessen Leerzeichen als U+2581 maskiert sind
             out, i, n = [], 0, len(text.replace(" ", "\u2581"))
             text = text.replace(" ", "\u2581")
             while i < n:
@@ -394,7 +398,7 @@ class Tokenizer:
             self._regeln = regeln_fuer(self.pre) or False
         if self._regeln:
             return regex_split(text, self._regeln)
-        # qwen2 family (and fallback without the regex package)
+        # qwen2-Familie (und Rückfall ohne das regex-Paket)
         return _pretokenize_qwen(text, letters_with_marks=False)
 
     def _bpe(self, piece: str) -> List[int]:
@@ -402,7 +406,7 @@ class Tokenizer:
         if cached is not None:
             return cached
         if self.spm_style:
-            if piece[0] == "\n" and piece in self.vocab:          # pure newline runs: whole-token lookup
+            if piece[0] == "\n" and piece in self.vocab:          # nur Zeilenumbrüche: als ganzes Token suchen
                 return [self.vocab[piece]]
             word = list(piece)
         else:
@@ -412,12 +416,13 @@ class Tokenizer:
         for sym in word:
             tid = self.vocab.get(sym)
             if tid is None:
-                # fall back to single-byte tokens
+                # Rückfall auf Einzelbyte-Tokens
                 if self.spm_style:
                     for byte in sym.encode("utf-8"):
-                        b = self.vocab.get(f"<0x{byte:02X}>")
-                        if b is not None:
-                            ids.append(b)
+                        b = self.vocab.get(f"<0x{byte:02X}>", getattr(self, "unk_id", None))
+                        if b is None:
+                            raise GGUFError(f"vocabulary lacks byte token <0x{byte:02X}> and <unk>")
+                        ids.append(b)
                     continue
                 for c in sym:
                     b = self.vocab.get(c)
@@ -426,14 +431,14 @@ class Tokenizer:
                     ids.append(b)
             else:
                 ids.append(tid)
-        if len(piece) <= 256:                            # whole lines (Gemma style) would bloat the cache
-            if len(self._bpe_cache) >= BPE_CACHE_MAX:    # long sessions with many web pages
+        if len(piece) <= 256:                            # ganze Zeilen (Gemma-Stil) würden den Cache aufblähen
+            if len(self._bpe_cache) >= BPE_CACHE_MAX:    # lange Sitzungen mit vielen Webseiten
                 self._bpe_cache.clear()
             self._bpe_cache[piece] = ids
         return ids
 
     def encode(self, text: str) -> List[int]:
-        """Encode plain text.  Special tokens in `text` are treated as ordinary text."""
+        """Klartext kodieren.  Spezial-Tokens in `text` werden als gewöhnlicher Text behandelt."""
         ids: List[int] = []
         for piece in self._pretokenize(text):
             ids.extend(self._bpe(piece))
@@ -477,14 +482,14 @@ class Tokenizer:
 
 
 class StreamDecoder:
-    """Incremental UTF-8 safe decoder for streaming output."""
+    """Inkrementeller, UTF-8-sicherer Decoder für Streaming-Ausgabe."""
 
     def __init__(self, tok: Tokenizer):
         self.tok = tok
         self.buf = bytearray()
 
     VISIBLE_CONTROL = ("<think>", "</think>", "<|channel>", "<channel|>", "[THINK]", "[/THINK]",
-                       # tool calls in the model's own format (read by NemiCLI's werkzeugsprache)
+                       # Tool-Calls im eigenen Format des Modells (gelesen von der werkzeugsprache von NemiCLI)
                        "<tool_call>", "</tool_call>", "<|tool_call>", "<tool_call|>", '<|"|>',
                        "<arg_key>", "</arg_key>", "<arg_value>", "</arg_value>", "[TOOL_CALLS]", "[ARGS]")
 
@@ -493,7 +498,7 @@ class StreamDecoder:
             t = self.tok.tokens[tid]
             return t if t in self.VISIBLE_CONTROL else ""
         self.buf += self.tok.token_bytes(tid)
-        # emit the longest valid UTF-8 prefix
+        # das längste gültige UTF-8-Präfix ausgeben
         for cut in range(len(self.buf), max(-1, len(self.buf) - 4), -1):
             try:
                 s = self.buf[:cut].decode("utf-8")
@@ -501,7 +506,7 @@ class StreamDecoder:
                 continue
             del self.buf[:cut]
             return s
-        if len(self.buf) > 3:            # undecodable prefix: never stall the stream
+        if len(self.buf) > 3:            # nicht dekodierbares Präfix: den Stream nie blockieren
             s = self.buf[:1].decode("utf-8", errors="replace")
             del self.buf[:1]
             return s

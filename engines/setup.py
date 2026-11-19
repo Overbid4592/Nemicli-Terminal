@@ -33,8 +33,24 @@ OLLAMA_LIBRARY_URL = "https://ollama.com/library"
 #  GPU erkennen
 # ===========================================================================
 
+def nvidia_smi() -> str:
+    """Voller Pfad zu nvidia-smi.exe – ein bloßer Name würde zuerst im Programm- und im aktuellen Ordner
+    gesucht. '' = nicht vorhanden."""
+    import os
+    if os.name != "nt":
+        return shutil.which("nvidia-smi") or ""
+    for p in (os.path.join(os.environ.get("SystemRoot") or r"C:\Windows", "System32", "nvidia-smi.exe"),
+              os.path.join(os.environ.get("ProgramFiles") or r"C:\Program Files",
+                           "NVIDIA Corporation", "NVSMI", "nvidia-smi.exe")):
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
 def _run(cmd: list[str], timeout: float = 8.0) -> str:
     """Führt ein Kommando aus und gibt stdout zurück ('' bei Fehler/fehlt)."""
+    if not cmd or not cmd[0]:
+        return ""
     try:
         r = subprocess.run(cmd, capture_output=True, text=True,
                            encoding="utf-8", errors="replace", timeout=timeout,
@@ -46,7 +62,7 @@ def _run(cmd: list[str], timeout: float = 8.0) -> str:
 
 def _nvidia() -> dict | None:
     """NVIDIA-GPU über nvidia-smi: Name, VRAM (MB) und max. CUDA-Version des Treibers."""
-    out = _run(["nvidia-smi", "--query-gpu=name,memory.total",
+    out = _run([nvidia_smi(), "--query-gpu=name,memory.total",
                 "--format=csv,noheader,nounits"])
     if not out.strip():
         return None
@@ -59,7 +75,7 @@ def _nvidia() -> dict | None:
         vram = int(m.group()) if m else 0
     # Max. unterstützte CUDA-Version steht im Kopf der normalen nvidia-smi-Ausgabe.
     # Je nach Treiber heißt sie „CUDA Version:" oder „CUDA UMD Version:".
-    head = _run(["nvidia-smi"])
+    head = _run([nvidia_smi()])
     cm = re.search(r"CUDA(?:\s+UMD)?\s+Version:\s*([\d.]+)", head)
     cuda_max = float(cm.group(1)) if cm else 12.4
     return {"vendor": "nvidia", "name": name, "vram_mb": vram, "cuda_max": cuda_max}

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from .nemijs import UNDEF, Grenze, JSFehler, JSObject, NemiJS, Wirt, ist_aufrufbar, zu_text
+from .nemijs import UNDEF, Grenze, JSFehler, JSObject, NemiJS, Wirt, intern, ist_aufrufbar, zu_text
 
 MAX_SKRIPT = 1_000_000
 SCHRITTE_AUFRUF = 3_000_000
@@ -83,6 +83,8 @@ def aufrufen(app_js: Path, funktion: str, felder: dict, storage: dict | None = N
         return False, f"Fehler beim Laden von app.js: {e}"
     except OSError as e:
         return False, str(e)
+    except Exception as e:                             # läuft im Sitzungsprozess: nie bis zum Aufrufer
+        return False, f"Fehler beim Laden von app.js: {intern(e)}"
     if funktion not in funktionen:
         return False, "Funktion nicht angemeldet (NemiApp.funktion fehlt in app.js)"
     fn = funktionen[funktion][0]
@@ -93,8 +95,23 @@ def aufrufen(app_js: Path, funktion: str, felder: dict, storage: dict | None = N
             js.einstieg()
             erg = js.warten_auf(erg)
         js.zeitgeber_laufen(ZEIT_VIRTUELL_MS)
-        return True, js.json_nach_py(erg) if erg is not UNDEF else None
+        return True, _ohne_halbe_surrogate(js.json_nach_py(erg)) if erg is not UNDEF else None
     except JSFehler as e:
         return False, str(e)
     except Grenze as e:
         return False, str(e)
+    except Exception as e:
+        return False, intern(e)
+
+
+def _ohne_halbe_surrogate(v):
+    """UTF-16-Paare verbinden, einzelne Hälften durch U+FFFD ersetzen – sonst scheitert UTF-8 beim Empfänger."""
+    if isinstance(v, str):
+        if not any("\ud800" <= c <= "\udfff" for c in v):
+            return v
+        return v.encode("utf-16-le", "surrogatepass").decode("utf-16-le", "replace")
+    if isinstance(v, list):
+        return [_ohne_halbe_surrogate(x) for x in v]
+    if isinstance(v, dict):
+        return {_ohne_halbe_surrogate(k): _ohne_halbe_surrogate(x) for k, x in v.items()}
+    return v

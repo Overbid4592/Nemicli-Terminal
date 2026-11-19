@@ -1954,13 +1954,10 @@ def _dunkler_rahmen(fenster: QWidget) -> None:
 
 def app_vorbereiten(kennung: str = "NemiCLI.GUI") -> QApplication:
     """QApplication mit dunkler Palette, Schrift und Symbol."""
-    if os.name == "nt":
-        try:
-            import ctypes
-            ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(kennung)
-        except Exception:
-            pass
+    import taskleiste
+    taskleiste.prozess_kennung(kennung)                       # vor dem ersten Fenster
     app = QApplication.instance() or QApplication(sys.argv[:1])
+    taskleiste.installieren(app, kennung)                     # Symbol in der Taskleiste auch ohne Verknüpfung
     app.setStyle("Fusion")
     pal = app.palette()
     for rolle, name in ((QPalette.ColorRole.Window, "grund"), (QPalette.ColorRole.Base, "flaeche"),

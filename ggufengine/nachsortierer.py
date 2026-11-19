@@ -26,6 +26,7 @@ VORLAGE_STANDARD = ("<|im_start|>system\nJudge whether the Document meets the re
                     "the query\n<Query>: {query}\n<Document>: {document}<|im_end|>\n<|im_start|>assistant\n"
                     "<think>\n\n</think>\n\n")
 DOKUMENT_MAX = 1536                # Token je Dokument, der Rest wird abgeschnitten
+DOKUMENT_MIN = 16                  # so viel Platz bleibt dem Dokument auch bei langer Frage
 
 
 class Nachsortierer:
@@ -64,15 +65,15 @@ class Nachsortierer:
             self.close()
             raise
 
-    def _mit_marken(self, text: str, frage: str = "") -> List[int]:
+    def _mit_marken(self, text: str, frage_ids: List[int] = ()) -> List[int]:
         """Vorlagen-Text: Sondermarken der Vorlage (<|im_start|>, <think> …) als ihre eigenen Token,
-        der Rest – auch die eingesetzte Frage – als gewöhnlicher Text."""
+        der Rest als gewöhnlicher Text; für {query} kommen `frage_ids` (die Frage, ebenfalls als Text)."""
         marken = sorted((m for m in self.tok.special if m and m in self.vorlage), key=len, reverse=True)
         muster = re.compile("(" + "|".join(map(re.escape, marken)) + ")") if marken else None
         ids: List[int] = []
         for i, teil in enumerate(text.split("{query}")):
             if i:
-                ids += self.tok.encode(frage)
+                ids += list(frage_ids)
             for stueck in (muster.split(teil) if muster else [teil]):
                 if stueck in marken:
                     ids.append(self.tok.special_id(stueck))
@@ -81,11 +82,14 @@ class Nachsortierer:
         return ids
 
     def tokens(self, frage: str, dokument: str) -> List[int]:
-        """Vorlage mit Frage und Dokument; ein zu langes Dokument wird gekürzt, die Vorlage bleibt ganz."""
+        """Vorlage mit Frage und Dokument; zu lange Fragen und Dokumente werden hinten gekürzt, die Vorlage
+        bleibt ganz – sonst schnitte das Kürzen ihren Anfang ab."""
         vorn, _, rest = self.vorlage.partition("{document}")
-        vorn_ids = self._mit_marken(vorn, frage)
         hinten_ids = self._mit_marken(rest)
-        platz = max(16, min(DOKUMENT_MAX, self.max_tokens - len(vorn_ids) - len(hinten_ids)))
+        geruest = len(self._mit_marken(vorn)) + len(hinten_ids)
+        frage_ids = self.tok.encode(frage)[:max(0, self.max_tokens - geruest - DOKUMENT_MIN)]
+        vorn_ids = self._mit_marken(vorn, frage_ids)
+        platz = max(DOKUMENT_MIN, min(DOKUMENT_MAX, self.max_tokens - len(vorn_ids) - len(hinten_ids)))
         dok_ids = self.tok.encode(dokument)[:platz]
         return (vorn_ids + dok_ids + hinten_ids)[-self.max_tokens:]
 

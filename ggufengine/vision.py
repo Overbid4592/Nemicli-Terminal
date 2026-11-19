@@ -1,33 +1,33 @@
 """
-Vision encoders for mmproj files.  `load_projector()` reads the projector type from
-the file and picks the matching encoder:
+Vision-Encoder für mmproj-Dateien.  `load_projector()` liest den Projektor-Typ aus
+der Datei und wählt den passenden Encoder:
 
 * "gemma4v"         -> Gemma4Vision  (Gemma 4)
-* "gemma4uv"        -> Gemma4UnifiedVision (Gemma 4 12B, no encoder layers)
-* "qwen3vl_merger"  -> Qwen3VLVision (Qwen3-VL with DeepStack / Qwen3.5)
+* "gemma4uv"        -> Gemma4UnifiedVision (Gemma 4 12B, ohne Encoder-Schichten)
+* "qwen3vl_merger"  -> Qwen3VLVision (Qwen3-VL mit DeepStack / Qwen3.5)
 * "pixtral"         -> PixtralVision (Mistral Small 3.x, Ministral 3)
 * "lfm3vl"          -> Lfm3Vision (LFM3-VL, LFM3-Omni, d1)
 
-Every encoder exposes `marks` (begin, placeholder, end token of an image in the
-prompt), `n_out` (width of the embeddings), `default_tokens`, `load()`, `unload()`
-and `encode()`.  Encoders with DeepStack (`n_deepstack` > 0) return `n_out * (1 +
-n_deepstack)` columns: the input embeddings, then one block per early LM layer.
+Jeder Encoder bietet `marks` (Anfangs-, Platzhalter- und End-Token eines Bildes im
+Prompt), `n_out` (Breite der Embeddings), `default_tokens`, `load()`, `unload()`
+und `encode()`.  Encoder mit DeepStack (`n_deepstack` > 0) liefern `n_out * (1 +
+n_deepstack)` Spalten: die Eingabe-Embeddings, dann je einen Block pro früher LM-Schicht.
 
-Gemma 4 vision encoder ("gemma4v" mmproj), following llama.cpp's
-tools/mtmd/models/gemma4v.cpp and the transformers reference:
+Gemma-4-Vision-Encoder ("gemma4v"-mmproj), nach tools/mtmd/models/gemma4v.cpp aus
+llama.cpp und der transformers-Referenz:
 
-* patches of 16x16 pixels, pixel values scaled to [-1, 1], no patch bias
-* learned 2-D position tables (one for x, one for y) added to the patch embeddings
-* ViT blocks: RMSNorm -> attention (q/k RMSNorm with weight, v RMSNorm without,
-  2-D NeoX RoPE with base 100: x on the first half of each head, y on the second,
-  scale 1.0, bidirectional) -> RMSNorm -> residual -> RMSNorm -> gated GELU MLP
-  -> RMSNorm -> residual
-* "clippable" linears: inputs and outputs clamped to per-matrix limits from the file
-* 3x3 average pooling over the patch grid, times sqrt(n_embd), weightless RMSNorm,
-  projection to the language model width
+* Patches zu 16x16 Pixeln, Pixelwerte auf [-1, 1] skaliert, kein Patch-Bias
+* gelernte 2-D-Positionstabellen (eine für x, eine für y), zu den Patch-Embeddings addiert
+* ViT-Blöcke: RMSNorm -> Attention (q/k-RMSNorm mit Gewicht, v-RMSNorm ohne,
+  2-D-NeoX-RoPE mit Basis 100: x auf der ersten Hälfte jedes Heads, y auf der zweiten,
+  Skalierung 1.0, bidirektional) -> RMSNorm -> Residual -> RMSNorm -> gegatetes GELU-MLP
+  -> RMSNorm -> Residual
+* „clippable“ Linears: Ein- und Ausgaben auf Grenzen je Matrix aus der Datei begrenzt
+* 3x3-Average-Pooling über das Patch-Raster, mal sqrt(n_embd), gewichtslose RMSNorm,
+  Projektion auf die Breite des Sprachmodells
 
-The weights stay in the file mapping (RAM) and are only put on the GPU while an
-image is encoded (`load()` / `unload()`).
+Die Gewichte bleiben im Datei-Mapping (RAM) und liegen nur auf der GPU, während ein
+Bild kodiert wird (`load()` / `unload()`).
 """
 from __future__ import annotations
 
@@ -41,9 +41,10 @@ import torch.nn.functional as F
 from .gguf import GGUFError, GGUFFile
 from .models.common import WeightLoader, rms_norm
 
-IMAGE_TOKENS = 280          # soft tokens per image (transformers default)
-MIN_IMAGE_TOKENS = 70       # llama.cpp limits for gemma4v
+IMAGE_TOKENS = 280          # Soft-Tokens je Bild (transformers-Standard)
+MIN_IMAGE_TOKENS = 70       # llama.cpp-Grenzen für gemma4v
 MAX_IMAGE_TOKENS = 1120
+MAX_PIXELS = 64 << 20                   # Obergrenze für image_max_pixels aus der Datei
 
 
 class _Clipped:
@@ -105,7 +106,7 @@ class Gemma4Vision:
         self.dtype = dtype
         self.loaded = False
 
-    # -- weights on the GPU only while needed ----------------------------------
+    # -- Gewichte nur auf der GPU, solange sie gebraucht werden ----------------
     def load(self):
         if self.loaded:
             return
@@ -138,7 +139,7 @@ class Gemma4Vision:
     max_tokens = MAX_IMAGE_TOKENS
 
     def grid_for(self, width: int, height: int, tokens: int = IMAGE_TOKENS) -> Tuple[int, int]:
-        """(tokens across, tokens down) keeping the aspect ratio, at most `tokens` in total."""
+        """(Tokens quer, Tokens hoch) bei erhaltenem Seitenverhältnis, insgesamt höchstens `tokens`."""
         tokens = max(MIN_IMAGE_TOKENS, min(int(tokens), getattr(self, "max_tokens", MAX_IMAGE_TOKENS)))
         if width <= 0 or height <= 0:
             raise ValueError("empty image")
@@ -152,7 +153,7 @@ class Gemma4Vision:
         return nx, ny
 
     def pixels(self, image, tokens: int = IMAGE_TOKENS) -> torch.Tensor:
-        """PIL image -> (3, H, W) float in [0, 1], H and W multiples of patch * merge."""
+        """PIL-Bild -> (3, H, W) float in [0, 1], H und W Vielfache von patch * merge."""
         from PIL import Image
         img = image.convert("RGB")
         nx, ny = self.grid_for(img.width, img.height, tokens)
@@ -163,7 +164,7 @@ class Gemma4Vision:
 
     # -- encoder -----------------------------------------------------------------
     def _rope(self, x: torch.Tensor, px: torch.Tensor, py: torch.Tensor) -> torch.Tensor:
-        """x: (N, H, D).  NeoX rotation of dims [0, D/2) by x and [D/2, D) by y."""
+        """x: (N, H, D).  NeoX-Rotation der Dims [0, D/2) um x und [D/2, D) um y."""
         half = x.shape[-1] // 2
 
         def rot(part, pos):
@@ -176,7 +177,7 @@ class Gemma4Vision:
 
     @torch.inference_mode()
     def encode(self, image, tokens: int = IMAGE_TOKENS) -> torch.Tensor:
-        """PIL image -> (n_tokens, projection_dim) float32 embeddings on the device."""
+        """PIL-Bild -> (n_tokens, projection_dim) float32-Embeddings auf dem Gerät."""
         if not self.loaded:
             raise RuntimeError("vision weights are not loaded")
         pix = self.pixels(image, tokens).to(self.device)
@@ -213,16 +214,16 @@ class Gemma4Vision:
 
 
 class Gemma4UnifiedVision(Gemma4Vision):
-    """Gemma 4 12B "Unified" ("gemma4uv" mmproj, llama.cpp tools/mtmd/models/gemma4uv.cpp):
-    no encoder layers.  Blocks of patch_size * 3 pixels (the 3x3 merge is built into
-    the patch embedding) with values in [0, 1] -> LayerNorm -> linear (+bias) ->
-    LayerNorm -> + x/y position tables -> LayerNorm -> weightless RMSNorm -> projection.
-    The feature order of a block is (channel, row, column) as in ggml's im2col.
+    """Gemma 4 12B „Unified“ ("gemma4uv"-mmproj, llama.cpp tools/mtmd/models/gemma4uv.cpp):
+    keine Encoder-Schichten.  Blöcke aus patch_size * 3 Pixeln (das 3x3-Merge steckt im
+    Patch-Embedding) mit Werten in [0, 1] -> LayerNorm -> Linear (+Bias) ->
+    LayerNorm -> + x/y-Positionstabellen -> LayerNorm -> gewichtslose RMSNorm -> Projektion.
+    Die Merkmalsreihenfolge eines Blocks ist (Kanal, Zeile, Spalte) wie in ggmls im2col.
 
-    The language model reads an image's tokens bidirectionally, so one image has to
-    fit into one forward call of the sliding-window model (at most PREFILL_CHUNK)."""
+    Das Sprachmodell liest die Tokens eines Bildes bidirektional, daher muss ein Bild in
+    einen Forward-Aufruf des Sliding-Window-Modells passen (höchstens PREFILL_CHUNK)."""
 
-    LN_EPS = 1e-5                # PyTorch LayerNorm default (Gemma4UnifiedVisionEmbedder)
+    LN_EPS = 1e-5                # Vorgabe von PyTorch-LayerNorm (Gemma4UnifiedVisionEmbedder)
 
     def __init__(self, path: str, device, dtype=torch.bfloat16):
         from .models.common import PREFILL_CHUNK
@@ -274,7 +275,7 @@ class Gemma4UnifiedVision(Gemma4Vision):
 
     @torch.inference_mode()
     def encode(self, image, tokens: int = IMAGE_TOKENS) -> torch.Tensor:
-        """PIL image -> (n_tokens, projection_dim) float32 embeddings on the device."""
+        """PIL-Bild -> (n_tokens, projection_dim) float32-Embeddings auf dem Gerät."""
         if not self.loaded:
             raise RuntimeError("vision weights are not loaded")
         pix = self.pixels(image, tokens).to(self.device)                              # [0, 1]
@@ -296,24 +297,25 @@ class Gemma4UnifiedVision(Gemma4Vision):
 
 
 class Qwen3VLVision:
-    """Qwen3-VL vision tower ("qwen3vl_merger" mmproj, also used by Qwen3.5):
+    """Qwen3-VL-Vision-Tower ("qwen3vl_merger"-mmproj, auch von Qwen3.5 genutzt):
 
-    * 16x16 patches; the video patch embedding has two temporal taps, an image is
-      both frames at once (conv with tap 0 + conv with tap 1 + bias); pixels to [-1, 1]
-    * learned 48x48 position table, bilinearly interpolated to the patch grid
-    * patches ordered in 2x2 merge windows (window row, window col, row, col)
-    * ViT blocks: LayerNorm -> fused qkv -> 2-D rotary (row on the first half of the
-      rotary frequencies, column on the second, NeoX pairs over the full head) ->
-      bidirectional attention -> LayerNorm -> GELU(tanh) MLP, all linears with bias
-    * merger: LayerNorm -> 4 neighbouring patches concatenated -> linear -> GELU -> linear
-    * DeepStack (Qwen3-VL, tensors v.deepstack.<block>.*): after the marked blocks a
-      second merger – 4 patches concatenated -> LayerNorm -> linear -> GELU -> linear –
-      makes features for the first LM layers; appended as extra columns in block order
-    The embeddings come out row-major over the merged grid; `encode` also returns its
-    shape for the M-RoPE positions of the language model."""
+    * 16x16-Patches; das Video-Patch-Embedding hat zwei zeitliche Taps, ein Bild ist
+      beide Frames zugleich (Conv mit Tap 0 + Conv mit Tap 1 + Bias); Pixel auf [-1, 1]
+    * gelernte 48x48-Positionstabelle, bilinear auf das Patch-Raster interpoliert
+    * Patches in 2x2-Merge-Fenstern geordnet (Fensterzeile, Fensterspalte, Zeile, Spalte)
+    * ViT-Blöcke: LayerNorm -> fusioniertes qkv -> 2-D-Rotary (Zeile auf der ersten Hälfte der
+      Rotary-Frequenzen, Spalte auf der zweiten, NeoX-Paare über den ganzen Head) ->
+      bidirektionale Attention -> LayerNorm -> GELU(tanh)-MLP, alle Linears mit Bias
+    * Merger: LayerNorm -> 4 benachbarte Patches verkettet -> Linear -> GELU -> Linear
+    * DeepStack (Qwen3-VL, Tensoren v.deepstack.<block>.*): nach den markierten Blöcken erzeugt
+      ein zweiter Merger – 4 Patches verkettet -> LayerNorm -> Linear -> GELU -> Linear –
+      Merkmale für die ersten LM-Schichten; als zusätzliche Spalten in Blockreihenfolge angehängt
+    Die Embeddings kommen zeilenweise über das zusammengeführte Raster; `encode` liefert auch
+    dessen Form für die M-RoPE-Positionen des Sprachmodells."""
 
     marks = ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>")
-    default_tokens = 1024       # merged tokens; enough for text on screenshots
+    default_tokens = 1024       # zusammengeführte Tokens; genug für Text auf Screenshots
+    beschreiber_tokens = 2048   # als Bildbeschreiber (4B, Kontext 4096): liest auf 4K-Screenshots Zahlen und Adressen
     min_tokens, max_tokens = 64, 4096
     uses_grid = True
 
@@ -389,7 +391,7 @@ class Qwen3VLVision:
                     or ds["fc2"][0].shape[0] != self.n_out):
                 raise GGUFError(f"deepstack merger {i} has an unexpected shape")
             self.ds[i] = ds
-        rot = self.head_dim // 2                                          # rotary dims of one axis pair
+        rot = self.head_dim // 2                                          # Rotary-Dims eines Achsenpaars
         self.inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rot, 2, device=self.device,
                                                          dtype=torch.float32) / rot))
         self.loaded = True
@@ -403,7 +405,7 @@ class Qwen3VLVision:
 
     # -- preprocessing -----------------------------------------------------------
     def pixels(self, image, tokens: int) -> torch.Tensor:
-        """PIL image -> (3, H, W) normalised, H and W multiples of patch * merge."""
+        """PIL-Bild -> (3, H, W) normalisiert, H und W Vielfache von patch * merge."""
         from PIL import Image
         img = image.convert("RGB")
         tokens = max(self.min_tokens, min(int(tokens), self.max_tokens))
@@ -416,7 +418,7 @@ class Qwen3VLVision:
 
     # -- encoder -----------------------------------------------------------------
     def _window_order(self, x: torch.Tensor) -> torch.Tensor:
-        """(C, gy, gx) -> (N, C) in merge-window order."""
+        """(C, gy, gx) -> (N, C) in Merge-Fenster-Reihenfolge."""
         C, gy, gx = x.shape
         m = self.merge
         return x.reshape(C, gy // m, m, gx // m, m).permute(1, 3, 2, 4, 0).reshape(-1, C)
@@ -428,7 +430,7 @@ class Qwen3VLVision:
 
     @torch.inference_mode()
     def encode(self, image, tokens: Optional[int] = None):
-        """PIL image -> ((n_tokens, projection_dim) float32 embeddings, (rows, cols))."""
+        """PIL-Bild -> ((n_tokens, projection_dim) float32-Embeddings, (Zeilen, Spalten))."""
         if not self.loaded:
             raise RuntimeError("vision weights are not loaded")
         pix = self.pixels(image, tokens or self.default_tokens).to(self.device).unsqueeze(0)
@@ -469,21 +471,21 @@ class Qwen3VLVision:
 
 
 class PixtralVision:
-    """Pixtral vision encoder with the Mistral 3 projector ("pixtral" mmproj: Mistral Small 3.x,
-    Ministral 3), following transformers PixtralVisionModel + Mistral3MultiModalProjector:
+    """Pixtral-Vision-Encoder mit dem Mistral-3-Projektor ("pixtral"-mmproj: Mistral Small 3.x,
+    Ministral 3), nach transformers PixtralVisionModel + Mistral3MultiModalProjector:
 
-    * 14x14 patches (conv without bias), mean/std from the file, RMSNorm (ln_pre)
-    * blocks: RMSNorm -> attention (no bias, 2-D RoPE, bidirectional) -> residual ->
-      RMSNorm -> SiLU-gated MLP -> residual
-    * 2-D RoPE in the layout llama.cpp stores (the converter interleaves the q/k rows): the
-      first half of each head turns adjacent pairs by the patch row with the even
-      frequencies, the second half by the column with the odd frequencies
-    * projector: RMSNorm -> 2x2 neighbouring patches concatenated (channel, row, column)
-      -> linear -> linear -> GELU -> linear
-    The embeddings come out row-major over the merged grid; in the prompt every row ends
-    with [IMG_BREAK], the last one with [IMG_END] (chat.ZEILEN_MARKEN)."""
+    * 14x14-Patches (Conv ohne Bias), mean/std aus der Datei, RMSNorm (ln_pre)
+    * Blöcke: RMSNorm -> Attention (ohne Bias, 2-D-RoPE, bidirektional) -> Residual ->
+      RMSNorm -> SiLU-gegatetes MLP -> Residual
+    * 2-D-RoPE im Layout, das llama.cpp speichert (der Konverter verschränkt die q/k-Zeilen): die
+      erste Hälfte jedes Heads dreht benachbarte Paare um die Patch-Zeile mit den geraden
+      Frequenzen, die zweite Hälfte um die Spalte mit den ungeraden Frequenzen
+    * Projektor: RMSNorm -> 2x2 benachbarte Patches verkettet (Kanal, Zeile, Spalte)
+      -> Linear -> Linear -> GELU -> Linear
+    Die Embeddings kommen zeilenweise über das zusammengeführte Raster; im Prompt endet jede Zeile
+    mit [IMG_BREAK], die letzte mit [IMG_END] (chat.ZEILEN_MARKEN)."""
 
-    default_tokens = 1024       # merged tokens, at most (image_size / 28)^2
+    default_tokens = 1024       # zusammengeführte Tokens, höchstens (image_size / 28)^2
     min_tokens = 4
     uses_grid = False
 
@@ -561,8 +563,8 @@ class PixtralVision:
 
     # -- preprocessing -----------------------------------------------------------
     def grid_for(self, width: int, height: int, tokens: int) -> Tuple[int, int]:
-        """(merged tokens across, down): aspect ratio kept, at most `tokens`, no wider than the
-        model's image size and no larger than the picture itself."""
+        """(zusammengeführte Tokens quer, hoch): Seitenverhältnis erhalten, höchstens `tokens`, nicht breiter
+        als die Bildgröße des Modells und nicht größer als das Bild selbst."""
         unit = self.patch * self.merge
         tokens = max(self.min_tokens, int(tokens))
         nx, ny = _fit_grid(width, height, tokens)
@@ -572,7 +574,7 @@ class PixtralVision:
         return min(nx, max(1, math.ceil(width / unit))), min(ny, max(1, math.ceil(height / unit)))
 
     def pixels(self, image, tokens: int) -> torch.Tensor:
-        """PIL image -> (3, H, W) normalised, H and W multiples of patch * merge."""
+        """PIL-Bild -> (3, H, W) normalisiert, H und W Vielfache von patch * merge."""
         from PIL import Image
         img = image.convert("RGB")
         nx, ny = self.grid_for(img.width, img.height, tokens)
@@ -590,14 +592,14 @@ class PixtralVision:
 
     @torch.inference_mode()
     def encode(self, image, tokens: Optional[int] = None):
-        """PIL image -> ((n_tokens, n_out) float32 embeddings, (rows, cols))."""
+        """PIL-Bild -> ((n_tokens, n_out) float32-Embeddings, (Zeilen, Spalten))."""
         if not self.loaded:
             raise RuntimeError("vision weights are not loaded")
         return self.encode_pixels(self.pixels(image, tokens or self.default_tokens))
 
     @torch.inference_mode()
     def encode_pixels(self, pix: torch.Tensor):
-        """(3, H, W) normalised pixels, H and W multiples of patch * merge."""
+        """(3, H, W) normalisierte Pixel, H und W Vielfache von patch * merge."""
         if not self.loaded:
             raise RuntimeError("vision weights are not loaded")
         P, m = self.patch, self.merge
@@ -639,18 +641,18 @@ class PixtralVision:
 
 
 class Lfm3Vision:
-    """LFM3-VL vision tower ("lfm3vl" mmproj; also the eyes of LFM3-Omni and d1):
+    """LFM3-VL-Vision-Tower ("lfm3vl"-mmproj; auch die Augen von LFM3-Omni und d1):
 
-    * 16x16 patches, pixels to [-1, 1]; the patchifier has two temporal taps (an image is both
-      frames at once), no bias; RMSNorm after it (v.embedding_norm)
-    * patches in 2x2 merge-block order (block row, block col, row, col)
-    * layers: RMSNorm -> (gated depthwise 3x3 conv over the patch grid | bidirectional GQA with
-      q/k RMSNorm per head and axial 2-D RoPE, base 1e6: row angles on the first quarter of the
-      head, column angles on the second, NeoX pairs over the whole head) -> residual ->
-      RMSNorm -> SwiGLU -> residual
-    * projector: LayerNorm -> 4 patches of a block concatenated -> linear -> GELU -> linear
-    Image size like the reference processor: sides multiples of 32, pixel count between the
-    file's limits and at most `tokens` merged tokens."""
+    * 16x16-Patches, Pixel auf [-1, 1]; der Patchifier hat zwei zeitliche Taps (ein Bild ist beide
+      Frames zugleich), kein Bias; danach RMSNorm (v.embedding_norm)
+    * Patches in 2x2-Merge-Block-Reihenfolge (Blockzeile, Blockspalte, Zeile, Spalte)
+    * Schichten: RMSNorm -> (gegatete depthwise 3x3-Conv über das Patch-Raster | bidirektionale GQA
+      mit q/k-RMSNorm je Head und axialer 2-D-RoPE, Basis 1e6: Zeilenwinkel auf dem ersten Viertel
+      des Heads, Spaltenwinkel auf dem zweiten, NeoX-Paare über den ganzen Head) -> Residual ->
+      RMSNorm -> SwiGLU -> Residual
+    * Projektor: LayerNorm -> 4 Patches eines Blocks verkettet -> Linear -> GELU -> Linear
+    Bildgröße wie beim Referenz-Prozessor: Seiten Vielfache von 32, Pixelzahl zwischen den
+    Grenzen der Datei und höchstens `tokens` zusammengeführte Tokens."""
 
     marks = ("<|vision_start|>", "<|image|>", "<|vision_end|>")
     default_tokens = 1024
@@ -673,7 +675,7 @@ class Lfm3Vision:
         self.eps = float(g.get("clip.vision.attention.layer_norm_epsilon", 1e-5))
         self.merge = int(g.get("clip.vision.spatial_merge_size", 2))
         self.min_pixels = int(g.get("clip.vision.image_min_pixels", 65536))
-        self.max_pixels = int(g.get("clip.vision.image_max_pixels", 16777216))
+        self.max_pixels = min(int(g.get("clip.vision.image_max_pixels", 16777216)), MAX_PIXELS)
         self.mean = [float(x) for x in (g.get("clip.vision.image_mean") or [0.5] * 3)]
         self.std = [float(x) for x in (g.get("clip.vision.image_std") or [0.5] * 3)]
         if not (0 < self.n_layer <= 128 and 0 < self.patch <= 64 and self.n_embd % self.n_head == 0
@@ -735,13 +737,14 @@ class Lfm3Vision:
 
     # -- preprocessing -----------------------------------------------------------
     def groesse(self, width: int, height: int, tokens: int) -> Tuple[int, int]:
-        """(width, height) as the reference smart_resize: multiples of patch * merge, pixel count
-        within [min_pixels, max_pixels] – the upper limit lowered to `tokens` merged tokens."""
+        """(Breite, Höhe) wie das Referenz-smart_resize: Vielfache von patch * merge, Pixelzahl
+        innerhalb [min_pixels, max_pixels] – die Obergrenze auf `tokens` zusammengeführte Tokens gesenkt."""
         if width <= 0 or height <= 0:
             raise ValueError("empty image")
         f = self.patch * self.merge
         tokens = max(self.min_tokens, min(int(tokens), self.max_tokens))
-        lo, hi = self.min_pixels, min(self.max_pixels, tokens * f * f)
+        hi = min(self.max_pixels, MAX_PIXELS, tokens * f * f)
+        lo = min(self.min_pixels, hi)
         h, w = max(f, round(height / f) * f), max(f, round(width / f) * f)
         if h * w > hi:
             beta = math.sqrt(height * width / hi)
@@ -752,7 +755,7 @@ class Lfm3Vision:
         return w, h
 
     def pixels(self, image, tokens: int) -> torch.Tensor:
-        """PIL image -> (3, H, W) normalised."""
+        """PIL-Bild -> (3, H, W), normalisiert."""
         from PIL import Image
         img = image.convert("RGB")
         img = img.resize(self.groesse(img.width, img.height, tokens), Image.BICUBIC)
@@ -762,19 +765,19 @@ class Lfm3Vision:
 
     # -- encoder -----------------------------------------------------------------
     def _block_order(self, x: torch.Tensor) -> torch.Tensor:
-        """(C, gy, gx) -> (N, C) in merge-block order."""
+        """(C, gy, gx) -> (N, C) in Merge-Block-Reihenfolge."""
         C, gy, gx = x.shape
         m = self.merge
         return x.reshape(C, gy // m, m, gx // m, m).permute(1, 3, 2, 4, 0).reshape(-1, C)
 
     def _raster(self, h: torch.Tensor, gy: int, gx: int) -> torch.Tensor:
-        """(N, C) in merge-block order -> (1, C, gy, gx)."""
+        """(N, C) in Merge-Block-Reihenfolge -> (1, C, gy, gx)."""
         m = self.merge
         return h.view(gy // m, gx // m, m, m, -1).permute(4, 0, 2, 1, 3).reshape(1, -1, gy, gx)
 
     @torch.inference_mode()
     def encode(self, image, tokens: Optional[int] = None) -> torch.Tensor:
-        """PIL image -> (n_tokens, projection_dim) float32 embeddings, row-major over the merged grid."""
+        """PIL-Bild -> (n_tokens, projection_dim) float32-Embeddings, zeilenweise über das zusammengeführte Raster."""
         if not self.loaded:
             raise RuntimeError("vision weights are not loaded")
         pix = self.pixels(image, tokens or self.default_tokens).to(self.device).unsqueeze(0)
@@ -815,7 +818,7 @@ class Lfm3Vision:
 
 
 def _fit_grid(width: int, height: int, tokens: int) -> Tuple[int, int]:
-    """(across, down) keeping the aspect ratio, at most `tokens` cells."""
+    """(quer, hoch) bei erhaltenem Seitenverhältnis, höchstens `tokens` Zellen."""
     if width <= 0 or height <= 0:
         raise ValueError("empty image")
     s = math.sqrt(tokens / (width * height))
@@ -829,8 +832,8 @@ def _fit_grid(width: int, height: int, tokens: int) -> Tuple[int, int]:
 
 
 def _deepstack_blocks(gg: GGUFFile, n_layer: int) -> List[int]:
-    """ViT blocks with a DeepStack merger, from the tensor names (the converter also
-    writes clip.vision.is_deepstack_layers; both must agree when present)."""
+    """ViT-Blöcke mit DeepStack-Merger, aus den Tensornamen (der Konverter schreibt auch
+    clip.vision.is_deepstack_layers; beides muss übereinstimmen, wenn vorhanden)."""
     bloecke = sorted({int(m.group(1)) for t in gg.tensor_list
                       if (m := re.fullmatch(r"v\.deepstack\.(\d+)\.fc1\.weight", t.name))})
     flags = gg.get("clip.vision.is_deepstack_layers")
@@ -841,18 +844,18 @@ def _deepstack_blocks(gg: GGUFFile, n_layer: int) -> List[int]:
     return bloecke
 
 
-# -- automatic selection -------------------------------------------------------
+# -- automatische Auswahl ------------------------------------------------------
 ENCODERS = {"gemma4v": Gemma4Vision, "gemma4uv": Gemma4UnifiedVision, "qwen3vl_merger": Qwen3VLVision,
             "pixtral": PixtralVision, "lfm3vl": Lfm3Vision}
 
 
 def projector_type(gg: GGUFFile) -> Optional[str]:
-    """Projector type of an mmproj (some files use clip.projector_type)."""
+    """Projektor-Typ eines mmproj (manche Dateien nutzen clip.projector_type)."""
     return gg.get("clip.vision.projector_type") or gg.get("clip.projector_type")
 
 
 def load_projector(path: str, device, dtype=torch.bfloat16):
-    """The encoder matching the mmproj at `path` (weights not loaded yet)."""
+    """Der Encoder passend zum mmproj unter `path` (Gewichte noch nicht geladen)."""
     gg = GGUFFile(path)
     try:
         typ = projector_type(gg)

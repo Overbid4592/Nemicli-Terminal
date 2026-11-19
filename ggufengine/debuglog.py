@@ -1,10 +1,10 @@
 """
-Markdown debug log: one file per session in <project>/debuglog/log_<date>_<time>.md.
+Debug-Log in Markdown: eine Datei je Sitzung in <projekt>/debuglog/log_<datum>_<zeit>.md.
 
-Everything the engine and the GUI do is appended here in a form that is easy to read
-afterwards: environment, scanned models, load details (hyper-parameters, tensor types,
-VRAM, timings), every prompt/reply with token counts and sampler settings, and full
-tracebacks.  Disabled (all calls are no-ops) until `enable()` is called.
+Alles, was Motor und Oberfläche tun, wird hier gut lesbar angehängt: Umgebung, gefundene
+Modelle, Ladedetails (Hyperparameter, Tensor-Typen, VRAM, Zeiten), jeder Prompt und jede
+Antwort mit Tokenzahlen und Sampler-Einstellungen sowie vollständige Tracebacks.
+Ausgeschaltet (alle Aufrufe tun nichts), bis `enable()` aufgerufen wird.
 """
 from __future__ import annotations
 
@@ -23,7 +23,7 @@ _t0 = time.time()
 
 
 def enable(log_dir: str) -> str:
-    """Create the log file for this session and write the environment header."""
+    """Legt die Log-Datei dieser Sitzung an und schreibt den Kopf mit der Umgebung."""
     global _path, _t0
     os.makedirs(log_dir, exist_ok=True)
     _t0 = time.time()
@@ -77,7 +77,7 @@ def text(msg: str) -> None:
 
 
 def kv(d: Dict[str, Any], title: Optional[str] = None) -> None:
-    """Key/value table."""
+    """Tabelle aus Schlüssel und Wert."""
     lines = []
     if title:
         lines.append(f"**{title}**\n")
@@ -109,6 +109,6 @@ def code(body: str, lang: str = "", title: Optional[str] = None, limit: int = 60
 
 
 def exception(where: str) -> None:
-    """Log the exception currently being handled, with full traceback."""
+    """Schreibt die gerade behandelte Ausnahme mit vollständigem Traceback ins Log."""
     section(f"❌ Fehler: {where}")
     code(traceback.format_exc(), "text")

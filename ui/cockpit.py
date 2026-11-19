@@ -133,6 +133,15 @@ def _kopf(titel: str, farbe: str) -> Text:
     return Text(titel, style=f"bold {farbe}")
 
 
+def _leise() -> str:
+    """Leiser Text im aktuellen Theme (mindestens 4,5 : 1)."""
+    try:
+        import ui
+        return ui.leise()
+    except Exception:
+        return "#9ea4ac"
+
+
 def render(stand: dict, farbe: str, breite: int = BREITE) -> Group:
     """Das Cockpit als Rich-Gruppe. stand: Sitzungsstand (model, ctx, ctx_max) und optional
     "plan" (plan.daten()), "aufgaben" (hintergrund.laufend()), "fortschritt", "wache"."""
@@ -142,18 +151,18 @@ def render(stand: dict, farbe: str, breite: int = BREITE) -> Group:
     g = gpu()
     zeilen.append(_kopf("🎮 Grafikkarte", farbe))
     if g is None:
-        zeilen.append(Text("  keine NVIDIA-Karte erkannt", style="#7d8590"))
+        zeilen.append(Text("  keine NVIDIA-Karte erkannt", style=_leise()))
     else:
         anteil = g["belegt"] / max(1, g["gesamt"])
-        z = Text("  VRAM ", style="#9298ac")
+        z = Text("  VRAM ", style=_leise())
         z.append_text(_balken(anteil, innen - 17, _ampel(anteil)))
         z.append(f" {g['belegt'] / 2**30:4.1f}/{g['gesamt'] / 2**30:.0f}G", style="#e4e7f2")
         zeilen.append(z)
-        z = Text("  Last ", style="#9298ac")
+        z = Text("  Last ", style=_leise())
         z.append_text(_balken(g["last"] / 100, innen - 17, farbe))
         z.append(f" {g['last']:3d}% {g['temp']:>3}°", style="#e4e7f2")
         zeilen.append(z)
-        zeilen.append(Text(f"  {g['name']}", style="#7d8590"))
+        zeilen.append(Text(f"  {g['name']}", style=_leise()))
 
     zeilen.append(Text(""))
     zeilen.append(_kopf("⚡ Tempo", farbe))
@@ -164,7 +173,7 @@ def render(stand: dict, farbe: str, breite: int = BREITE) -> Group:
         zeilen.append(Text(f"  zuletzt {TEMPO[-1]:.0f} · Mittel {sum(TEMPO) / len(TEMPO):.0f} tok/s", style="#e4e7f2"))
         zeilen.append(Text("  " + funke(TEMPO, innen - 2), style=farbe))
     elif not live:
-        zeilen.append(Text("  noch keine Antwort", style="#7d8590"))
+        zeilen.append(Text("  noch keine Antwort", style=_leise()))
 
     zeilen.append(Text(""))
     zeilen.append(_kopf("🧠 Kontext", farbe))
@@ -173,13 +182,15 @@ def render(stand: dict, farbe: str, breite: int = BREITE) -> Group:
         anteil = voll / gesamt
         z = Text("  ")
         z.append_text(_balken(anteil, innen - 14, _ampel(anteil)))
-        z.append(f" {voll / 1000:.1f}k/{gesamt / 1000:.0f}k", style="#e4e7f2")
+        import ui
+        fenster = ui.fmt_tokens(gesamt) if gesamt >= 1_000_000 else f"{gesamt / 1000:.0f}k"
+        z.append(f" {voll / 1000:.1f}k/{fenster}", style="#e4e7f2")
         zeilen.append(z)
     else:
-        zeilen.append(Text("  –", style="#7d8590"))
+        zeilen.append(Text("  –", style=_leise()))
     modell = str(stand.get("model") or "–")
     zeilen.append(Text("  " + (modell if len(modell) <= innen - 2 else "…" + modell[-(innen - 3):]),
-                       style="#7d8590"))
+                       style=_leise()))
 
     aufgaben = stand.get("aufgaben") or []
     if aufgaben:
@@ -189,7 +200,7 @@ def render(stand: dict, farbe: str, breite: int = BREITE) -> Group:
             titel = str(e.get("titel") or e.get("tool") or "")
             zeilen.append(Text(f"  #{e.get('nr')} {titel[:innen - 6]}", style="#e4e7f2"))
         if stand.get("fortschritt"):
-            zeilen.append(Text(f"  {str(stand['fortschritt'])[:innen - 2]}", style="#9298ac"))
+            zeilen.append(Text(f"  {str(stand['fortschritt'])[:innen - 2]}", style=_leise()))
 
     plan = stand.get("plan")
     if plan and plan.get("punkte"):

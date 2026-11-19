@@ -90,12 +90,17 @@ def bewerten(e: Eintrag, frage: str) -> float:
     if all(t in name for t in teile):
         return 10.0 - (0 if name.startswith(teile[0]) else 2) - len(name) / 100
     if all(t in name or t in besch for t in teile):
-        return 6.0 + 0.5 * sum(t in name for t in teile) - len(name) / 100
+        # Beschreibung, die mit dem Wort beginnt („🔍 Vollscan …“), vor einer, die es nur enthält („Auto-Vollscan“)
+        erstes = (re.findall(r"[a-z0-9]+", besch) or [""])[0]
+        return (6.0 + 0.5 * sum(t in name for t in teile) + (0.3 if erstes.startswith(teile[0]) else 0.0)
+                - len(name) / 100)
     im_namen = min(_wortnaehe(t, name) for t in teile)
     ueberall = min(max(_wortnaehe(t, name), _wortnaehe(t, besch)) for t in teile)
     if im_namen >= 0.72:
         return 5.0 * im_namen - len(name) / 100
-    return 4.0 * ueberall - len(name) / 100 if ueberall >= 0.72 else 0.0
+    erstes = (re.findall(r"[a-z0-9]+", besch) or [""])[0]
+    vorne = 0.1 if len(erstes) >= 3 and _aehnlich(teile[0], erstes) >= 0.72 else 0.0
+    return 4.0 * ueberall + vorne - len(name) / 100 if ueberall >= 0.72 else 0.0
 
 
 def suchen(liste: list[Eintrag], frage: str, n: int = 12) -> list[Eintrag]:

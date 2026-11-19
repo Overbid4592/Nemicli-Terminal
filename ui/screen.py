@@ -47,6 +47,7 @@ import ui
 import mascot
 from commands import SlashCompleter
 import models as M
+from terminal_text import ESC_FOLGE as _ESC_FOLGE, FARBE as _FARBE, STEUER as _STEUER
 
 
 def _uebung_gewuenscht() -> bool:
@@ -115,23 +116,17 @@ _SKIN = re.compile(r"[\U0001f3fb-\U0001f3ff]")
 _ZWJ_TAIL = re.compile("‍.")
 
 
-_STEUER = re.compile(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]")
-_ESC_FOLGE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[P^_][^\x1b]*(?:\x1b\\)?"
-                        r"|\x1b[@-Z\\-_]|\x1b")
-_FARBE = re.compile(r"\x1b\[[0-9;:]*m")
-
-
-def terminal_safe(text: str) -> str:
+def terminal_safe(text: str, emoji_ganz: bool = False) -> str:
     """Emoji-Varianten auf die Form bringen, deren Breite überall gleich ist. Steuerzeichen und Escape-Folgen aus
     Modell-, Datei- oder Webtext fliegen raus – über sie ließen sich Zwischenablage (OSC 52), Fenstertitel, Links
     oder die Anzeige selbst (Cursor bewegen, Zeilen überschreiben) steuern. Nur Farben (ESC[…m) bleiben, dazu
-    Zeilenumbruch und Tab."""
+    Zeilenumbruch und Tab. `emoji_ganz`: Emoji bleiben vollständig (Fenster und Oberfläche zählen Graphem-Gruppen)."""
     if not text:
         return text
     if "\x1b" in text:
         text = _ESC_FOLGE.sub(lambda m: m.group(0) if _FARBE.fullmatch(m.group(0)) else "", text)
     text = _STEUER.sub("", text)
-    if text.isascii():
+    if text.isascii() or emoji_ganz:
         return text
     text = _VS_KEYCAP.sub("", text)
     text = _SKIN.sub("", text)
@@ -492,7 +487,7 @@ class Screen:
         width = self._terminal_width()
         p = ui.THEMES[ui.current_theme()]
         border = self._border_style()
-        muted = f"fg:#9298ac bg:{_COMPOSER_BG}"
+        muted = f"fg:{ui.leise()} bg:{_COMPOSER_BG}"
         accent = f"fg:{p['accent']} bg:{_COMPOSER_BG}"
         status = "● bereit"
         if self._modal is not None:
@@ -528,12 +523,8 @@ class Screen:
         return [(self._border_style(), "╰" + "─" * max(0, width - 2) + "╯")]
 
     def _input_height(self) -> int:
-        """Wie viele Zeilen braucht die Eingabe gerade?
-        _MIN_INPUT_ROWS bis _MAX_INPUT_ROWS.
-
-        Die Mindesthöhe gibt beim Tippen Luft: früher klebte die eine Eingabe-
-        zeile direkt zwischen Trennlinie und Statusleiste – das wirkte eng.
-        """
+        """Wie viele Zeilen braucht die Eingabe gerade? _MIN_INPUT_ROWS bis _MAX_INPUT_ROWS.
+        Die Mindesthöhe lässt Luft zwischen Trennlinie und Statusleiste."""
         width = self._input_width()
         rows = 0
         for line in (self.buffer.text or "").split("\n"):
@@ -676,6 +667,17 @@ class Screen:
         """Tippt der Nutzer, gilt das als Aktivität – und stoppt eine Übung sofort."""
         self._last_input = time.monotonic()
         self._stop_practice()
+        try:                                        # 🧭 Kompass: Befehle neben dem Terminal
+            import kompass
+            kompass.getippt(self.buffer.text, self.eingabe_setzen)
+        except Exception:
+            pass
+
+    def eingabe_setzen(self, text: str) -> None:
+        """Text in die Eingabe (Kompass-Klick) – abgeschickt wird erst mit Enter."""
+        from prompt_toolkit.document import Document
+        self.buffer.document = Document(text, len(text))
+        self.invalidate()
 
     def _stop_practice(self) -> bool:
         """Bricht eine laufende Übungsrunde ab. True, wenn eine lief."""
@@ -866,7 +868,7 @@ class Screen:
             if i == m["sel"]:
                 frags.append((f"fg:{accent} bold", f"  ❯ {i + 1}. {label}\n"))
             else:
-                frags.append(("fg:#7d8590", f"    {i + 1}. {label}\n"))
+                frags.append((f"fg:{ui.leise()}", f"    {i + 1}. {label}\n"))
         return frags
 
     def _render_modal_question(self):
@@ -1037,7 +1039,7 @@ class Screen:
         def _(event):
             import modes
             key = modes.cycle()
-            ui.info(f"Modus: {modes.label()}" + (
+            ui.info(f"Modus: {modes.anzeige()}" + (
                 f"  ·  Zünder: nach {modes.AUTO_FUSE_S // 60} min zurück in Chatten"
                 if key == "auto" else ""))
             self.invalidate()

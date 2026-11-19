@@ -16,6 +16,7 @@ Das ID-Token kommt direkt per TLS vom Token-Endpunkt; geprüft werden iss, aud, 
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import http.server
 import json
@@ -47,6 +48,7 @@ APP_NAME = "NemiCLI"
 WARTEN_S = 300.0
 ERNEUERN_VORHER_S = 120                 # so lange vor Ablauf wird erneuert
 NUTZUNG_URL = "https://chatgpt.com/#settings"
+SPERRE_WARTEN_S = 75.0                  # länger als ein Erneuern (Zeitgrenze 30 s) in einem anderen Prozess
 
 KONTO_DATEI = paths.INSTALL / "chatgpt_konto.json"
 _GEHEIM = ("access_token", "refresh_token", "id_token")
@@ -98,11 +100,55 @@ def _schreiben(daten: dict) -> None:
             raus[k] = verschluesselt
         else:
             _im_speicher[k] = wert
-    tmp = KONTO_DATEI.with_suffix(".tmp")
-    tmp.write_text(json.dumps(raus, ensure_ascii=False, indent=1), encoding="utf-8")
-    if os.name != "nt":
-        os.chmod(tmp, 0o600)
-    tmp.replace(KONTO_DATEI)
+    tmp = KONTO_DATEI.with_name(f"{KONTO_DATEI.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp")
+    try:
+        tmp.write_text(json.dumps(raus, ensure_ascii=False, indent=1), encoding="utf-8")
+        if os.name != "nt":
+            os.chmod(tmp, 0o600)
+        tmp.replace(KONTO_DATEI)
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
+@contextlib.contextmanager
+def _dateisperre(warten_s: float = SPERRE_WARTEN_S):
+    """Sperre über Prozesse hinweg (Lesen – Erneuern – Schreiben): zwei NemiCLI-Fenster dürfen nicht
+    gleichzeitig mit demselben Refresh-Token erneuern."""
+    pfad = KONTO_DATEI.with_name(KONTO_DATEI.name + ".lock")
+    pfad.parent.mkdir(parents=True, exist_ok=True)
+    f = open(pfad, "a+b")
+    ende = time.monotonic() + warten_s
+    try:
+        while True:
+            try:
+                f.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError:
+                if time.monotonic() > ende:
+                    raise RuntimeError("ChatGPT-Anmeldung: ein anderes NemiCLI-Fenster erneuert gerade – "
+                                       "bitte gleich noch einmal versuchen.") from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            try:
+                f.seek(0)
+                if os.name == "nt":
+                    import msvcrt
+                    msvcrt.locking(f.fileno(), msvcrt.LK_UNLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+            except OSError:
+                pass
+    finally:
+        f.close()
 
 
 def _host_id(daten: dict) -> str:
@@ -184,7 +230,7 @@ def nutzbar() -> bool:
 
 def abmelden() -> None:
     """Tokens löschen. Client-ID und Host-ID bleiben: die nächste Anmeldung nutzt sie wieder."""
-    with _sperre:
+    with _sperre, _dateisperre():
         d = _lesen()
         for k in (*_GEHEIM, "scope", "expires_at", "earliest_refresh_at", "email"):
             d.pop(k, None)
@@ -217,12 +263,28 @@ def _uebernehmen(d: dict, antwort: dict, nonce: str | None) -> None:
     d["issuer"] = AUSSTELLER
 
 
+def _gueltig(d: dict, jetzt: float | None = None) -> bool:
+    jetzt = time.time() if jetzt is None else jetzt
+    return bool(d.get("access_token")) and jetzt < float(d.get("expires_at") or 0) - ERNEUERN_VORHER_S
+
+
 def _erneuern(d: dict) -> None:
+    """Nur unter _dateisperre aufrufen. Lehnt der Server ab, wird die Datei neu gelesen: hat ein anderer
+    Prozess inzwischen erneuert, gilt dessen Stand, und nichts wird gelöscht."""
+    gesendet = d["refresh_token"]
     r = httpx.post(TOKEN_URL, data={"grant_type": "refresh_token", "client_id": d["client_id"],
-                                    "refresh_token": d["refresh_token"], "resource": RESSOURCE}, timeout=30.0)
+                                    "refresh_token": gesendet, "resource": RESSOURCE}, timeout=30.0)
     if r.status_code >= 400:
         code = _fehlercode(r)
         if code in _NEU_ANMELDEN or r.status_code in (400, 401):
+            frisch = _lesen()
+            if frisch.get("refresh_token") and frisch["refresh_token"] != gesendet:
+                d.clear()
+                d.update(frisch)
+                if _gueltig(d):
+                    return
+                raise RuntimeError("ChatGPT-Anmeldung: ein anderes Fenster hat gerade erneuert – "
+                                   "bitte noch einmal versuchen.")
             for k in ("access_token", "refresh_token"):      # ID-Token und E-Mail bleiben als Hinweis für die neue Anmeldung
                 d.pop(k, None)
             _schreiben(d)
@@ -234,8 +296,7 @@ def _erneuern(d: dict) -> None:
 
 def zugang() -> str:
     """Gültiges Access-Token für api.openai.com – vor Ablauf von selbst erneuert."""
-    with _sperre:
-        d = _lesen()
+    def faellig(d: dict) -> bool:
         if not d.get("refresh_token") or not d.get("client_id"):
             raise AnmeldungNoetig("Noch nicht mit ChatGPT angemeldet – /model → ChatGPT-Konto.")
         if PLAN_SCOPE not in str(d.get("scope") or "").split():
@@ -244,9 +305,16 @@ def zugang() -> str:
         jetzt = time.time()
         ablauf = float(d.get("expires_at") or 0)
         frueh = d.get("earliest_refresh_at")
-        if not d.get("access_token") or jetzt >= ablauf - ERNEUERN_VORHER_S:
-            if not frueh or jetzt >= float(frueh) or jetzt >= ablauf:
-                _erneuern(d)
+        return (not d.get("access_token") or jetzt >= ablauf - ERNEUERN_VORHER_S) and \
+            (not frueh or jetzt >= float(frueh) or jetzt >= ablauf)
+
+    with _sperre:
+        d = _lesen()
+        if faellig(d):
+            with _dateisperre():
+                d = _lesen()                 # ein anderer Prozess kann schon erneuert haben
+                if faellig(d):
+                    _erneuern(d)
         return d["access_token"]
 
 
@@ -285,7 +353,8 @@ _SEITE = ("<!doctype html><meta charset='utf-8'><title>NemiCLI</title>"
           "<h2>{titel}</h2><p>{text}</p></div></body>")
 
 
-def _empfaenger(port: int, ergebnis: dict, fertig: threading.Event) -> http.server.HTTPServer:
+def _empfaenger(port: int, ergebnis: dict, fertig: threading.Event,
+                state: str | None = None) -> http.server.HTTPServer:
     class Rueckruf(http.server.BaseHTTPRequestHandler):
         def do_GET(self):                           # noqa: N802 (Name von http.server vorgegeben)
             teile = urllib.parse.urlsplit(self.path)
@@ -293,7 +362,15 @@ def _empfaenger(port: int, ergebnis: dict, fertig: threading.Event) -> http.serv
                 self.send_response(404)
                 self.end_headers()
                 return
-            ergebnis.update({k: v[0] for k, v in urllib.parse.parse_qs(teile.query).items() if v})
+            antwort = {k: v[0] for k, v in urllib.parse.parse_qs(teile.query).items() if v}
+            # fremde Aufrufe (falscher state) beenden das Warten nicht
+            if state is not None and not secrets.compare_digest(str(antwort.get("state", "")).encode("utf-8"),
+                                                                state.encode("utf-8")):
+                self.send_response(400)
+                self.end_headers()
+                return
+            ergebnis.update(antwort)
+            fertig.set()                     # vor der Antwort: wer die Seite gesehen hat, findet das Ergebnis schon vor
             ok = "code" in ergebnis and "error" not in ergebnis
             seite = _SEITE.format(titel="✓ Angemeldet" if ok else "Anmeldung abgebrochen",
                                   text="Du kannst dieses Fenster schließen und zu NemiCLI zurückkehren." if ok
@@ -304,12 +381,12 @@ def _empfaenger(port: int, ergebnis: dict, fertig: threading.Event) -> http.serv
             self.send_header("Content-Length", str(len(daten)))
             self.end_headers()
             self.wfile.write(daten)
-            fertig.set()
 
         def log_message(self, *_args):              # nichts ins Terminal (die Adresse trägt den Code)
             pass
 
-    return http.server.HTTPServer(("127.0.0.1", port), Rueckruf)
+    import lokalserver
+    return lokalserver.EinzelServer(("127.0.0.1", port), Rueckruf)
 
 
 def anmelden(browser_oeffnen=None, warten_s: float = WARTEN_S) -> dict:
@@ -338,7 +415,7 @@ def anmelden(browser_oeffnen=None, warten_s: float = WARTEN_S) -> dict:
         param["agent_name_hint"] = APP_NAME
     ergebnis: dict = {}
     fertig = threading.Event()
-    server = _empfaenger(port, ergebnis, fertig)       # erst lauschen, dann den Browser öffnen
+    server = _empfaenger(port, ergebnis, fertig, state)   # erst lauschen, dann den Browser öffnen
     faden = threading.Thread(target=server.serve_forever, kwargs={"poll_interval": 0.2},
                              name="chatgpt-anmeldung", daemon=True)
     faden.start()
@@ -364,7 +441,7 @@ def anmelden(browser_oeffnen=None, warten_s: float = WARTEN_S) -> dict:
                                     "redirect_uri": rueckruf, "resource": RESSOURCE}, timeout=30.0)
     if r.status_code >= 400:
         raise AnmeldeFehler(f"OpenAI lehnt die Anmeldung ab ({r.status_code} {_fehlercode(r)}).".strip())
-    with _sperre:
+    with _sperre, _dateisperre():
         d = _lesen()
         d["client_id"] = ausgegeben
         d["ext_agent_host_id"] = host

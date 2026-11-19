@@ -151,7 +151,7 @@ class EmbeddingGemma2Model:
 
     def forward(self, *_a, **_k):
         raise GGUFError("EmbeddingGemma is an embedding model and cannot write text – it belongs in "
-                        "Models/embeddings (choose it with /embeddings)")
+                        "KI-Modelle/KI-Gedaechtnis/Suchmodell (choose it with /embeddings)")
 
     # -- compute ---------------------------------------------------------------
     def _verborgen(self, h: torch.Tensor, pos: torch.Tensor, segmente: Optional[torch.Tensor]) -> torch.Tensor:

@@ -38,7 +38,7 @@ except Exception:
 def compute_cap() -> str:
     """Compute Capability der ersten NVIDIA-Karte, z.B. '12.0' (= sm_120).
     Leerer String, wenn keine NVIDIA-Karte da ist oder nvidia-smi es nicht sagt."""
-    out = S._run(["nvidia-smi", "--query-gpu=compute_cap",
+    out = S._run([S.nvidia_smi(), "--query-gpu=compute_cap",
                   "--format=csv,noheader"])
     m = re.search(r"(\d+)\.(\d+)", out)
     return f"{int(m.group(1))}.{int(m.group(2))}" if m else ""
@@ -310,7 +310,7 @@ def todo(rep: dict) -> list[str]:
     out: list[str] = []
     st = rep["stock"]
     if not st["ollama"] and not st.get("gguf"):
-        out.append("Kein lokales Modell: eine GGUF-Datei in einen Ordner unter ModelGGUF/ legen "
+        out.append("Kein lokales Modell: eine GGUF-Datei in einen Ordner unter KI-Modelle/KI-Chat/Chatmodell/ legen "
                    "(eigener Motor) oder Ollama einrichten (/model).")
     if st["bildmodelle"] == 0:
         out.append(f"Zum Bilder-Malen fehlt ein Krea-2-Modell in {st['bild_ordner']} "

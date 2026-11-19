@@ -59,8 +59,6 @@ def context_window(ref: str | None) -> int:
     if _prov == "gguf":                       # eigener Motor: eingestellter Kontext
         import gguflokal
         return gguflokal.wirksamer_kontext(mid)
-    if _prov == "funke":                      # Funke Groß kürzt den Verlauf selbst auf sein Gedächtnis
-        return 512
     try:                                      # wie der Anbieter sie nennt (Modell-Liste, /api/show, Server)
         import providers
         if (n := providers.kontext(_prov, mid)):
@@ -106,10 +104,10 @@ def price_per_million(ref: str | None) -> tuple[float, float] | None:
     if not ref:
         return None
     prov, mid = M.split_ref(ref)
-    if prov in ("ollama", "gguf", "funke"):  # lokal (Ollama, eigener GGUF-Motor, Funke) -> kostenlos
+    if prov in ("ollama", "gguf"):            # lokal (Ollama, eigener GGUF-Motor) -> kostenlos
         return None
-    if prov == "ollama_cloud":           # Ollama Cloud rechnet nicht je Token ab
-        return None                      # (Abo/Kontingent) -> kein Token-Preis
+    if prov in ("ollama_cloud", "chatgpt"):   # Ollama Cloud, ChatGPT-Konto: Abo/Kontingent statt Token-Preis
+        return None
     low = mid.lower()
     for needle, pin, pout in _PRICE:
         if needle in low:

@@ -1,4 +1,4 @@
-"""High-level API: load a GGUF model and generate text."""
+"""High-Level-API: GGUF-Modell laden und Text erzeugen."""
 from __future__ import annotations
 
 import gc
@@ -20,14 +20,14 @@ from .sampling import Sampler, SamplerConfig
 from .spekulativ import MtpEntwurf, NGramEntwurf, Nutzen
 from .tokenizer import StreamDecoder, Tokenizer
 
-RELEASE_FROM = UNPACK_FROM   # reads this long allocate scratch worth releasing afterwards
+RELEASE_FROM = UNPACK_FROM   # Einlesevorgänge dieser Länge belegen Scratch, den man danach freigeben sollte
 # Einlesen: Kopien wachsen mit jedem Stück (vervielfachte K/V-Köpfe), der Allocator kann die kleineren
 # freien Blöcke nicht wiederverwenden. Wächst der leere Vorrat über diese Grenze, geht er zurück an den Treiber.
 VORRAT_GRENZE = 1 << 30
-SPEKULATIV = 8               # proposed tokens per check (prompt lookup)
-VORSCHLAG_STUFEN = (8, 4, 3, 2, 1)  # a proposal is cut to one of these lengths
-HOSTMEM_AB = 1 << 20          # offload: tensors from this size go to exact-size pinned blocks
-LAGER_TAKT = 32              # MoE storeroom: re-sort the VRAM slots every this many answer tokens (0: off)
+SPEKULATIV = 8               # vorgeschlagene Tokens je Prüfung (Prompt-Lookup)
+VORSCHLAG_STUFEN = (8, 4, 3, 2, 1)  # ein Vorschlag wird auf eine dieser Längen gekürzt
+HOSTMEM_AB = 1 << 20          # Offload: Tensoren ab dieser Größe kommen in passgenaue pinned Blöcke
+LAGER_TAKT = 32              # MoE-Lager: VRAM-Slots alle so viele Antwort-Tokens neu sortieren (0: aus)
 
 _BILD_NR = itertools.count(1)
 
@@ -73,11 +73,11 @@ _DTYPES = {"bf16": torch.bfloat16, "bfloat16": torch.bfloat16, "fp16": torch.flo
 
 
 def _move_tensors(root, select, convert, ansichten: bool = False) -> set:
-    """Replaces every tensor reachable from `root` (attributes, __slots__, lists, tuples,
-    dicts of engine objects) for which `select(t)` holds by `convert(t)`.  A tensor
-    referenced twice is converted once and stays shared; with `ansichten` (moving between devices) also
-    tensors that are views on one storage stay views on one storage.  Returns the ids of the new
-    tensors."""
+    """Ersetzt jeden von `root` erreichbaren Tensor (Attribute, __slots__, Listen, Tupel,
+    Dicts von Engine-Objekten), für den `select(t)` gilt, durch `convert(t)`.  Ein zweifach
+    referenzierter Tensor wird einmal umgewandelt und bleibt geteilt; mit `ansichten` (Verschieben zwischen
+    Geräten) bleiben auch Tensoren, die Views auf einen Storage sind, Views auf einen Storage.  Gibt die ids
+    der neuen Tensoren zurück."""
     memo: dict = {}
     seen: set = set()
     speicher: dict = {}            # Speicher -> verschobener Speicher: Ansichten bleiben Ansichten
@@ -123,7 +123,7 @@ def _move_tensors(root, select, convert, ansichten: bool = False) -> set:
             if hasattr(obj, name):
                 old = getattr(obj, name)
                 new = conv(old)
-                if new is not old:                  # frozen objects are only read
+                if new is not old:                  # eingefrorene Objekte werden nur gelesen
                     setattr(obj, name, new)
 
     walk(root)
@@ -131,7 +131,7 @@ def _move_tensors(root, select, convert, ansichten: bool = False) -> set:
 
 
 def _haelt_tensor(v, tiefe: int = 8) -> bool:
-    """Does `v` (a tensor, or a list/tuple/dict a few levels deep) hold a tensor?"""
+    """Enthält `v` (ein Tensor oder eine Liste/ein Tupel/ein Dict einige Ebenen tief) einen Tensor?"""
     if isinstance(v, torch.Tensor):
         return True
     if tiefe <= 0:
@@ -167,8 +167,8 @@ def _dry_frei(erzeugt: bytes, marken: tuple) -> bool:
 
 
 def _gleiche_form(geladen, soll, n_ctx: int) -> bool:
-    """Has a stored model state exactly the structure of the current one (nesting, shapes,
-    dtypes)?  Integer tensors are positions and must lie in [-1, n_ctx]."""
+    """Hat ein gespeicherter Modellzustand genau die Struktur des aktuellen (Verschachtelung, Shapes,
+    dtypes)?  Integer-Tensoren sind Positionen und müssen in [-1, n_ctx] liegen."""
     if soll is None or geladen is None:
         return soll is None and geladen is None
     if isinstance(soll, torch.Tensor):
@@ -184,8 +184,8 @@ def _gleiche_form(geladen, soll, n_ctx: int) -> bool:
 
 
 def _im_vram(t: torch.Tensor) -> bool:
-    """Tensor in VRAM – not a weight mapped from pinned RAM (Schichten im RAM), which holds no
-    VRAM and stays where it is when the model is parked."""
+    """Tensor im VRAM – kein aus pinned RAM abgebildetes Gewicht (Schichten im RAM), das kein
+    VRAM belegt und an seinem Platz bleibt, wenn das Modell geparkt wird."""
     return t.device.type == "cuda" and not hostmem.abgebildet(t)
 
 
@@ -195,18 +195,18 @@ class Engine:
                  progress=None, max_tok_s: Optional[float] = None, kv_bits: int = 16,
                  experts_vram: Optional[int] = None, kv_gpu_tokens: Optional[int] = None,
                  weights_vram: Optional[int] = None):
-        """`denk_budget` (attribute): max. thinking tokens per answer in chat() (None: no limit).
-        progress: optional callback(fraction 0..1) for loading progress (used by the GUI).
-        max_tok_s: upper limit for generated tokens per second (None = as fast as possible);
-        the GPU idles between steps instead of running flat out.
-        kv_bits: 16 = KV cache in the compute dtype, 8 = int8 with a scale per 32 values
-        (about half the VRAM per token of context), 4 = rotated 4-bit levels (about 28 %).
-        experts_vram: VRAM budget in bytes for MoE experts (None: all in VRAM, 0: all in pinned
-        RAM); experts beyond it stay in RAM and the GPU reads the chosen ones over PCIe.
-        kv_gpu_tokens: positions of each full KV cache kept in VRAM (None: all); the rest of
-        n_ctx lives in RAM and is copied to the GPU per attention call (no CUDA graphs then).
-        weights_vram: VRAM budget in bytes for the weights (None: all in VRAM, 0: everything that
-        can move in pinned RAM); see ggufengine.schichten – the GPU reads those matrices over PCIe."""
+        """`denk_budget` (Attribut): max. Denk-Tokens je Antwort in chat() (None: keine Grenze).
+        progress: optionaler callback(Anteil 0..1) für den Ladefortschritt (von der GUI genutzt).
+        max_tok_s: Obergrenze für erzeugte Tokens pro Sekunde (None = so schnell wie möglich);
+        die GPU pausiert zwischen den Schritten, statt unter Volllast zu laufen.
+        kv_bits: 16 = KV-Cache im Rechen-dtype, 8 = int8 mit einer Skala je 32 Werte
+        (etwa halbes VRAM je Kontext-Token), 4 = rotierte 4-Bit-Stufen (etwa 28 %).
+        experts_vram: VRAM-Budget in Bytes für MoE-Experts (None: alle im VRAM, 0: alle im pinned
+        RAM); Experts darüber hinaus bleiben im RAM, und die GPU liest die gewählten über PCIe.
+        kv_gpu_tokens: Positionen jedes vollen KV-Cache, die im VRAM bleiben (None: alle); der Rest von
+        n_ctx liegt im RAM und wird je Attention-Aufruf auf die GPU kopiert (dann keine CUDA-Graphs).
+        weights_vram: VRAM-Budget in Bytes für die Gewichte (None: alle im VRAM, 0: alles, was in
+        pinned RAM wandern kann); siehe ggufengine.schichten – die GPU liest diese Matrizen über PCIe."""
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         self.device = torch.device(device)
@@ -214,11 +214,11 @@ class Engine:
             raise ValueError(f"unknown dtype {dtype!r}")
         self.dtype = _DTYPES[dtype]
         if self.device.type == "cpu" and self.dtype == torch.float16:
-            self.dtype = torch.bfloat16   # fp16 matmul is very slow on CPU
+            self.dtype = torch.bfloat16   # fp16-matmul ist auf der CPU sehr langsam
         self.verbose = verbose
         self.max_tok_s = max_tok_s if max_tok_s and max_tok_s > 0 else None
         t0 = time.time()
-        self.load_phases: dict = {}   # seconds per phase: file, tokenizer, weights, warmup (+ vision)
+        self.load_phases: dict = {}   # Sekunden je Phase: Datei, Tokenizer, Gewichte, Warmup (+ Vision)
         self.gg = GGUFFile(path)
         self.load_phases["file"] = time.time() - t0
         t = time.time()
@@ -240,8 +240,8 @@ class Engine:
         if weights not in ("quant", "bf16"):
             raise ValueError("weights must be 'quant' or 'bf16'")
         t = time.time()
-        # pinned allocations, frees and synchronize would break a graph capture of another
-        # engine in this process
+        # pinned Allokationen, Freigaben und synchronize würden die Graph-Aufnahme einer anderen
+        # Engine in diesem Prozess zerstören
         from .models import common as _common
         self.schichten_plan = None
         if weights_vram is not None and self.device.type == "cuda":
@@ -256,9 +256,9 @@ class Engine:
                 _common.KV_GPU_SLOTS = None
                 _common.SCHICHTEN_RAM = frozenset()
             if any(c.geteilt for c in self._full_caches()):
-                self.model.graph = None                  # RAM copies cannot be captured
+                self.model.graph = None                  # RAM-Kopien lassen sich nicht aufnehmen
             if self.device.type == "cuda":
-                torch.cuda.synchronize(self.device)      # queued conversions count as weights
+                torch.cuda.synchronize(self.device)      # anstehende Umwandlungen zählen als Gewichte
                 release_pinned_memory()
         self.load_phases["weights"] = time.time() - t
         t = time.time()
@@ -281,31 +281,31 @@ class Engine:
         self.n_ctx = n_ctx
         self._pos = 0
         self._history: List[int] = []
-        self._own: List[bool] = []        # per position: generated by the model (DRY)
-        self._breaker = None              # bool array over the vocabulary, built on first use
-        # DRY stays off between these marks of the model's own output (besides ``` code blocks): a tool call
-        # repeats names and values on purpose – (start, end) as bytes, end b"" = up to the end of the answer
+        self._own: List[bool] = []        # je Position: vom Modell erzeugt (DRY)
+        self._breaker = None              # Bool-Array über das Vokabular, beim ersten Gebrauch gebaut
+        # DRY bleibt zwischen diesen Marken der eigenen Modellausgabe aus (neben ```-Codeblöcken): ein Tool-Call
+        # wiederholt Namen und Werte absichtlich – (Anfang, Ende) als Bytes, Ende b"" = bis zum Ende der Antwort
         self.dry_frei: tuple = ()
-        # one key per cached position: the token id, or ("img", bild_nr(embeddings), row) for an
-        # image position – different images share the placeholder id but not the key
+        # ein Schlüssel je gecachter Position: die Token-id oder ("img", bild_nr(embeddings), Zeile) für eine
+        # Bildposition – verschiedene Bilder teilen die Platzhalter-id, aber nicht den Schlüssel
         self._keys: list = []
-        self._images: dict = {}          # image key -> (embeddings tensor, row)
+        self._images: dict = {}          # Bildschlüssel -> (Embeddings-Tensor, Zeile)
         self.pad_id = int(self.gg.get("tokenizer.ggml.padding_token_id", 0) or 0)
-        # M-RoPE models: rotary position of the next text token and of the start of the
-        # image being read (images take fewer positions than cache slots)
+        # M-RoPE-Modelle: Rotary-Position des nächsten Text-Tokens und des Anfangs des
+        # gerade gelesenen Bildes (Bilder belegen weniger Positionen als Cache-Slots)
         self._mrope = bool(getattr(self.model, "uses_mrope", False))
         self._rope_state = (0, 0)
         self.vision = None
-        self._checkpoint = None          # (position, prefix keys, model state) after the system turn
-        self._answer_checkpoint = None   # the same before the generation prompt of the last chat()
-        self.checkpoint_new = False      # set when chat() made a new checkpoint (save_prefix)
-        self.last_cached = 0             # prompt tokens taken from the cache in the last chat()
-        self.last_ids: List[int] = []    # token ids generated in the last call
-        # speculative decoding: max. proposed tokens checked per pass (0 = off), see spekulativ.py
+        self._checkpoint = None          # (Position, Präfix-Schlüssel, Modellzustand) nach dem System-Turn
+        self._answer_checkpoint = None   # dasselbe vor dem Generierungs-Prompt des letzten chat()
+        self.checkpoint_new = False      # gesetzt, wenn chat() einen neuen Checkpoint angelegt hat (save_prefix)
+        self.last_cached = 0             # Prompt-Tokens, die im letzten chat() aus dem Cache kamen
+        self.last_ids: List[int] = []    # im letzten Aufruf erzeugte Token-ids
+        # spekulatives Decoding: max. vorgeschlagene Tokens je Durchgang geprüft (0 = aus), siehe spekulativ.py
         self.spekulativ = SPEKULATIV
-        self._vorrat: list = []          # (proposed token, logits after it) not taken yet
+        self._vorrat: list = []          # (vorgeschlagenes Token, Logits danach), noch nicht übernommen
 
-    # -- debug log -------------------------------------------------------------
+    # -- Debug-Log -------------------------------------------------------------
     def _log_model_header(self, path, weights, n_ctx):
         gg = self.gg
         arch = gg.architecture
@@ -339,13 +339,13 @@ class Engine:
                 "Modellklasse": type(self.model).__name__}, "Geladen")
 
     def _warmup(self):
-        """Trigger lazy CUDA/cuBLAS initialisation and the first graph capture up front."""
+        """Lazy CUDA/cuBLAS-Initialisierung und die erste Graph-Aufnahme vorab auslösen."""
         ids = self.tokenizer.encode("warm up") or [0]
         self.model.forward(ids, 0)
         self.model.forward([ids[0]], len(ids))
         self.model.reset()
 
-    # -- low level -----------------------------------------------------------
+    # -- Low-Level -----------------------------------------------------------
     def reset(self):
         self.model.reset()
         self._answer_checkpoint = None
@@ -356,9 +356,9 @@ class Engine:
         self._rope_state = (0, 0)
 
     def _rope_positions(self, keys: list, state: tuple):
-        """(t, h, w) rotary positions for `keys` starting from `state`; returns them with
-        the new state.  Text: the same position on all axes.  Image of r x c tokens
-        starting at s: (s, s + row, s + col); the following text starts at s + max(r, c)."""
+        """(t, h, w)-Rotary-Positionen für `keys` ab `state`; gibt sie mit dem neuen
+        Zustand zurück.  Text: dieselbe Position auf allen Achsen.  Bild aus r x c Tokens
+        ab s: (s, s + row, s + col); der folgende Text beginnt bei s + max(r, c)."""
         nxt, start = state
         out = []
         for k in keys:
@@ -377,10 +377,10 @@ class Engine:
 
     def feed(self, tokens: List[int], chunk: Optional[int] = None, keys: Optional[list] = None,
              own: Optional[list] = None, abbruch: Optional[Callable[[], bool]] = None) -> torch.Tensor:
-        """Run tokens through the model (in chunks); returns logits of the last token.
-        `keys` marks image positions (see `chat`); their embeddings come from `_images`.
-        `own`: per token, generated by the model (default: no).  `abbruch()` True stops
-        before the next chunk; only what was read counts."""
+        """Tokens durch das Modell schicken (in Stücken); gibt die Logits des letzten Tokens zurück.
+        `keys` markiert Bildpositionen (siehe `chat`); ihre Embeddings kommen aus `_images`.
+        `own`: je Token, vom Modell erzeugt (Standard: nein).  `abbruch()` True stoppt
+        vor dem nächsten Stück; nur das Gelesene zählt."""
         if self.offloaded:
             self.restore()
         keys = list(tokens) if keys is None else list(keys)
@@ -394,7 +394,7 @@ class Engine:
             if abbruch is not None and abbruch():
                 break
             ende = min(i + chunk, len(tokens))
-            if ganz:                                    # an image is read in one call (bidirectional)
+            if ganz:                                    # ein Bild wird in einem Aufruf gelesen (bidirektional)
                 ende = _bild_nicht_teilen(keys, i, ende)
             part, kpart = tokens[i:ende], keys[i:ende]
             i = ende
@@ -404,7 +404,7 @@ class Engine:
                 pos3, self._rope_state = self._rope_positions(kpart, self._rope_state)
                 if rows:
                     extra["pos3"] = pos3
-                else:                           # plain text: slot + offset, keeps the CUDA graph
+                else:                           # reiner Text: Slot + Offset, behält den CUDA-Graph
                     self.model.set_rope_offset(pos3[0][0] - self._pos)
             if rows:
                 emb = torch.stack([self._images[kpart[j]][0][self._images[kpart[j]][1]] for j in rows])
@@ -416,7 +416,7 @@ class Engine:
             self._pos += len(part)
             if i < len(tokens) and self.device.type == "cuda" and _frei_reserviert(self.device) > VORRAT_GRENZE:
                 self._release_scratch()
-        if i < len(tokens):                             # stopped: only the part read is cached
+        if i < len(tokens):                             # abgebrochen: nur der gelesene Teil wird gecacht
             tokens, keys = tokens[:i], keys[:i]
             own = own[:i] if own is not None else None
         if len(tokens) >= RELEASE_FROM and self.device.type == "cuda":
@@ -428,17 +428,17 @@ class Engine:
 
     @staticmethod
     def _release_scratch() -> None:
-        """Hands the scratch memory of a long read (bf16-unpacked matrices, activations)
-        back to the driver; the caching allocator would otherwise keep it reserved for the
-        rest of the session.  Not while a CUDA graph is being captured."""
+        """Gibt den Scratch-Speicher eines langen Einlesens (bf16-entpackte Matrizen, Aktivierungen)
+        an den Treiber zurück; der Caching-Allocator hielte ihn sonst für den Rest der
+        Sitzung reserviert.  Nicht während ein CUDA-Graph aufgenommen wird."""
         with GPU_SPERRE:
             torch.cuda.empty_cache()
 
-    # -- images ------------------------------------------------------------------
+    # -- Bilder ------------------------------------------------------------------
     def enable_vision(self, mmproj_path: str) -> None:
-        """Attaches a vision projector (mmproj); the encoder is picked from the file
-        (see vision.load_projector).  Its weights stay in RAM and only go to the GPU
-        inside `encode_image`."""
+        """Hängt einen Vision-Projektor (mmproj) an; der Encoder wird anhand der Datei gewählt
+        (siehe vision.load_projector).  Seine Gewichte bleiben im RAM und kommen nur
+        innerhalb von `encode_image` auf die GPU."""
         if not getattr(self.model, "supports_images", False):
             raise ValueError(f"{self.gg.architecture} does not take image inputs")
         from .vision import load_projector
@@ -458,9 +458,9 @@ class Engine:
         self.vision = vision
 
     def encode_image(self, image, tokens: Optional[int] = None) -> torch.Tensor:
-        """PIL image -> image embeddings (CPU tensor) for `Message.images`.  The vision
-        weights are loaded onto the GPU for this call only.  Encoders with a token grid
-        leave it in `.grid` (rows, cols)."""
+        """PIL-Bild -> Bild-Embeddings (CPU-Tensor) für `Message.images`.  Die Vision-
+        Gewichte werden nur für diesen Aufruf auf die GPU geladen.  Encoder mit Token-Raster
+        hinterlegen es in `.grid` (rows, cols)."""
         if self.vision is None:
             raise RuntimeError("no vision projector attached (enable_vision)")
         t0 = time.time()
@@ -483,15 +483,15 @@ class Engine:
         return emb
 
     def _breakers(self):
-        """For DRY, over the vocabulary: (tokens that end a match – newline, ':', '"', '*'
-        and special tokens; tokens that begin a word – space or punctuation first)."""
+        """Für DRY, über das Vokabular: (Tokens, die einen Treffer beenden – Zeilenumbruch, ':', '"', '*'
+        und Spezial-Tokens; Tokens, die ein Wort beginnen – Leerzeichen oder Satzzeichen zuerst)."""
         if self._breaker is None:
             import numpy as np
             tok = self.tokenizer
             n = max(tok.n_vocab, self.model.n_vocab)
             b, w = np.zeros(n, dtype=bool), np.zeros(n, dtype=bool)
             for tid in range(tok.n_vocab):
-                if tok.types[tid] != 1:                      # control, user-defined, byte …
+                if tok.types[tid] != 1:                      # Steuerzeichen, benutzerdefiniert, Byte …
                     b[tid] = True
                     continue
                 try:
@@ -504,10 +504,10 @@ class Engine:
             self._breaker = (b, w)
         return self._breaker
 
-    # -- speculative decoding ------------------------------------------------------
-    # A proposal of k tokens is read together with the sampled token in one forward pass
-    # (logits of every row).  Each position is still sampled from the model's own logits,
-    # with the history up to it; a proposed token is kept only if it equals that sample.
+    # -- spekulatives Decoding -----------------------------------------------------
+    # Ein Vorschlag aus k Tokens wird zusammen mit dem gesampelten Token in einem Forward-Pass gelesen
+    # (Logits jeder Zeile).  Jede Position wird weiterhin aus den eigenen Logits des Modells gesampelt,
+    # mit dem Verlauf bis dorthin; ein vorgeschlagenes Token bleibt nur, wenn es diesem Sample gleicht.
     def _entwurf(self) -> Optional[NGramEntwurf]:
         model = getattr(self, "model", None)
         n = getattr(self, "spekulativ", 0)
@@ -518,12 +518,12 @@ class Engine:
         return NGramEntwurf(self._history, max_neu=n)
 
     def _rekurrent(self) -> bool:
-        """The model state cannot step back (recurrent layers): it is saved before a check."""
+        """Der Modellzustand kann nicht zurückgehen (rekurrente Schichten): er wird vor einer Prüfung gesichert."""
         return self.model.resume_from(1, 2) != 1
 
     def _vorwaerts(self, tokens: List[int], pos: int, alle: bool = False) -> torch.Tensor:
-        """Text tokens at cache slots pos.. without bookkeeping; alle: logits of every row."""
-        if self._mrope:                     # text: the rotary offset is the same for every slot
+        """Text-Tokens an den Cache-Slots pos.. ohne Buchführung; alle: Logits jeder Zeile."""
+        if self._mrope:                     # Text: der Rotary-Offset ist für jeden Slot gleich
             self.model.set_rope_offset(self._rope_state[0] - self._pos)
         self._kv_room(pos + len(tokens))
         graph = getattr(self.model, "graph", None)
@@ -534,7 +534,7 @@ class Engine:
                 return out if alle else out[-1]
         self.model.alle_logits = alle
         try:
-            if alle:                                 # a check: recurrent layers keep their rows
+            if alle:                                 # eine Prüfung: rekurrente Schichten behalten ihre Zeilen
                 with ZeilenMerken():
                     return self.model.forward(tokens, pos)
             return self.model.forward(tokens, pos)
@@ -551,8 +551,8 @@ class Engine:
             self._rope_state = (self._rope_state[0] + n, self._rope_state[1])
 
     def _uhr(self) -> float:
-        if self.device.type == "cuda":      # the sampler waits for the GPU right after anyway
-            with GPU_SPERRE:                # not during a graph capture in another thread
+        if self.device.type == "cuda":      # der Sampler wartet gleich danach ohnehin auf die GPU
+            with GPU_SPERRE:                # nicht während einer Graph-Aufnahme in einem anderen Thread
                 torch.cuda.synchronize()
         return time.perf_counter()
 
@@ -564,19 +564,19 @@ class Engine:
         if entwurf is None:
             return
         if self._graph_aufnahmen() != getattr(self, "_aufnahmen", 0):
-            self._nutzen.ungueltig()                 # this check captured a graph: not a typical one
+            self._nutzen.ungueltig()                 # diese Prüfung hat einen Graph aufgenommen: keine typische
         entwurf.ergebnis(angenommen)
         pause = self._nutzen.pause(angenommen)
         if pause:
             entwurf.pausieren(pause)
 
     def _weiter(self, tid: int, entwurf: Optional[NGramEntwurf], vorschlagen: bool = True) -> torch.Tensor:
-        """Takes the sampled `tid` at position `_pos`; returns the logits for the next position."""
+        """Übernimmt das gesampelte `tid` an Position `_pos`; gibt die Logits für die nächste Position zurück."""
         if entwurf is not None:
             entwurf.zufuegen(tid)
         if self._vorrat:
             gedacht, zeile = self._vorrat.pop(0)
-            if gedacht == tid:                       # already in the cache
+            if gedacht == tid:                       # schon im Cache
                 self._eintragen([tid])
                 self._spek_stat[1] += 1
                 self._nutzen.pruefung(0.0, 1)
@@ -587,33 +587,33 @@ class Engine:
             self._vorrat = []
             basis, zustand = self._spek_basis
             logits = None
-            if zustand is not None:                  # state of the kept rows: rebuilt, else read again
+            if zustand is not None:                  # Zustand der behaltenen Zeilen: neu gebaut, sonst neu gelesen
                 t0 = self._uhr()
                 self.model.restore_state(zustand)
                 if not self._nachholen(basis):
                     logits = self._vorwaerts(self._history[basis:self._pos] + [tid], basis)
                     self._eintragen([tid])
                 self._nutzen.pruefung(self._uhr() - t0, 0 if logits is None else 1)
-            self._spek_ende(entwurf, angenommen)     # after the rebuild: it is part of the check
+            self._spek_ende(entwurf, angenommen)     # nach dem Neuaufbau: er gehört zur Prüfung
             if logits is not None:
                 return logits
-            # attention caches: the slots behind _pos are masked and get overwritten; `tid` is read
-            # next, like after a check without proposals
+            # Attention-Caches: die Slots hinter _pos sind maskiert und werden überschrieben; `tid` wird
+            # als Nächstes gelesen, wie nach einer Prüfung ohne Vorschläge
         platz = min(self.n_ctx - self._pos - 1, PREFILL_CHUNK - 1)
-        # the sampler has just waited for the GPU: the clock starts without a synchronize
-        t0 = time.perf_counter()                     # proposing counts as part of the check
-        vorher = self._graph_aufnahmen() if entwurf is not None else 0   # before proposing: MTP captures too
+        # der Sampler hat gerade auf die GPU gewartet: die Uhr startet ohne synchronize
+        t0 = time.perf_counter()                     # Vorschlagen zählt zur Prüfung
+        vorher = self._graph_aufnahmen() if entwurf is not None else 0   # vor dem Vorschlagen: auch MTP nimmt auf
         if isinstance(entwurf, MtpEntwurf) and vorschlagen and platz > 0:
-            self._kv_room(self._pos + min(entwurf.mtp_n, platz))   # MTP writes its KV cache from _pos on
+            self._kv_room(self._pos + min(entwurf.mtp_n, platz))   # MTP schreibt seinen KV-Cache ab _pos
         vorschlag = entwurf.vorschlag(platz) if entwurf is not None and vorschlagen else []
         grenze = self._nutzen.erlaubt(len(vorschlag)) if vorschlag else 0
         k = next((s for s in VORSCHLAG_STUFEN if s <= min(len(vorschlag), grenze)), 0)
-        vorschlag = vorschlag[:k]                    # few sizes: few captured graphs
+        vorschlag = vorschlag[:k]                    # wenige Größen: wenige aufgenommene Graphs
         if not vorschlag:
             logits = self.feed([tid], own=[True])
-            if entwurf is not None and self._nutzen.einzeln_messen():   # a synchronize only now and then
+            if entwurf is not None and self._nutzen.einzeln_messen():   # ein synchronize nur ab und zu
                 dauer = self._uhr() - t0
-                if self._graph_aufnahmen() == vorher:   # not a step that captured its graph
+                if self._graph_aufnahmen() == vorher:   # kein Schritt, der seinen Graph aufgenommen hat
                     self._nutzen.einzeln(dauer)
             return logits
         self._nutzen.start(len(vorschlag))
@@ -630,7 +630,7 @@ class Engine:
         return zeilen[0]
 
     def _verwerfen(self) -> None:
-        """Drops proposed tokens not taken (end of the answer, forced end of thinking)."""
+        """Verwirft nicht übernommene vorgeschlagene Tokens (Ende der Antwort, erzwungenes Denk-Ende)."""
         if not self._vorrat:
             return
         self._vorrat = []
@@ -641,18 +641,21 @@ class Engine:
                 self._vorwaerts(self._history[basis:self._pos], basis)
 
     def _nachholen(self, basis: int) -> bool:
-        """Recurrent state after the rows of the last check kept up to `_pos` (state before the
-        check restored), from the per-row inputs the layers kept - no reading again."""
+        """Rekurrenter Zustand nach den Zeilen der letzten Prüfung, behalten bis `_pos` (Zustand vor der
+        Prüfung wiederhergestellt), aus den Eingaben je Zeile, die die Schichten behalten haben – ohne erneutes
+        Lesen."""
         f = getattr(self.model, "zeilen_nachholen", None)
         return f is not None and f(self._spek_L, self._pos - basis)
 
     def generate_tokens(self, prompt_ids: List[int], max_tokens: int = 512,
                         sampler: Optional[SamplerConfig] = None, stop_ids=None,
                         prompt_keys: Optional[list] = None, prompt_own: Optional[list] = None,
-                        denk_budget: Optional[tuple] = None) -> Iterator[int]:
-        """denk_budget = (tokens, open ids, close ids, starts inside): after `tokens` thinking
-        tokens the close ids are inserted and generation goes on with the answer (budget
-        forcing).  The model's own close (first close token) ends the thinking as well."""
+                        denk_budget: Optional[tuple] = None,
+                        abbruch: Optional[Callable[[], bool]] = None) -> Iterator[int]:
+        """denk_budget = (Tokens, Öffnen-ids, Schließen-ids, beginnt innen): nach `tokens` Denk-Tokens
+        werden die Schließen-ids eingefügt und die Generierung geht mit der Antwort weiter (Budget
+        Forcing).  Das eigene Schließen des Modells (erstes Schließen-Token) beendet das Denken ebenfalls.
+        `abbruch()` True stoppt schon beim Einlesen des Prompts (zwischen Stücken), ohne Token."""
         cfg = sampler or SamplerConfig()
         if denk_budget:
             grenze, auf, zu, drin = denk_budget
@@ -664,22 +667,29 @@ class Engine:
         if self._pos + len(prompt_ids) + 1 > self.n_ctx:
             raise RuntimeError("prompt does not fit into the context window")
         t0 = time.time()
-        logits = self.feed(prompt_ids, keys=prompt_keys, own=prompt_own)
-        self._lager_umsortieren()                            # what the prompt chose goes to VRAM
+        if abbruch is not None:
+            vorher = len(self._history)
+            logits = self.feed(prompt_ids, keys=prompt_keys, own=prompt_own, abbruch=abbruch)
+            if len(self._history) - vorher < len(prompt_ids):   # Prompt nur zum Teil gelesen
+                self._prefill_seconds = time.time() - t0
+                return
+        else:
+            logits = self.feed(prompt_ids, keys=prompt_keys, own=prompt_own)
+        self._lager_umsortieren()                            # was der Prompt gewählt hat, kommt ins VRAM
         self._prefill_seconds = time.time() - t0
         step = 1.0 / self.max_tok_s if self.max_tok_s else 0.0
         next_at = time.perf_counter()
         dry = cfg.dry_multiplier > 0
         breaker, word_start = self._breakers() if dry else (None, None)
-        erzeugt = b""                                        # for code blocks: DRY stays off inside
+        erzeugt = b""                                        # für Codeblöcke: DRY bleibt darin aus
         entwurf = self._entwurf()
-        self._vorrat, self._spek_stat = [], [0, 0]           # proposed, taken
+        self._vorrat, self._spek_stat = [], [0, 0]           # vorgeschlagen, übernommen
         if entwurf is not None and getattr(self, "_nutzen", None) is None:
-            self._nutzen = Nutzen()                          # kept across answers (same model)
+            self._nutzen = Nutzen()                          # bleibt über Antworten hinweg (gleiches Modell)
         try:
             for nr in range(1, max_tokens + 1):
                 if LAGER_TAKT and nr % LAGER_TAKT == 0:
-                    self._lager_umsortieren(melden=False)   # experts of this answer into VRAM
+                    self._lager_umsortieren(melden=False)   # Experts dieser Antwort ins VRAM
                 code = dry and _dry_frei(erzeugt, self.dry_frei)
                 tid = smp.sample(logits, self._history, self._own if dry and not code else None, breaker,
                                  word_start)
@@ -697,9 +707,9 @@ class Engine:
                     elif drin:
                         gedacht += 1
                         if gedacht >= grenze and self._pos + 1 + len(zu) <= self.n_ctx:
-                            self._weiter(tid, entwurf, vorschlagen=False)   # last thinking token
+                            self._weiter(tid, entwurf, vorschlagen=False)   # letztes Denk-Token
                             self._verwerfen()
-                            for t in zu:                                     # then close the block
+                            for t in zu:                                     # dann den Block schließen
                                 yield t
                                 if entwurf is not None:
                                     entwurf.zufuegen(t)
@@ -712,15 +722,15 @@ class Engine:
                     if wait > 0:
                         time.sleep(wait)
                     else:
-                        next_at = time.perf_counter()   # slower than the limit: do not catch up
+                        next_at = time.perf_counter()   # langsamer als die Grenze: nicht aufholen
                 if dry:
                     erzeugt += self.tokenizer.token_bytes(tid)
                 logits = self._weiter(tid, entwurf)
         finally:
             self._verwerfen()
-            self._spek_basis = None                          # its state snapshot would stay in VRAM
+            self._spek_basis = None                          # sein Zustands-Snapshot bliebe im VRAM
 
-    # -- high level ----------------------------------------------------------
+    # -- High-Level ----------------------------------------------------------
     def complete(self, text: str, **kw) -> Iterator[str]:
         ids = self.tokenizer.encode(text)
         if self.tokenizer.add_bos and self.tokenizer.bos_id is not None:
@@ -728,30 +738,37 @@ class Engine:
         yield from self._stream(ids, **kw)
 
     def chat(self, messages: List[Message], reuse: bool = True, checkpoint_system: bool = True,
-             **kw) -> Iterator[str]:
-        """Chat over the whole conversation.  With `reuse` the tokens already in the KV
-        cache are kept as far as they match the new prompt (prefix cache), and only the
-        rest is read.  `checkpoint_system` saves the small model state right after the
-        system turn, so a conversation that diverges later never re-reads the system
-        prompt.  `self.last_ids` holds the generated token ids afterwards (for
-        `Message.ids`)."""
+             abbruch: Optional[Callable[[], bool]] = None, **kw) -> Iterator[str]:
+        """Chat über das ganze Gespräch.  Mit `reuse` bleiben die Tokens, die schon im KV-
+        Cache liegen, erhalten, soweit sie zum neuen Prompt passen (Präfix-Cache), und nur der
+        Rest wird gelesen.  `checkpoint_system` sichert den kleinen Modellzustand direkt nach dem
+        System-Turn, sodass ein Gespräch, das später abzweigt, den System-Prompt nie erneut
+        liest.  `self.last_ids` enthält danach die erzeugten Token-ids (für
+        `Message.ids`).  `abbruch()` True stoppt das Einlesen zwischen Stücken (ohne Antwort);
+        das Gelesene bleibt gecacht."""
         ids = self.chat_format.encode(messages, add_generation_prompt=True)
         keys = self._image_keys(messages, ids)
         own = self._own_mask(messages, ids)
         start = self._resume(keys) if reuse else self._start_over()
         self.last_cached = start
+        self.last_ids = []
+        ab = {} if abbruch is None else {"abbruch": abbruch}
         if checkpoint_system and (cut := self._system_end(messages, ids)) and start < cut < len(ids):
-            self.feed(ids[start:cut], keys=keys[start:cut], own=own[start:cut])
+            self.feed(ids[start:cut], keys=keys[start:cut], own=own[start:cut], **ab)
+            if len(self._history) < cut:
+                return
             self._checkpoint = (cut, keys[:cut], self.model.checkpoint_state())
             self.checkpoint_new = True
             start = cut
-        # checkpoint before the generation prompt: when the next prompt renders this answer
-        # differently (thinking left out), models whose state cannot step back (recurrent
-        # layers, sliding-window rings) continue here instead of re-reading the conversation
+        # Checkpoint vor dem Generierungs-Prompt: wenn der nächste Prompt diese Antwort
+        # anders darstellt (Denken weggelassen), setzen Modelle, deren Zustand nicht zurückgehen kann (rekurrente
+        # Schichten, Sliding-Window-Ringe) hier fort, statt das Gespräch erneut zu lesen
         ohne = self.chat_format.encode(messages, add_generation_prompt=False)
         vor = len(ohne)
         if start < vor < len(ids) and ids[:vor] == ohne:
-            self.feed(ids[start:vor], keys=keys[start:vor], own=own[start:vor])
+            self.feed(ids[start:vor], keys=keys[start:vor], own=own[start:vor], **ab)
+            if len(self._history) < vor:
+                return
             zustand = self.model.checkpoint_state()
             self._answer_checkpoint = (vor, keys[:vor], zustand) if zustand is not None else None
             start = vor
@@ -768,13 +785,13 @@ class Engine:
         marken = self.chat_format.denk_marken() if self.chat_format.thinking else None
         if getattr(self, "denk_budget", None) and marken and "denk_budget" not in kw:
             kw["denk_budget"] = (self.denk_budget, marken[0], marken[1], self.chat_format.opens_thinking)
-        yield from self._stream(ids[start:], keys=keys[start:], own=own[start:], **kw)
+        yield from self._stream(ids[start:], keys=keys[start:], own=own[start:], **ab, **kw)
 
     def vorlesen(self, messages: List[Message], abbruch: Optional[Callable[[], bool]] = None) -> int:
-        """Reads `messages` into the cache without answering – the beginning of the next
-        prompt, so the next chat() that starts with it only reads its new message (prefix
-        cache).  `abbruch()` True stops between chunks; what was read stays cached.
-        Returns the tokens read."""
+        """Liest `messages` in den Cache, ohne zu antworten – der Anfang des nächsten
+        Prompts, sodass der nächste chat(), der damit beginnt, nur seine neue Nachricht liest (Präfix-
+        Cache).  `abbruch()` True stoppt zwischen Stücken; das Gelesene bleibt gecacht.
+        Gibt die gelesenen Tokens zurück."""
         ids = self.chat_format.encode(messages, add_generation_prompt=False)
         if not ids:
             return 0
@@ -796,7 +813,7 @@ class Engine:
 
     @staticmethod
     def _own_mask(messages: List[Message], ids: List[int]) -> List[bool]:
-        """True at the positions of earlier answers this engine generated (Message.ids)."""
+        """True an den Positionen früherer Antworten, die diese Engine erzeugt hat (Message.ids)."""
         own = [False] * len(ids)
         pos = 0
         for m in messages:
@@ -817,8 +834,8 @@ class Engine:
         return own
 
     def _image_keys(self, messages: List[Message], ids: List[int]) -> list:
-        """Keys for `ids`: the token id, or ("img", bild_nr(embeddings), row) at the image
-        placeholders (in message order).  Registers the embeddings in `_images`."""
+        """Schlüssel für `ids`: die Token-id oder ("img", bild_nr(embeddings), row) an den Bild-
+        Platzhaltern (in Nachrichtenreihenfolge).  Registriert die Embeddings in `_images`."""
         images = [img for m in messages if m.role == "user" for img in (m.images or [])]
         if not images:
             return list(ids)
@@ -842,39 +859,39 @@ class Engine:
             self._images[key] = (img, r)
         return keys
 
-    # -- system prompt on disk ------------------------------------------------------
-    PREFIX_FORMAT = 2                # 2: Qwen3.5 state with the MTP hidden state
+    # -- System-Prompt auf der Platte -----------------------------------------------
+    PREFIX_FORMAT = 2                # 2: Qwen3.5-Zustand mit dem MTP-Hidden-State
 
     def _kv_room(self, n: int) -> None:
-        """Grow the full KV caches to hold n positions; drop captured decode graphs if a
-        cache moved."""
+        """Die vollen KV-Caches auf n Positionen vergrößern; aufgenommene Decode-Graphs verwerfen, wenn
+        ein Cache verschoben wurde."""
         if getattr(self, "_kv_list", None) is None:
             self._kv_list = self._full_caches()
         moved = False
         for c in self._kv_list:
             moved |= c.ensure(n)
         graph = getattr(self.model, "graph", None)
-        if moved and graph is not None:            # graphs and their memory pool, as in offload()
+        if moved and graph is not None:            # Graphs und ihr Speicherpool, wie in offload()
             with GPU_SPERRE:
                 torch.cuda.synchronize()
                 graph.leeren()
 
     def _full_caches(self) -> list:
-        """Full-context KV caches of the model in a fixed order (ring caches belong to
-        the checkpoint state)."""
+        """Volle Kontext-KV-Caches des Modells in fester Reihenfolge (Ring-Caches gehören zum
+        Checkpoint-Zustand)."""
         from .models.common import KVCache
         return self._objekte(KVCache)
 
     def _lager(self) -> list:
-        """Storerooms of the MoE layers (VRAM slots for the most used experts)."""
+        """Lager der MoE-Schichten (VRAM-Slots für die meistgenutzten Experts)."""
         if getattr(self, "_lager_liste", None) is None:
             from .models.moe import ExpertenLager
             self._lager_liste = self._objekte(ExpertenLager) if getattr(self, "model", None) is not None else []
         return self._lager_liste
 
     def _lager_umsortieren(self, melden: bool = True) -> None:
-        """Most used experts into the VRAM slots – between steps, never inside a graph.
-        Within an answer (`melden=False`) every LAGER_TAKT tokens: the slots follow the topic."""
+        """Meistgenutzte Experts in die VRAM-Slots – zwischen den Schritten, nie innerhalb eines Graphs.
+        Innerhalb einer Antwort (`melden=False`) alle LAGER_TAKT Tokens: die Slots folgen dem Thema."""
         lager = self._lager()
         if not lager:
             return
@@ -887,8 +904,8 @@ class Engine:
                       f"Treffer danach {treffer:.0%}")
 
     def experten_zaehlung(self) -> Optional[List[List[float]]]:
-        """How often each expert was chosen, per MoE layer with a storeroom (None: no storeroom)
-        – to keep for the next start."""
+        """Wie oft jeder Expert gewählt wurde, je MoE-Schicht mit Lager (None: kein Lager)
+        – zum Aufbewahren für den nächsten Start."""
         lager = self._lager()
         if not lager:
             return None
@@ -896,8 +913,8 @@ class Engine:
             return [[round(x, 3) for x in l.zaehler.tolist()] for l in lager]
 
     def experten_zaehlung_setzen(self, zaehlung) -> bool:
-        """Counts from an earlier run: the storerooms start warm (the most used experts go to
-        VRAM right away).  False if they do not fit this model."""
+        """Zählungen aus einem früheren Lauf: die Lager starten warm (die meistgenutzten Experts kommen
+        sofort ins VRAM).  False, wenn sie nicht zu diesem Modell passen."""
         lager = self._lager()
         if not lager or not isinstance(zaehlung, list) or len(zaehlung) != len(lager):
             return False
@@ -916,7 +933,7 @@ class Engine:
         return True
 
     def _objekte(self, typ) -> list:
-        """Objects of type `typ` reachable from the model, in a fixed order."""
+        """Vom Modell erreichbare Objekte vom Typ `typ`, in fester Reihenfolge."""
         found, seen = [], set()
 
         def walk(obj, wurzel=False):
@@ -940,8 +957,8 @@ class Engine:
         return found
 
     def save_prefix(self, path: str, fingerprint: str) -> bool:
-        """Writes the system-turn checkpoint (tokens, KV of those positions, model state)
-        as safetensors – data only, nothing in the file is ever executed."""
+        """Schreibt den System-Turn-Checkpoint (Tokens, KV dieser Positionen, Modellzustand)
+        als safetensors – nur Daten, nichts in der Datei wird je ausgeführt."""
         if self._checkpoint is None:
             return False
         import json
@@ -949,10 +966,10 @@ class Engine:
         from safetensors.torch import save_file
         cut, keys, state = self._checkpoint
         if any(not isinstance(k, int) for k in keys):
-            return False                                     # images in the system turn: not stored
+            return False                                     # Bilder im System-Turn: nicht gespeichert
         tensors = {}
         for i, c in enumerate(self._full_caches()):
-            k, v = c.kv_echt(cut)                            # unrotated: valid for every KV format
+            k, v = c.kv_echt(cut)                            # unrotiert: gültig für jedes KV-Format
             tensors[f"kv.{i}.k"] = k.contiguous()
             tensors[f"kv.{i}.v"] = v.contiguous()
 
@@ -975,8 +992,8 @@ class Engine:
         return True
 
     def load_prefix(self, path: str, fingerprint: str, system_ids: List[int]) -> bool:
-        """Loads a stored system-turn checkpoint if it belongs to this model file and to
-        exactly these system tokens; returns False (and changes nothing) otherwise."""
+        """Lädt einen gespeicherten System-Turn-Checkpoint, wenn er zu dieser Modelldatei und genau
+        diesen System-Tokens gehört; gibt sonst False zurück (und ändert nichts)."""
         import json
         from safetensors import safe_open
         try:
@@ -1029,26 +1046,32 @@ class Engine:
         return bool(getattr(self, "_moved", None))
 
     def offload(self) -> float:
-        """Moves every CUDA tensor of the model (weights, KV caches, buffers) into pinned
-        RAM and frees the VRAM.  The conversation state is kept; `restore()` brings it
-        back.  Returns the seconds taken."""
+        """Verschiebt jeden CUDA-Tensor des Modells (Gewichte, KV-Caches, Buffer) in pinned
+        RAM und gibt das VRAM frei.  Der Gesprächszustand bleibt erhalten; `restore()` holt ihn
+        zurück.  Gibt die benötigten Sekunden zurück."""
         if self.device.type != "cuda" or self.offloaded:
             return 0.0
         t0 = time.time()
 
         def to_ram(t):
             n = t.numel() * t.element_size()
-            if n >= HOSTMEM_AB:              # exact size (torch rounds pinned blocks up to 2^k)
-                host = hostmem.empty(n, self.device).view(t.dtype).view(t.shape)
-            else:
+            host = None
+            if not hostmem.ram_reicht(n):    # zu wenig RAM zum Festsetzen: normaler RAM (langsamere Kopie)
+                host = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+            elif n >= HOSTMEM_AB:            # passgenau (torch rundet pinned Blöcke auf 2^k auf)
+                try:
+                    host = hostmem.empty(n, self.device).view(t.dtype).view(t.shape)
+                except RuntimeError:
+                    host = torch.empty(t.shape, dtype=t.dtype, device="cpu")
+            if host is None:
                 host = torch.empty(t.shape, dtype=t.dtype, device="cpu", pin_memory=True)
             host.copy_(t, non_blocking=True)
             return host
-        with GPU_SPERRE:                             # synchronize, moves, empty_cache: not during a capture
+        with GPU_SPERRE:                             # synchronize, Verschieben, empty_cache: nicht beim Aufnehmen
             torch.cuda.synchronize()
             from .models.common import GraphDecoder
-            for decoder in self._objekte(GraphDecoder):  # captured graphs point at VRAM addresses – all of
-                decoder.leeren()                         # them, also the MTP proposals (qwen35 _mtp_graph)
+            for decoder in self._objekte(GraphDecoder):  # aufgenommene Graphs zeigen auf VRAM-Adressen – alle,
+                decoder.leeren()                         # auch die MTP-Vorschläge (qwen35 _mtp_graph)
             if (leser := getattr(self.model, "schnell", None)) is not None:
                 leser.parken()                          # TensorRT-Leser: Gewichte aus dem VRAM
             punkte = _Pruefpunkte(self)
@@ -1063,8 +1086,8 @@ class Engine:
         return time.time() - t0
 
     def restore(self) -> float:
-        """Brings an offloaded model back onto the GPU (only the tensors that were moved;
-        tables that live in RAM on purpose stay there)."""
+        """Holt ein ausgelagertes Modell zurück auf die GPU (nur die verschobenen Tensoren;
+        Tabellen, die absichtlich im RAM liegen, bleiben dort)."""
         if not self.offloaded:
             return 0.0
         t0 = time.time()
@@ -1073,28 +1096,29 @@ class Engine:
         if (leser := getattr(self.model, "schnell", None)) is not None:
             leser.aufwecken()
         zurueck = lambda t: t.to(self.device, non_blocking=True)          # noqa: E731
-        with GPU_SPERRE:                             # moves and synchronize: not during a capture
+        with GPU_SPERRE:                             # Verschieben und synchronize: nicht während einer Aufnahme
             punkte = _Pruefpunkte(self)
             _move_tensors(self.model, lambda t: id(t) in moved, zurueck, ansichten=True)
             _move_tensors(punkte, lambda t: id(t) in moved, zurueck, ansichten=True)
             punkte.zurueck(self)
-            for lager in self._lager():              # the slots got new addresses
+            for lager in self._lager():              # die Slots haben neue Adressen bekommen
                 lager.verankern()
             torch.cuda.synchronize()
-            release_pinned_memory()                  # the RAM copies are no longer needed
+            release_pinned_memory()                  # die RAM-Kopien werden nicht mehr gebraucht
         dbg.event(f"zurück auf der GPU in {time.time() - t0:.2f}s")
         return time.time() - t0
 
-    # -- unload ----------------------------------------------------------------
+    # -- Entladen --------------------------------------------------------------
     @property
     def geleert(self) -> bool:
         return bool(getattr(self, "_geleert", False))
 
     def leeren(self) -> None:
-        """Frees all memory the engine holds (VRAM, pinned RAM, file views), even while other code still
-        references the engine object - the in-process counterpart of ending a runner process. Captured
-        graphs are dropped, the TensorRT reader is detached, and every tensor reachable from the engine is
-        replaced by an empty placeholder. The engine cannot be used afterwards."""
+        """Gibt allen Speicher frei, den die Engine hält (VRAM, pinned RAM, Datei-Views), auch während anderer Code
+        das Engine-Objekt noch referenziert – das In-Process-Gegenstück zum Beenden eines Runner-Prozesses.
+        Aufgenommene Graphs werden verworfen, der TensorRT-Leser wird abgehängt, und jeder von der Engine
+        erreichbare Tensor wird durch einen leeren Platzhalter ersetzt. Die Engine ist danach nicht mehr
+        nutzbar."""
         if self.geleert:
             return
         self._geleert = True
@@ -1105,48 +1129,53 @@ class Engine:
             if (decoder := getattr(self.model, name, None)) is not None:
                 decoder.leeren()
         if (hilfskopf_weg := getattr(self.model, "hilfskopf_weg", None)) is not None:
-            hilfskopf_weg()                          # closes the assistant's GGUF file
+            hilfskopf_weg()                          # schließt die GGUF-Datei des Hilfskopfs
         if getattr(self.model, "schnell", None) is not None:
             self.model.schnell = None
         leer = torch.empty(0, device="meta")
         for wurzel in (self.model, getattr(self, "vision", None)):
             if wurzel is not None:
                 _move_tensors(wurzel, lambda t: True, lambda t: leer)
-        for name, wert in list(vars(self).items()):  # checkpoints, proposals, last logits
+        for name, wert in list(vars(self).items()):  # Checkpoints, Vorschläge, letzte Logits
             if name not in ("model", "vision", "device") and _haelt_tensor(wert):
                 setattr(self, name, None)
         self._moved = None
+        if (bild_gg := getattr(getattr(self, "vision", None), "gg", None)) is not None:
+            try:
+                bild_gg.close()                      # mmproj-Datei frei (noch offene Sichten schließen mit ihr)
+            except Exception:
+                pass
 
-    # -- prefix cache ----------------------------------------------------------
+    # -- Präfix-Cache ----------------------------------------------------------
     def _start_over(self) -> int:
         self.reset()
         return 0
 
     def _resume(self, ids: list) -> int:
-        """Keeps the cached prefix shared with `ids` (keys, see `_image_keys`); returns
-        the position to read from."""
+        """Behält das mit `ids` gemeinsame gecachte Präfix (Schlüssel, siehe `_image_keys`); gibt
+        die Position zurück, ab der gelesen wird."""
         old = self._keys
         common = 0
         for a, b in zip(old, ids):
             if a != b:
                 break
             common += 1
-        common = min(common, len(ids) - 1)          # at least one token yields the logits
+        common = min(common, len(ids) - 1)          # mindestens ein Token liefert die Logits
         start = self.model.resume_from(common, len(old)) if common > 0 else None
         cp = self._checkpoint
         if cp is not None and (len(ids) < cp[0] or ids[:cp[0]] != cp[1]):
-            cp = self._checkpoint = None             # its prefix is about to be overwritten
+            cp = self._checkpoint = None             # sein Präfix wird gleich überschrieben
         acp = getattr(self, "_answer_checkpoint", None)
         if acp is not None and (len(ids) < acp[0] or ids[:acp[0]] != acp[1]):
             acp = self._answer_checkpoint = None
-        for punkt in (acp, cp):                      # the later one first
+        for punkt in (acp, cp):                      # der spätere zuerst
             if start is None and punkt is not None and punkt[0] <= common:
                 self.model.restore_checkpoint(punkt[2])
                 start = punkt[0]
         if start is None:
             return self._start_over()
         if acp is not None and acp[0] > start:
-            self._answer_checkpoint = None           # the slots behind `start` get overwritten
+            self._answer_checkpoint = None           # die Slots hinter `start` werden überschrieben
         self._pos = start
         self._history = self._history[:start]
         self._own = self._own[:start]
@@ -1156,7 +1185,7 @@ class Engine:
         return start
 
     def _system_end(self, messages: List[Message], ids: List[int]) -> int:
-        """Token count of the system turn at the start of `ids` (0 if there is none)."""
+        """Token-Anzahl des System-Turns am Anfang von `ids` (0, wenn es keinen gibt)."""
         system = [m for m in messages if m.role == "system"]
         if not system:
             return 0
@@ -1192,8 +1221,8 @@ class Engine:
             raise
         else:
             dbg.code("".join(reply), "text", "Antwort")
-            self._lager_umsortieren()                       # the answer's choices count for the next one
-        finally:   # also runs when the consumer stops iterating early
+            self._lager_umsortieren()                       # die Wahl dieser Antwort zählt für die nächste
+        finally:   # läuft auch, wenn der Verbraucher früher aufhört zu iterieren
             total = time.time() - t0
             pre = self._prefill_seconds
             self.last_stats = dict(prompt_tokens=len(ids), generated=n, seconds=total,

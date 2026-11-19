@@ -219,8 +219,21 @@ def label(art: str = "bild") -> str:
 
 def _client(zeit: float):
     import httpx
-    return httpx.Client(timeout=httpx.Timeout(30.0, read=zeit), follow_redirects=True,
+    # ohne automatische Weiterleitung: der Schlüssel im Kopf ginge sonst an den neuen Rechner mit
+    return httpx.Client(timeout=httpx.Timeout(30.0, read=zeit), follow_redirects=False,
                         headers={"User-Agent": "NemiCLI"})
+
+
+def _abfrage_url(url, basis: str, wer: str) -> str:
+    """Abfrage-Adresse aus einer Anbieter-Antwort: nur https und nur beim Anbieter selbst (seine Domain
+    oder eine Unter-Domain davon) – sie bekommt den Schlüssel im Kopf."""
+    from urllib.parse import urlparse
+    teile = urlparse(url) if isinstance(url, str) else None
+    domain = ".".join((urlparse(basis).hostname or "").split(".")[-2:])
+    host = (teile.hostname or "") if teile else ""
+    if not teile or teile.scheme != "https" or not domain or not (host == domain or host.endswith("." + domain)):
+        raise CloudFehler(f"{wer}: Abfrage-Adresse abgelehnt (nicht https oder fremder Rechner).")
+    return url
 
 
 def _fehlertext(r) -> str:
@@ -244,6 +257,8 @@ def _fehlertext_json(j) -> str:
 
 
 def _pruefen(r, wer: str):
+    if getattr(r, "is_redirect", False):
+        raise CloudFehler(f"{wer} leitet die Anfrage um ({r.status_code}) – abgelehnt.")
     if r.status_code >= 400:
         raise CloudFehler(f"{wer} antwortet mit {r.status_code}: {_fehlertext(r)}")
     return r.json()
@@ -318,6 +333,7 @@ def _fal(c, modell_id: str, koerper: dict, schluessel: str, *, zeit: float, on_s
     status_url, antwort_url = j.get("status_url"), j.get("response_url")
     if not status_url or not antwort_url:
         raise CloudFehler("fal.ai hat keinen Auftrag angenommen.")
+    status_url, antwort_url = _abfrage_url(status_url, FAL, "fal.ai"), _abfrage_url(antwort_url, FAL, "fal.ai")
     _warten(c, status_url, kopf, "fal.ai", lambda s: True if s.get("status") == "COMPLETED" else None,
             zeit=zeit, warten=2.0, on_status=on_status, abbruch=abbruch, text=text)
     erg = _pruefen(c.get(antwort_url, headers=kopf), "fal.ai")
@@ -350,8 +366,8 @@ def _replicate(c, modell_id: str, eingabe: dict, schluessel: str, *, zeit: float
     abfrage = (j.get("urls") or {}).get("get") or (f"{REPLICATE}/predictions/{j['id']}" if j.get("id") else None)
     if not abfrage:
         raise CloudFehler("Replicate hat keinen Auftrag angenommen.")
-    return _warten(c, abfrage, kopf, "Replicate", fertig, zeit=zeit, warten=2.0, on_status=on_status,
-                   abbruch=abbruch, text=text)
+    return _warten(c, _abfrage_url(abfrage, REPLICATE, "Replicate"), kopf, "Replicate", fertig, zeit=zeit,
+                   warten=2.0, on_status=on_status, abbruch=abbruch, text=text)
 
 
 def _luma(c, koerper: dict, schluessel: str, *, zeit: float, on_status=None, abbruch=None,
@@ -493,7 +509,8 @@ def generate(prompt: str, *, model: str | None = None, neg: str | None = None, s
                 if stand in ("Error", "Failed", "Request Moderated", "Content Moderated"):
                     raise CloudFehler(f"Black Forest Labs: {stand}")
                 return None
-            url = _warten(c, j["polling_url"], {"x-key": schluessel, "accept": "application/json"},
+            url = _warten(c, _abfrage_url(j["polling_url"], BFL, "Black Forest Labs"),
+                          {"x-key": schluessel, "accept": "application/json"},
                           "Black Forest Labs", _bfl_fertig, zeit=ZEIT_BILD, warten=1.0, on_status=on_status)
             daten = _laden(url) if url else None           # Link gilt nur 10 Minuten: gleich holen
         elif anbieter == "ideogram":

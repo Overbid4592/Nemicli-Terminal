@@ -1,25 +1,25 @@
 """
-Quantised linear layers: the GGUF block formats stay quantised in VRAM and the
-matmul runs directly on them, the way llama.cpp's mul_mat_vec_q kernels do.
+Quantisierte Linear-Schichten: Die GGUF-Blockformate bleiben im VRAM quantisiert, und die
+matmul läuft direkt auf ihnen, so wie die mul_mat_vec_q-Kernel von llama.cpp.
 
-We use the int4 group-wise kernel that ships inside the PyTorch wheel
-(`torch._weight_int4pack_mm`, "tinygemm"): groups of 32 along K with a bf16
-scale and zero per group, computing  w = (u - 8) * s + z  for nibbles u.
-GGUF blocks are mapped onto that exactly:
+Verwendet wird der int4-Kernel mit Gruppen, der im PyTorch-Wheel mitkommt
+(`torch._weight_int4pack_mm`, "tinygemm"): Gruppen zu 32 entlang K mit einer bf16-Scale
+und einem Zero je Gruppe, berechnet wird  w = (u - 8) * s + z  für Nibbles u.
+GGUF-Blöcke werden exakt darauf abgebildet:
 
-  Q4_0 / Q4_1 / Q4_K   one int4 matmul   (u = nibble, s = d*sc, z = 8s - m)
+  Q4_0 / Q4_1 / Q4_K   eine int4-matmul      (u = Nibble, s = d*sc, z = 8s - m)
   Q8_0 / Q5_0 / Q5_1 / Q5_K
-                        8-bit value u8 = 16*hi + lo -> two int4 matmuls with
+                        8-Bit-Wert u8 = 16*hi + lo -> zwei int4-matmuls mit
                         s_lo = s8, z_lo = 8 s8 ; s_hi = 16 s8, z_hi = 128 s8 + c8
-                        so that  y = s8 * u8 + c8   (exact)
-  Q6_K                  the two 16-element sub-blocks of a 32-group are put on
-                        a common 8-bit grid (near-lossless), then as above.
+                        sodass  y = s8 * u8 + c8   (exakt)
+  Q6_K                  die beiden 16-Element-Sub-Blöcke einer 32er-Gruppe kommen auf
+                        ein gemeinsames 8-Bit-Raster (nahezu verlustfrei), dann wie oben.
 
-No custom kernels, no compiler: everything is data + torch's own operators.
+Keine eigenen Kernel, kein Compiler: alles ist Daten + torchs eigene Operatoren.
 
-Reading a long prompt (M >= UNPACK_FROM rows) is faster another way: tinygemm is built
-for small M, so the matrix is unpacked to bf16 for that one call (the tile order of the
-packed format is learned once from the packer itself) and multiplied with cuBLAS.
+Das Einlesen eines langen Prompts (M >= UNPACK_FROM Zeilen) geht anders schneller: tinygemm ist
+für kleine M gebaut, daher wird die Matrix für diesen einen Aufruf nach bf16 entpackt (die Tile-
+Reihenfolge des gepackten Formats wird einmal vom Packer selbst gelernt) und mit cuBLAS multipliziert.
 """
 from __future__ import annotations
 
@@ -30,13 +30,13 @@ import torch
 from .gguf import GGML_TYPES, GGUFError
 from .quant import _blocks, _f16, _nibbles, _q5_high_bits, _scale_min_k4
 
-G = 32                 # kernel group size == GGUF sub-block size
+G = 32                 # Gruppengröße des Kernels == Sub-Block-Größe von GGUF
 INNER_K_TILES = 8
-PREFILL_SLICE = 32     # rows per kernel call for M > 1 (kernel is tuned for small M)
-UNPACK_FROM = 256      # from this many rows: unpack to bf16 + cuBLAS instead of the kernel
+PREFILL_SLICE = 32     # Zeilen je Kernel-Aufruf für M > 1 (der Kernel ist auf kleine M abgestimmt)
+UNPACK_FROM = 256      # ab so vielen Zeilen: nach bf16 entpacken + cuBLAS statt des Kernels
 ROW_CHUNK_ELEMENTS = 32 * 1024 * 1024
-TILE_N, TILE_K = 8, 16 * INNER_K_TILES   # one packed tile: 8 rows x 128 columns = 1024 nibbles
-_TILE_ORDER: dict = {}                   # device -> tile element index per packed slot (inverse)
+TILE_N, TILE_K = 8, 16 * INNER_K_TILES   # ein gepacktes Tile: 8 Zeilen x 128 Spalten = 1024 Nibbles
+_TILE_ORDER: dict = {}                   # Gerät -> Tile-Elementindex je gepacktem Slot (Umkehrung)
 
 
 def kernel_available(device: torch.device) -> bool:
@@ -52,9 +52,9 @@ def quantizable(ggml_type: int, n_out: int, n_in: int, min_elements: int = 1 << 
     return n_out % 8 == 0 and n_in % (INNER_K_TILES * 16) == 0 and n_in % G == 0 and n_out * n_in >= min_elements
 
 
-# --- block -> group conversions --------------------------------------------------
-# 4-bit converters return (u4 (n, 32) uint8, s (n,), z (n,)) per group of 32.
-# 8-bit converters return (u8 (n, 32) uint8, s8 (n,), c8 (n,))  with y = s8*u8 + c8.
+# --- Umrechnung Block -> Gruppe --------------------------------------------------
+# 4-Bit-Konverter liefern (u4 (n, 32) uint8, s (n,), z (n,)) je Gruppe von 32.
+# 8-Bit-Konverter liefern (u8 (n, 32) uint8, s8 (n,), c8 (n,))  mit y = s8*u8 + c8.
 
 def _q4_0(raw):
     b = _blocks(raw, 18)
@@ -121,7 +121,7 @@ def _q6_k(raw):
     nb = b.shape[0]
     ql = b[:, 0:128].to(torch.int16)
     qh = b[:, 128:192].to(torch.int16)
-    sc = b[:, 192:208].contiguous().view(torch.int8).float()      # (nb,16) one per 16 elements
+    sc = b[:, 192:208].contiguous().view(torch.int8).float()      # (nb,16) eine je 16 Elemente
     d = _f16(b[:, 208:210])                                       # (nb,1)
     halves = []
     for n in range(2):
@@ -132,18 +132,18 @@ def _q6_k(raw):
         q4 = (ql_n[:, 32:] >> 4) | (((qh_n >> 6) & 3) << 4)
         halves.append(torch.stack([q1, q2, q3, q4], dim=1).reshape(nb, 128))
     q = (torch.cat(halves, dim=1).float() - 32.0).reshape(nb, 8, 2, 16)   # (nb, group, sub, 16)
-    scg = sc.reshape(nb, 8, 2)                                            # scales per sub-block
-    m = scg.abs().amax(dim=2, keepdim=True).clamp_min(1.0)                # common magnitude per group
-    # put both sub-blocks on the grid d*m/4 (finer than the coarser sub-block's own grid)
+    scg = sc.reshape(nb, 8, 2)                                            # Scales je Sub-Block
+    m = scg.abs().amax(dim=2, keepdim=True).clamp_min(1.0)                # gemeinsamer Betrag je Gruppe
+    # beide Sub-Blöcke auf das Raster d*m/4 legen (feiner als das eigene Raster des gröberen Sub-Blocks)
     u = torch.round(q * (scg * 4.0 / m).unsqueeze(-1)) + 128.0
     u8 = u.clamp_(0, 255).reshape(nb * 8, 32).to(torch.uint8)
     s8 = (d * m[:, :, 0] / 4.0).reshape(-1)
     return u8, s8, -128 * s8
 
 
-# converter, value bits.  5-bit values are shifted left by 3 before the nibble split so
-# that the hi-matmul zero point (2^(bits-1)*s8 + c8) stays small: large zero points would
-# lose precision to bf16 rounding.
+# Konverter, Wert-Bits.  5-Bit-Werte werden vor der Nibble-Aufteilung um 3 nach links geschoben, damit
+# der Zero-Point der hi-matmul (2^(bits-1)*s8 + c8) klein bleibt: große Zero-Points würden
+# durch die bf16-Rundung Genauigkeit verlieren.
 _CONVERTERS = {
     "Q4_0": (_q4_0, 4), "Q4_1": (_q4_1, 4), "Q4_K": (_q4_k, 4),
     "Q8_0": (_q8_0, 8), "Q5_0": (_q5_0, 5), "Q5_1": (_q5_1, 5), "Q5_K": (_q5_k, 5), "Q6_K": (_q6_k, 8),
@@ -152,7 +152,7 @@ _CONVERTERS = {
 
 # --- packing -------------------------------------------------------------------------
 def _pack(u4: torch.Tensor) -> torch.Tensor:
-    """u4: (N, K) uint8 nibbles -> tinygemm packed layout (row chunks must be multiples of 8)."""
+    """u4: (N, K) uint8-Nibbles -> gepacktes tinygemm-Layout (Zeilen-Chunks müssen Vielfache von 8 sein)."""
     b = ((u4[:, 0::2] << 4) | u4[:, 1::2]).contiguous()
     return torch._convert_weight_to_int4pack(b, INNER_K_TILES)
 
@@ -163,14 +163,14 @@ def _sz(s: torch.Tensor, z: torch.Tensor) -> torch.Tensor:
 
 
 def _packed_nibbles(packed: torch.Tensor) -> torch.Tensor:
-    """Packed (N/8, K/128, 32, 4) int32 -> (N/8, K/128, 1024) uint8 in memory order."""
+    """Gepackt (N/8, K/128, 32, 4) int32 -> (N/8, K/128, 1024) uint8 in Speicherreihenfolge."""
     b = packed.contiguous().view(torch.uint8).reshape(packed.shape[0], packed.shape[1], -1)
     return torch.stack([b & 0x0F, b >> 4], dim=-1).reshape(packed.shape[0], packed.shape[1], -1)
 
 
 def _tile_order(device: torch.device) -> torch.Tensor:
-    """For each tile element (row*128 + column): its slot in the packed tile. Learned by
-    packing the element index itself, digit by digit (3 x 4 bits cover 1024 slots)."""
+    """Für jedes Tile-Element (Zeile*128 + Spalte): sein Slot im gepackten Tile. Gelernt, indem
+    der Elementindex selbst gepackt wird, Stelle für Stelle (3 x 4 Bits decken 1024 Slots ab)."""
     key = str(device)
     if key not in _TILE_ORDER:
         idx = torch.arange(TILE_N * TILE_K, device=device).view(TILE_N, TILE_K)
@@ -187,13 +187,13 @@ def _tile_order(device: torch.device) -> torch.Tensor:
 
 
 def unpack_u4(packed: torch.Tensor, n: int, k: int) -> torch.Tensor:
-    """Inverse of _pack: (n, k) uint8 nibbles."""
+    """Umkehrung von _pack: (n, k) uint8-Nibbles."""
     tiles = _packed_nibbles(packed).index_select(-1, _tile_order(packed.device))
     return tiles.view(n // TILE_N, k // TILE_K, TILE_N, TILE_K).transpose(1, 2).reshape(n, k)
 
 
 class QuantLinear:
-    """y = x @ W^T (+ b) with W kept in int4 group format (one or two matmuls)."""
+    """y = x @ W^T (+ b), wobei W im int4-Gruppenformat bleibt (eine oder zwei matmuls)."""
 
     def __init__(self, mats: List[Tuple[torch.Tensor, torch.Tensor]], n_out: int, n_in: int,
                  bias: Optional[torch.Tensor] = None, type_name: str = ""):
@@ -201,7 +201,7 @@ class QuantLinear:
         self.n_out, self.n_in = n_out, n_in
         self.b = None if bias is None else bias.to(torch.bfloat16)
         self.type_name = type_name
-        self.w = None   # for duck-typing with Linear (dtype queries)
+        self.w = None   # für Duck-Typing mit Linear (dtype-Abfragen)
 
     @property
     def dtype(self):
@@ -215,7 +215,7 @@ class QuantLinear:
         return y
 
     def bf16_weight(self) -> torch.Tensor:
-        """The matrix as (n_out, n_in) bf16 – same values the kernel uses (w = (u-8)*s + z)."""
+        """Die Matrix als (n_out, n_in) bf16 – dieselben Werte, die der Kernel nutzt (w = (u-8)*s + z)."""
         w = None
         for packed, sz in self.mats:
             u = unpack_u4(packed, self.n_out, self.n_in).view(self.n_out, -1, G).to(torch.bfloat16)
@@ -241,7 +241,7 @@ class QuantLinear:
 
 def build_quant_linear(raw: torch.Tensor, ggml_type: int, n_out: int, n_in: int,
                        bias: Optional[torch.Tensor] = None) -> QuantLinear:
-    """raw: uint8 block bytes of a (n_out, n_in) GGUF matrix already on the CUDA device."""
+    """raw: uint8-Block-Bytes einer (n_out, n_in) GGUF-Matrix, die schon auf dem CUDA-Gerät liegt."""
     name, block_size, type_size = GGML_TYPES[ggml_type]
     conv, bits = _CONVERTERS[name]
     if raw.numel() != n_out * n_in // block_size * type_size:
@@ -261,7 +261,7 @@ def build_quant_linear(raw: torch.Tensor, ggml_type: int, n_out: int, n_in: int,
         if bits == 4:
             packed_parts[0].append(_pack(u)); s_parts[0].append(s); z_parts[0].append(c)
         else:
-            shift = 8 - bits                       # use the full 8-bit range: u' = u << shift, s' = s / 2^shift
+            shift = 8 - bits                       # den vollen 8-Bit-Bereich nutzen: u' = u << shift, s' = s / 2^shift
             u = u << shift
             s = s / (1 << shift)
             lo, hi = u & 0x0F, u >> 4

@@ -17,6 +17,7 @@ from .nemidom import Element, Text
 
 INLINE = {"inline", "inline-block", "inline-flex", "inline-grid"}
 ERSETZT = {"input", "button", "select", "textarea", "img", "svg", "canvas", "progress", "meter"}
+MAX_SPUREN = 1000                  # Grid-Spalten aus repeat()
 
 
 class Messer:
@@ -895,12 +896,14 @@ class Layout:
                 if anzahl in ("auto-fill", "auto-fit"):
                     mm = re.fullmatch(r"minmax\(([^,]+),(.*)\)", muster[0]) if muster else None
                     mind = laenge(mm.group(1) if mm else muster[0], w, fs, self.ctx) or 100.0
-                    n = max(1, int((w + gap) // (mind + gap)))
-                    teile += ["1fr"] * n
+                    teiler = mind + gap
+                    n = (w + gap) / teiler if teiler > 0 and math.isfinite(teiler) else 1.0
+                    teile += ["1fr"] * _spuren_anzahl(n)
                 else:
-                    teile += muster * max(1, int(_zahl(anzahl, 1)))
+                    teile += muster * _spuren_anzahl(_zahl(anzahl, 1))
             else:
                 teile.append(t)
+        del teile[MAX_SPUREN:]
         fest, fr = 0.0, 0.0
         werte_ = []
         for t in teile:
@@ -1003,6 +1006,13 @@ def _zahl(v, vorgabe):
         return float(v)
     except (TypeError, ValueError):
         return vorgabe
+
+
+def _spuren_anzahl(n: float) -> int:
+    """repeat()-Anzahl auf 1 … MAX_SPUREN klemmen (auch inf/nan)."""
+    if n != n:
+        return 1
+    return int(max(1.0, min(float(MAX_SPUREN), n)))
 
 
 _ = math

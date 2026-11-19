@@ -715,7 +715,7 @@ class KVCache:
 
     def _empty(self, heads: int, n: int, dim: int, device, pin: bool = False):
         def neu(shape, dt):
-            if pin:
+            if pin and hostmem.ram_reicht(math.prod(shape) * dt.itemsize):
                 try:
                     return torch.zeros(shape, dtype=dt, pin_memory=True)
                 except RuntimeError:              # pinned RAM exhausted: pageable (slower copies)

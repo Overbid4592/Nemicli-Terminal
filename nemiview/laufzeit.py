@@ -8,14 +8,17 @@ JavaScript erreichen kann, steht hier oder in nemidom/nemijs_eingebaut – sonst
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from . import nemicss, nemidom
 from .appjs import nemiapp_objekt
-from .nemijs import UNDEF, Grenze, JSFehler, JSObject, NemiJS, Wirt, ist_aufrufbar, zu_text
+from .nemijs import (ZEITGEBER_ZEIT_S, UNDEF, Grenze, JSFehler, JSObject, NemiJS, Wirt, intern, ist_aufrufbar,
+                     zu_text)
 
 MAX_INDEX = 2_000_000
 STORAGE_MAX = 1_000_000
+SPEICHER_ABSTAND_S = 1.0
 
 
 class Fenster(Wirt):
@@ -80,6 +83,8 @@ class AppLaufzeit:
         self.scroll_y = 0.0
         self.speicher_datei = (Path(speicher_ordner) / f"{self.ordner.name}.json") if speicher_ordner else None
         self.gastgeber = gastgeber
+        self._speicher_offen: dict | None = None
+        self._speicher_zuletzt = 0.0
         self.js = NemiJS(virtuelle_zeit=virtuelle_zeit)
         self.funktionen: dict = {}
         self.fehler: list[str] = []
@@ -106,9 +111,12 @@ class AppLaufzeit:
                 js.ausfuehren(code, name)
             except (JSFehler, Grenze) as e:
                 self.melden(f"❌ {name}: {e}")
+            except Exception as e:
+                self.melden(f"❌ {name}: {intern(e)}")
         for typ in ("DOMContentLoaded", "load"):
             ziel = self.dok if typ == "DOMContentLoaded" else None
             self._ereignis_global(typ, ziel)
+        self.speicher_sichern()
 
     def _globale(self, js: NemiJS):
         g = js.global_scope.vars
@@ -117,7 +125,7 @@ class AppLaufzeit:
         g["NemiApp"] = nemiapp_objekt(js, self.funktionen)
         js.storage = self._speicher_lesen()
         js.storage_max = STORAGE_MAX
-        js.storage_geaendert = self._speicher_schreiben
+        js.storage_geaendert = self._speicher_merken
 
         def dialog(art):
             def f(js_, t, a):
@@ -194,6 +202,9 @@ class AppLaufzeit:
                 self.js.mikro_abarbeiten()
         except (JSFehler, Grenze) as e:
             self.melden(f"❌ {typ}: {e}")
+        except Exception as e:
+            self.melden(f"❌ {typ}: {intern(e)}")
+        self.speicher_sichern(sofort=False)
 
     # -- Speicher -----------------------------------------------------------------------
     def _speicher_lesen(self) -> dict:
@@ -204,6 +215,22 @@ class AppLaufzeit:
             return {str(k): str(v) for k, v in d.items()} if isinstance(d, dict) else {}
         except (OSError, ValueError):
             return {}
+
+    def _speicher_merken(self, daten: dict) -> None:
+        self._speicher_offen = daten                 # geschrieben wird am Ende des Einstiegs (speicher_sichern)
+
+    def speicher_sichern(self, sofort: bool = True) -> None:
+        """Offene localStorage-Änderungen schreiben. sofort=False: höchstens alle SPEICHER_ABSTAND_S – ein
+        Skript, das je Takt setItem ruft, schreibt sonst bis zu 1 MB je Takt im UI-Thread."""
+        daten = self._speicher_offen
+        if daten is None:
+            return
+        jetzt = time.monotonic()
+        if not sofort and jetzt - self._speicher_zuletzt < SPEICHER_ABSTAND_S:
+            return
+        self._speicher_offen = None
+        self._speicher_zuletzt = jetzt
+        self._speicher_schreiben(daten)
 
     def _speicher_schreiben(self, daten: dict) -> None:
         if self.speicher_datei is None:
@@ -234,6 +261,10 @@ class AppLaufzeit:
             return fn(*args)
         except (JSFehler, Grenze) as e:
             self.melden(f"❌ {e}")
+        except Exception as e:
+            self.melden(f"❌ {intern(e)}")
+        finally:
+            self.speicher_sichern(sofort=False)
         return None
 
     def ausloesen(self, el, typ: str, **felder) -> bool:
@@ -256,9 +287,15 @@ class AppLaufzeit:
     def zeitgeber_laufen(self, bis_ms: float, max_fehler: int = 100) -> None:
         """Headless: Zeitgeber bis bis_ms (virtuelle Zeit); ein Fehler meldet sich und hält die übrigen nicht an."""
         ende = self.js.jetzt() + bis_ms
+        frist = time.monotonic() + ZEITGEBER_ZEIT_S          # gilt für alle Versuche zusammen
         for _ in range(max_fehler):
             try:
-                self.js.zeitgeber_laufen(max(0.0, ende - self.js.jetzt()))
-                return
+                self.js.zeitgeber_laufen(max(0.0, ende - self.js.jetzt()), frist=frist)
+                break
             except (JSFehler, Grenze) as e:
                 self.melden(f"❌ Zeitgeber: {e}")
+            except Exception as e:
+                self.melden(f"❌ Zeitgeber: {intern(e)}")
+            if time.monotonic() > frist:
+                break
+        self.speicher_sichern()

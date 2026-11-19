@@ -15,29 +15,37 @@ import time
 PALETTEN: dict[str, dict[str, str]] = {
     "klassik": {
         "grund": "#0c0c10", "leiste": "#111116", "flaeche": "#1b1b22", "flaeche_hell": "#26262f",
-        "flaeche_hoch": "#30303b", "rand": "#2c2c36", "text": "#ececf1", "dim": "#a3a3ae", "blass": "#6f6f7b",
+        "flaeche_hoch": "#30303b", "rand": "#2c2c36", "text": "#ececf1", "dim": "#a3a3ae", "blass": "#8d8d97",
         "cyan": "#22d3ee", "lila": "#a855f7", "blase_a": "#4c1d95", "blase_b": "#155e75",
         "ok": "#34d399", "warn": "#fbbf24", "fehler": "#f87171",
     },
     "nachtglas": {
         "grund": "#0a0e1a", "leiste": "#0e1424", "flaeche": "#141b2e", "flaeche_hell": "#1c2540",
-        "flaeche_hoch": "#263152", "rand": "#27324f", "text": "#e8ecf8", "dim": "#9aa6c4", "blass": "#67718e",
+        "flaeche_hoch": "#263152", "rand": "#27324f", "text": "#e8ecf8", "dim": "#9aa6c4", "blass": "#848ca3",
         "cyan": "#5ee7ff", "lila": "#9d7bff", "blase_a": "#3b2a7a", "blase_b": "#134a66",
         "ok": "#4ade80", "warn": "#fcd34d", "fehler": "#fb7185",
     },
     "pastell": {
         "grund": "#14111a", "leiste": "#1a1622", "flaeche": "#221d2c", "flaeche_hell": "#2c2639",
-        "flaeche_hoch": "#372f47", "rand": "#3a3247", "text": "#f3eef8", "dim": "#b9aec8", "blass": "#857a96",
+        "flaeche_hoch": "#372f47", "rand": "#3a3247", "text": "#f3eef8", "dim": "#b9aec8", "blass": "#958ba4",
         "cyan": "#8be3c9", "lila": "#f5a6d0", "blase_a": "#6b3a63", "blase_b": "#2f5f57",
         "ok": "#9be7b0", "warn": "#f8d58c", "fehler": "#f49aa6",
     },
     "neon": {
         "grund": "#050507", "leiste": "#09090d", "flaeche": "#111117", "flaeche_hell": "#1a1a22",
-        "flaeche_hoch": "#24242e", "rand": "#2e2e3a", "text": "#f5f5fa", "dim": "#a8a8b8", "blass": "#70707e",
+        "flaeche_hoch": "#24242e", "rand": "#2e2e3a", "text": "#f5f5fa", "dim": "#a8a8b8", "blass": "#83838f",
         "cyan": "#00f0ff", "lila": "#ff2fd0", "blase_a": "#5a0f6e", "blase_b": "#00525c",
         "ok": "#39ff88", "warn": "#ffe14d", "fehler": "#ff4d6d",
     },
+    "tigra": {
+        "grund": "#101018", "leiste": "#15151f", "flaeche": "#191923", "flaeche_hell": "#222230",
+        "flaeche_hoch": "#2c2c3c", "rand": "#302d40", "text": "#f6f2f7", "dim": "#c5bfd0", "blass": "#8d8799",
+        "cyan": "#67e8f9", "lila": "#c084fc", "blase_a": "#5b2a86", "blase_b": "#13505c",
+        "ok": "#67e8aa", "warn": "#ffd166", "fehler": "#ff7b8e",
+    },
 }
+# Text in den Fenstern: text, dim und blass schaffen auf flaeche_hell mindestens 4,5 : 1 (WCAG AA),
+# blass bleibt dabei die leiseste Stufe (Hinweise, Platzhalter, Abgeschaltetes).
 
 
 def palette_name() -> str:

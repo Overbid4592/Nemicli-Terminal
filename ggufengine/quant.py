@@ -1,10 +1,9 @@
 """
-Dequantisation of GGML block formats into torch tensors.
+Dequantisierung der GGML-Blockformate in torch-Tensoren.
 
-All functions take the raw block bytes as a uint8 tensor (any device) and
-return a float32 tensor with `n_blocks * block_size` elements.  The bit
-layouts follow ggml-quants.c exactly.  Everything is vectorised, so it runs
-on CUDA as well as on the CPU.
+Alle Funktionen nehmen die rohen Block-Bytes als uint8-Tensor (beliebiges Gerät) und
+geben einen float32-Tensor mit `n_blocks * block_size` Elementen zurück.  Die Bit-Layouts
+folgen exakt ggml-quants.c.  Alles ist vektorisiert und läuft daher auf CUDA wie auf der CPU.
 """
 from __future__ import annotations
 
@@ -20,7 +19,7 @@ _LOW = 0x0F
 
 
 def _f16(b: torch.Tensor) -> torch.Tensor:
-    """Interpret the last dimension (2 bytes) as one float16 value -> float32."""
+    """Die letzte Dimension (2 Bytes) als einen float16-Wert deuten -> float32."""
     return b.contiguous().view(torch.float16).float()
 
 
@@ -30,7 +29,7 @@ def _blocks(raw: torch.Tensor, type_size: int) -> torch.Tensor:
     return raw.view(-1, type_size)
 
 
-# --- simple formats ---------------------------------------------------------
+# --- einfache Formate -------------------------------------------------------
 
 def deq_f32(raw):
     return raw.contiguous().view(torch.float32)
@@ -52,7 +51,7 @@ def deq_q8_0(raw):
 
 
 def _nibbles(qs: torch.Tensor):
-    """qs (nb,16) uint8 -> (nb,32) int16 with low nibbles first then high."""
+    """qs (nb,16) uint8 -> (nb,32) int16, erst die unteren Nibbles, dann die oberen."""
     lo = (qs & _LOW).to(torch.int16)
     hi = (qs >> 4).to(torch.int16)
     return torch.cat([lo, hi], dim=1)
@@ -73,7 +72,7 @@ def deq_q4_1(raw):
 
 
 def _q5_high_bits(qh_bytes: torch.Tensor) -> torch.Tensor:
-    """qh (nb,4) uint8 -> (nb,32) int16 with the 5th bit (value 16) for each element."""
+    """qh (nb,4) uint8 -> (nb,32) int16 mit dem 5. Bit (Wert 16) für jedes Element."""
     qh = qh_bytes.contiguous().view(torch.int32)          # (nb,1)
     j = torch.arange(16, device=qh.device, dtype=torch.int32)
     lo = ((qh >> j) & 1) << 4                             # elements 0..15
@@ -98,7 +97,7 @@ def deq_q5_1(raw):
 # --- K-quants ---------------------------------------------------------------
 
 def _scale_min_k4(scales: torch.Tensor):
-    """scales (nb,12) uint8 -> (sc, m) each (nb,8) float, per ggml get_scale_min_k4."""
+    """scales (nb,12) uint8 -> (sc, m), je (nb,8) float, nach ggml get_scale_min_k4."""
     s = scales.to(torch.int16)
     sc = torch.empty(s.shape[0], 8, dtype=torch.int16, device=s.device)
     mn = torch.empty_like(sc)
@@ -114,9 +113,9 @@ def deq_q4_k(raw):
     nb = b.shape[0]
     d = _f16(b[:, :2]); dmin = _f16(b[:, 2:4])
     sc, mn = _scale_min_k4(b[:, 4:16])
-    qs = b[:, 16:144].reshape(nb, 4, 32)                 # 4 groups of 32 bytes
+    qs = b[:, 16:144].reshape(nb, 4, 32)                 # 4 Gruppen zu 32 Bytes
     lo = (qs & _LOW).float(); hi = (qs >> 4).float()
-    q = torch.stack([lo, hi], dim=2).reshape(nb, 8, 32)   # sub-block 2i = low, 2i+1 = high
+    q = torch.stack([lo, hi], dim=2).reshape(nb, 8, 32)   # Sub-Block 2i = untere, 2i+1 = obere Hälfte
     y = (d * sc).unsqueeze(-1) * q - (dmin * mn).unsqueeze(-1)
     return y.reshape(-1)
 
@@ -146,7 +145,7 @@ def deq_q6_k(raw):
     sc = b[:, 192:208].contiguous().view(torch.int8).float()   # (nb,16)
     d = _f16(b[:, 208:210])                                    # (nb,1)
     out = []
-    for n in range(2):                                         # two halves of 128 elements
+    for n in range(2):                                         # zwei Hälften zu 128 Elementen
         ql_n = ql[:, n * 64:(n + 1) * 64]
         qh_n = qh[:, n * 32:(n + 1) * 32]
         sc_n = sc[:, n * 8:(n + 1) * 8]                        # (nb,8)
@@ -155,28 +154,28 @@ def deq_q6_k(raw):
         q3 = (ql_n[:, :32] >> 4) | (((qh_n >> 4) & 3) << 4)
         q4 = (ql_n[:, 32:] >> 4) | (((qh_n >> 6) & 3) << 4)
         q = torch.stack([q1, q2, q3, q4], dim=1).float() - 32.0          # (nb,4,32)
-        s = sc_n.reshape(nb, 4, 2).repeat_interleave(16, dim=2)          # scale[is+2c] for l<16 / l>=16
+        s = sc_n.reshape(nb, 4, 2).repeat_interleave(16, dim=2)          # scale[is+2c] für l<16 / l>=16
         out.append((d.unsqueeze(-1) * s * q).reshape(nb, 128))
     return torch.cat(out, dim=1).reshape(-1)
 
 
-# --- IQ formats -------------------------------------------------------------
-# Grid entry and sign pattern of a group of 8 values are merged into one table row
-# (value = grid byte * sign), so a group costs one lookup.  The tables are built once
-# per device and dtype; the formats can return bf16 directly (`dtype`).
+# --- IQ-Formate -------------------------------------------------------------
+# Grid-Eintrag und Vorzeichenmuster einer Gruppe von 8 Werten sind in einer Tabellenzeile zusammengefasst
+# (Wert = Grid-Byte * Vorzeichen), so kostet eine Gruppe einen Lookup.  Die Tabellen entstehen einmal
+# je Gerät und dtype; die Formate können direkt bf16 liefern (`dtype`).
 
 _TABLES: dict = {}
 
 
 def _gitter(werte, n: int) -> torch.Tensor:
-    """Packed grid entries (n bytes each, lowest first) -> (n_grid, n) float32."""
+    """Gepackte Grid-Einträge (je n Bytes, das niedrigste zuerst) -> (n_grid, n) float32."""
     g = torch.tensor([v - (1 << 64) if v >= 1 << 63 else v for v in werte], dtype=torch.int64)
     return g.view(torch.uint8).view(-1, 8)[:, :n].float() if n == 8 else         torch.stack([(g >> (8 * j)) & 0xFF for j in range(n)], dim=1).float()
 
 
 def _vorzeichen(n_bits: int) -> torch.Tensor:
-    """(2^n_bits, 8) of +-1: bit j set -> element j negative.  7 stored bits get the parity
-    as 8th bit (ksigns_iq2xs)."""
+    """(2^n_bits, 8) aus +-1: Bit j gesetzt -> Element j negativ.  Bei 7 gespeicherten Bits kommt die
+    Parität als 8. Bit dazu (ksigns_iq2xs)."""
     s = torch.arange(1 << n_bits)
     if n_bits == 7:
         s = s | ((torch.stack([(s >> j) & 1 for j in range(7)]).sum(0) & 1) << 7)
@@ -184,15 +183,15 @@ def _vorzeichen(n_bits: int) -> torch.Tensor:
 
 
 def _nibble_paare(werte) -> torch.Tensor:
-    """(256, 2): the values of the low and the high nibble of a byte."""
+    """(256, 2): die Werte des unteren und des oberen Nibbles eines Bytes."""
     kv = torch.tensor(werte, dtype=torch.float32)
     b = torch.arange(256)
     return torch.stack([kv[b & 0x0F], kv[b >> 4]], dim=1)
 
 
 def _table(name: str, device, dtype) -> torch.Tensor:
-    """IQ2_*: (n_grid * n_sign, 8), row = g * n_sign + s.  *_GRID: (n_grid, 4 or 8).
-    SIGNS7/SIGNS8: (n_sign, 8) of +-1.  IQ4_NL/MXFP4: nibble pairs (256, 2)."""
+    """IQ2_*: (n_grid * n_sign, 8), Zeile = g * n_sign + s.  *_GRID: (n_grid, 4 oder 8).
+    SIGNS7/SIGNS8: (n_sign, 8) aus +-1.  IQ4_NL/MXFP4: Nibble-Paare (256, 2)."""
     key = (name, str(device), dtype)
     if key not in _TABLES:
         from . import iqtabellen as it
@@ -222,8 +221,8 @@ _WORT = {4: torch.int32, 8: torch.int64, 16: torch.complex128}
 
 
 def _lookup(t: torch.Tensor, idx: torch.Tensor) -> torch.Tensor:
-    """t[idx] -> (idx.numel(), row length).  Rows are fetched as whole machine words of up
-    to 16 bytes: gathering rows element by element is an order of magnitude slower."""
+    """t[idx] -> (idx.numel(), Zeilenlänge).  Zeilen werden als ganze Maschinenwörter von bis zu
+    16 Bytes geholt: Zeilen Element für Element einzusammeln ist um eine Größenordnung langsamer."""
     rb = t.shape[1] * t.element_size()
     w = min(rb, 16)
     flat = t.view(_WORT[w]).reshape(-1)
@@ -237,7 +236,7 @@ def deq_iq2_xxs(raw, dtype=torch.float32):
     b = _blocks(raw, 66)
     nb = b.shape[0]
     d = _f16(b[:, :2]).to(dtype)                                   # (nb,1)
-    q = b[:, 2:].reshape(nb, 8, 8)                                 # per 32 values: 4 grid bytes + uint32
+    q = b[:, 2:].reshape(nb, 8, 8)                                 # je 32 Werte: 4 Grid-Bytes + uint32
     w = q[:, :, 4:].contiguous().view(torch.int32)                 # (nb,8,1)
     shifts = torch.arange(0, 28, 7, device=b.device, dtype=torch.int32)
     row = q[:, :, :4].long() * 128 + ((w >> shifts) & 127).long()   # (nb,8,4)
@@ -257,7 +256,7 @@ def deq_iq2_s(raw, dtype=torch.float32):
     shifts = torch.arange(0, 8, 2, device=b.device)
     row = (qs | (((qh >> shifts) & 3) << 8)) * 256 + signs          # (nb,8,4)
     vals = _lookup(_table("IQ2_S", b.device, dtype), row).view(nb, 8, 2, 16)
-    scale = torch.stack([sc.remainder(16), torch.floor(sc / 16)], dim=2)   # low nibble: groups 0,1
+    scale = torch.stack([sc.remainder(16), torch.floor(sc / 16)], dim=2)   # unteres Nibble: Gruppen 0,1
     db = d.unsqueeze(-1) * (0.125 + 0.25 * scale)                  # (nb,8,2)
     return (vals * db.unsqueeze(-1)).reshape(-1)
 
@@ -267,15 +266,15 @@ def deq_iq4_nl(raw, dtype=torch.float32):
     nb = b.shape[0]
     d = _f16(b[:, :2]).to(dtype)
     pairs = _lookup(_table("IQ4_NL", b.device, dtype), b[:, 2:18].long()).view(nb, 16, 2)
-    return (pairs.transpose(1, 2) * d.unsqueeze(-1)).reshape(-1)   # low nibbles first, then high
+    return (pairs.transpose(1, 2) * d.unsqueeze(-1)).reshape(-1)   # erst die unteren Nibbles, dann die oberen
 
 
 _U8: dict = {}
 
 
 def _u8(t: torch.Tensor, *shifts) -> torch.Tensor:
-    """Shift amounts as a uint8 tensor on the device of t – made once, so that unpacking (e.g. an
-    embedding row in a CUDA graph) copies nothing from the CPU during a graph capture."""
+    """Verschiebeweiten als uint8-Tensor auf dem Gerät von t – einmal angelegt, damit das Entpacken (z. B.
+    einer Embedding-Zeile in einem CUDA-Graph) während eines Graph-Captures nichts von der CPU kopiert."""
     schluessel = (shifts, t.device)
     if (wert := _U8.get(schluessel)) is None:
         wert = _U8[schluessel] = torch.tensor(shifts, dtype=torch.uint8, device=t.device)
@@ -287,7 +286,7 @@ def deq_q2_k(raw, dtype=torch.float32):
     nb = b.shape[0]
     sc, qs = b[:, :16], b[:, 16:80]
     d, dmin = _f16(b[:, 80:82]).to(dtype), _f16(b[:, 82:84]).to(dtype)
-    dl = (d * (sc & 0x0F).to(dtype)).unsqueeze(-1)                 # (nb,16,1), 16 values each
+    dl = (d * (sc & 0x0F).to(dtype)).unsqueeze(-1)                 # (nb,16,1), je 16 Werte
     ml = (dmin * (sc >> 4).to(dtype)).unsqueeze(-1)
     q = ((qs.view(nb, 2, 1, 32) >> _u8(b, 0, 2, 4, 6).view(1, 1, 4, 1)) & 3).reshape(nb, 16, 16)
     return (dl * q.to(dtype) - ml).reshape(-1)
@@ -304,7 +303,7 @@ def deq_q3_k(raw, dtype=torch.float32):
     ql = ((qs.view(nb, 2, 1, 32) >> _u8(b, 0, 2, 4, 6).view(1, 1, 4, 1)) & 3).reshape(nb, 16, 16)
     qh = ((hmask.view(nb, 1, 1, 32) >> torch.arange(8, dtype=torch.uint8, device=b.device).view(1, 1, 8, 1))
           & 1).reshape(nb, 16, 16)
-    q = ql.to(torch.int16) - ((qh ^ 1).to(torch.int16) << 2)    # high bit clear: value - 4
+    q = ql.to(torch.int16) - ((qh ^ 1).to(torch.int16) << 2)    # oberes Bit nicht gesetzt: Wert - 4
     return (dl * q.to(dtype)).reshape(-1)
 
 
@@ -316,7 +315,7 @@ def deq_iq2_xs(raw, dtype=torch.float32):
     row = (q & 511).long() * 128 + (q >> 9).long()
     vals = _lookup(_table("IQ2_XS", b.device, dtype), row).view(nb, 16, 16)
     sc = (b[:, 66:74].view(nb, 8, 1) >> _u8(b, 0, 4).view(1, 1, 2)).reshape(nb, 16) & 0x0F
-    db = d * (0.125 + 0.25 * sc.to(dtype))                         # (nb,16), 16 values each
+    db = d * (0.125 + 0.25 * sc.to(dtype))                         # (nb,16), je 16 Werte
     return (vals * db.unsqueeze(-1)).reshape(-1)
 
 
@@ -325,7 +324,7 @@ def deq_iq3_xxs(raw, dtype=torch.float32):
     nb = b.shape[0]
     d = _f16(b[:, :2]).to(dtype)
     grid = _lookup(_table("IQ3_XXS_GRID", b.device, dtype), b[:, 2:66].long()).view(nb, 8, 4, 8)
-    aux = b[:, 66:98].contiguous().view(torch.int32).view(nb, 8, 1)                 # per 32 values
+    aux = b[:, 66:98].contiguous().view(torch.int32).view(nb, 8, 1)                 # je 32 Werte
     s7 = (aux >> torch.arange(0, 28, 7, device=b.device, dtype=torch.int32)) & 127   # (nb,8,4)
     signs = _lookup(_table("SIGNS7", b.device, dtype), s7.long()).view(nb, 8, 4, 8)
     db = d.unsqueeze(-1) * (0.25 + 0.5 * ((aux >> 28) & 15).to(dtype))             # (nb,8,1)
@@ -341,7 +340,7 @@ def deq_iq3_s(raw, dtype=torch.float32):
     grid = _lookup(_table("IQ3_S_GRID", b.device, dtype), idx).view(nb, 8, 4, 8)
     signs = _lookup(_table("SIGNS8", b.device, dtype), b[:, 74:106].long()).view(nb, 8, 4, 8)
     sc = (b[:, 106:110].view(nb, 4, 1) >> _u8(b, 0, 4).view(1, 1, 2)).reshape(nb, 8) & 0x0F
-    db = d * (1 + 2 * sc.to(dtype))                                # (nb,8), 32 values each
+    db = d * (1 + 2 * sc.to(dtype))                                # (nb,8), je 32 Werte
     return (grid * signs * db.view(nb, 8, 1, 1)).reshape(-1)
 
 
@@ -368,7 +367,7 @@ def deq_iq1_m(raw, dtype=torch.float32):
     d16 = ((sc[:, 0] >> 12) | ((sc[:, 1] >> 8) & 0xF0) | ((sc[:, 2] >> 4) & 0xF00) | (sc[:, 3] & 0xF000))
     d = d16.to(torch.int16).view(torch.float16).float().to(dtype).view(nb, 1)
     s3 = (sc.unsqueeze(-1) >> torch.arange(0, 12, 3, device=b.device, dtype=torch.int32)) & 7  # (nb,4,4)
-    dl = d * (2 * s3.reshape(nb, 16) + 1).to(dtype)               # (nb,16), 16 values each
+    dl = d * (2 * s3.reshape(nb, 16) + 1).to(dtype)               # (nb,16), je 16 Werte
     nib = (b[:, 32:48].view(nb, 16, 1) >> _u8(b, 0, 4).view(1, 1, 2)).reshape(nb, 32) & 0x0F
     idx = b[:, :32].long() | ((nib & 7).long() << 8)
     grid = _lookup(_table("IQ1_S_GRID", b.device, dtype), idx).view(nb, 32, 8)
@@ -383,12 +382,12 @@ def deq_iq4_xs(raw, dtype=torch.float32):
     sh = b[:, 2:4].contiguous().view(torch.int16).to(torch.int32) & 0xFFFF       # (nb,1)
     sl = (b[:, 4:8].view(nb, 4, 1) >> _u8(b, 0, 4).view(1, 1, 2)).reshape(nb, 8) & 0x0F
     hi = (sh >> torch.arange(0, 16, 2, device=b.device, dtype=torch.int32)) & 3                # (nb,8)
-    dl = d * ((sl.to(torch.int32) | (hi << 4)) - 32).to(dtype)    # (nb,8), 32 values each
+    dl = d * ((sl.to(torch.int32) | (hi << 4)) - 32).to(dtype)    # (nb,8), je 32 Werte
     pairs = _lookup(_table("IQ4_NL", b.device, dtype), b[:, 8:136].long()).view(nb, 8, 16, 2)
-    return (pairs.transpose(2, 3) * dl.view(nb, 8, 1, 1)).reshape(-1)   # low nibbles first
+    return (pairs.transpose(2, 3) * dl.view(nb, 8, 1, 1)).reshape(-1)   # untere Nibbles zuerst
 
 
-# MXFP4: e2m1 values (doubled) with a shared power-of-two scale per 32 values (E8M0)
+# MXFP4: e2m1-Werte (verdoppelt) mit einer gemeinsamen Zweierpotenz-Scale je 32 Werte (E8M0)
 KVALUES_MXFP4 = (0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12)
 
 
@@ -396,22 +395,22 @@ def deq_mxfp4(raw, dtype=torch.float32):
     b = _blocks(raw, 17)
     nb = b.shape[0]
     e = b[:, :1].to(torch.int32)
-    # 2^(e-128) as float32 bits, as ggml's E8M0_TO_FP32_HALF (subnormal for e < 2)
+    # 2^(e-128) als float32-Bits, wie ggmls E8M0_TO_FP32_HALF (subnormal für e < 2)
     bits = torch.where(e < 2, torch.full_like(e, 0x00200000) << e, (e - 1) << 23)
     d = bits.view(torch.float32).to(dtype)                         # (nb,1)
     pairs = _lookup(_table("MXFP4", b.device, dtype), b[:, 1:17].long()).view(nb, 16, 2)
     return (pairs.transpose(1, 2) * d.unsqueeze(-1)).reshape(-1)
 
 
-# --- ternary and 1-bit formats ------------------------------------------------
-# Code q stands for (q - 1) * d (Q2_0 also allows q = 3, i.e. 2d); Q1_0: bit set +d, clear -d.
-# TQ1_0/PTQ1_0 store five trits per byte as a fixed-point fraction (3^5 = 243 < 256):
-# trit n of byte v = ((v * 3^n) mod 256) * 3 >> 8.
+# --- ternäre und 1-Bit-Formate ------------------------------------------------
+# Code q steht für (q - 1) * d (Q2_0 erlaubt auch q = 3, also 2d); Q1_0: Bit gesetzt +d, gelöscht -d.
+# TQ1_0/PTQ1_0 speichern fünf Trits je Byte als Festkomma-Bruch (3^5 = 243 < 256):
+# Trit n von Byte v = ((v * 3^n) mod 256) * 3 >> 8.
 
 def deq_q2_0(raw, dtype=torch.float32, groesse=18):
     b = _blocks(raw, groesse)
     nb = b.shape[0]
-    q = (b[:, 2:].view(nb, -1, 1) >> _u8(b, 0, 2, 4, 6).view(1, 1, 4)) & 3      # value j: byte j/4
+    q = (b[:, 2:].view(nb, -1, 1) >> _u8(b, 0, 2, 4, 6).view(1, 1, 4)) & 3      # Wert j: Byte j/4
     return (_f16(b[:, :2]).to(dtype) * (q.reshape(nb, -1).to(dtype) - 1)).reshape(-1)
 
 
@@ -425,13 +424,13 @@ def deq_tq2_0(raw, dtype=torch.float32):
 def deq_q1_0(raw, dtype=torch.float32):
     b = _blocks(raw, 18)
     nb = b.shape[0]
-    bit = (b[:, 2:].view(nb, 16, 1) >> _u8(b, *range(8)).view(1, 1, 8)) & 1     # value j: byte j/8, bit j%8
+    bit = (b[:, 2:].view(nb, 16, 1) >> _u8(b, *range(8)).view(1, 1, 8)) & 1     # Wert j: Byte j/8, Bit j%8
     return (_f16(b[:, :2]).to(dtype) * (2 * bit.reshape(nb, 128).to(dtype) - 1)).reshape(-1)
 
 
 def trit_plan(n_qs: int, n_qh: int) -> tuple:
-    """Byte index and power of 3 of every value of a TQ1_0-like block: qs in stages of 32, 16, 8
-    columns (five values each), then four values per qh byte (as ggml-quants.c)."""
+    """Byte-Index und Dreierpotenz jedes Werts eines TQ1_0-artigen Blocks: qs in Stufen von 32, 16, 8
+    Spalten (je fünf Werte), danach vier Werte je qh-Byte (wie ggml-quants.c)."""
     byte, pot = [], []
     j = 0
     for c in (32, 16, 8):
@@ -446,7 +445,7 @@ def trit_plan(n_qs: int, n_qh: int) -> tuple:
     return byte, pot
 
 
-_TRITS = {"TQ1_0": (48, 4, 54), "PTQ1_0": (24, 2, 28)}        # qs bytes, qh bytes, block bytes
+_TRITS = {"TQ1_0": (48, 4, 54), "PTQ1_0": (24, 2, 28)}        # Bytes für qs, qh und den Block
 _PLAENE: dict = {}
 
 
@@ -454,7 +453,7 @@ def _deq_trits(name: str, raw, dtype=torch.float32):
     n_qs, n_qh, groesse = _TRITS[name]
     b = _blocks(raw, groesse)
     schluessel = (name, b.device)
-    if (plan := _PLAENE.get(schluessel)) is None:                 # once per device (as _u8)
+    if (plan := _PLAENE.get(schluessel)) is None:                 # einmal je Gerät (wie _u8)
         byte, pot = trit_plan(n_qs, n_qh)
         plan = _PLAENE[schluessel] = (torch.tensor(byte, device=b.device),
                                       torch.tensor(pot, dtype=torch.int16, device=b.device))
@@ -474,17 +473,17 @@ DEQUANT: Dict[str, Callable[[torch.Tensor], torch.Tensor]] = {
     "Q1_0": deq_q1_0, "Q2_0": deq_q2_0, "PQ2_0": partial(deq_q2_0, groesse=34), "TQ2_0": deq_tq2_0,
     "TQ1_0": partial(_deq_trits, "TQ1_0"), "PTQ1_0": partial(_deq_trits, "PTQ1_0"),
 }
-# formats that can produce the target dtype themselves (no float32 intermediate)
+# Formate, die den Ziel-dtype selbst erzeugen können (ohne float32-Zwischenschritt)
 _EIGENER_DTYPE = {"Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS", "IQ3_S",
                   "IQ4_NL", "IQ4_XS", "MXFP4", "Q1_0", "Q2_0", "PQ2_0", "TQ2_0", "TQ1_0", "PTQ1_0"}
 
-# how many elements to dequantise per chunk (bounds temporary memory on the GPU)
+# wie viele Elemente je Chunk dequantisiert werden (begrenzt den temporären Speicher auf der GPU)
 CHUNK_ELEMENTS = 32 * 1024 * 1024
 
 
 def dequantize(raw: torch.Tensor, ggml_type: int, n_elements: int,
                out_dtype: torch.dtype = torch.float32) -> torch.Tensor:
-    """Dequantise raw block bytes (uint8 tensor) into a flat tensor of n_elements."""
+    """Rohe Block-Bytes (uint8-Tensor) in einen flachen Tensor mit n_elements dequantisieren."""
     name, block_size, type_size = GGML_TYPES[ggml_type]
     fn = DEQUANT.get(name)
     if fn is None:
@@ -505,8 +504,8 @@ def dequantize(raw: torch.Tensor, ggml_type: int, n_elements: int,
 
 
 def raw_to_tensor(buf: memoryview, device) -> torch.Tensor:
-    """Wrap a read-only memoryview (mmap slice) as uint8 tensor and move it to device."""
+    """Einen schreibgeschützten memoryview (mmap-Ausschnitt) als uint8-Tensor verpacken und auf device verschieben."""
     with warnings.catch_warnings():
-        warnings.simplefilter("ignore")   # torch warns about non-writable buffers; we never write
+        warnings.simplefilter("ignore")   # torch warnt vor nicht beschreibbaren Puffern; wir schreiben nie
         t = torch.frombuffer(buf, dtype=torch.uint8)
     return t.to(device, non_blocking=False)

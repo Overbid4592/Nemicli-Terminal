@@ -9,10 +9,14 @@ Leitung (send_bytes/recv_bytes, nie pickle).
 Sitzung -> Fenster: Ereignisse wie bei web_converse ({"t": "answer", "delta": …}).
 Fenster -> Sitzung: Aufträge {"op": "<name>", …}; `handlers` ordnet sie Funktionen zu.
 Ist kein Fenster verbunden, gilt jede offene Nachfrage als abgelehnt.
+
+Gesendet wird je Verbindung aus einer eigenen Schlange in einem eigenen Faden: `senden` blockiert nie, ein
+hängendes Fenster hält weder die Sitzung noch die anderen Fenster auf. Staut sich zu viel, wird es getrennt.
 """
 from __future__ import annotations
 
 import json
+import queue
 import secrets
 import threading
 import time
@@ -20,6 +24,55 @@ from multiprocessing.connection import Listener, answer_challenge, deliver_chall
 
 MAX_NACHRICHT = 4 * 1024 * 1024           # Aufträge sind Text; Anhänge gehen als Pfad
 ABGELEHNT = "no"                          # gilt in jeder Freigabe als Nein
+STAU_NACHRICHTEN = 20_000                 # so viel darf sich je Fenster stauen, dann wird es getrennt
+STAU_BYTES = 64 * 1024 * 1024
+
+
+class _Sender:
+    """Schlange und Faden für eine Verbindung; Reihenfolge bleibt."""
+
+    def __init__(self, conn, bei_fehler):
+        self.conn = conn
+        self.bei_fehler = bei_fehler
+        self.schlange: queue.SimpleQueue = queue.SimpleQueue()
+        self.bytes = 0
+        self.anzahl = 0
+        self.zu = False
+        self._lock = threading.Lock()
+        threading.Thread(target=self._lauf, name="nemicli-gui-senden", daemon=True).start()
+
+    def legen(self, daten: bytes) -> bool:
+        """False: Rückstau – die Verbindung wird getrennt."""
+        with self._lock:
+            if self.zu:
+                return True
+            if self.anzahl >= STAU_NACHRICHTEN or self.bytes + len(daten) > STAU_BYTES:
+                return False
+            self.anzahl += 1
+            self.bytes += len(daten)
+        self.schlange.put(daten)
+        return True
+
+    def schliessen(self) -> None:
+        with self._lock:
+            self.zu = True
+        self.schlange.put(None)
+
+    def _lauf(self) -> None:
+        while True:
+            daten = self.schlange.get()
+            if daten is None:
+                return
+            with self._lock:
+                self.anzahl -= 1
+                self.bytes -= len(daten)
+                if self.zu:
+                    continue
+            try:
+                self.conn.send_bytes(daten)
+            except (OSError, ValueError):
+                self.bei_fehler(self.conn)
+                return
 
 
 class GuiBruecke:
@@ -31,8 +84,8 @@ class GuiBruecke:
         self.schluessel = secrets.token_bytes(32)
         self._listener = Listener(self.adresse, family="AF_PIPE")   # Schlüssel prüft _lesen
         self._clients: list = []
+        self._sender: dict = {}                # Verbindung -> _Sender
         self._lock = threading.Lock()
-        self._senden_lock = threading.Lock()   # eine Nachricht nach der anderen
         self._fragen: dict[int, object] = {}   # id -> asyncio.Future
         self._fid = 0
         self._aus = False
@@ -62,6 +115,7 @@ class GuiBruecke:
             return
         with self._lock:
             self._clients.append(conn)
+            self._sender[conn] = _Sender(conn, self._trennen)
             anzahl = len(self._clients)
         self._gewechselt(anzahl)
         try:
@@ -82,12 +136,23 @@ class GuiBruecke:
             except OSError:
                 pass
 
+    def _trennen(self, conn) -> None:
+        """Senden gescheitert oder Rückstau: Verbindung zu – der Lese-Faden räumt dann auf."""
+        self._entfernen(conn)
+        try:
+            conn.close()
+        except OSError:
+            pass
+
     def _entfernen(self, conn) -> None:
         with self._lock:
             weg = conn in self._clients
             if weg:
                 self._clients.remove(conn)
+            sender = self._sender.pop(conn, None)
             anzahl = len(self._clients)
+        if sender is not None:
+            sender.schliessen()
         if anzahl == 0:                                    # niemand mehr da, der antworten kann
             for fid in list(self._fragen):
                 self.antworten(fid, ABGELEHNT)
@@ -119,16 +184,13 @@ class GuiBruecke:
 
     # -- senden ----------------------------------------------------------------------
     def senden(self, ereignis: dict) -> None:
-        """Ereignis an alle offenen Fenster. Aus jedem Thread aufrufbar."""
+        """Ereignis an alle offenen Fenster. Aus jedem Thread aufrufbar, kehrt sofort zurück."""
         daten = json.dumps(ereignis, ensure_ascii=False, default=str).encode("utf-8")
         with self._lock:
-            ziele = list(self._clients)
-        for conn in ziele:
-            try:
-                with self._senden_lock:
-                    conn.send_bytes(daten)
-            except (OSError, ValueError):
-                self._entfernen(conn)
+            ziele = [(conn, self._sender.get(conn)) for conn in self._clients]
+        for conn, sender in ziele:
+            if sender is not None and not sender.legen(daten):
+                self._trennen(conn)
 
     # -- Nachfragen (async, aus dem Lese-Thread beantwortet) ---------------------------
     async def fragen(self, frage: str, optionen: list[tuple[str, str]], preview: str | None = None) -> str:
@@ -163,6 +225,9 @@ class GuiBruecke:
         self._aus = True
         with self._lock:
             ziele, self._clients = list(self._clients), []
+            sender, self._sender = list(self._sender.values()), {}
+        for s in sender:
+            s.schliessen()
         for conn in ziele:
             try:
                 conn.close()

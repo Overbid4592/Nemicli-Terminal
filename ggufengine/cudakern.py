@@ -1,18 +1,18 @@
 """
-Own CUDA kernels: matrix-vector products directly on GGUF block data for every block format
-(legacy Q4/Q5/Q8, K-quants, the IQ family, MXFP4, ternary and 1-bit formats).  Nothing is unpacked, each weight byte is
-read once.  Used for one token per step: MoE experts (also from pinned RAM, read directly over
-PCIe) and dense layers in formats without the int4 path (IMMER_GEPACKT).
+Eigene CUDA-Kernel: Matrix-Vektor-Produkte direkt auf GGUF-Blockdaten für jedes Blockformat
+(klassische Q4/Q5/Q8, K-Quants, die IQ-Familie, MXFP4, ternäre und 1-Bit-Formate).  Nichts wird entpackt,
+jedes Gewichtsbyte wird einmal gelesen.  Genutzt für ein Token je Schritt: MoE-Experten (auch aus
+gepinntem RAM, direkt über PCIe gelesen) und dichte Schichten in Formaten ohne int4-Pfad (IMMER_GEPACKT).
 
-Each format contributes one device function "32 weights of a block times 32 inputs";
-one kernel skeleton per format turns it into y[e, row] = W_ids[e][row, :] . x_e, where
-x_e is either one input shared by all experts or each expert's own input.  A second one
-(`mm`) multiplies one matrix with a few input rows, reading the weights once.
+Jedes Format liefert eine Device-Funktion "32 Gewichte eines Blocks mal 32 Eingaben";
+ein Kernel-Gerüst je Format macht daraus y[e, row] = W_ids[e][row, :] . x_e, wobei
+x_e entweder eine von allen Experten geteilte Eingabe oder die eigene Eingabe jedes Experten ist.
+Ein zweites (`mm`) multipliziert eine Matrix mit wenigen Eingabezeilen und liest die Gewichte einmal.
 
-The CUDA source is compiled at runtime with NVRTC, which ships with the PyTorch wheel
-(no toolkit, no host compiler), and launched through the driver API on torch's current
-stream, so the launches can be captured in CUDA graphs.  Without NVRTC or on errors the
-callers fall back to unpacking with torch (quant.py).
+Der CUDA-Quelltext wird zur Laufzeit mit NVRTC übersetzt, das im PyTorch-Wheel mitkommt
+(kein Toolkit, kein Host-Compiler), und über die Driver-API auf dem aktuellen Stream von torch
+gestartet, sodass sich die Starts in CUDA-Graphs aufzeichnen lassen.  Ohne NVRTC oder bei Fehlern
+weichen die Aufrufer auf das Entpacken mit torch aus (quant.py).
 """
 from __future__ import annotations
 
@@ -26,19 +26,19 @@ import torch
 
 from . import debuglog as dbg
 
-THREADS = 256                 # 8 warps per block, one output row per warp at a time
-BLOECKE_JE_SM = 2             # mv: blocks per multiprocessor (each walks over several rows)
-MM_ZEILEN = 16                # input rows of one `mm` call (weights read once for all)
-MM_GROESSEN = tuple(range(2, MM_ZEILEN + 1))   # one kernel per row count
-MM_SPALTEN = 1024             # mm: columns of X per shared-memory tile
-MM_JE_WARP = 4                # mm: rows per warp (one tile of X serves 8 * 4 rows)
+THREADS = 256                 # 8 Warps je Block, je Warp eine Ausgabezeile auf einmal
+BLOECKE_JE_SM = 2             # mv: Blöcke je Multiprozessor (jeder läuft über mehrere Zeilen)
+MM_ZEILEN = 16                # Eingabezeilen eines `mm`-Aufrufs (Gewichte einmal für alle gelesen)
+MM_GROESSEN = tuple(range(2, MM_ZEILEN + 1))   # ein Kernel je Zeilenzahl
+MM_SPALTEN = 1024             # mm: Spalten von X je Shared-Memory-Tile
+MM_JE_WARP = 4                # mm: Zeilen je Warp (ein Tile von X bedient 8 * 4 Zeilen)
 _MAX_DYNAMIC_SHARED = 8       # CU_FUNC_ATTRIBUTE_MAX_DYNAMIC_SHARED_SIZE_BYTES
 
 
 def _mm_bytes(m: int) -> int:
     return m * (MM_SPALTEN + MM_SPALTEN // 32) * 4
 
-# format -> (values per block, bytes per block)
+# Format -> (Werte je Block, Bytes je Block)
 FORMATE = {
     "Q2_K": (256, 84), "Q3_K": (256, 110), "IQ1_S": (256, 50), "IQ1_M": (256, 56),
     "IQ2_XXS": (256, 66), "IQ2_XS": (256, 74), "IQ2_S": (256, 82), "IQ3_XXS": (256, 98),
@@ -48,7 +48,7 @@ FORMATE = {
     "Q1_0": (128, 18), "Q2_0": (64, 18), "PQ2_0": (128, 34), "TQ2_0": (256, 66), "TQ1_0": (256, 54),
     "PTQ1_0": (128, 28),
 }
-# formats without the int4 path (qlinear): always kept in block format
+# Formate ohne int4-Pfad (qlinear): bleiben immer im Blockformat
 IMMER_GEPACKT = frozenset(("Q2_K", "Q3_K", "IQ1_S", "IQ1_M", "IQ2_XXS", "IQ2_XS", "IQ2_S", "IQ3_XXS",
                            "IQ3_S", "IQ4_NL", "IQ4_XS", "MXFP4", "Q1_0", "Q2_0", "PQ2_0", "TQ2_0", "TQ1_0",
                            "PTQ1_0"))
@@ -139,7 +139,7 @@ __constant__ float KV_IQ4NL[16] = {-127, -104, -83, -65, -49, -35, -22, -10, 1, 
 __constant__ float KV_MXFP4[16] = {0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
 '''
 
-# dot_<FORMAT>(block, unit s of 32 values in the block, x of these 32 values, value tables)
+# dot_<FORMAT>(Block, Einheit s aus 32 Werten im Block, x dieser 32 Werte, Werttabellen)
 _FORMATE = r'''
 template <class X> __device__ __forceinline__ RT dot_Q2_K(const u8* b, int s, X x, const float* kv) {
     const float d = h2f(ld16(b + 80)), dmin = h2f(ld16(b + 82));
@@ -476,9 +476,9 @@ template <class X> __device__ __forceinline__ RT dot_PTQ1_0(const u8* b, int s, 
 }
 '''
 
-# y[e, row] = W_ids[e][row, :] . x_e  with x_e = x + e * x_stride (x_stride 0: shared input).
-# One warp per row, a block walks over several rows (x is loaded once per block); in shared
-# memory x[i] sits at i + i / 32, so the 32 lanes (one 32-value unit each) hit 32 banks.
+# y[e, row] = W_ids[e][row, :] . x_e  mit x_e = x + e * x_stride (x_stride 0: geteilte Eingabe).
+# Ein Warp je Zeile, ein Block läuft über mehrere Zeilen (x wird einmal je Block geladen); im Shared
+# Memory liegt x[i] bei i + i / 32, so treffen die 32 Lanes (je eine 32-Werte-Einheit) 32 Banks.
 _GERUEST = r'''
 extern "C" __global__ void mv_{F}(const u8* __restrict__ raw, const long long* __restrict__ ids,
         const unsigned short* __restrict__ x, float* __restrict__ y, int n_out, int n_in,
@@ -573,7 +573,7 @@ def _quelle() -> str:
 
 
 _SPERRE = threading.Lock()
-_MODULE: dict = {}            # device index -> {format: CUfunction} or None (not available)
+_MODULE: dict = {}            # Geräteindex -> {Format: CUfunction} oder None (nicht verfügbar)
 _cu = None
 
 
@@ -586,7 +586,7 @@ def _nvrtc_pfad() -> Optional[str]:
 def _treiber():
     global _cu
     if _cu is None:
-        if os.name == "nt":       # full path: a bare name is searched in the program folder first
+        if os.name == "nt":       # voller Pfad: ein bloßer Name wird zuerst im Programmordner gesucht
             cu = ctypes.WinDLL(os.path.join(os.environ.get("SystemRoot", r"C:\Windows"), "System32", "nvcuda.dll"))
         else:
             cu = ctypes.CDLL("libcuda.so.1")
@@ -630,57 +630,87 @@ def _uebersetzen(device: torch.device) -> dict:
             dbg.event(f"GGUF-Kernel aus dem Cache: {os.path.basename(datei)}")
         except OSError:
             cubin = None
+    aus_cache = cubin is not None
     if cubin is None:
-        nvrtc = ctypes.CDLL(pfad)
-        prog = ctypes.c_void_p()
-        if nvrtc.nvrtcCreateProgram(ctypes.byref(prog), quelle.encode(), b"gguf.cu", 0, None, None):
-            raise RuntimeError("nvrtcCreateProgram")
-        opts = (ctypes.c_char_p * 2)(arch.encode(), b"--use_fast_math")
-        if nvrtc.nvrtcCompileProgram(prog, 2, opts):
-            n = ctypes.c_size_t()
-            nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(n))
-            log = ctypes.create_string_buffer(n.value)
-            nvrtc.nvrtcGetProgramLog(prog, log)
-            raise RuntimeError("NVRTC: " + log.value.decode(errors="replace")[:500])
+        cubin = _nvrtc_uebersetzen(pfad, quelle, arch, datei)
+    try:
+        return _laden(device, cubin)
+    except _ImageKaputt as exc:
+        if not aus_cache:
+            raise
+        # unbrauchbares Image im Cache: weg damit und einmal neu übersetzen, sonst bliebe es für immer beim torch-Weg
+        dbg.event(f"GGUF-Kernel aus dem Cache nicht ladbar ({exc}) – neu übersetzt")
+        try:
+            os.remove(datei)
+        except OSError:
+            pass
+        return _laden(device, _nvrtc_uebersetzen(pfad, quelle, arch, datei))
+
+
+class _ImageKaputt(RuntimeError):
+    """Das CUBIN lässt sich nicht laden oder ihm fehlen Funktionen."""
+
+
+def _nvrtc_uebersetzen(pfad: str, quelle: str, arch: str, datei: Optional[str]):
+    """Quelle mit NVRTC zu CUBIN übersetzen und (wenn möglich) in den Cache legen."""
+    nvrtc = ctypes.CDLL(pfad)
+    prog = ctypes.c_void_p()
+    if nvrtc.nvrtcCreateProgram(ctypes.byref(prog), quelle.encode(), b"gguf.cu", 0, None, None):
+        raise RuntimeError("nvrtcCreateProgram")
+    opts = (ctypes.c_char_p * 2)(arch.encode(), b"--use_fast_math")
+    if nvrtc.nvrtcCompileProgram(prog, 2, opts):
         n = ctypes.c_size_t()
-        nvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(n))
-        cubin = ctypes.create_string_buffer(n.value)
-        nvrtc.nvrtcGetCUBIN(prog, cubin)
-        nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
-        if datei:
-            try:
-                tmp = datei + ".teil"
-                with open(tmp, "wb") as f:
-                    f.write(cubin.raw[:n.value])
-                os.replace(tmp, datei)
-            except OSError:
-                pass
+        nvrtc.nvrtcGetProgramLogSize(prog, ctypes.byref(n))
+        log = ctypes.create_string_buffer(n.value)
+        nvrtc.nvrtcGetProgramLog(prog, log)
+        raise RuntimeError("NVRTC: " + log.value.decode(errors="replace")[:500])
+    n = ctypes.c_size_t()
+    nvrtc.nvrtcGetCUBINSize(prog, ctypes.byref(n))
+    cubin = ctypes.create_string_buffer(n.value)
+    nvrtc.nvrtcGetCUBIN(prog, cubin)
+    nvrtc.nvrtcDestroyProgram(ctypes.byref(prog))
+    if datei:
+        try:
+            tmp = datei + ".teil"
+            with open(tmp, "wb") as f:
+                f.write(cubin.raw[:n.value])
+            os.replace(tmp, datei)
+        except OSError:
+            pass
+    return cubin
+
+
+def _laden(device: torch.device, cubin) -> dict:
+    """CUBIN als Modul laden und die Funktionen holen; scheitert es, bleibt kein Modul liegen."""
     cu = _treiber()
     eig = torch.cuda.get_device_properties(device)
-    # dynamic shared memory beyond the 48 KiB default (opt-in), minus the static tables
+    # dynamischer Shared Memory über die 48-KiB-Vorgabe hinaus (Opt-in), abzüglich der statischen Tabellen
     geteilt = int(getattr(eig, "shared_memory_per_block_optin", 0) or 49152) - 1024
     with torch.cuda.device(device):
-        torch.zeros(1, device=device)                   # primary context of torch is current
+        torch.zeros(1, device=device)                   # der primäre Kontext von torch ist aktuell
         mod = ctypes.c_void_p()
         if cu.cuModuleLoadData(ctypes.byref(mod), cubin):
-            raise RuntimeError("cuModuleLoadData")
-
-        def holen(name: str, bytes_: int):
-            fn = ctypes.c_void_p()
-            if cu.cuModuleGetFunction(ctypes.byref(fn), mod, name.encode()):
-                raise RuntimeError(f"cuModuleGetFunction {name}")
-            if bytes_ > 49152 and cu.cuFuncSetAttribute(fn, _MAX_DYNAMIC_SHARED, ctypes.c_int(bytes_)):
-                raise RuntimeError(f"cuFuncSetAttribute {name}")
-            return fn
-        fns = {"_max_n_in": geteilt // 4 * 32 // 33 // 256 * 256, "_sm": int(eig.multi_processor_count)}
-        mm_bis = max((m for m in MM_GROESSEN if _mm_bytes(m) <= geteilt), default=1)
-        fns["_mm_bis"] = mm_bis
-        for name in FORMATE:
-            fns[name] = holen(f"mv_{name}", geteilt)
-            for m in MM_GROESSEN:
-                if m <= mm_bis:
-                    fns[f"mm{m}_{name}"] = holen(f"mm{m}_{name}", _mm_bytes(m))
-    fns["_cubin"] = cubin                               # keep the image alive with the module
+            raise _ImageKaputt("cuModuleLoadData")
+        try:
+            def holen(name: str, bytes_: int):
+                fn = ctypes.c_void_p()
+                if cu.cuModuleGetFunction(ctypes.byref(fn), mod, name.encode()):
+                    raise _ImageKaputt(f"cuModuleGetFunction {name}")
+                if bytes_ > 49152 and cu.cuFuncSetAttribute(fn, _MAX_DYNAMIC_SHARED, ctypes.c_int(bytes_)):
+                    raise RuntimeError(f"cuFuncSetAttribute {name}")
+                return fn
+            fns = {"_max_n_in": geteilt // 4 * 32 // 33 // 256 * 256, "_sm": int(eig.multi_processor_count)}
+            mm_bis = max((m for m in MM_GROESSEN if _mm_bytes(m) <= geteilt), default=1)
+            fns["_mm_bis"] = mm_bis
+            for name in FORMATE:
+                fns[name] = holen(f"mv_{name}", geteilt)
+                for m in MM_GROESSEN:
+                    if m <= mm_bis:
+                        fns[f"mm{m}_{name}"] = holen(f"mm{m}_{name}", _mm_bytes(m))
+        except BaseException:
+            cu.cuModuleUnload(mod)
+            raise
+    fns["_cubin"] = cubin                               # das Image zusammen mit dem Modul am Leben halten
     return fns
 
 
@@ -694,14 +724,14 @@ def _funktionen(device: torch.device) -> Optional[dict]:
                 try:
                     _MODULE[idx] = _uebersetzen(torch.device("cuda", idx))
                     dbg.event("GGUF-Kernel übersetzt (NVRTC)")
-                except Exception as exc:                # torch path instead
+                except Exception as exc:                # stattdessen der torch-Weg
                     _MODULE[idx] = None
                     dbg.event(f"GGUF-Kernel nicht verfügbar: {exc}")
     return _MODULE[idx]
 
 
 def verfuegbar(device, fmt: str, n_in: int) -> bool:
-    """Kernel for this format and row length on this device."""
+    """Kernel für dieses Format und diese Zeilenlänge auf diesem Gerät."""
     device = torch.device(device)
     if fmt not in FORMATE or n_in % FORMATE[fmt][0]:
         return False
@@ -710,7 +740,7 @@ def verfuegbar(device, fmt: str, n_in: int) -> bool:
 
 
 def mm_bis(device) -> int:
-    """Most input rows of one `mm` call on this device (1: none)."""
+    """Höchstzahl an Eingabezeilen eines `mm`-Aufrufs auf diesem Gerät (1: keiner)."""
     fns = _funktionen(torch.device(device))
     return fns["_mm_bis"] if fns is not None else 1
 
@@ -725,10 +755,10 @@ def _starten(fn, grid: tuple, bytes_: int, args: list) -> None:
 
 def mv(fmt: str, raw: torch.Tensor, ids: torch.Tensor, x: torch.Tensor, n_out: int, n_in: int,
        adressen: torch.Tensor | None = None) -> torch.Tensor:
-    """raw (n_exp, bytes per expert) on the GPU or in pinned RAM (read by the kernel directly
-    over PCIe), ids (k,): expert ids.  x (n_in,) on the GPU is shared by all experts, x (k, n_in)
-    is each expert's own input.  adressen (n_exp,) int64 on the GPU: where each expert's bytes
-    are (VRAM slot or RAM) – then raw is not read.  -> (k, n_out) float32."""
+    """raw (n_exp, Bytes je Experte) auf der GPU oder in gepinntem RAM (vom Kernel direkt über PCIe
+    gelesen), ids (k,): Experten-IDs.  x (n_in,) auf der GPU wird von allen Experten geteilt, x (k, n_in)
+    ist die eigene Eingabe jedes Experten.  adressen (n_exp,) int64 auf der GPU: wo die Bytes jedes
+    Experten liegen (VRAM-Slot oder RAM) – dann wird raw nicht gelesen.  -> (k, n_out) float32."""
     geraet = x.device
     fns = _funktionen(geraet)
     ids = ids.to(geraet, torch.int64).contiguous()
@@ -745,8 +775,8 @@ def mv(fmt: str, raw: torch.Tensor, ids: torch.Tensor, x: torch.Tensor, n_out: i
 
 
 def mm(fmt: str, raw: torch.Tensor, x: torch.Tensor, n_out: int, n_in: int) -> torch.Tensor:
-    """raw: one matrix (n_out rows) in block format on the GPU, x (M, n_in) with
-    2 <= M <= mm_bis(device) -> (M, n_out) float32; each weight is read and decoded once."""
+    """raw: eine Matrix (n_out Zeilen) im Blockformat auf der GPU, x (M, n_in) mit
+    2 <= M <= mm_bis(device) -> (M, n_out) float32; jedes Gewicht wird einmal gelesen und dekodiert."""
     geraet = x.device
     fns = _funktionen(geraet)
     M = x.shape[0]

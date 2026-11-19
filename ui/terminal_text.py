@@ -25,6 +25,24 @@ _PFAD = re.compile(r"(?<![A-Za-z0-9])[A-Za-z]:[\\/][^<>\"|?*" + _RAHMEN + r"]*")
 _ENDE_WEG = ".,;:!?)]}'\"…»›"
 _ZEILENNUMMER = re.compile(r":\d+(:\d+)?$")
 
+# Fremder Text (Modell, Befehlsausgabe, Web) darf nur färben: andere Escape-Folgen steuern Cursor,
+# Zwischenablage (OSC 52), Titel oder Links. Bleiben: Farben (ESC[…m), Zeilenumbruch, Tab.
+STEUER = re.compile(r"[\x00-\x08\x0b-\x1a\x1c-\x1f\x7f-\x9f]")
+ESC_FOLGE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)?|\x1b[P^_][^\x1b]*(?:\x1b\\)?"
+                       r"|\x1b[@-Z\\-_]|\x1b")
+FARBE = re.compile(r"\x1b\[[0-9;:]*m")
+BILDSTELLE = re.compile(r"[\ue000-\ue1ff]")   # Platzhalter, über die das Fenster Bilder malt
+
+
+def nur_farben(text: str) -> str:
+    """Escape-Folgen außer Farben, Steuerzeichen außer \\n und \\t sowie Bild-Platzhalter entfernen."""
+    if not text:
+        return text
+    if "\x1b" in text:
+        text = ESC_FOLGE.sub(lambda m: m.group(0) if FARBE.fullmatch(m.group(0)) else "", text)
+    text = STEUER.sub("", text)
+    return text if text.isascii() else BILDSTELLE.sub("", text)
+
 
 def zeilentext(zellen: list, platzhalter=None) -> tuple[str, list[int]]:
     """Zeile als Text und je Zeichen die Zelle, in der es steht. Bildstellen zählen als Leerzeichen."""

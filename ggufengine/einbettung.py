@@ -3,6 +3,12 @@
 Das Modell setzt sich wie jedes Sprachmodell aus der Datei zusammen (Baukasten);
 statt Logits wird der Zustand nach der Schluss-Norm gepoolt. Auf der GPU bleiben
 die Gewichte gepackt (Q8_0 ~0,6 GB statt ~1,2 GB in bf16).
+
+Modelle mit Medien-Eingang (EmbeddingGemma 2 + mmproj) betten auch Bilder, Videos und Ton ein, einzeln
+oder gemischt mit Text in einem Vektor (`medien_vektor`), wie transformers' EmbeddingGemma2Processor:
+<bos> Teile … <eos>; ein Bild ist <|image> + 280 Bild-Token + <image|>, ein Video je Einzelbild dasselbe mit
+140 Token und <|video|> als Platzhalter, Ton je Stück bis 30 s <|audio> + 25 Token/s + <audio|>. Alle Teile
+teilen sich MEDIEN_KONTEXT Token.
 """
 from __future__ import annotations
 
@@ -12,13 +18,18 @@ from typing import List, Optional
 import torch
 
 from .gguf import GGUFError, GGUFFile
-from .models import build_model
+from .models import build_model, klasse
 from .models.common import GPU_SPERRE, KV_GROWTH
 from .qlinear import kernel_available
 from .tokenizer import Tokenizer
 
 # llama.cpp: {arch}.pooling_type – 1 Mittel, 2 erstes Token (CLS), 3 letztes Token
 POOLING = {1: "mean", 2: "cls", 3: "last"}
+MEDIEN_KONTEXT = 8192           # Token für gemischte Eingaben (Kontext von EmbeddingGemma 2)
+BILD_TOKEN = 280                # je Bild (image_seq_length)
+VIDEO_TOKEN = 140               # je Einzelbild eines Videos (video_processor.max_soft_tokens)
+TON_MARKEN = ("<|audio>", "<|audio|>", "<audio|>")
+VIDEO_MARKE = "<|video|>"
 
 
 class Einbetter:
@@ -39,8 +50,11 @@ class Einbetter:
             self.tok = Tokenizer(self.gg)
             self.add_eos = bool(self.gg.get("tokenizer.ggml.add_eos_token", False))
             dtype = torch.bfloat16 if self.device.type == "cuda" else torch.float32
+            n_ctx = self.max_tokens + 2
+            if getattr(klasse(a), "supports_images", False):         # Medien brauchen den ganzen Kontext
+                n_ctx = max(n_ctx, min(int(self.gg.get(f"{a}.context_length", 0) or MEDIEN_KONTEXT), MEDIEN_KONTEXT))
             with GPU_SPERRE:                        # nicht neben dem Bau einer Engine (KV_GPU_SLOTS, SCHICHTEN_RAM)
-                self.model = build_model(self.gg, self.device, dtype, self.max_tokens + 2,
+                self.model = build_model(self.gg, self.device, dtype, n_ctx,
                                          quant=kernel_available(self.device))
             if not hasattr(self.model, "einbetten"):
                 raise GGUFError(f"architecture {a!r} cannot produce embeddings")
@@ -112,23 +126,90 @@ class Einbetter:
     def kann_sehen(self) -> bool:
         return getattr(self, "_sehen", None) is not None
 
+    def hoeren_laden(self, mmproj: str) -> None:
+        """Ton-Teil (Gemma-4-Audio im mmproj) dazuladen; danach nimmt `medien_vektor` auch Ton."""
+        if not getattr(self.model, "supports_images", False) or not hasattr(self.model, "eingabe"):
+            raise GGUFError(f"architecture {self.arch!r} cannot embed audio")
+        from .tonlader import laden
+        marken = [self.tok.special.get(m) for m in TON_MARKEN]
+        if None in marken:
+            raise GGUFError("the tokenizer lacks the audio marks")
+        self._hoeren = laden(mmproj, self.device)
+        self._ton_marken = marken
+
+    def kann_hoeren(self) -> bool:
+        return getattr(self, "_hoeren", None) is not None
+
     def bild_vektor(self, bild, normieren: bool = True) -> torch.Tensor:
         """Bild (Pfad oder PIL) -> Vektor: <bos> <|image> Bild-Token <image|> <eos>, Bild-Zeilen aus dem
         Bild-Teil statt der Platzhalter, Mittel über alle Zeilen."""
-        if not self.kann_sehen():
-            raise RuntimeError("no vision projector loaded (sehen_laden)")
+        return self.medien_vektor([("bild", bild)], normieren)
+
+    def _bild(self, bild):
         from PIL import Image
         img = bild if isinstance(bild, Image.Image) else Image.open(bild)
+        return img.convert("RGB")
+
+    def medien_vektor(self, teile: list, normieren: bool = True, ton_stuecke: int = 8) -> torch.Tensor:
+        """Ein Vektor aus Teilen in Reihenfolge: ("text", str) · ("bild", Pfad/PIL) · ("video", [Einzelbilder als
+        PIL oder (H, W, 3) uint8]) · ("ton", 16-kHz-Mono-Welle). Langer Ton wird in höchstens `ton_stuecke`
+        Stücke zu 30 s geteilt (gleichmäßig über die Aufnahme)."""
+        import numpy as np
+        ids, zeilen, embs = [self.tok.bos_id] if self.tok.bos_id is not None else [], [], []
+
+        def medien(emb, auf: int, platz: int, zu: int) -> None:
+            n = int(emb.shape[0])
+            ids.append(auf)
+            zeilen.extend(range(len(ids), len(ids) + n))
+            ids.extend([platz] * n)
+            ids.append(zu)
+            embs.append(emb)
+
         with torch.inference_mode():
-            emb = self._sehen.encode(img)
-        auf, platz, zu = self._bild_marken
-        n = int(emb.shape[0])
-        ids = [self.tok.bos_id, auf] + [platz] * n + [zu, self.tok.eos_id]
-        rows = torch.arange(2, 2 + n, dtype=torch.long)
-        v = self.model.einbetten(ids, self.pooling, inject=(rows, emb))
+            for art, wert in teile:
+                if art == "text":
+                    ids.extend(self.tok.encode(wert))
+                elif art in ("bild", "video"):
+                    if not self.kann_sehen():
+                        raise RuntimeError("no vision projector loaded (sehen_laden)")
+                    auf, platz, zu = self._bild_marken
+                    if art == "bild":
+                        medien(self._sehen.encode(self._bild(wert), BILD_TOKEN), auf, platz, zu)
+                        continue
+                    video = self.tok.special.get(VIDEO_MARKE)
+                    if video is None:
+                        raise GGUFError("the tokenizer lacks the video placeholder")
+                    from PIL import Image
+                    for b in wert:
+                        img = b if isinstance(b, Image.Image) else Image.fromarray(np.asarray(b, np.uint8))
+                        medien(self._sehen.encode(img.convert("RGB"), VIDEO_TOKEN), auf, video, zu)
+                elif art == "ton":
+                    if not self.kann_hoeren():
+                        raise RuntimeError("no audio encoder loaded (hoeren_laden)")
+                    from . import ton
+                    for stueck in ton.stuecke(wert, ton_stuecke):
+                        if len(stueck) < ton.FENSTER + 1:
+                            continue
+                        merk, gueltig = ton.merkmale(stueck)
+                        medien(self._hoeren.encode(merk, gueltig), *self._ton_marken)
+                else:
+                    raise ValueError(f"unknown part {art!r}")
+        if self.tok.eos_id is not None:
+            ids.append(self.tok.eos_id)
+        if not ids:
+            raise ValueError("empty input")
+        if len(ids) > self.model.n_ctx:
+            raise ValueError(f"input has {len(ids)} tokens, at most {self.model.n_ctx} fit")
+        inject = None
+        if embs:
+            inject = (torch.tensor(zeilen, dtype=torch.long), torch.cat([e.float().to(self.device) for e in embs]))
+        v = self.model.einbetten(ids, self.pooling, inject=inject)
         return torch.nn.functional.normalize(v, dim=-1) if normieren else v
 
     def close(self):
+        hoeren, self._hoeren = getattr(self, "_hoeren", None), None
+        if hoeren is not None and hasattr(hoeren, "unload"):
+            hoeren.unload()
         sehen, self._sehen = getattr(self, "_sehen", None), None
         if sehen is not None:
             sehen.unload()

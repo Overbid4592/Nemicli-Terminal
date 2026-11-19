@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (QApplication, QColorDialog, QDialog, QFrame, QGri
 
 from .laufzeit import AppLaufzeit
 from .layout import Layout
+from .nemijs import intern
 from .zeichnen import Maler, QtMesser, bild_laden
 
 MAX_NACHRICHT = 4 * 1024 * 1024
@@ -136,6 +137,8 @@ class AppAnsicht(QWidget):
         if self.im_dialog:                             # erst nach dem Dialog des laufenden Skripts
             QTimer.singleShot(200, self.laden)
             return
+        if self.lz is not None:
+            self.lz.speicher_sichern()
         self._bilder.clear()
         self.layout_ = None
         self.scroll = 0.0
@@ -147,6 +150,9 @@ class AppAnsicht(QWidget):
         except (OSError, RecursionError) as e:
             self.lz = None
             self.fehler_text = f"Die App lässt sich nicht laden: {e}"
+        except Exception as e:                         # z. B. CSS, das nemicss nicht verdaut
+            self.lz = None
+            self.fehler_text = f"Die App lässt sich nicht laden: {intern(e)}"
         self.update()
 
     def neu_laden(self):
@@ -214,6 +220,9 @@ class AppAnsicht(QWidget):
                 L.rechnen()
             except RecursionError:
                 lz.melden("❌ Layout zu tief verschachtelt")
+            except Exception as e:                     # erst nach der nächsten DOM-Änderung neu versuchen
+                lz.melden(f"❌ Layout: {intern(e)}")
+                lz.dok.geaendert = False
             self.layout_ = L
             self.scroll = max(0.0, min(self.scroll, L.dok_hoehe - self.height()))
             self.window().setWindowTitle(self.titel())
@@ -227,9 +236,16 @@ class AppAnsicht(QWidget):
             p.end()
             return
         self._rechnen()
+        if self.layout_ is None or self.layout_.wurzel is None:    # Layout abgebrochen: Fehler in der Konsole
+            p.fillRect(self.rect(), QColor(DUNKEL))
+            p.end()
+            return
         maler = Maler(self.layout_, self._bild)
         maler.fokus = self.lz.dok.fokus
-        maler.malen(p, self.scroll, self.width(), self.height())
+        try:
+            maler.malen(p, self.scroll, self.width(), self.height())
+        except Exception as e:                         # halb gerechnetes Layout: nicht bei jedem Bild werfen
+            self.lz.melden(f"❌ Zeichnen: {intern(e)}")
         if self.zeige_modus or self.markiert is not None:
             el = self.markiert if self.markiert is not None else self.lz.dok.ueber
             if el is not None and el.box:
@@ -615,6 +631,8 @@ class AppFenster(QWidget):
         # Geschlossen heißt beendet: App und Dateiwache anhalten, keine Ereignisse der Leitung mehr.
         self.wache.stop()
         self.ansicht.uhr.stop()
+        if self.ansicht.lz is not None:
+            self.ansicht.lz.speicher_sichern()
         if self.leitung is not None:
             try:
                 self.leitung.ereignis.disconnect(self._ereignis)

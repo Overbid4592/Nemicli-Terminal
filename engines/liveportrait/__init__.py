@@ -2,6 +2,6 @@
 
 Getrennt von Krea, Wan und dem GGUF-Motor; nichts dort hängt hiervon ab. Bewegt wird das
 Originalbild selbst (Verformen über Schlüsselpunkte, kein Diffusionsmodell) – die Identität
-bleibt, der Körper steht still. Gewichte: Models/LivePortrait (gewichte.py).
+bleibt, der Körper steht still. Gewichte: KI-Modelle/KI-Portraet/Portraetmodell/LivePortrait (gewichte.py).
 Werkzeug: portraet_bewegen (tools/actions.py).
 """

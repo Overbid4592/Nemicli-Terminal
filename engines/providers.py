@@ -13,6 +13,7 @@ nativ (chat.py).
 
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 import time
@@ -71,6 +72,12 @@ def get(provider_id: str) -> Provider | None:
     return PROVIDERS.get(provider_id)
 
 
+def proxy_erlaubt(url: str | None) -> bool:
+    """trust_env für httpx: ein System-Proxy gilt nur für fremde Rechner, nie für den eigenen."""
+    from urllib.parse import urlsplit
+    return not (url and netzadresse.lokal(urlsplit(url).hostname or ""))
+
+
 _LOKAL_CACHE: dict[str, tuple[float, bool]] = {}
 _LOKAL_TTL = 15.0
 
@@ -83,7 +90,7 @@ def lokal_erreichbar(url: str | None) -> bool:
     if hit and time.monotonic() - hit[0] < _LOKAL_TTL:
         return hit[1]
     try:
-        ok = httpx.get(url, timeout=0.4).status_code < 400
+        ok = httpx.get(url, timeout=0.4, trust_env=proxy_erlaubt(url)).status_code < 400
     except Exception:
         ok = False
     _LOKAL_CACHE[url] = (time.monotonic(), ok)
@@ -118,7 +125,7 @@ def _norm_host(raw: str) -> str:
     from urllib.parse import urlparse
     teile = urlparse(host)
     name = teile.hostname or "127.0.0.1"
-    if name in ("0.0.0.0", "::", "[::]"):               # Lausch-Adresse, als Ziel unter Windows nicht erreichbar
+    if name in ("0.0.0.0", "::", "[::]", "localhost"):   # Lausch-Adresse bzw. umbiegbarer Name → feste Loopback-IP
         name = "127.0.0.1"
     schema = teile.scheme
     if schema == "http" and not netzadresse.lokal(name):   # unverschlüsselt nur zum eigenen Rechner
@@ -127,6 +134,12 @@ def _norm_host(raw: str) -> str:
         port = f":{teile.port}"
     else:                                              # ohne Port: Ollama-Vorgabe – außer bei https (Vermittler)
         port = "" if teile.scheme == "https" else ":11434"
+    if schema == "http" and port:                      # eingestellter lokaler Ollama-Port: für den Netz-Zwang frei
+        try:
+            import netzzwang
+            netzzwang.lokal_erlauben(int(port[1:]), "Ollama")
+        except Exception:
+            pass
     if ":" in name:                                    # IPv6 in der Adresse wieder einklammern
         name = f"[{name}]"
     return f"{schema}://{name}{port}{teile.path}".rstrip("/")
@@ -156,7 +169,8 @@ def _ollama_tags(force: bool = False) -> list | None:
     try:
         # Kurzer Verbindungsaufbau: ein laufendes Ollama nimmt sofort an. Ein abgelehnter
         # Aufbau zu localhost dauert unter Windows sonst rund 2 s je Adresse (::1, 127.0.0.1).
-        r = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=httpx.Timeout(0.8, connect=0.25))
+        r = httpx.get(f"{OLLAMA_HOST}/api/tags", timeout=httpx.Timeout(0.8, connect=0.25),
+                      trust_env=proxy_erlaubt(OLLAMA_HOST))
         r.raise_for_status()
         tags = r.json().get("models") or []
     except Exception:
@@ -173,7 +187,8 @@ def ollama_kontext(model_id: str) -> int | None:
     """Kontext, mit dem Ollama das Modell gerade geladen hat (/api/ps, `context_length`) – die Einstellung
     von Ollama gilt, nicht der Höchstwert des Modells. None = nicht geladen oder unbekannt."""
     try:
-        r = httpx.get(f"{OLLAMA_HOST}/api/ps", timeout=httpx.Timeout(1.0, connect=0.25))
+        r = httpx.get(f"{OLLAMA_HOST}/api/ps", timeout=httpx.Timeout(1.0, connect=0.25),
+                      trust_env=proxy_erlaubt(OLLAMA_HOST))
         r.raise_for_status()
         geladen = r.json().get("models") or []
     except Exception:
@@ -197,7 +212,8 @@ def _ollama_lokal() -> bool:
 def _ollama_im_vram() -> list[str] | None:
     """Namen der Modelle, die Ollama gerade im Grafikspeicher hält (/api/ps, size_vram > 0). None = keine Antwort."""
     try:
-        r = httpx.get(f"{OLLAMA_HOST}/api/ps", timeout=httpx.Timeout(1.0, connect=0.25))
+        r = httpx.get(f"{OLLAMA_HOST}/api/ps", timeout=httpx.Timeout(1.0, connect=0.25),
+                      trust_env=proxy_erlaubt(OLLAMA_HOST))
         r.raise_for_status()
         geladen = r.json().get("models") or []
     except Exception:
@@ -221,7 +237,7 @@ def ollama_gpu_freigeben(warten_s: float = 5.0) -> list[str]:
     for name in namen:
         try:
             httpx.post(f"{OLLAMA_HOST}/api/generate", json={"model": name, "keep_alive": 0},
-                       timeout=httpx.Timeout(10.0, connect=0.25))
+                       timeout=httpx.Timeout(10.0, connect=0.25), trust_env=proxy_erlaubt(OLLAMA_HOST))
         except Exception:
             pass
     ende = time.monotonic() + warten_s                 # Ollama gibt den Speicher kurz nach der Antwort frei
@@ -297,7 +313,7 @@ def _ollama_capabilities(model_id: str) -> list:
         return _ollama_caps_cache[model_id]
     try:
         r = httpx.post(f"{OLLAMA_HOST}/api/show", json={"model": model_id},
-                       timeout=httpx.Timeout(3.0, connect=0.25))
+                       timeout=httpx.Timeout(3.0, connect=0.25), trust_env=proxy_erlaubt(OLLAMA_HOST))
         r.raise_for_status()
         caps = r.json().get("capabilities") or []
     except Exception:
@@ -348,8 +364,10 @@ async def list_models(provider_id: str, limit: int = 40,
     if not force and hit and time.monotonic() - hit[0] < _MODELS_TTL:
         return list(hit[1])
 
-    async with httpx.AsyncClient(timeout=15.0) as client:
-        r = await client.get(p.list_url, headers=_auth_headers(p))
+    # ChatGPT-Konto: der Schlüssel kann ein Erneuern übers Netz auslösen – nicht in der Ereignisschleife
+    kopf = await asyncio.to_thread(_auth_headers, p) if p.kind == "chatgpt" else _auth_headers(p)
+    async with httpx.AsyncClient(timeout=15.0, trust_env=proxy_erlaubt(p.list_url)) as client:
+        r = await client.get(p.list_url, headers=kopf)
         if r.status_code >= 400:
             raise RuntimeError(status_text(p.label, r.status_code))
         data = r.json()
@@ -381,18 +399,18 @@ def _lokal_kontext_holen(p: Provider, model_id: str) -> bool:
     n = None
     zeit = httpx.Timeout(2.0, connect=0.4)
     if p.id == "lmstudio":
-        daten = httpx.get(wurzel + "/api/v0/models", timeout=zeit).json()
+        daten = httpx.get(wurzel + "/api/v0/models", timeout=zeit, trust_env=proxy_erlaubt(wurzel)).json()
         for m in daten.get("data", []) if isinstance(daten, dict) else []:
             if isinstance(m, dict) and m.get("id") == model_id:
                 n = CP._zahl(m.get("loaded_context_length")) or CP.kontext_aus_eintrag(m)
     elif p.id == "llamacpp":
         try:
-            daten = httpx.get(wurzel + "/props", timeout=zeit).json()
+            daten = httpx.get(wurzel + "/props", timeout=zeit, trust_env=proxy_erlaubt(wurzel)).json()
             n = CP._zahl((daten.get("default_generation_settings") or {}).get("n_ctx")) or CP._zahl(daten.get("n_ctx"))
         except Exception:
             n = None                              # LocalAI kennt /props nicht: dann aus /v1/models
     if not n:
-        daten = httpx.get(p.list_url, timeout=zeit).json()
+        daten = httpx.get(p.list_url, timeout=zeit, trust_env=proxy_erlaubt(p.list_url)).json()
         n = next((CP.kontext_aus_eintrag(m) for mid, m in CP._eintraege(p, daten) if mid == model_id), None)
     if n:
         _LOKAL_KONTEXT[f"{p.id}:{model_id}"] = (time.monotonic(), n)

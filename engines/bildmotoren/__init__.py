@@ -1,7 +1,7 @@
 """
 bildmotoren - Bild-Modelle neben Krea 2, je Bauart ein eigener Motor.
 
-Ordner `Models/Bildmodelle/` (Daten- und Programmordner):
+Ordner `KI-Modelle/KI-Bild/BildgenKI/` (früher `Models/Bildmodelle/` im Daten- und Programmordner):
 
     <Name>/                Modell: eine .safetensors (auch in Teilen) oder .gguf mit dem DiT,
                            optional eigene text_encoders/, vae/, tokenizer/
@@ -29,8 +29,15 @@ except Exception:
     _ROOT = _INSTALL = Path(__file__).resolve().parents[2]
 
 BAUARTEN = {"zimage": zimage, "flux2": flux2, "qwenimage": qwenimage, "flux1": flux1, "chroma": chroma}
-ORDNER = [_ROOT / "Models" / "Bildmodelle", _INSTALL / "Models" / "Bildmodelle"]
+try:
+    import modellorte as _MO
+    ORDNER = _MO.orte("bild")                          # KI-Modelle/KI-Bild/BildgenKI, dann frühere Orte
+    _KREA = _MO.KREA
+except Exception:                                      # Selbsttest ohne Bootstrap
+    ORDNER, _KREA = [_ROOT / "Models" / "Bildmodelle", _INSTALL / "Models" / "Bildmodelle"], "Krea2"
+# Unterordner, die kein eigenes Modell dieser Motoren sind (Krea 2 hat einen eigenen Motor)
 GETEILT = ("text_encoders", "vae", "tokenizer", "tokenizer_t5", "tokenizer_clip")
+FREMD = (_KREA,)
 GEPRUEFT = ".geprueft.json"
 BACKEND = "motor"
 MAX_KANTE = 2048
@@ -42,7 +49,7 @@ ENTLADEN_NACH = 300
 # ===========================================================================
 
 def ordner() -> Path:
-    """Der erste vorhandene Bildmodelle-Ordner (sonst der im Datenordner)."""
+    """Der erste vorhandene Bildmodell-Ordner (sonst der neue Ort)."""
     for o in ORDNER:
         if o.is_dir():
             return o
@@ -87,7 +94,7 @@ def modelle() -> dict[str, dict]:
         for p in _kandidaten(o):
             if (b := bauart_von(p)) and p.stem not in aus:
                 aus[p.stem] = {"name": p.stem, "bauart": b, "dit": p, "ordner": o}
-        for unter in sorted(x for x in o.iterdir() if x.is_dir() and x.name not in GETEILT):
+        for unter in sorted(x for x in o.iterdir() if x.is_dir() and x.name not in GETEILT + FREMD):
             for p in _kandidaten(unter):
                 if (b := bauart_von(p)) and unter.name not in aus:
                     aus[unter.name] = {"name": unter.name, "bauart": b, "dit": p, "ordner": unter}
@@ -420,7 +427,7 @@ def ordner_anlegen() -> Path:
     o = ordner()
     for unter in GETEILT:
         (o / unter).mkdir(parents=True, exist_ok=True)
-    zettel = o / "LIES-MICH.txt"
+    zettel = o / "Anleitung.txt"
     if not zettel.exists():
         try:
             zettel.write_text(LIES_MICH, encoding="utf-8")

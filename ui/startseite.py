@@ -35,7 +35,12 @@ KARTEN_PAAR_AB = 46          # rechte Spalte so breit: Offen und Wache nebeneina
 GRUSS_MAX = 160
 
 STATUS = {"bereit": ("●", "#4ade80", "bereit"), "laedt": ("◌", "#fbbf24", "lädt …"),
-          "ohne": ("○", "#7d8590", "kein Modell")}
+          "ohne": ("○", "#7d8590", "kein Modell"),
+          # was die KI gerade tut (taetig): Zeichen und Wort, die Farbe ist nur Beigabe
+          "denkt": ("◐", "#c084fc", "denkt …"), "prueft": ("◎", "#67e8f9", "prüft …"),
+          "arbeitet": ("◆", "#fbbf24", "arbeitet …")}
+TAETIG = frozenset({"denkt", "prueft", "arbeitet"})
+ERINNERUNGEN_MAX = 3         # so viele kommende Erinnerungen zeigt die Karte
 
 # Im eigenen Terminal-Fenster (terminal_fenster.py) malt das Fenster echte Bilder über Platzhalter-Zeichen
 # U+E000 + n·64 + Zeile; die Sitzung meldet Pfad und Zeilen per Steuerbefehl (main: _fenster_steuern).
@@ -44,8 +49,8 @@ STEUERN = None
 PLATZ = 0xE000
 _GEMELDET: dict[int, tuple[str, int]] = {}
 
-STAND: dict = {"name": "", "bild": None, "status": "laedt", "gruss": "", "letzter": None, "offen": [],
-               "wache": None, "liebling": None}
+STAND: dict = {"name": "", "bild": None, "status": "laedt", "ruhe": "laedt", "gruss": "", "letzter": None,
+               "offen": [], "wache": None, "liebling": None, "erinnerungen": []}
 _BILDER: dict = {}
 
 
@@ -98,6 +103,12 @@ def echtes_fenster() -> bool:
     return os.environ.get("NEMICLI_FENSTER") == "1" and STEUERN is not None
 
 
+class Bildstelle(Text):
+    """Platzhalter-Zeichen einer echten Bildstelle. Nur dieser Text darf sie enthalten – screen_tx.sanitize
+    entfernt sie aus allem anderen (sonst könnte Modelltext Bilder über beliebige Zellen legen)."""
+    BILDSTELLE = True
+
+
 def bild_platz(pfad: Path, spalten: int, zeilen: int, nr: int) -> Text | None:
     """Platzhalter in Bildgröße für das eigene Fenster, das dort das echte Bild malt; meldet den Pfad
     einmal je Bild-Nummer. None, wenn das Bild nicht lesbar ist."""
@@ -115,8 +126,19 @@ def bild_platz(pfad: Path, spalten: int, zeilen: int, nr: int) -> Text | None:
             _GEMELDET[nr] = (str(pfad), hoehe)
         except Exception:
             return None
-    return Text("\n".join(chr(PLATZ + nr * 64 + z) * breite for z in range(hoehe)), no_wrap=True,
-                overflow="crop")
+    return Bildstelle("\n".join(chr(PLATZ + nr * 64 + z) * breite for z in range(hoehe)), no_wrap=True,
+                      overflow="crop")
+
+
+def bild_abmelden(nr: int) -> None:
+    """Bild Nummer `nr` ist nicht mehr zu sehen (Startseite weg): das Fenster gibt es frei und sucht seine
+    Platzhalter nicht mehr. Zeigt sich die Stelle wieder, meldet bild_platz das Bild neu an."""
+    if _GEMELDET.pop(nr, None) is None or not echtes_fenster():
+        return
+    try:
+        STEUERN(f"bild{nr}-1=")
+    except Exception:
+        pass
 
 
 def _bild(pfad, spalten: int, zeilen: int, nr: int) -> Text | None:
@@ -225,22 +247,69 @@ def sammeln(seit: float | None = None) -> None:
             STAND["liebling"] = random.choice(da)
     except Exception:
         pass
+    STAND["erinnerungen"] = erinnerungen_zeilen()
+    _figur(lambda F: F.melden(STAND["name"]))
+
+
+def _figur(tun) -> None:
+    """Figur im eigenen Terminal-Fenster (ui/figur.py) – ohne sie läuft alles weiter."""
+    try:
+        import figur
+        tun(figur)
+    except Exception:
+        pass
+
+
+def erinnerungen_zeilen(jetzt: float | None = None) -> list[str]:
+    """Die nächsten Erinnerungen: die des Nutzers und die Wecker der aktiven Persönlichkeit an sich selbst."""
+    try:
+        from wache import erinnerungen as ER
+        name = STAND.get("name") or ""
+        eigene = [d for d in ER.offen() if d.get("fuer") != ER.FUER_KI or (d.get("wer") or "") == name]
+    except Exception:
+        return []
+    zeilen = []
+    for d in eigene[:ERINNERUNGEN_MAX]:
+        zeichen = "🤖" if d.get("fuer") == ER.FUER_KI else "⏰"
+        wieder = " 🔁" if int(d.get("alle") or 0) else ""
+        zeilen.append(f"{zeichen} {ER.zeit_text(float(d['zeit']), jetzt)}{wieder}  {d['text'][:60]}")
+    if len(eigene) > ERINNERUNGEN_MAX:
+        zeilen.append(f"… und {len(eigene) - ERINNERUNGEN_MAX} weitere  ·  /kugel erinnerungen")
+    return zeilen
 
 
 def wache_text(laeuft: bool, statistik: dict) -> str:
-    """Ampel für die Wache-Karte aus alarm_statistik()."""
+    """Ampel für die Wache-Karte aus Speicher.lage() – dieselben Stufen wie der Tray der Wache:
+    echt → rot, offen oder unklar → gelb, sonst grün."""
     if not laeuft:
         return "⚪ aus  ·  /wache start"
     echt, offen = int(statistik.get("echt") or 0), int(statistik.get("offen") or 0)
+    unklar = int(statistik.get("unklar") or 0)
     if echt:
         return f"🔴 {echt} echte{'r' if echt == 1 else ''} Alarm{'e' if echt > 1 else ''}  ·  /wache"
     if offen:
-        return f"🟡 {offen} Alarm{'e' if offen > 1 else ''} offen  ·  /wache"
+        return (f"🟡 {offen} Alarm{'e' if offen > 1 else ''} offen" + (f" · {unklar} unklar" if unklar else "")
+                + "  ·  /wache")
+    if unklar:
+        return f"🟡 {unklar} unklar (wird beobachtet)  ·  /wache"
     return "🟢 alles ruhig"
 
 
 def setzen(**werte) -> None:
+    if werte.get("status") is not None and werte["status"] not in TAETIG:
+        werte["ruhe"] = werte["status"]          # dahin kehrt der Status nach einem Zug zurück
     STAND.update(werte)
+    auffrischen()
+
+
+def taetig(art: str | None) -> None:
+    """Was die KI gerade tut: „denkt“, „prueft“ (Lese-Werkzeug), „arbeitet“ (verändert etwas);
+    None = fertig, zurück zu bereit/kein Modell. Neu gezeichnet wird nur bei einem Wechsel."""
+    neu = art if art in TAETIG else STAND.get("ruhe") or "bereit"
+    _figur(lambda F: F.status(neu))
+    if STAND.get("status") == neu:
+        return
+    STAND["status"] = neu
     auffrischen()
 
 
@@ -298,22 +367,37 @@ def _farbe() -> str:
         return "#8b7cff"
 
 
+def _lesbar(farbe: str) -> str:
+    """Farbe als Text auf dem Hintergrund des Themes (mindestens 4,5 : 1); Rahmen nehmen die Farbe selbst."""
+    try:
+        import kontrast
+        import ui
+        return kontrast.lesbar(farbe, ui._grund(ui.current_theme()))
+    except Exception:
+        return farbe
+
+
+def _status_text(justify: str | None = None) -> Text:
+    """Zeichen und Wort – beides in der Farbe des Zustands, damit es nicht nur an der Farbe hängt."""
+    zeichen, f, wort = STATUS.get(STAND.get("status"), STATUS["laedt"])
+    t = Text(justify=justify)
+    t.append(f"{zeichen} {wort}", style=_lesbar(f))
+    return t
+
+
 def _person() -> Group:
     farbe = _farbe()
+    schrift = _lesbar(farbe)
     teile = []
     bild = _bild(STAND["bild"], BILD_SPALTEN, BILD_ZEILEN, 0) if STAND.get("bild") else None
     if bild is not None:
         teile += [Align.center(bild), Text("")]
-    name = Text(STAND["name"] or "Nemi", style=f"bold {farbe}", justify="center")
-    zeichen, f, wort = STATUS.get(STAND.get("status"), STATUS["laedt"])
-    status = Text(justify="center")
-    status.append(f"{zeichen} ", style=f)
-    status.append(wort, style="muted")
-    teile += [name, status]
+    name = Text(STAND["name"] or "Nemi", style=f"bold {schrift}", justify="center")
+    teile += [name, _status_text("center")]
     kasten = Panel(Group(*teile), box=ROUNDED, border_style=farbe, padding=(0, 1), width=LINKS_BREITE)
     gruss = []
     if STAND.get("gruss"):
-        gruss = [Padding(Text(f"„{STAND['gruss']}“", style=f"italic {farbe}"), (0, 0, 0, 1))]
+        gruss = [Padding(Text(f"„{STAND['gruss']}“", style=f"italic {schrift}"), (0, 0, 0, 1))]
     return Group(kasten, *gruss)
 
 
@@ -328,10 +412,11 @@ def _kacheln() -> Text:
     """Eine Zeile großer Knöpfe in den Farben des Themes – klickbar im Vollbild."""
     try:
         import ui
+        import kontrast
         p = ui.THEMES[ui.current_theme()]
-        farben = (p["brand_dim"], p["accent_dim"])
+        farben = tuple(kontrast.unter_weiss(p[k]) for k in ("brand_dim", "accent_dim"))   # Weiß darauf ≥ 4,5 : 1
     except Exception:
-        farben = ("#5b54a8", "#2a8f86")
+        farben = ("#5b54a8", "#227369")
     t = Text(justify="left")
     for i, (zeichen, titel, befehl) in enumerate(KACHELN):
         if i:
@@ -345,13 +430,19 @@ def _kacheln() -> Text:
     return t
 
 
-def _karte(titel: str, inhalt) -> Panel:
+def _karte(titel: str, inhalt, rahmen: str = "brand.rand") -> Panel:
     try:
         import ui
         kopf = ui.verlauf_text(titel)                  # Titel im Farbverlauf des Themes
     except Exception:
         kopf = f"[brand]{titel}[/brand]"
-    return Panel(inhalt, title=kopf, title_align="left", box=ROUNDED, border_style="brand.dim", padding=(0, 1))
+    return Panel(inhalt, title=kopf, title_align="left", box=ROUNDED, border_style=rahmen, padding=(0, 1))
+
+
+def _wache_karte(w: str) -> Panel:
+    """Alarme bleiben deutlich: Rahmen und Text in Fehler- bzw. Warnfarbe, Wortlaut unverändert."""
+    stil = "err" if w.startswith("🔴") else "warn" if w.startswith("🟡") else None
+    return _karte("🛡 Wache", Text(w, style=stil or ""), rahmen=stil or "brand.rand")
 
 
 def _karten(breite: int) -> list:
@@ -368,7 +459,7 @@ def _karten(breite: int) -> list:
         paar.append(_karte("📋 Offen", Text("\n".join(STAND["offen"]))))
     w = STAND.get("wache")
     if w:
-        paar.append(_karte("🛡 Wache", Text(w)))
+        paar.append(_wache_karte(w))
     if len(paar) == 2 and breite >= KARTEN_PAAR_AB:
         reihe = Table.grid(expand=True, padding=(0, 1))
         reihe.add_column(ratio=1)
@@ -377,6 +468,8 @@ def _karten(breite: int) -> list:
         karten.append(reihe)
     else:
         karten += paar
+    if STAND.get("erinnerungen"):
+        karten.append(_karte("⏰ Erinnerungen", Text("\n".join(STAND["erinnerungen"]))))
     lieb = STAND.get("liebling")
     if lieb:
         bild = _bild(lieb["pfad"], LIEBLING_SPALTEN, LIEBLING_ZEILEN, 1)
@@ -390,16 +483,26 @@ def _karten(breite: int) -> list:
     return karten
 
 
+def _zeichen() -> Text:
+    """Kleines Zeichen des Themes neben der Version (z. B. ♥ bei tigra), sonst nichts."""
+    try:
+        import ui
+        zeichen = ui.THEMES[ui.current_theme()].get("zeichen")
+    except Exception:
+        zeichen = None
+    return Text(f" {zeichen[0]}", style=_lesbar(zeichen[1])) if zeichen else Text("")
+
+
 def leiste(breite: int):
     """Feste Leiste über dem Chat: kleines Bild, Name und Status, Gruß, Lage (Wache, Offenes), Version."""
     farbe = _farbe()
+    schrift = _lesbar(farbe)
     bild = _bild(STAND["bild"], LEISTE_SPALTEN, LEISTE_ZEILEN, 2) if STAND.get("bild") else None
-    zeichen, f, wort = STATUS.get(STAND.get("status"), STATUS["laedt"])
     oben = Text(no_wrap=True, overflow="ellipsis")
-    oben.append(STAND["name"] or "Nemi", style=f"bold {farbe}")
-    oben.append(f"  {zeichen} ", style=f)
-    oben.append(wort, style="muted")
-    gruss = Text(f"„{STAND['gruss']}“" if STAND.get("gruss") else "", style=f"italic {farbe}",
+    oben.append(STAND["name"] or "Nemi", style=f"bold {schrift}")
+    oben.append("  ")
+    oben.append_text(_status_text())
+    gruss = Text(f"„{STAND['gruss']}“" if STAND.get("gruss") else "", style=f"italic {schrift}",
                  no_wrap=True, overflow="ellipsis")
     lage = []
     if STAND.get("wache"):
@@ -410,6 +513,7 @@ def leiste(breite: int):
     try:
         from version import VERSION
         version = Text(f"NemiCLI {VERSION.split()[0]}", style="brand.dim", no_wrap=True)
+        version.append_text(_zeichen())
     except Exception:
         version = Text("")
     raster = Table.grid(expand=True, padding=(0, 2))

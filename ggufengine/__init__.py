@@ -1,4 +1,4 @@
-"""ggufengine - a memory-safe GGUF inference engine (pure Python + torch)."""
+"""ggufengine – ein speichersicherer GGUF-Motor (reines Python + torch)."""
 from .engine import Engine
 from .chat import Message
 from .sampling import SamplerConfig

@@ -3,6 +3,8 @@
 SDK-Suche: <Programm- oder Daten-Ordner>/Models/TensorRT-RTX/ (der entpackte NVIDIA-Ordner darf
 eine Ebene tiefer liegen). Die DLL-Ordner kommen vor dem Import in den Suchpfad, das Python-Paket
 (tensorrt_rtx) liegt im venv – fehlt es, installiert `laden()` es einmal offline aus dem SDK-Ordner.
+Vorher muss die TensorRT-RTX-DLL des Ordners gültig von NVIDIA signiert sein (Authenticode, lokal geprüft);
+sonst wird weder etwas geladen noch installiert (Config `trt_signatur` = false schaltet die Prüfung ab).
 
 Gebaute Netze liegen unter Models/TensorRT-RTX/engines/<schlüssel>.engine; der Schlüssel enthält
 SDK-Version, Grafikkarte und alles, was das Netz bestimmt – ein Treiber- oder SDK-Wechsel baut neu.
@@ -29,6 +31,7 @@ except Exception:                                    # ohne core/ im Pfad (Tests
 
 ORDNER_NAME = "TensorRT-RTX"
 _DLL = "tensorrt_rtx_1_*.dll"
+SIGNIERER = "nvidia corporation"
 
 _lock = threading.Lock()
 _zustand: dict = {}                                  # trt, sdk, grund, dll_handles
@@ -76,6 +79,33 @@ def rad(sdk: Path | None = None) -> Path | None:
     return treffer[-1] if treffer else None
 
 
+def _signatur_pruefen() -> bool:
+    try:
+        import config
+        return bool(config.load().get("trt_signatur", True))
+    except Exception:
+        return True
+
+
+def signatur_fehler(sdk: Path) -> str | None:
+    """None, wenn jede TensorRT-RTX-DLL im SDK gültig von NVIDIA signiert ist; sonst der Grund."""
+    if os.name != "nt" or not _signatur_pruefen():
+        return None
+    try:
+        from wache import herkunft
+    except Exception as exc:
+        return f"Signaturprüfung nicht verfügbar ({exc})"
+    dlls = sorted((sdk / "bin").glob(_DLL))
+    if not dlls:
+        return "keine TensorRT-RTX-DLL im SDK-Ordner"
+    for dll in dlls:
+        s = herkunft.signatur(str(dll))
+        if not (s.get("gueltig") and SIGNIERER in str(s.get("signierer") or "").lower()):
+            return (f"{dll.name} ist nicht gültig von NVIDIA signiert ({s.get('status')}"
+                    f"{', ' + s['signierer'] if s.get('signierer') else ''}) – nichts geladen oder installiert")
+    return None
+
+
 def laden():
     """Das Modul tensorrt_rtx – oder None (dann sagt `grund()` warum). Einmal je Prozess."""
     with _lock:
@@ -86,6 +116,10 @@ def laden():
         _zustand["sdk"] = sdk
         if sdk is None:
             _zustand["grund"] = f"kein TensorRT-RTX unter Models/{ORDNER_NAME}/"
+            return None
+        if (fehler := signatur_fehler(sdk)) is not None:   # vor Suchpfad, Import und Installation
+            _zustand["grund"] = fehler
+            _DBG.ereignis(f"TensorRT-RTX abgelehnt: {fehler}")
             return None
         bin_ = str(sdk / "bin")
         # Hinten anhängen, nicht vorne: sonst fänden alle Kindprozesse (git, python, PowerShell …) zuerst
