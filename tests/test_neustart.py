@@ -28,9 +28,9 @@ class NeustartTests(unittest.TestCase):
     tearDown = setUp
 
     def test_befehl_erkannt(self):
-        for t in ("/restart", "  /RESTART ", "/neustart"):
+        for t in ("/restart", "  /RESTART ", "/neustart", "/restart jetzt"):
             self.assertTrue(neustart.ist_befehl(t), t)
-        for t in ("/restart jetzt", "restart", "/reset", ""):
+        for t in ("restart", "/reset", "/restarten", "bitte /restart", ""):
             self.assertFalse(neustart.ist_befehl(t), t)
 
     def test_ki_darf_ihn_nicht_oeffnen(self):
@@ -55,6 +55,7 @@ class NeustartTests(unittest.TestCase):
                 neustart.beenden()
         argv = popen.call_args.args[0]
         self.assertEqual(["--warte-pid", str(os.getpid())], argv[-2:])
+        self.assertEqual(os.getcwd(), popen.call_args.kwargs["cwd"])          # Arbeitsordner bleibt
 
     def test_debugbericht_endet_sauber(self):
         import debugbericht

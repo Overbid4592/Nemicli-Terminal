@@ -54,18 +54,28 @@ class KatalogTests(unittest.TestCase):
     def test_gleiche_pruefsummen_wie_die_motoren(self):
         for teil, datei in (("musik", "engines/musik/gewichte.py"), ("portraet", "engines/liveportrait/gewichte.py")):
             motor = _sha_liste(ROOT / datei)
-            for d in K.teil(teil).dateien:
+            dateien = K.teil(teil).dateien
+            self.assertTrue(motor and dateien, teil)                          # nicht leer durchgewunken
+            for d in dateien:
                 self.assertEqual(motor.get(d.name), d.sha256, d.name)
 
     def test_ziele_wie_die_motoren_suchen(self):
-        video = K.teil("video")
-        self.assertEqual({"", "vae", "text_encoders", "tokenizer"}, {d.unter for d in video.dateien})
-        self.assertEqual("tokenizer.json", next(d.name for d in video.dateien if d.unter == "tokenizer"))
-        self.assertEqual(("Models", "reranker"), K.teil("reranker").ziel().parts[-3:-1])
+        self.assertNotIn("video", [t.id for t in K.KATALOG])                # kein Video-Modell im Angebot
+        self.assertFalse(any("wan" in d.repo.lower() for t in K.KATALOG for d in t.dateien))
+        self.assertEqual(("KI-Gedaechtnis", "Sortiermodell"), K.teil("reranker").ziel().parts[-3:-1])
         self.assertEqual(1, len(K.teil("reranker").dateien))                  # Ordner mit genau einer .gguf
         sehen = [d.name for d in K.teil("sehen").dateien]
         self.assertEqual(1, sum("mmproj" in n for n in sehen))
-        self.assertEqual("Vision", K.teil("stimme").ziel().parent.name)
+        self.assertEqual("Stimmmodell", K.teil("stimme").ziel().parent.name)
+        self.assertEqual("Sehmodell", K.teil("sehen").ziel().parent.name)
+
+    def test_gedaechtnis_ist_embeddinggemma2(self):
+        t = K.teil("gedaechtnis")
+        self.assertEqual("EmbeddingGemma2Q8_0", t.ziel().name)
+        self.assertEqual(("KI-Gedaechtnis", "Suchmodell"), t.ziel().parts[-3:-1])
+        self.assertEqual(["embeddinggemma-2-Q8_0.gguf", "mmproj-BF16.gguf"], [d.name for d in t.dateien])
+        self.assertTrue(all(d.repo == "unsloth/embeddinggemma-2-GGUF" for d in t.dateien))
+        self.assertFalse(any("qwen" in d.name.lower() for d in t.dateien))
 
     def test_eingerichtet_erkannt(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -143,13 +153,13 @@ class AblaufTests(unittest.TestCase):
         self.assertEqual(1, sum(m[0] == "frage" for m in meldungen))
 
     def test_ein_teil_laden(self):
-        geladen, meldungen = _ablauf(["ja", "video", "ja", "__fertig__"])
-        video = K.teil("video")
-        self.assertEqual([(d.repo, d.pfad, d.sha256, K.ziel_ordner(video, d), d.revision) for d in video.dateien],
+        geladen, meldungen = _ablauf(["ja", "musik", "ja", "__fertig__"])
+        musik = K.teil("musik")
+        self.assertEqual([(d.repo, d.pfad, d.sha256, K.ziel_ordner(musik, d), d.revision) for d in musik.dateien],
                          geladen)
         texte = " ".join(str(m[1]) for m in meldungen)
-        self.assertIn("Lizenz: Apache 2.0", texte)                             # Lizenz vor dem Laden
-        self.assertIn(("debug", "Modell video geladen"), meldungen)
+        self.assertIn("Lizenz: MIT", texte)                                    # Lizenz vor dem Laden
+        self.assertIn(("debug", "Modell musik geladen"), meldungen)
         liste = next(m[2] for m in meldungen if m[0] == "frage" and m[1].startswith("Modelle für die Motoren"))
         self.assertEqual([t.id for t in K.KATALOG] + ["__fertig__"], liste)
 

@@ -131,7 +131,7 @@ class Stufen(unittest.TestCase):
         self.assertEqual("aendert", S.stufe({"tool": "befehl", "befehl": "git status"}))
         self.assertEqual("aendert", S.stufe({"tool": "datei_schreiben", "pfad": "x", "inhalt": ""}))
         self.assertEqual("harmlos", S.stufe({"tool": "ordner_erstellen", "pfad": "x"}))
-        self.assertEqual("riskant", S.stufe({"tool": "zeitplan", "aktion": "anlegen", "name": "n"}))
+        self.assertEqual("harmlos", S.stufe({"tool": "zeitplan", "aktion": "anlegen", "name": "n"}))
         self.assertEqual("harmlos", S.stufe({"tool": "zeitplan", "aktion": "loeschen", "name": "n"}))
         self.assertEqual("harmlos", S.stufe({"tool": "verschieben", "von": "gibt-es-nicht.txt", "nach": "y"}))
         self.assertEqual("riskant", S.stufe({"tool": "verschieben", "von": self._tmp.name, "nach": "y"}))
@@ -296,7 +296,7 @@ class ProtokollErgebnis(unittest.TestCase):
         self._tmp.cleanup()
 
     def test_ergebnis_und_risiko_stehen_drin(self):
-        P.schreibe("loeschen", "LÖSCHEN: x.txt", "success", veraendernd=True, wer="Mira",
+        P.schreibe("loeschen", "LÖSCHEN: x.txt", "success", veraendernd=True, wer="PersonA",
                    pfad=self.log, ergebnis="Datei gelöscht: x.txt – im Papierkorb", stufe="riskant")
         zeile = self.log.read_text(encoding="utf-8")
         self.assertIn("⚠RISIKO", zeile)

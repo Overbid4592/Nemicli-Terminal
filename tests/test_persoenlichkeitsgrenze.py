@@ -27,8 +27,7 @@ class Grenze(unittest.TestCase):
         self.pers = self.daten / "Persoenlichkeiten"
         self.profile = self.daten / "Profile"
         programm = Path(tmp.name).resolve() / "Programm"
-        for o in (self.pers / "Alpha", self.pers / "Beta", self.profile / "Alpha" / "Chats",
-                  self.profile / "Beta" / "Chats", self.daten / "Bilder", programm):
+        for o in (self.pers / "Alpha", self.pers / "Beta", self.daten / "Bilder", programm):
             o.mkdir(parents=True)
         for p in (mock.patch.object(paths, "DATEN", self.daten),
                   mock.patch.object(paths, "INSTALL", programm),
@@ -41,6 +40,8 @@ class Grenze(unittest.TestCase):
         self.addCleanup(actions._PERS_CACHE.update, schluessel=None, wert=None)
         PS.create("Alpha", "eins")
         PS.create("Beta", "zwei")
+        for o in (self.profile / "Alpha" / "Chats", self.profile / "Beta" / "Chats"):   # erst nach dem Anlegen:
+            o.mkdir(parents=True)                       # ein schon liegender Profil-Ordner gäbe „Alpha 2“
         for name in ("alpha.sprueche.md", "beta.sprueche.md", "Alpha_neutral.png", "Beta_neutral.png",
                      "LIES-MICH.txt"):
             (self.pers / name).write_text("x", encoding="utf-8")
@@ -50,7 +51,7 @@ class Grenze(unittest.TestCase):
     def test_eigener_bereich_frei(self):
         for p in (self.pers / "alpha.md", self.pers / "alpha.sprueche.md", self.pers / "Alpha_neutral.png",
                   self.pers / "Alpha" / "neutral.png", self.profile / "Alpha" / "Chats" / "002.json",
-                  self.pers / "LIES-MICH.txt", self.daten / "Bilder" / "a.png"):
+                  self.pers / "LIES-MICH.txt", self.daten / "Zeitplan" / "a.json"):
             self.assertIsNone(actions._read_guard(str(p)), p)
             self.assertIsNone(actions._guard(str(p)), p)
 

@@ -10,9 +10,11 @@ for _d in ("", "core", "engines", "tools"):
     if str(ROOT / _d) not in sys.path:
         sys.path.insert(0, str(ROOT / _d))
 
-try:
-    from trtmotor import bild as TB, video as TV
-except Exception:                                   # noqa: BLE001 – ohne torch kein trtmotor
+import importlib.util                              # noqa: E402
+
+if importlib.util.find_spec("torch") is not None:  # ohne torch kein trtmotor; sonst Importfehler sichtbar
+    from trtmotor import bild as TB, video as TV   # noqa: E402
+else:
     TB = TV = None
 
 
@@ -55,9 +57,9 @@ class HostLesenNurImEigenenFaden(unittest.TestCase):
         import time
         try:
             import torch
-            from ggufengine.models.common import _host_lesen_finden
-        except Exception:                                   # noqa: BLE001
+        except ImportError:
             self.skipTest("torch fehlt")
+        from ggufengine.models.common import _host_lesen_finden
         if not torch.cuda.is_available():
             self.skipTest("keine Grafikkarte")
         x = torch.arange(4, device="cuda")

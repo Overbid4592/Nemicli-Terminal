@@ -26,7 +26,7 @@ class StatsTests(unittest.TestCase):
         stats.start_session("m1")
         stats.record_command("/model")
         stats.record_command("/model")
-        stats.record_turn("m1", "Mira", "auto", 100, 20, 0.0)
+        stats.record_turn("m1", "PersonA", "auto", 100, 20, 0.0)
         stats.record_turn("m2", "NemiCLI", "normal", 200, 50, 0.01)
         stats.record_tools([{"tool": "datei_lesen", "status": "success"},
                             {"tool": "befehl", "status": "failed"},
@@ -47,7 +47,7 @@ class StatsTests(unittest.TestCase):
         self.assertEqual(tools["befehl"], (1, 0, 1))
         models = {name: turns for name, turns, _, _ in r["top_models"]}
         self.assertEqual(models, {"m1": 1, "m2": 1})
-        self.assertEqual(dict(r["top_personas"]), {"Mira": 1, "NemiCLI": 1})
+        self.assertEqual(dict(r["top_personas"]), {"PersonA": 1, "NemiCLI": 1})
         self.assertEqual(r["modes"], {"auto": 1, "normal": 1})
 
     def test_no_message_content_stored(self):

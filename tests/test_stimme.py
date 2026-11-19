@@ -153,7 +153,7 @@ class Modus(unittest.TestCase):
         self.assertEqual(self._modus({"voice_modus": "an"}), "an")
         self.assertEqual(self._modus({"voice_modus": "AUS"}), "aus")
         self.assertEqual(self._modus({"voice_modus": True}), "an")           # alter Sprachmodus
-        self.assertEqual(self._modus({"voice_modus": False}), "aus")         # alt: der Nutzer hatte /voice aus gesagt
+        self.assertEqual(self._modus({"voice_modus": False}), "aus")         # alter Wert für /voice aus
         self.assertEqual(self._modus({"vorlesen_auto": True}), "an")         # alter Schalter der KI
         self.assertEqual(self._modus({"voice_modus": "knopf", "vorlesen_auto": True}), "knopf")
 
@@ -250,7 +250,7 @@ class Werkzeuge(unittest.TestCase):
             self.assertIn("Kugel spricht: aus", text)
             actions._stimme_schalter({"vorlesen_auto": False})
             self.assertEqual(gespeichert["voice_modus"], "knopf")
-            gespeichert["voice_modus"] = "aus"                      # der Nutzer hat abgeschaltet
+            gespeichert["voice_modus"] = "aus"                      # von Hand abgeschaltet
             text = actions._stimme_schalter({"vorlesen_auto": True})
             self.assertEqual(gespeichert["voice_modus"], "aus")     # die KI hebt das nicht auf
             self.assertIn("/voice aus", text)

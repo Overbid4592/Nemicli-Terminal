@@ -204,7 +204,7 @@ if __name__ == "__main__":
 
 
 class OllamaCloudTabelle(unittest.TestCase):
-    """Echte Kontextfenster und Denkstufen der Ollama-Cloud-Modelle."""
+    """Echte Kontextfenster und Denkstufen der Ollama-Cloud-Modelle (Stand 19.09.2026)."""
 
     def test_kontext_aus_tabelle(self):
         import sys

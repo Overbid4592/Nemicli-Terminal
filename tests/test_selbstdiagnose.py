@@ -80,7 +80,7 @@ class Systemcheck(unittest.TestCase):
         import syscheck
         self.assertFalse(any("lokales Modell" in t for t in syscheck.todo(self._rep(gguf=2))))
         self.assertFalse(any("lokales Modell" in t for t in syscheck.todo(self._rep(gguf=0, ollama=True))))
-        self.assertTrue(any("ModelGGUF" in t for t in syscheck.todo(self._rep(gguf=0))))
+        self.assertTrue(any("KI-Chat/Chatmodell" in t for t in syscheck.todo(self._rep(gguf=0))))
 
 
 if __name__ == "__main__":

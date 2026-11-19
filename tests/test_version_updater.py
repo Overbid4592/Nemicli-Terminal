@@ -46,7 +46,7 @@ class VersionTests(unittest.TestCase):
                     mock.patch.object(VER, "_FROZEN", False), \
                     mock.patch.object(VER, "_INSTALL", Path(repo)), \
                     mock.patch.object(VER, "_git", return_value="412"):
-                self.assertEqual(VER.build_nummer(), "5.2.412")
+                self.assertEqual(VER.build_nummer(), f"5.2.{VER.BUILD_START + 412}")    # zählt ab der Startzahl
         with tempfile.TemporaryDirectory() as d:          # exe: Nummer aus build.txt
             (Path(d) / "build.txt").write_text("5.2.99\n", encoding="utf-8")
             with mock.patch.object(VER, "VERSION", "5.2 Alpha"), \
@@ -80,15 +80,19 @@ class UpdaterTests(unittest.TestCase):
         _git(self.work, "branch", "-q", "--set-upstream-to=origin/master", "master")
         _git(t, "clone", "-q", str(t / "origin.git"), "other")
         self.other = t / "other"
-        # Der Updater sieht auf INSTALL statt ROOT: er zieht das
-        # PROGRAMM per git nach, nicht den Daten-Ordner des Nutzers.
+        # Der Updater sieht auf INSTALL, nicht auf ROOT: er zieht das Programm per git nach,
+        # nicht den Daten-Ordner.
         self._old_root, self._old_frozen = updater.INSTALL, updater.FROZEN
         updater.ROOT = updater.INSTALL = self.work
         updater.FROZEN = False
+        # Das Test-Remote ist ein lokaler Ordner; /update selbst holt nur über https:// oder SSH
+        self._old_sicher = updater.remote_sicher
+        updater.remote_sicher = lambda url: bool(url)
 
     def tearDown(self):
         updater.ROOT = updater.INSTALL = self._old_root
         updater.FROZEN = self._old_frozen
+        updater.remote_sicher = self._old_sicher
         self._tmp.cleanup()
 
     def _push_update(self, touch_requirements: bool):
@@ -97,6 +101,14 @@ class UpdaterTests(unittest.TestCase):
             (self.other / "requirements.txt").write_text("rich\nhttpx\n")
         _git(self.other, "add", "-A"); _git(self.other, "commit", "-qm", "upd")
         _git(self.other, "push", "-q", "origin", "master")
+
+    def test_lokales_remote_wird_abgelehnt(self):
+        self._push_update(touch_requirements=False)
+        updater.remote_sicher = self._old_sicher
+        r = updater.run(lambda m: None)
+        self.assertFalse(r["ok"])
+        self.assertIn("https://", r["output"])
+        self.assertEqual((self.work / "a.txt").read_text().strip(), "1")       # nichts geholt
 
     def test_ready_and_up_to_date(self):
         self.assertIsNone(updater.why_not())

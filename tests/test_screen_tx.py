@@ -25,6 +25,21 @@ def screen_text(app) -> str:
     return "\n".join("".join(seg.text for seg in strip) for strip in strips)
 
 
+_FREMDES_TERMINAL = None
+
+
+def setUpModule():
+    """Diese Tests prüfen die vereinfachte Emoji-Form (fremdes Terminal); das eigene Fenster: test_emoji_ganz."""
+    global _FREMDES_TERMINAL
+    from unittest import mock
+    _FREMDES_TERMINAL = mock.patch.dict("os.environ", {"NEMICLI_FENSTER": ""})
+    _FREMDES_TERMINAL.start()
+
+
+def tearDownModule():
+    _FREMDES_TERMINAL.stop()
+
+
 class _Ctx:
     backend = None
     model = "ollama_cloud:x"
@@ -81,7 +96,7 @@ class AppTests(unittest.TestCase):
             try:
                 self.assertIs(ui.TUI, sc)
                 ui.banner()                                   # gepuffert bis zum Start
-                ui.console.print(ui.assistant_panel("Hallo **Alex** ❤️"))
+                ui.console.print(ui.assistant_panel("Hallo **Nutzer** ❤️"))
                 ui.info("Info-Zeile")
                 seen = []
 
@@ -108,7 +123,7 @@ class AppTests(unittest.TestCase):
                     self.assertEqual(len(list(app.query(".block"))), 4)
                     txt = screen_text(app)
                     self.assertIn(ui.APP_SUBTITLE, txt)
-                    self.assertIn("Hallo Alex ❤", txt)          # ❤️ -> ❤
+                    self.assertIn("Hallo Nutzer ❤", txt)          # ❤️ -> ❤
                     # Kein fester Name: die Kopfzeile zeigt, wer gerade eingestellt ist
                     self.assertIn(f"╭─ {ui.persona_name()} · ● bereit", txt)
                     self.assertEqual(ui.console.width, 100)
@@ -274,7 +289,11 @@ class InboxTests(unittest.TestCase):
                         self.assertTrue(K.nemicli_laeuft())
                         K.INBOX_DATEI.write_text("Schau dir das an: C:/x.png", encoding="utf-8")
                         await pilot.pause(1.5)
-                        self.assertEqual(seen, ["Schau dir das an: C:/x.png"])
+                        # nicht in der Form des Kontextmenüs: kommt gerahmt an (kontextmenue.inbox_auftrag)
+                        self.assertEqual(1, len(seen))
+                        self.assertIn("Herkunft ungeprüft", seen[0])
+                        self.assertIn("Schau dir das an: C:/x.png", seen[0])
+                        K.fremdauftrag_zeit = 0.0           # Sperre der Wache-Urteile nicht in andere Tests tragen
                         self.assertFalse(K.INBOX_DATEI.exists())
                         app.exit()
                     self.assertFalse(K.ALIVE_DATEI.exists())              # beim Ende weg

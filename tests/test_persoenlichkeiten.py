@@ -129,14 +129,14 @@ class PersoenlichkeitenTests(unittest.TestCase):
 
     def test_placeholders_rendered_fresh(self):
         from datetime import datetime
-        (PS.DIR / "mira.md").write_text(
-            "# Mira\n> c\nZeit {{current_time}} Datum {{date}} User {{user}} "
+        (PS.DIR / "persona.md").write_text(
+            "# PersonA\n> c\nZeit {{current_time}} Datum {{date}} User {{user}} "
             "Ich {{char}} {{unbekannt}}\n",
             encoding="utf-8")
-        p = PS.list_all()["mira"]
-        config.update(nutzername="Alex")
+        p = PS.list_all()["persona"]
+        config.update(nutzername="test_user")
         out = PS.render_text(p, datetime(2026, 9, 12, 4, 5))
-        self.assertEqual(out.strip(), "Zeit 04:05 Datum 12.09.2026 User Alex Ich Mira {{unbekannt}}")
+        self.assertEqual(out.strip(), "Zeit 04:05 Datum 12.09.2026 User test_user Ich PersonA {{unbekannt}}")
         self.assertIn("{{current_time}}", p.text)          # Rohtext bleibt roh
 
     def test_edit_operations(self):

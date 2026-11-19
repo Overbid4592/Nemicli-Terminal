@@ -614,7 +614,7 @@ class StartbildVonSelbst(unittest.TestCase):
         self.assertEqual(videomotoren.EINSTELLUNGEN["startbild"], ("auto", ("auto", "aus")))
         quelle = main_quelle.text()
         raum = {"re": re}
-        exec(quelle[quelle.index("def _video_opts("):quelle.index("async def _funke_vorgaben_waehlen")], raum)
+        exec(quelle[quelle.index("def _video_opts("):quelle.index("async def ersatzbank_waehlen(")], raum)
         o = raum["_video_opts"]('a woman dancing --figur --sekunden 15 --start "C:/a b.png"')
         self.assertEqual(o, {"figur": True, "sekunden": 15.0, "start": "C:/a b.png", "prompt": "a woman dancing"})
         self.assertNotIn("figur", raum["_video_opts"]("a --figurine in a shop"))

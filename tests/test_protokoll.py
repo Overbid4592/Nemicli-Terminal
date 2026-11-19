@@ -32,15 +32,15 @@ class Schreiben(unittest.TestCase):
 
     def test_eine_zeile_pro_aktion(self):
         P.schreibe("befehl", "Befehl: git status", "success", veraendernd=True,
-                   wer="Mira", pfad=self.log)
+                   wer="PersonA", pfad=self.log)
         P.schreibe("datei_lesen", "Datei lesen: x.py", "success", veraendernd=False,
-                   wer="Mira", pfad=self.log)
+                   wer="PersonA", pfad=self.log)
         zeilen = self.log.read_text(encoding="utf-8").splitlines()
         self.assertEqual(len(zeilen), 2)
         self.assertIn("ÄNDERT", zeilen[0])
         self.assertIn("befehl", zeilen[0])
         self.assertIn("ausgeführt", zeilen[0])
-        self.assertIn("Mira", zeilen[0])
+        self.assertIn("PersonA", zeilen[0])
         self.assertIn("git status", zeilen[0])
         self.assertIn("liest", zeilen[1])
 

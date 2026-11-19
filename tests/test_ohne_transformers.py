@@ -76,7 +76,7 @@ class AufraeumenTests(unittest.TestCase):
 
     def test_altlasten_ohne_abnehmer(self):
         liste = {e.name: e for e in V.pruefen()}
-        self.assertEqual(sorted(liste), ["accelerate", "diffusers", "transformers"])   # opencv braucht rembg
+        self.assertEqual(sorted(liste), ["accelerate", "diffusers"])   # opencv braucht rembg; transformers: Vorprüfer
         self.assertTrue(all(e.grund == "ueberfluessig" and e.entfernen for e in liste.values()))
         self.assertFalse(liste["diffusers"].noetig)
 
@@ -106,11 +106,16 @@ class AufraeumenTests(unittest.TestCase):
         self.assertNotIn("pyside6-addons", {e.name for e in V.pruefen()})
 
     def test_mit_luecke_ist_entfernen_noetig(self):
-        funde = {"transformers": [L.Luecke(id="G", cve="CVE-2026-4372", schwere="hoch", behoben="5.3.0")]}
-        e = {e.name: e for e in V.pruefen(luecken_holen=lambda inst: funde)}["transformers"]
+        funde = {"diffusers": [L.Luecke(id="G", cve="CVE-2026-4372", schwere="hoch", behoben="0.41.0")]}
+        e = {e.name: e for e in V.pruefen(luecken_holen=lambda inst: funde)}["diffusers"]
         self.assertEqual(e.grund, "ueberfluessig")
         self.assertTrue(e.noetig)
         self.assertIn("Lücken", e.hinweis)
+
+    def test_vorpruefer_behaelt_transformers(self):
+        with mock.patch.object(wizard, "requirements_ohne_torch", lambda: ["rich>=13", "transformers>=5.23.0"]):
+            namen = {e.name: e.grund for e in V.pruefen()}
+        self.assertEqual(namen.get("transformers"), "passt nicht")       # 4.57 → wird aktualisiert, nicht entfernt
 
     def test_entwickler_behalten_transformers(self):
         with mock.patch.object(V, "_dev_wuensche", lambda: ["transformers>=5.10"]):

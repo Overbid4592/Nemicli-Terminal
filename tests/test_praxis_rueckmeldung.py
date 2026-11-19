@@ -29,16 +29,16 @@ class TodoPflicht(unittest.TestCase):
         return plan.zurueckweisen([{"tool": t} for t in tools])
 
     def test_neuer_versuch_nach_fehlschlag_ist_frei(self):
-        laufen, gesperrt = self._zug("portraet_bewegen")
-        self.assertEqual(([{"tool": "portraet_bewegen"}], []), (laufen, gesperrt))
-        plan.abhaken_nach({"tool": "portraet_bewegen"}, False)
-        self.assertEqual([], self._zug("portraet_bewegen")[1])        # ein neuer Versuch läuft
-        self.assertEqual(1, len(self._zug("portraet_bewegen")[1]))    # ein zweiter ohne neuen Fehlschlag nicht
+        laufen, gesperrt = self._zug("ordner_erstellen")
+        self.assertEqual(([{"tool": "ordner_erstellen"}], []), (laufen, gesperrt))
+        plan.abhaken_nach({"tool": "ordner_erstellen"}, False)
+        self.assertEqual([], self._zug("ordner_erstellen")[1])        # ein neuer Versuch läuft
+        self.assertEqual(1, len(self._zug("ordner_erstellen")[1]))    # ein zweiter ohne neuen Fehlschlag nicht
 
     def test_geklappte_aktion_gibt_keinen_freischein(self):
-        self._zug("bild_malen")
-        plan.abhaken_nach({"tool": "bild_malen"}, True)
-        self.assertEqual(1, len(self._zug("bild_malen")[1]))
+        self._zug("befehl")
+        plan.abhaken_nach({"tool": "befehl"}, True)
+        self.assertEqual(1, len(self._zug("befehl")[1]))
 
     def test_urteile_sind_frei(self):
         for _ in range(5):
@@ -54,11 +54,11 @@ class TodoPflicht(unittest.TestCase):
         self.assertIn("neuer Versuch", text)
 
     def test_neue_nachricht_setzt_zurueck(self):
-        self._zug("bild_malen")
-        plan.abhaken_nach({"tool": "portraet_bewegen"}, False)
+        self._zug("befehl")
+        plan.abhaken_nach({"tool": "ordner_erstellen"}, False)
         plan.runde_neu()
         self.assertEqual([], self._zug("datei_schreiben")[1])
-        self.assertEqual(1, len(self._zug("portraet_bewegen")[1]))     # alter Fehlschlag gilt nicht mehr
+        self.assertEqual(1, len(self._zug("ordner_erstellen")[1]))     # alter Fehlschlag gilt nicht mehr
 
 
 class SehenOllamaCloud(unittest.TestCase):

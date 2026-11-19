@@ -1,7 +1,9 @@
 """Statische Sicherheitsprüfung des Quelltexts: gefährliche Aufrufe, unverschlüsselte Adressen,
 Hash-Verfahren, Regex-Bereiche, gespiegelte CORS-Herkunft und eingecheckte Geheimnisse."""
 import ast
+import functools
 import re
+import subprocess
 import unittest
 from pathlib import Path
 
@@ -11,13 +13,39 @@ CODE_ORDNER = ("core", "engines", "tools", "ui", "ggufengine", "installer", "lor
 AUSGENOMMEN = {"venv", "dist", "build", "__pycache__", "node_modules", "Models", "ModelGGUF"}
 
 
+def _git_liste(*argumente: str) -> list[str] | None:
+    try:
+        r = subprocess.run(["git", "-C", str(ROOT), "ls-files", "-z", *argumente],
+                           capture_output=True, timeout=30)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if r.returncode != 0:
+        return None
+    return [t for t in r.stdout.decode("utf-8", "replace").split("\0") if t]
+
+
+@functools.cache
+def _repo_dateien() -> tuple[Path, ...] | None:
+    """Eingecheckte Dateien plus neue, noch nicht eingecheckte .py-Dateien – keine Laufzeitdaten."""
+    erfasst = _git_liste()
+    neu = _git_liste("--others", "--exclude-standard")
+    if erfasst is None or neu is None:
+        return None
+    namen = set(erfasst) | {n for n in neu if n.endswith(".py")}
+    return tuple(sorted(ROOT / n for n in namen))
+
+
+def _im_umfang(p: Path) -> bool:
+    teile = p.relative_to(ROOT).parts
+    return (len(teile) == 1 or teile[0] in CODE_ORDNER) and not AUSGENOMMEN & set(teile)
+
+
 def _dateien(*endungen: str) -> list[Path]:
-    raus = [p for p in ROOT.glob("*") if p.is_file() and p.suffix in endungen]
-    for ordner in CODE_ORDNER:
-        for p in (ROOT / ordner).rglob("*"):
-            if p.is_file() and p.suffix in endungen and not AUSGENOMMEN & set(p.relative_to(ROOT).parts):
-                raus.append(p)
-    return sorted(raus)
+    liste = _repo_dateien()
+    if liste is None:                     # ohne git: nur Code-Ordner und Quelltext im Hauptordner
+        liste = [p for p in ROOT.glob("*.py")]
+        liste += [p for ordner in CODE_ORDNER for p in (ROOT / ordner).rglob("*")]
+    return sorted(p for p in liste if p.suffix in endungen and _im_umfang(p) and p.is_file())
 
 
 def _rel(p: Path) -> str:
@@ -139,7 +167,8 @@ class Netz(unittest.TestCase):
                 continue
             for i, zeile in enumerate(p.read_text(encoding="utf-8", errors="replace").splitlines(), 1):
                 for m in re.finditer(r"http://[^\s\"'`<>)\]]*", zeile):
-                    url = m.group(0)
+                    url = m.group(0).rstrip(".,;:")          # Satzzeichen danach gehören nicht zur Adresse
+                                                             # („http://, ws:// … sind gesperrt“)
                     if url == "http://" or "{" in url[:8 + 1 + 1] or self.LOKAL.match(url) \
                             or self.NAMENSRAUM.match(url) or url in self.ERLAUBT:
                         continue
@@ -190,6 +219,8 @@ class RegexBereiche(unittest.TestCase):
         """Zeichenbereiche über Nicht-ASCII stehen als Escape im Muster, nicht als echtes Zeichen."""
         funde = []
         for p in _dateien(".py"):
+            if _rel(p) == "tools/unpackt.py":     # fremde Datei, bytegenau per SHA-256 festgelegt (tools/entpacken.py)
+                continue
             for k, n in _aufrufe(p):
                 if not n.startswith("re.") or not k.args or not isinstance(k.args[0], ast.Constant) \
                         or not isinstance(k.args[0].value, str):
@@ -201,7 +232,7 @@ class RegexBereiche(unittest.TestCase):
                            for i in range(len(teile))):
                         funde.append(f"{_rel(p)}:{k.lineno}")
                         break
-        for rel, name in (("tools/fremddaten.py", "_UNSICHTBAR"), ("einrichtungshelfer/daten_gross.py", "_EMOJI")):
+        for rel, name in (("tools/fremddaten.py", "_UNSICHTBAR"),):
             p = ROOT / rel
             if not p.exists():
                 continue

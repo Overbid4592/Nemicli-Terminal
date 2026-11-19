@@ -181,7 +181,9 @@ class WaechterNeu(MitDatenordner):
 
     def test_zweit_lesen(self):
         self.assertIsNone(W.zweit_lesen("OK"))
-        self.assertIsNone(W.zweit_lesen("Sieht gut aus."))
+        self.assertIsNone(W.zweit_lesen("Ich habe den Skill gelesen.\n**OK**"))
+        self.assertIn("kein eindeutiges Urteil", W.zweit_lesen("Sieht gut aus."))   # Unklares ist kein OK
+        self.assertIn("kein eindeutiges Urteil", W.zweit_lesen(None))
         self.assertEqual("Zweitmeinung: zu speziell", W.zweit_lesen("- NEIN: zu speziell\nweil …"))
         self.assertEqual("Zweitmeinung: passt nicht", W.zweit_lesen("Nein"))
 

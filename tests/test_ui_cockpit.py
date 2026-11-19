@@ -39,7 +39,7 @@ class Palette(unittest.TestCase):
             "/voice": [("", "Status", None), ("an", "An – jede Antwort hören", None),
                        ("knopf", "Knopf – nur auf Anfrage", None)],
             "/kugel": [("malen {}", "Gesicht malen", "Wie?")]}.get(c, []),
-            modelle={"anthropic": "Anthropic"}, personas=[("juna", "Juna")])
+            modelle={"anthropic": "Anthropic"}, personas=[("personb", "PersonB")])
 
     def test_tippfehler_und_umlaute(self):
         self.assertEqual(palette.suchen(self.liste, "musick")[0].zeile, "/musik")
@@ -55,7 +55,7 @@ class Palette(unittest.TestCase):
         self.assertTrue(malen.braucht_eingabe)
         self.assertEqual(malen.befehl, "/kugel malen ")
         self.assertIn("/model anthropic", [e.zeile for e in self.liste])
-        self.assertIn("/persönlichkeiten juna", [e.zeile for e in self.liste])
+        self.assertIn("/persönlichkeiten personb", [e.zeile for e in self.liste])
         self.assertEqual(palette.suchen(self.liste, "")[0].zeile, "/model")      # ohne Frage: das Wichtigste
 
 

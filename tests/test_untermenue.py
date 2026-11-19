@@ -49,8 +49,8 @@ class UntermenueTests(unittest.TestCase):
             return antwort
 
         ns = _funktionen({"Ctx": object, "ask_confirm": ask_confirm, "ask_text": ask_text,
-                          "modes": NS(current=lambda: "normal", MODES=[("chat", "💬", "Chatten"),
-                                                                         ("normal", "⚙", "Normal")]),
+                          "modes": NS(current=lambda: "normal", bild_stufe=lambda: "frei",
+                                      MODES=[("chat", "💬", "Chatten"), ("normal", "⚙", "Normal")]),
                           "ui": NS(current_theme=lambda: "cyan", THEMES={"cyan": {"label": "Cyan"}, "amber": {}, "wald": {"label": "Grün"}},
                                    EINGEBAUT=frozenset({"cyan", "amber"})),
                           "M": NS(strength_menu=lambda ref: {"schnell": "flott", "stark": "gründlich"})})
@@ -82,6 +82,9 @@ class UntermenueTests(unittest.TestCase):
         zusatz, g = self.lauf("/modus", "0")
         self.assertEqual(zusatz, "chat")
         self.assertTrue(g["optionen"][1][1].endswith("✔️"))
+        texte = " | ".join(o[1] for o in g["optionen"])                     # Bereiche mit eigener Stufe
+        self.assertIn("Coding frei", texte)
+        self.assertIn("Bilder fragen", texte)
         self.assertEqual(self.lauf("/theme", "1")[0], "amber")
         _, g = self.lauf("/theme", "0")
         self.assertEqual(g["optionen"][0][1], "cyan  · Cyan  ✔️")

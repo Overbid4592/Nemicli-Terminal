@@ -260,7 +260,7 @@ class MotorNetzTests(unittest.TestCase):
         self.m = MO.Motor(ordner / "w.db", self.e)
         self.addCleanup(self.m.speicher.schliessen)
         self.addCleanup(self.m.baseline.schliessen)
-        self.m.auskunft.name = lambda ip: "ollama.com" if ip == "34.36.133.15" else ""
+        self.m.auskunft.name = lambda ip, pid=None: "ollama.com" if ip == "34.36.133.15" else ""
 
     def test_anreichern_stempelt_name_und_ziele(self):
         e = verbindung("NemiCLI.exe", "34.36.133.15")

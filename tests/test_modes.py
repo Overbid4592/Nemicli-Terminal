@@ -25,6 +25,10 @@ class ModeTests(unittest.TestCase):
         self.addCleanup(self._ohne_ws.stop)
         modes.set_mode("normal")
         cwd = os.getcwd()
+        import sicherheit                     # Befehle laufen hier im aktuellen Ordner, nicht umgeleitet
+        p = mock.patch.object(sicherheit, "ausfuehrungsordner", lambda: Path(cwd))
+        p.start()
+        self.addCleanup(p.stop)
         self.lese = {"tool": "datei_lesen", "pfad": os.path.join(cwd, "a.txt")}
         self.innen = {"tool": "datei_schreiben", "pfad": os.path.join(cwd, "x", "b.txt"), "inhalt": ""}
         self.aussen = {"tool": "datei_schreiben", "pfad": os.path.join(cwd, "..", "b.txt"), "inhalt": ""}

@@ -36,7 +36,7 @@ class VergleichTests(unittest.TestCase):
         self.assertFalse(S.trifft(r, start(r"C:\x\v.exe", "v delete")))
         r = regel("  a:\n    CommandLine|re: 'x[0-9]+y'\n  condition: a\n")
         self.assertTrue(S.trifft(r, start(r"C:\x\p.exe", "a x42y b")))
-        r = regel("  a:\n    Image: 'C:\\*\\tool?.exe'\n  condition: a\n")
+        r = regel("  a:\n    Image: 'C:\\\\*\\\\tool?.exe'\n  condition: a\n")      # Sigma: \\* = \ + Platzhalter
         self.assertTrue(S.trifft(r, start(r"C:\Prog\tool1.exe")))
         r = regel("  a:\n    ParentImage|endswith: '\\winword.exe'\n  condition: a\n")
         self.assertTrue(S.trifft(r, start(r"C:\x\cmd.exe", eltern="WINWORD.EXE")))

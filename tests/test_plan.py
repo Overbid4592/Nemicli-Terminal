@@ -61,13 +61,13 @@ class PlanTests(unittest.TestCase):
         self.assertFalse(plan.aktiv())
 
     def test_ohne_liste_nur_ein_arbeitsschritt(self):
-        acts = [{"tool": "bild_malen"}, {"tool": "ordner_erstellen"}, {"tool": "befehl"}]
+        acts = [{"tool": "datei_loeschen"}, {"tool": "ordner_erstellen"}, {"tool": "befehl"}]
         laufen, gesperrt = plan.zurueckweisen(acts)
         self.assertEqual(acts[:1], laufen)
         self.assertEqual(acts[1:], gesperrt)
         self.assertIn("ordner_erstellen, befehl", plan.sperr_text(gesperrt))
         self.assertIn("Pro Nachricht des Nutzers ist ein Arbeitsschritt", plan.sperr_text(gesperrt))
-        self.assertIn("schon: bild_malen", plan.sperr_text(gesperrt))
+        self.assertIn("schon: datei_loeschen", plan.sperr_text(gesperrt))
         self.assertEqual(([], [{"tool": "befehl"}]), plan.zurueckweisen([{"tool": "befehl"}]))  # auch im nächsten Zug
 
     def test_lesen_und_begleiten_brauchen_keine_liste(self):
@@ -77,10 +77,63 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(([{"tool": "bild_malen"}], []), plan.zurueckweisen([{"tool": "bild_malen"}]))
 
     def test_neue_runde_gibt_wieder_einen_schritt_frei(self):
-        plan.zurueckweisen([{"tool": "bild_malen"}])
-        self.assertEqual([], plan.zurueckweisen([{"tool": "bild_malen"}])[0])
+        plan.zurueckweisen([{"tool": "ordner_erstellen"}])
+        self.assertEqual([], plan.zurueckweisen([{"tool": "ordner_erstellen"}])[0])
         plan.runde_neu()
-        self.assertEqual([{"tool": "bild_malen"}], plan.zurueckweisen([{"tool": "bild_malen"}])[0])
+        self.assertEqual([{"tool": "ordner_erstellen"}], plan.zurueckweisen([{"tool": "ordner_erstellen"}])[0])
+
+    def test_bilder_und_videos_ohne_liste(self):
+        acts = [{"tool": t} for t in ("bild_malen", "portraet_bewegen", "video_erstellen", "bild_malen")]
+        acts.append({"tool": "ordner_erstellen"})
+        self.assertEqual((acts, []), plan.zurueckweisen(acts))       # der Ordner ist der eine freie Schritt
+
+    def test_hoechstens_zehn_medien_je_nachricht(self):
+        serie = {"tool": "bild_serie", "varianten": ["a"] * 8}
+        laufen, zu_viel = plan.medien_begrenzen([serie, {"tool": "bild_malen"}, {"tool": "befehl"}])
+        self.assertEqual([serie, {"tool": "bild_malen"}, {"tool": "befehl"}], laufen)
+        self.assertEqual([], zu_viel)
+        comic = {"tool": "comic_malen", "panels": [{"szene": "x"}] * 2}
+        laufen, zu_viel = plan.medien_begrenzen([{"tool": "video_erstellen"}, comic])
+        self.assertEqual([{"tool": "video_erstellen"}], laufen)       # 10 erreicht
+        self.assertEqual([comic], zu_viel)
+        self.assertIn("höchstens 10", plan.medien_text(zu_viel))
+        self.assertIn("comic_malen", plan.medien_text(zu_viel))
+        plan.runde_neu()
+        self.assertEqual(([comic], []), plan.medien_begrenzen([comic]))
+
+    def test_fehlgeschlagenes_bild_zaehlt_nicht(self):
+        plan.medien_begrenzen([{"tool": "bild_serie", "varianten": ["a"] * 10}])
+        self.assertEqual([], plan.medien_begrenzen([{"tool": "bild_malen"}])[0])
+        plan.abhaken_nach({"tool": "bild_serie", "varianten": ["a"] * 10}, False)
+        self.assertEqual([{"tool": "bild_malen"}], plan.medien_begrenzen([{"tool": "bild_malen"}])[0])
+
+    def test_einmal_von_sich_aus_neu_malen(self):
+        bild = {"tool": "bild_malen"}
+        self.assertEqual([bild], plan.medien_begrenzen([bild])[0])        # 1. Zug
+        plan.abhaken_nach(bild, True)
+        self.assertEqual([bild], plan.medien_begrenzen([bild])[0])        # ein neuer Versuch
+        plan.abhaken_nach(bild, True)
+        laufen, zurueck = plan.medien_begrenzen([bild, {"tool": "merken"}])
+        self.assertEqual(([{"tool": "merken"}], [bild]), (laufen, zurueck))
+        self.assertIn("kein Fehler", plan.medien_text(zurueck))
+        self.assertIn("neu gemalt", plan.medien_hinweis())
+        plan.runde_neu()
+        self.assertEqual([bild], plan.medien_begrenzen([bild])[0])
+
+    def test_fehlschlag_und_liste_zaehlen_nicht_als_neu_malen(self):
+        bild = {"tool": "bild_malen"}
+        for _ in range(4):                                                # Fehlschläge: kein Mal-Zug
+            self.assertEqual([bild], plan.medien_begrenzen([bild])[0])
+            plan.abhaken_nach(bild, False)
+        plan.ausfuehren({"tool": "plan", "punkte": ["Bild 1", "Bild 2", "Bild 3"]})
+        for _ in range(3):                                                # mit Liste: Bild für Bild
+            self.assertEqual([bild], plan.medien_begrenzen([bild])[0])
+            plan.abhaken_nach(bild, True)
+
+    def test_serie_grenze_passt_zur_nachricht(self):
+        import actions
+        self.assertLessEqual(actions.MAX_SERIE, plan.MAX_MEDIEN)
+        self.assertLessEqual(actions.MAX_COMIC, plan.MAX_MEDIEN)
 
     def test_liste_im_selben_zug_gibt_frei(self):
         acts = [{"tool": "plan", "punkte": ["Lesen"]}, {"tool": "datei_lesen"}]

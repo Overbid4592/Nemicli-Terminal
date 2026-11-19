@@ -404,7 +404,9 @@ class Fenster(unittest.TestCase):
         f.komponieren()
         a = lt.gesendet[-1]
         self.assertEqual((a["op"], a["stil"], a["bpm"], a["sekunden"], a["titel"]), ("komponieren", "pop", 120, 40, "Meer"))
-        song = Path(tempfile.mkdtemp()) / "meer.wav"
+        tmp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(tmp.cleanup)
+        song = Path(tmp.name) / "meer.wav"
         song.write_bytes(b"RIFF")
         with mock.patch.object(musik_fenster.QDesktopServices, "openUrl") as offen:
             lt.ereignis.emit({"t": "fertig", "pfad": str(song), "sekunden": 40, "rechnen": 6.1, "seed": 1})

@@ -89,7 +89,9 @@ class KennzeichenTests(_Basis):
         kopie = _quelltext(self.tmp / "NemiCli")
         ordner = actions.befehl_ordner(kopie / "core")
         self.assertIsNone(actions._absolut_gesperrt(str(ordner)))
-        self.assertEqual(self.tmp, actions.befehl_ordner(self.tmp))
+        frei = self.tmp / "frei"                            # self.tmp selbst enthält das Register (gesperrt)
+        frei.mkdir()
+        self.assertEqual(frei, actions.befehl_ordner(frei))
 
 
 class RegisterTests(_Basis):

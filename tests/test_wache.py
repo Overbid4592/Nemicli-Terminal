@@ -61,16 +61,16 @@ class Regeln(unittest.TestCase):
         self.assertIn("R001", self.ids(prozess("powershell.exe", "winword.exe", cmd=cmd)))
 
     def test_r006_r007_beaconing(self):
-        self.assertEqual(["R006"], self.ids(netz("x.exe", "8.8.8.8", 4444)))
+        self.assertEqual(["R006"], self.ids(netz("x.exe", "192.0.2.8", 4444)))
         r = R.Regelwerk()
         treffer = set()
         for i in range(8):
-            treffer |= {a.regel for a in r.pruefen(netz("impl.exe", "45.1.2.3", 443, ANKER + i * 60))}
+            treffer |= {a.regel for a in r.pruefen(netz("impl.exe", "198.51.100.3", 443, ANKER + i * 60))}
         self.assertIn("R007", treffer)
         r2 = R.Regelwerk()
         treffer = set()
         for i, gap in enumerate([5, 90, 20, 200, 3, 150, 40, 300]):
-            treffer |= {a.regel for a in r2.pruefen(netz("mensch.exe", "45.1.2.3", 443, ANKER + sum([5, 90, 20, 200, 3, 150, 40, 300][:i + 1])))}
+            treffer |= {a.regel for a in r2.pruefen(netz("mensch.exe", "198.51.100.3", 443, ANKER + sum([5, 90, 20, 200, 3, 150, 40, 300][:i + 1])))}
         self.assertNotIn("R007", treffer)                     # unregelmäßig = menschlich
 
     def test_r005_r013_dateien(self):
@@ -108,7 +108,7 @@ class Regeln(unittest.TestCase):
     def test_r007_auch_bei_langsamem_takt(self):
         treffer = set()
         for i in range(8):
-            treffer |= {a.regel for a in self.r.pruefen(netz("impl.exe", "45.1.2.3", 443, ANKER + i * 120))}
+            treffer |= {a.regel for a in self.r.pruefen(netz("impl.exe", "198.51.100.3", 443, ANKER + i * 120))}
         self.assertIn("R007", treffer)
 
     def test_r009_zaehlt_verschobene_dateien(self):
@@ -176,7 +176,7 @@ class Merkmale(unittest.TestCase):
         v = m.vektor(prozess("a.exe", exe=r"C:\Temp\a.exe", eltern="winword.exe"))
         self.assertEqual(1.0, v[idx("pfad_neu")])
         self.assertEqual(1.0, v[idx("eltern_neu")])
-        v = m.vektor(netz("a.exe", "1.2.3.4", 4444))
+        v = m.vektor(netz("a.exe", "192.0.2.4", 4444))
         self.assertEqual(1.0, v[idx("port_neu_fuer_prozess")])
 
     def test_stunde_untypisch_braucht_mindestmenge(self):
@@ -351,7 +351,7 @@ class Speicher(unittest.TestCase):
         self.assertEqual("z", neu[0].text.split(": ")[1].split(" (")[0])
 
     def test_justierungen_und_aufraeumen(self):
-        self.sp.justierung_merken("Mira", "schwelle", 0.97, 0.98, "zu viele Fehlalarme")
+        self.sp.justierung_merken("PersonA", "schwelle", 0.97, 0.98, "zu viele Fehlalarme")
         self.assertEqual("schwelle", self.sp.justierungen()[0]["was"])
         alt = prozess("alt.exe", ts=time.time() - 30 * 86400)
         self.sp.ereignisse_schreiben([alt, prozess("neu.exe", ts=time.time())])
@@ -374,10 +374,11 @@ class Justierung(unittest.TestCase):
             J.pruefen("schwelle", 0.5)
         with self.assertRaises(J.Grenzverletzung):
             J.pruefen("schwelle", "abc")
-        self.assertEqual(("stumme_regeln", [], ["R004"]), J.pruefen("regel_stumm", "R004=aus"))
-        self.e["stumme_regeln"] = ["R001", "R002", "R003"]
-        with self.assertRaises(J.Grenzverletzung):
+        with self.assertRaises(J.Grenzverletzung):                 # ganze Regeln: nur der Nutzer
             J.pruefen("regel_stumm", "R004=aus")
+        self.assertEqual(("stumme_paare", [], ["R004@dienst.exe"]), J.pruefen("regel_stumm", "R004@Dienst.exe=aus"))
+        self.assertEqual(("stumme_regeln", [], ["R004"]), J.pruefen("regel_stumm", "R004=aus", nutzer=True))
+        self.e["stumme_regeln"] = ["R001", "R002", "R003"]
         self.assertEqual(("stumme_regeln", ["R001", "R002", "R003"], ["R002", "R003"]), J.pruefen("stumm", "R001=an"))
         with self.assertRaises(J.Grenzverletzung):
             J.pruefen("regel_stumm", "R099")
@@ -536,13 +537,13 @@ class WeckerTest(unittest.IsolatedAsyncioTestCase):
             e = prozess("evil.exe", "winword.exe", cmd="-enc AAAA")
             sp.ereignisse_schreiben([e])
             a = E.Alarm("Verdächtig", "x", E.Schwere.HOCH, "R001", ereignis_id=e.id)
-            text = WK.auftrag_text([a], sp, "Juna")
+            text = WK.auftrag_text([a], sp, "PersonB")
             self.assertIn("wache_bewerten", text)
             self.assertIn("evil.exe", text)
             self.assertIn("winword.exe", text)
             self.assertTrue(WK.ANLEITUNG.exists())          # Vorgabe angelegt
             self.assertNotIn("Bitdefender", WK.VORGABE_ANLEITUNG)   # rechnerneutral
-            self.assertIn("Nachfrage", WK.auftrag_text([a], sp, "Juna", nachhaken=True))
+            self.assertIn("Nachfrage", WK.auftrag_text([a], sp, "PersonB", nachhaken=True))
         finally:
             WK.ANLEITUNG = alt
             sp.schliessen(); tmp.cleanup()
@@ -555,14 +556,14 @@ class KugelTest(unittest.TestCase):
         alt = K.GRUESSE_DATEI
         K.GRUESSE_DATEI = Path(tmp.name) / "gruesse.md"
         try:
-            liste = K.gruesse("Juna", "Alex")
+            liste = K.gruesse("PersonB", "test_user")
             self.assertTrue(K.GRUESSE_DATEI.exists())
-            self.assertTrue(any("Alex" in g for g in liste))
-            self.assertTrue(any("Juna" in g for g in liste))
+            self.assertTrue(any("test_user" in g for g in liste))
+            self.assertTrue(any("PersonB" in g for g in liste))
             self.assertFalse(any("{nutzer}" in g or "{name}" in g for g in liste))
             K.GRUESSE_DATEI.write_text("# Kommentar\n- Hey {nutzer}, hier {name}\n\nAlles gut.\n",
                                        encoding="utf-8")
-            self.assertEqual(["Hey Alex, hier Juna", "Alles gut."], K.gruesse("Juna", "Alex"))
+            self.assertEqual(["Hey test_user, hier PersonB", "Alles gut."], K.gruesse("PersonB", "test_user"))
         finally:
             K.GRUESSE_DATEI = alt
             tmp.cleanup()
@@ -574,7 +575,7 @@ class KugelTest(unittest.TestCase):
             self.assertIn(f, K.FARBEN)
 
     def test_qt_kugel_blase_panel_und_tray(self):
-        """Qt: Kugel, Blase, Chatfenster und Tray-Schild
+        """Seit 20.09.2026 Qt statt tkinter: Kugel, Blase, Chatfenster und Tray-Schild
         entstehen ohne Bildschirm (offscreen), malen sich und reden über die Brücke."""
         import os
         os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -596,17 +597,17 @@ class KugelTest(unittest.TestCase):
         async def chat(text, bilder):
             return f"Antwort auf: {text} ({len(bilder)} Bilder)", []
 
-        k = K.Kugel(stand=lambda: lage, chat=chat, schleife=loop, sichtbar=lambda: True, name="Mira",
-                    nutzer="Alex", nemicli_oeffnen=lambda: None, screenshot=lambda: None)
+        k = K.Kugel(stand=lambda: lage, chat=chat, schleife=loop, sichtbar=lambda: True, name="PersonA",
+                    nutzer="test_user", nemicli_oeffnen=lambda: None, screenshot=lambda: None)
         k._takt_tick()
         self.assertTrue(k._gezeigt)
         k.fenster.takt()
         self.assertFalse(k.fenster.grab().isNull())
-        k.blase("Hey Alex", 5)
+        k.blase("Hey test_user", 5)
         self.assertIsNotNone(k._blase)
         k.panel_umschalten()                                    # Blase weg, Fenster auf
         self.assertIsNone(k._blase); self.assertIsNotNone(k._panel)
-        self.assertIn("Mira", k._panel.eingabe.placeholderText())
+        self.assertIn("PersonA", k._panel.eingabe.placeholderText())
         k.senden("Wie ist die Lage?")
         for _ in range(40):                                     # Antwort kommt über im_gui zurück
             app.processEvents(); time.sleep(0.02)
@@ -615,7 +616,7 @@ class KugelTest(unittest.TestCase):
         self.assertFalse(k._beschaeftigt)
         texte = [w.text() for w in k._panel.inhalt.findChildren(type(k._panel.status))]
         self.assertTrue(any("Antwort auf: Wie ist die Lage?" in t for t in texte))
-        self.assertTrue(any(t == "Du" for t in texte) and any(t == "Mira" for t in texte))
+        self.assertTrue(any(t == "Du" for t in texte) and any(t == "PersonA" for t in texte))
         lage["farbe"] = "rot"; k._takt_tick()
         self.assertEqual("rot", k.fenster.farbe)
         k.verstecken(True); self.assertFalse(k.fenster.isVisible())
@@ -652,7 +653,7 @@ class KugelTest(unittest.TestCase):
 
         loop = asyncio.new_event_loop(); self.addCleanup(loop.close)
         k = K.Kugel(stand=lambda: lage, chat=chat, schleife=loop, sichtbar=lambda: True,
-                    name="Mira", nutzer="Alex", nemicli_oeffnen=lambda: None, screenshot=lambda: None)
+                    name="PersonA", nutzer="test_user", nemicli_oeffnen=lambda: None, screenshot=lambda: None)
         k._takt_tick()
         self.assertIsNotNone(k._blase)                          # Rot: gleich eine Erinnerung
         k._blase_weg(); k._takt_tick()
@@ -680,26 +681,26 @@ class KugelTest(unittest.TestCase):
                                  setattr(K, "VERLAUF_DATEI", alt[2]), setattr(ST, "ZUSTAND", alt[3])))
         K.VERLAUF_DATEI.write_text('[{"wer": "sie", "text": "alter Verlauf"}]', encoding="utf-8")
         K.GRUESSE_DATEI.write_text("Kurz gemeldet: nichts Auffälliges. 🌙" + chr(10), encoding="utf-8")
-        self.assertEqual(["Kurz gemeldet: nichts Auffälliges. 🛡"], K.gruesse("Mira", "Alex"))
+        self.assertEqual(["Kurz gemeldet: nichts Auffälliges. 🛡"], K.gruesse("PersonA", "test_user"))
         O.anwendung()
         loop = asyncio.new_event_loop(); self.addCleanup(loop.close)
-        aktiv = {"name": "Mira"}
+        aktiv = {"name": "PersonA"}
 
         async def chat(text, bilder):
             return "ok", []
 
         k = K.Kugel(stand=lambda: {"farbe": "gruen"}, chat=chat, schleife=loop, sichtbar=lambda: True,
-                    name="Mira", nutzer="Alex", nemicli_oeffnen=lambda: None, screenshot=lambda: None,
+                    name="PersonA", nutzer="test_user", nemicli_oeffnen=lambda: None, screenshot=lambda: None,
                     name_von=lambda: aktiv["name"])
-        self.assertEqual(1, len(k._verlauf))                    # der alte gemeinsame Verlauf geht an Mira
-        k._merken({"wer": "du", "text": "Hallo Mira"})
+        self.assertEqual(1, len(k._verlauf))                    # der alte gemeinsame Verlauf geht an PersonA
+        k._merken({"wer": "du", "text": "Hallo PersonA"})
         aktiv["name"] = "Nemi"
         for _ in range(10):
             k._takt_tick()
         self.assertEqual("Nemi", k.name)
         self.assertEqual([], k._verlauf)                        # fremder Verlauf bleibt unsichtbar
-        self.assertEqual(2, len(K.verlauf_laden("Mira")))
-        ST.schreiben({"stimmung": "froh", "wer": "Mira"})
+        self.assertEqual(2, len(K.verlauf_laden("PersonA")))
+        ST.schreiben({"stimmung": "froh", "wer": "PersonA"})
         k._zustand_anwenden(ST.lesen())
         self.assertEqual("", k._gesteuert["stimmung"])          # fremde Stimmung gilt nicht
 
@@ -708,9 +709,9 @@ class KugelTest(unittest.TestCase):
         self.addCleanup(sp.schliessen)
         a, b, c = (E.Alarm(n, "x", E.Schwere.NIEDRIG, "R008") for n in "abc")
         sp.alarme_schreiben([a, b, c])
-        sp.alarm_urteil(a.id, "gesehen", "Mira", "unklar, beobachten")
+        sp.alarm_urteil(a.id, "gesehen", "PersonA", "unklar, beobachten")
         sp.alarm_urteil(b.id, "gesehen", "Wache", "an die Persönlichkeit übergeben")
-        sp.alarm_urteil(c.id, "harmlos", "Mira", "bekannt")
+        sp.alarm_urteil(c.id, "harmlos", "PersonA", "bekannt")
         self.assertEqual(1, sp.unklar(time.time() - 3600))
         self.assertEqual(0, sp.unklar(time.time() + 3600))
 
@@ -744,17 +745,17 @@ class KugelTest(unittest.TestCase):
         from wache import steuerung as ST
         import protokoll
         tmp = tempfile.TemporaryDirectory(); self.addCleanup(tmp.cleanup)
-        (Path(tmp.name) / "Mira").mkdir()
-        (Path(tmp.name) / "Mira" / "neutral.png").write_bytes(b"x")
+        (Path(tmp.name) / "PersonA").mkdir()
+        (Path(tmp.name) / "PersonA" / "neutral.png").write_bytes(b"x")
         alt = (ST.BILDER_ORDNER, ST.ZUSTAND, protokoll.schreibe)
         ST.BILDER_ORDNER, ST.ZUSTAND = Path(tmp.name), Path(tmp.name) / "z.json"
         protokoll.schreibe = lambda *a, **k: None
         self.addCleanup(lambda: (setattr(ST, "BILDER_ORDNER", alt[0]), setattr(ST, "ZUSTAND", alt[1]),
                                  setattr(protokoll, "schreibe", alt[2])))
-        text = ST.steuern({"stimmung": "neutral"}, wer="Mira")
+        text = ST.steuern({"stimmung": "neutral"}, wer="PersonA")
         self.assertIn("Stimmung neutral", text)
         self.assertNotIn("kein passendes Bild", text)
-        self.assertIn("kein passendes Bild für „froh“", ST.steuern({"stimmung": "froh"}, wer="Mira"))
+        self.assertIn("kein passendes Bild für „froh“", ST.steuern({"stimmung": "froh"}, wer="PersonA"))
 
     def test_qt_kugel_verlauf_bleibt_und_neu_leert(self):
         import os
@@ -902,23 +903,23 @@ class BekanntTests(unittest.TestCase):
     def test_bezeichnung_wird_gemerkt_und_beim_naechsten_alarm_gezeigt(self):
         a = self._alarm()
         out = self.W.bewerten({"id": a.id, "urteil": "harmlos", "begruendung": "Signiert von Microsoft, Store-App.",
-                               "bezeichnung": "Microsoft Store"}, wer="Juna")
+                               "bezeichnung": "Microsoft Store"}, wer="PersonB")
         self.assertIn("Als bekannt gemerkt: WinStore.App.exe = Microsoft Store", out)
         schluessel = "prozess:" + r"C:\Programme\WindowsApps\x.exe".lower()     # mit Pfad gilt der Pfad
         b = self.sp.bekannt(schluessel)
-        self.assertEqual(("prozess", "Microsoft Store", "Juna"), (b["art"], b["bezeichnung"], b["wer"]))
+        self.assertEqual(("prozess", "Microsoft Store", "PersonB"), (b["art"], b["bezeichnung"], b["wer"]))
         # zweiter Alarm zum selben Prozess: „bekannt“ steht in Detail, Liste und Weckruf
         a2 = self._alarm()
         detail = self.W.alarme({"id": a2.id})
         self.assertIn("bekannt: WinStore.App.exe = Microsoft Store – harmlos seit", detail)
         liste = self.W.alarme({"anzahl": 5})
         self.assertIn("↳ bekannt: WinStore.App.exe = Microsoft Store", liste)
-        weck = WK.auftrag_text([a2], self.sp, "Juna")
+        weck = WK.auftrag_text([a2], self.sp, "PersonB")
         self.assertIn("⭑ bekannt: WinStore.App.exe = Microsoft Store", weck)
         self.assertIn("genügt ein kurzes Urteil", weck)
         # nochmal harmlos → Zähler steigt
         self.W.bewerten({"id": a2.id, "urteil": "harmlos", "begruendung": "Wie beim letzten Mal, nichts Neues.",
-                         "bezeichnung": "Microsoft Store"}, wer="Juna")
+                         "bezeichnung": "Microsoft Store"}, wer="PersonB")
         self.assertEqual(2, self.sp.bekannt(schluessel)["anzahl"])
         # gleicher Name, anderer Ort: NICHT bekannt
         falsch = prozess(name="WinStore.App.exe", exe=r"C:\Users\x\AppData\Local\Temp\WinStore.App.exe")
@@ -927,10 +928,10 @@ class BekanntTests(unittest.TestCase):
 
     def test_begruendung_auch_als_grund_und_fehler_nennt_das_feld(self):
         a = self._alarm()
-        fehler = self.W.bewerten({"id": a.id, "urteil": "harmlos", "begründung": "x"}, wer="Juna")
+        fehler = self.W.bewerten({"id": a.id, "urteil": "harmlos", "begründung": "x"}, wer="PersonB")
         self.assertIn('"begruendung"', fehler)                    # der Feldname steht in der Meldung
         out = self.W.bewerten({"id": a.id, "urteil": "harmlos", "grund": "Signiert von Microsoft, Store-App.",
-                               "bezeichnung": "Microsoft Store"}, wer="Juna")
+                               "bezeichnung": "Microsoft Store"}, wer="PersonB")
         self.assertNotIn("Fehler", out)
         self.assertIn("Als bekannt gemerkt", out)
 
@@ -940,7 +941,7 @@ class BekanntTests(unittest.TestCase):
         self.sp.ereignisse_schreiben([e])
         a = E.Alarm("Seltener Prozess", "x", E.Schwere.HOCH, "R001", ereignis_id=e.id)
         self.sp.alarme_schreiben([a])
-        weck = WK.auftrag_text([a], self.sp, "Juna")
+        weck = WK.auftrag_text([a], self.sp, "PersonB")
         self.assertIn("MESSWERTE", weck)
         self.assertNotIn("\nherkunft:", weck)                         # keine eigene Zeile
         k = weck.split("Messwerte [", 1)[1][:6]
@@ -954,12 +955,12 @@ class BekanntTests(unittest.TestCase):
         self.assertEqual([], self.sp.bekannt_liste())
 
     def test_netz_alarm_merkt_prozess_und_ziel(self):
-        a = self._alarm(name="WindowsPackageManagerServer.exe", ziel="11.22.33.44")
+        a = self._alarm(name="WindowsPackageManagerServer.exe", ziel="203.0.113.164")
         self.W.bewerten({"id": a.id, "urteil": "harmlos", "begruendung": "winget lädt von Akamai.",
                          "bezeichnung": "winget-Dienst, Akamai-CDN"})
         arten = sorted(b["art"] for b in self.sp.bekannt_liste())
         self.assertEqual(["prozess", "ziel"], arten)
-        self.assertTrue(self.sp.bekannt_vergessen("ziel:11.22.33.44"))
+        self.assertTrue(self.sp.bekannt_vergessen("ziel:203.0.113.164"))
         self.assertEqual(1, len(self.sp.bekannt_liste()))
 
     def test_echt_merkt_nichts(self):
@@ -1002,71 +1003,71 @@ class KugelSteuerungTests(unittest.TestCase):
         img.save(str(self.ST.BILDER_ORDNER / name))
 
     def test_bilder_je_persoenlichkeit(self):
-        for n in ("Mira.png", "mira_froh.PNG", "Mira-ernst.png", "Nemi_froh.png", "Mira_notizen.txt"):
+        for n in ("PersonA.png", "persona_froh.PNG", "PersonA-ernst.png", "Nemi_froh.png", "PersonA_notizen.txt"):
             self._bild(n) if n.lower().endswith("png") else (self.ST.BILDER_ORDNER / n).write_text("x")
-        self.assertEqual({"", "froh", "ernst"}, set(self.ST.bilder("Mira")))
+        self.assertEqual({"", "froh", "ernst"}, set(self.ST.bilder("PersonA")))
         self.assertEqual({"froh"}, set(self.ST.bilder("Nemi")))
-        self.assertEqual({}, self.ST.bilder("Juna"))
+        self.assertEqual({}, self.ST.bilder("PersonB"))
 
     def test_steuern_mit_grenzen(self):
         ST = self.ST
         # ohne Bild: Stimmung abgelehnt, Hinweis, wie man eins anlegt
-        out = ST.steuern({"stimmung": "froh"}, wer="Mira")
-        self.assertIn("kein Bild", out); self.assertIn("Persoenlichkeiten/Mira/", out)
-        self._bild("Mira.png")
-        out = ST.steuern({"stimmung": "froh", "bewegung": "hüpfen", "ecke": "oben links", "groesse": 120}, wer="Mira")
-        self.assertIn("kein passendes Bild für „froh“ – zeige das Standardbild Mira.png", out)
+        out = ST.steuern({"stimmung": "froh"}, wer="PersonA")
+        self.assertIn("kein Bild", out); self.assertIn("Persoenlichkeiten/PersonA/", out)
+        self._bild("PersonA.png")
+        out = ST.steuern({"stimmung": "froh", "bewegung": "hüpfen", "ecke": "oben links", "groesse": 120}, wer="PersonA")
+        self.assertIn("kein passendes Bild für „froh“ – zeige das Standardbild PersonA.png", out)
         self.assertIn("huepfen", out); self.assertIn("Ecke oben_links", out); self.assertIn("Größe 120px", out)
         z = ST.lesen()
-        self.assertEqual(("froh", "huepfen", "oben_links", 120, "Mira"),
+        self.assertEqual(("froh", "huepfen", "oben_links", 120, "PersonA"),
                          (z["stimmung"], z["bewegung"], z["ecke"], z["groesse"], z["wer"]))
         self.assertTrue(any(p.startswith("kugel: Kugel: Stimmung froh") for p in self.protokoll))
         # reden: einmal ja, gleich nochmal nein (10-min-Pause), mit wichtig ja; nachts nur wichtig
         stunde = datetime.now().hour
         tag = 8 <= stunde < 23
-        out = ST.steuern({"sagen": "Hey  Alex,   alles ruhig."}, wer="Mira")
+        out = ST.steuern({"sagen": "Hey  test_user,   alles ruhig."}, wer="PersonA")
         if tag:
-            self.assertIn("Blase „Hey Alex, alles ruhig.“", out)
-            self.assertIn("Pause ist 10 min", ST.steuern({"sagen": "nochmal"}, wer="Mira"))
+            self.assertIn("Blase „Hey test_user, alles ruhig.“", out)
+            self.assertIn("Pause ist 10 min", ST.steuern({"sagen": "nochmal"}, wer="PersonA"))
         else:
             self.assertIn("nachts", out)
-        self.assertIn("Blase „Dringend", ST.steuern({"sagen": "Dringend!", "wichtig": True, "sekunden": 99}, wer="Mira"))
+        self.assertIn("Blase „Dringend", ST.steuern({"sagen": "Dringend!", "wichtig": True, "sekunden": 99}, wer="PersonA"))
         self.assertEqual(60.0, ST.lesen()["sagen_sekunden"])
         # Unsinn wird benannt, nicht geschluckt
-        out = ST.steuern({"bewegung": "fliegen", "ecke": "dach", "groesse": 999, "position": "abc"}, wer="Mira")
+        out = ST.steuern({"bewegung": "fliegen", "ecke": "dach", "groesse": 999, "position": "abc"}, wer="PersonA")
         self.assertIn("fliegen", out); self.assertIn("dach", out); self.assertIn("48–200", out); self.assertIn("[x, y]", out)
-        self.assertIn("versteckt", ST.steuern({"versteckt": "ja"}, wer="Mira"))
+        self.assertIn("versteckt", ST.steuern({"versteckt": "ja"}, wer="PersonA"))
         self.assertTrue(ST.lesen()["versteckt"])
-        self.assertIn("wieder da", ST.steuern({"versteckt": False}, wer="Mira"))
-        self.assertIn("Bilder für dich: (Standard)", ST.steuern({}, wer="Mira"))
-        self.assertIn("wieder die Kugel", ST.steuern({"stimmung": "kugel"}, wer="Mira"))
+        self.assertIn("wieder da", ST.steuern({"versteckt": False}, wer="PersonA"))
+        self.assertIn("Bilder für dich: (Standard)", ST.steuern({}, wer="PersonA"))
+        self.assertIn("wieder die Kugel", ST.steuern({"stimmung": "kugel"}, wer="PersonA"))
 
     def test_kugel_setzt_zustand_um(self):
         from wache import oberflaeche as O
         ST, K = self.ST, self.K
         app = O.anwendung()
-        self._bild("Mira.png"); self._bild("Mira_froh.png")
+        self._bild("PersonA.png"); self._bild("PersonA_froh.png")
         loop = asyncio.new_event_loop()
         k = K.Kugel(stand=lambda: {"farbe": "gruen"}, chat=None, schleife=loop, sichtbar=lambda: True,
-                    name="Mira", nutzer="Alex", nemicli_oeffnen=lambda: None, screenshot=lambda: None)
+                    name="PersonA", nutzer="test_user", nemicli_oeffnen=lambda: None, screenshot=lambda: None)
         k._takt_tick()
-        self.assertEqual(ST.BILDER_ORDNER / "Mira.png", k._gesteuert["bild_pfad"])   # Bild da → Bild statt Kugel
-        ST.steuern({"stimmung": "froh", "groesse": 100, "bewegung": "wackeln", "ecke": "oben_links"}, wer="Mira")
+        self.assertEqual(ST.BILDER_ORDNER / "PersonA.png", k._gesteuert["bild_pfad"])   # Bild da → Bild statt Kugel
+        ST.steuern({"stimmung": "froh", "groesse": 100, "bewegung": "wackeln", "ecke": "oben_links"}, wer="PersonA")
         k._takt_tick()
         self.assertIsNotNone(k.fenster.bild)
         self.assertEqual(100, k.fenster.groesse)
         self.assertEqual("wackeln", k.fenster._bewegung)
-        self.assertEqual(ST.BILDER_ORDNER / "Mira_froh.png", k._gesteuert["bild_pfad"])
+        self.assertEqual(ST.BILDER_ORDNER / "PersonA_froh.png", k._gesteuert["bild_pfad"])
         self.assertLess(k.fenster.x(), 200)                      # oben links
         self.assertFalse(k.fenster.grab().isNull())              # malt sich mit Bild + Geste
-        ST.steuern({"sagen": "Hallo Alex", "wichtig": True}, wer="Mira")
+        ST.steuern({"sagen": "Hallo test_user", "wichtig": True}, wer="PersonA")
         k._takt_tick()
-        self.assertIsNotNone(k._blase); self.assertEqual("Hallo Alex", k._blase.label.text())
+        self.assertIsNotNone(k._blase); self.assertEqual("Hallo test_user", k._blase.label.text())
         k._takt_tick()                                           # dieselbe Blase kommt nicht zweimal
-        self.assertEqual("Hallo Alex", k._blase.label.text())
-        ST.steuern({"versteckt": True}, wer="Mira"); k._takt_tick()
+        self.assertEqual("Hallo test_user", k._blase.label.text())
+        ST.steuern({"versteckt": True}, wer="PersonA"); k._takt_tick()
         self.assertFalse(k._gezeigt)
-        ST.steuern({"versteckt": False, "stimmung": "kugel"}, wer="Mira"); k._takt_tick()
+        ST.steuern({"versteckt": False, "stimmung": "kugel"}, wer="PersonA"); k._takt_tick()
         self.assertTrue(k._gezeigt); self.assertIsNone(k.fenster.bild)
         # Aktion ist verdrahtet und im Wache-Dienst erlaubt
         import actions, modes, sicherheit
@@ -1115,7 +1116,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         return m
 
     def _r008(self, name="chrome.exe", ts=ANKER):
-        e = netz(name, "142.250.1.1", 443, ts=ts)
+        e = netz(name, "203.0.113.1", 443, ts=ts)
         self.sp.ereignisse_schreiben([e])
         return E.Alarm("Auffällig viele Verbindungen", "x", E.Schwere.MITTEL, "R008",
                        ereignis_id=e.id, zeit=ts, subjekt=name), e
@@ -1135,14 +1136,16 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         fremd = prozess("llama-server.exe", eltern="NemiCLIc.exe", exe=r"C:\Users\x\Downloads\llama-server.exe")
         falsche_eltern = prozess("llama-server.exe", eltern="cmd.exe", exe=pfad)
         with patch.object(llamareserve, "server_pfad", return_value=Path(pfad)), \
+                patch.object(llamareserve, "installiert", return_value=["b12199"]), \
                 patch.object(llamareserve, "pruefen", return_value=None):
             self.assertTrue(R.eigener_server(unser))
             for e, erwartet in ((unser, False), (fremd, True), (falsche_eltern, True)):
                 alarme = []
                 m._bewerten_in(e, alarme)
                 self.assertEqual(erwartet, any(a.regel == "ML-001" for a in alarme), e.exe)
-            self.assertFalse(R.eigener_server(netz("llama-server.exe", "1.2.3.4", 443)))   # nach außen nie
+            self.assertFalse(R.eigener_server(netz("llama-server.exe", "192.0.2.4", 443)))   # nach außen nie
         with patch.object(llamareserve, "server_pfad", return_value=Path(pfad)), \
+                patch.object(llamareserve, "installiert", return_value=["b12199"]), \
                 patch.object(llamareserve, "pruefen", return_value="Datei verändert: ggml.dll"):
             self.assertFalse(R.eigener_server(unser))                       # Prüfliste verletzt: wieder Alarm
 
@@ -1169,7 +1172,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
 
     def test_bekanntes_subjekt_kommt_leiser(self):
         m = self._motor()
-        self.sp.bekannt_merken("prozess:chrome.exe", "prozess", "chrome.exe", "Google Chrome", "Browser.", "Juna")
+        self.sp.bekannt_merken("prozess:chrome.exe", "prozess", "chrome.exe", "Google Chrome", "Browser.", "PersonB")
         a, e = self._r008()
         out = m._verdichten([a], e)
         self.assertEqual(E.Schwere.NIEDRIG, out[0].schwere)
@@ -1209,7 +1212,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         self.assertEqual(1, len(m._verdichten([a], e)))
         # 0 = Dämpfung aus
         self.assertEqual({}, self.sp.gedaempft(0))
-        # Muster-Regeln werden nie gedämpft – auch nach 23× harmlos (R001·powershell.exe)
+        # Muster-Regeln werden nie gedämpft – auch nach 23× harmlos (Beispiel: R001·powershell.exe)
         r001 = []
         for i in range(5):
             e = prozess(name="powershell.exe", cmd="-nop -w hidden", ts=ANKER + i); self.sp.ereignisse_schreiben([e])
@@ -1297,7 +1300,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         self.assertFalse(self.sp.profil_bekannt("neu.exe"))                         # noch nicht geschrieben
         m._profil_lernen(e, belastet=True)
         self.assertFalse(self.sp.profil_bekannt("neu.exe"))                         # mit Alarm: nie
-        netz_e = netz("neu.exe", "1.2.3.4", 443, ts=ANKER + 1)
+        netz_e = netz("neu.exe", "192.0.2.4", 443, ts=ANKER + 1)
         netz_e.pid, netz_e.start = 42, ANKER
         m._belastet[(42, round(ANKER, 3))] = ANKER
         m._profil_lernen(netz_e, belastet=False)                                     # gleiche Kette: nein
@@ -1314,7 +1317,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
     def test_bekannt_gilt_nicht_am_fremden_ort(self):
         m = self._motor()
         self.sp.bekannt_merken("prozess:chrome.exe", "prozess", "chrome.exe", "Google Chrome", "Browser.", "Test")
-        e = netz("chrome.exe", "142.250.1.1", 443)
+        e = netz("chrome.exe", "203.0.113.1", 443)
         e.exe = r"C:\Users\user\AppData\Local\Temp\chrome.exe"
         self.sp.ereignisse_schreiben([e])
         a = E.Alarm("Auffällig viele Verbindungen", "x", E.Schwere.MITTEL, "R008", ereignis_id=e.id,
@@ -1395,8 +1398,13 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         liste = self.W.alarme({"status": "offen"})
         self.assertIn('3× R008 zu "chrome.exe" → wache_bewerten regel="R008" subjekt="chrome.exe"', liste)
         # nach Regel + Subjekt: der Rest von Chrome, Steam bleibt offen
+        # die KI braucht das genaue Subjekt – ein Teilstring nimmt nichts mit
         out = self.W.bewerten({"regel": "r008", "subjekt": "chrome", "urteil": "harmlos",
                                "begruendung": "Chrome mit vielen Tabs.", "bezeichnung": "Google Chrome"})
+        self.assertIn("genaues Subjekt nötig", out)
+        self.assertIn("laufenden Weckrufs", self.W.bewerten({"regel": "R008", "urteil": "gesehen"}))
+        out = self.W.bewerten({"regel": "r008", "subjekt": "chrome", "urteil": "harmlos",
+                               "begruendung": "Chrome mit vielen Tabs.", "bezeichnung": "Google Chrome"}, wer="Nutzer")
         self.assertIn('3 Alarme zu R008 · "chrome" (offen/gesehen) → harmlos', out)
         self.assertEqual("offen", self.sp.alarm(steam[0].id).status)
         self.assertTrue(all(self.sp.alarm(a.id).status == "harmlos" for a in chrome))
@@ -1404,8 +1412,10 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         # ids als Liste, unbekannte werden genannt, nichts mehr offen → klare Meldung
         out = self.W.bewerten({"ids": [steam[0].id, "gibtsnicht"], "urteil": "gesehen"})
         self.assertIn("1 Alarm (nicht gefunden: gibtsnicht) → gesehen", out)
-        self.assertIn("1 Alarm zu R008 (offen/gesehen) → gesehen", self.W.bewerten({"regel": "R008", "urteil": "gesehen"}))
-        self.assertEqual("Keine unbeurteilten Alarme zu R004.", self.W.bewerten({"regel": "R004", "urteil": "gesehen"}))
+        self.assertIn("1 Alarm zu R008 (offen/gesehen) → gesehen",
+                      self.W.bewerten({"regel": "R008", "urteil": "gesehen"}, wer="Nutzer"))
+        self.assertEqual("Keine unbeurteilten Alarme zu R004.",
+                         self.W.bewerten({"regel": "R004", "urteil": "gesehen"}, wer="Nutzer"))
         self.assertIn("unbekannte Regel R099", self.W.bewerten({"regel": "R099", "urteil": "gesehen"}))
         self.assertIn("id (eine oder mehrere", self.W.bewerten({"urteil": "gesehen"}))
         self.assertEqual("Kein Alarm mit id abc, def.", self.W.bewerten({"id": "abc,def", "urteil": "gesehen"}))
@@ -1439,7 +1449,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         sp0 = S.Speicher(pfad); sp0.schliessen()          # legt ereignisse an, rüstet nach – noch ohne Ereignisse
         c = sqlite3.connect(str(pfad))
         c.execute("UPDATE alarme SET subjekt = ''")
-        e1, e2 = netz("chrome.exe", "1.1.1.1", 443), prozess(name="k.exe", eltern="chrome.exe")
+        e1, e2 = netz("chrome.exe", "192.0.2.1", 443), prozess(name="k.exe", eltern="chrome.exe")
         c.executemany(f"INSERT INTO ereignisse VALUES ({','.join('?' * len(E.Ereignis.SPALTEN))})",
                       [e1.zeile(), e2.zeile()])
         c.executemany("INSERT INTO alarme (id, zeit, titel, regel, ereignis_id) VALUES (?, ?, 'x', ?, ?)",
@@ -1469,7 +1479,7 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         self.assertEqual(10, m.stand()["seit_training"])
 
     def test_nemicli_selbst_ist_kein_r001(self):
-        """NemiCLIs eigene abfragen-PowerShell (-NoProfile = „-nop“ + „-noprofile“ +
+        """20.09.2026: NemiCLIs eigene abfragen-PowerShell (-NoProfile = „-nop“ + „-noprofile“ +
         „-noninteractive“) galt als R001 Hoch → weckte die Persönlichkeit → die machte abfragen → …"""
         r = R.Regelwerk()
         rahmen = ("powershell -NoProfile -NonInteractive -Command $ProgressPreference='SilentlyContinue'; "
@@ -1508,8 +1518,8 @@ class VerdichtenDaempfenTests(unittest.TestCase):
         for i in range(65):
             alarme += r.pruefen(netz("chrome.exe", f"10.0.0.{i}", 443, ts=ANKER + i))
         self.assertTrue(alarme and all(a.regel == "R008" and a.subjekt == "chrome.exe" for a in alarme))
-        (a,) = r.pruefen(netz("evil.exe", "1.2.3.4", 4444))
-        self.assertEqual(("R006", "evil.exe → 1.2.3.4"), (a.regel, a.subjekt))
+        (a,) = r.pruefen(netz("evil.exe", "192.0.2.4", 4444))
+        self.assertEqual(("R006", "evil.exe → 192.0.2.4"), (a.regel, a.subjekt))
 
 
 class HerkunftTests(unittest.TestCase):
@@ -1611,8 +1621,8 @@ class R014Tests(unittest.TestCase):
 
     def test_netzverbindung_traegt_den_pfad_und_faellt_auf(self):
         # Netz-Alarm mit Pfad – und der Pfad passt nicht zum Namen.
-        e = E.Ereignis(E.NETZ, "conn_open", "TextInputHost.exe → 104.18.20.226:80",
-                       prozess="TextInputHost.exe", ziel="104.18.20.226", zielport=80,
+        e = E.Ereignis(E.NETZ, "conn_open", "TextInputHost.exe → 198.51.100.226:80",
+                       prozess="TextInputHost.exe", ziel="198.51.100.226", zielport=80,
                        exe=r"C:\Users\x\AppData\Local\Temp\TextInputHost.exe",
                        extra={"extern": True})
         self.assertIn("R014", self.ids(e))
@@ -1624,8 +1634,8 @@ class R014Tests(unittest.TestCase):
     def test_ohne_pfad_kein_alarm(self):
         # Ereignis ohne exe-Feld: Kein Pfad heißt „nichts gewusst“,
         # nicht „verdächtig“ – sonst alarmiert jeder unlesbare Prozess.
-        e = E.Ereignis(E.NETZ, "conn_open", "TextInputHost.exe → 104.18.20.226:80",
-                       prozess="TextInputHost.exe", ziel="104.18.20.226", zielport=80,
+        e = E.Ereignis(E.NETZ, "conn_open", "TextInputHost.exe → 198.51.100.226:80",
+                       prozess="TextInputHost.exe", ziel="198.51.100.226", zielport=80,
                        extra={"extern": True})
         self.assertNotIn("R014", self.ids(e))
 
@@ -1680,12 +1690,12 @@ class NetzSensorPfadTests(unittest.TestCase):
             return s, s.sammeln()
 
     def test_conn_open_traegt_exe(self):
-        conns = [self._Conn(4711, 50000, "104.18.20.226", 80)]
+        conns = [self._Conn(4711, 50000, "198.51.100.226", 80)]
         _, ereignisse = self._sensor(conns, {4711: ("TextInputHost.exe", r"C:\Windows\SystemApps\X\TextInputHost.exe")})
         (e,) = [x for x in ereignisse if x.aktion == "conn_open"]
         self.assertEqual("TextInputHost.exe", e.prozess)
         self.assertEqual(r"C:\Windows\SystemApps\X\TextInputHost.exe", e.exe)
-        self.assertEqual(("104.18.20.226", 80), (e.ziel, e.zielport))
+        self.assertEqual(("198.51.100.226", 80), (e.ziel, e.zielport))
 
     def test_listener_traegt_exe(self):
         conns = [self._Conn(99, 8188, status="LISTEN")]
@@ -1694,7 +1704,7 @@ class NetzSensorPfadTests(unittest.TestCase):
         self.assertEqual(r"C:\venv\python.exe", e.exe)
 
     def test_ohne_leserecht_bleibt_das_feld_leer_statt_zu_raten(self):
-        conns = [self._Conn(4, 445, "8.8.8.8", 443)]
+        conns = [self._Conn(4, 445, "192.0.2.8", 443)]
         _, ereignisse = self._sensor(conns, {4: ("fremd.exe", None)})   # exe() = AccessDenied
         (e,) = [x for x in ereignisse if x.aktion == "conn_open"]
         self.assertEqual("fremd.exe", e.prozess)
@@ -1737,7 +1747,7 @@ class ShellKontextTests(unittest.TestCase):
         self.assertEqual([], self.gefragt)              # kein PowerShell-Start für nichts
 
     def test_netzereignis_fragt_nicht(self):
-        self.assertEqual([], self.WZ._shell_kontext(netz("rundll32.exe", "1.2.3.4", 443)))
+        self.assertEqual([], self.WZ._shell_kontext(netz("rundll32.exe", "192.0.2.4", 443)))
         self.assertEqual([], self.gefragt)
 
 
@@ -1881,7 +1891,7 @@ class UpdateKontextTests(unittest.TestCase):
         from unittest import mock
         with mock.patch.object(self.H, "update_kontext") as uk:
             self.assertEqual([], self.WZ._update_kontext(prozess("spiel.exe", exe=r"D:\Spiele\spiel.exe")))
-            self.assertEqual([], self.WZ._update_kontext(netz("svchost.exe", "1.2.3.4", 443)))
+            self.assertEqual([], self.WZ._update_kontext(netz("svchost.exe", "192.0.2.4", 443)))
         uk.assert_not_called()
 
     def test_anleitung_verlangt_den_beleg(self):
@@ -1942,7 +1952,7 @@ class UnpruefbarTests(unittest.TestCase):
 
     def test_urteil_zaehlt_getrennt_und_daempft_nicht(self):
         liste = self._alarme()
-        self.assertIn("begruendung", self.W.bewerten({"regel": "R008", "urteil": "unpruefbar"}))
+        self.assertIn("begruendung", self.W.bewerten({"regel": "R008", "urteil": "unpruefbar"}, wer="Nutzer"))
         out = self.W.bewerten({"regel": "R008", "subjekt": "downloader.exe", "urteil": "nicht prüfbar",
                                "begruendung": "Elternprozess liegt im gesperrten Bereich der Schutzsoftware."})
         self.assertIn("→ unpruefbar", out)
@@ -1987,6 +1997,18 @@ class SchutzrevierTests(unittest.TestCase):
             self.assertIn("Revier des Virenschutzes", self.H.signatur_zeile(drin))
         self.assertFalse(self.H.im_schutzrevier(str(Path(self.tmp.name) / "anders" / "x.exe")))
         self.assertFalse(self.H.im_schutzrevier(str(self.revier) + r"Fake\x.exe"))   # kein Präfix-Trick
+
+    def test_kurzname_zaehlt_zum_revier(self):
+        import ctypes
+        self.revier.mkdir()
+        puffer = ctypes.create_unicode_buffer(1024)
+        if not ctypes.windll.kernel32.GetShortPathNameW(str(self.revier.resolve()), puffer, 1024) \
+                or "~" not in puffer.value:
+            self.skipTest("8.3-Kurznamen sind auf diesem Laufwerk aus")
+        drin = puffer.value + r"\Unterordner\agent.exe"
+        with self.mock.patch.object(self.H, "_kennung", side_effect=AssertionError("kein stat")):
+            self.assertTrue(self.H.im_schutzrevier(drin))
+            self.assertEqual(self.H.SCHUTZ_STATUS, self.H.signatur(drin)["status"])
 
     def test_systemstand_prueft_revier_nicht_und_zeigt_gruen(self):
         from wache import systemstand as SY

@@ -218,7 +218,7 @@ class VideoTests(Basis):
 
 
 class NeueAnbieterTests(Basis):
-    """Black Forest Labs, Ideogram, Runway und fal.ai – Anfragen wie in den offiziellen Anleitungen."""
+    """Black Forest Labs, Ideogram, Runway und fal.ai – Anfragen wie in den offiziellen Anleitungen (25.10.2026)."""
 
     def setUp(self):
         super().setUp()

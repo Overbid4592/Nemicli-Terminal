@@ -1,8 +1,8 @@
 """Offline-Tests: ein geschwätziger Suchtreffer darf die anderen nicht verdrängen.
 
-Beispiel: Auf eine Frage nach API-Preisen lieferte Treffer 1 die komplette OpenAI-Preisseite – 6.832 Zeichen,
-67 Tabellenzeilen. Damit war das Gesamtbudget (MAX_OUT) aufgebraucht und die
-Treffer 2 bis 5 wurden abgeschnitten. Stünde die Antwort in Treffer 3, wäre sie weg.
+Fall: Treffer 1 ist eine komplette Preisseite (rund 6.800 Zeichen, 67 Tabellenzeilen)
+und verbraucht das Gesamtbudget (MAX_OUT); die Treffer 2 bis 5 werden abgeschnitten.
+Steht die Antwort in einem späteren Treffer, ist sie weg.
 
 python -m unittest discover -s tests -p test_websuche_schnipsel.py
 """
@@ -19,7 +19,7 @@ for sub in ("core", "engines", "tools", "ui"):
 import webfetch as W      # noqa: E402
 
 
-# So sah der echte Treffer aus, der alles verdrängt hat.
+# Langer Treffer, der ohne Begrenzung alle anderen verdrängt.
 PREISSEITE = ("Pricing | OpenAI API\n\n# Pricing\n\nPrices per 1M tokens.\n\n"
               + "| Model | Input | Cached input | Cache writes | Output |\n"
               + "| --- | --- | --- | --- | --- |\n"
@@ -86,6 +86,11 @@ class AlleTrefferKommenAn(unittest.TestCase):
             def __exit__(self_, *a): return False
             def post(self_, *a, **k): return Antwort()
             def get(self_, *a, **k): return Antwort()
+
+            def stream(self_, methode, url, **k):       # netzhilfe.abrufen liest als Stream
+                import contextlib
+                return contextlib.nullcontext(W.httpx.Response(200, json={"results": treffer},
+                                                               request=W.httpx.Request(methode, url)))
         return Client
 
     def _treffer(self):

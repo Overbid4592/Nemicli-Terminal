@@ -19,6 +19,13 @@ import video as V          # noqa: E402
 import videodatei as VD    # noqa: E402
 
 
+def _ordner(test: unittest.TestCase) -> Path:
+    """Eigener Temp-Ordner, nach dem Test wieder weg."""
+    t = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    test.addCleanup(t.cleanup)
+    return Path(t.name)
+
+
 class Umrechnung(unittest.TestCase):
     def test_nv12_grenzwerte(self):
         bild = np.zeros((4, 4, 3), np.uint8)
@@ -40,7 +47,7 @@ class Schreiben(unittest.TestCase):
         b = np.zeros((T, H, W, 3), np.uint8)
         b[:, :H // 2] = (255, 0, 0)                                 # oben rot, unten blau
         b[:, H // 2:] = (0, 0, 255)
-        ziel = Path(tempfile.mkdtemp()) / "unter" / "probe.mp4"
+        ziel = _ordner(self) / "unter" / "probe.mp4"
         VD.schreiben(b, ziel, 24)
         daten = ziel.read_bytes()
         self.assertEqual(daten[4:8], b"ftyp")
@@ -60,7 +67,7 @@ class Schreiben(unittest.TestCase):
         """Sprechendes Porträt: AAC-Ton neben dem Bild, auch wenn der Ton länger ist als die Bilder."""
         b = np.zeros((25, 64, 48, 3), np.uint8)
         t = np.arange(24000 * 2) / 24000                            # 2 s Ton zu 1 s Bild
-        ziel = Path(tempfile.mkdtemp()) / "ton.mp4"
+        ziel = _ordner(self) / "ton.mp4"
         VD.schreiben(b, ziel, 25, ton=((0.3 * np.sin(2 * np.pi * 440 * t)).astype(np.float32), 24000))
         daten = ziel.read_bytes()
         self.assertIn(b"avcC", daten)
@@ -80,7 +87,7 @@ class Schreiben(unittest.TestCase):
             for i in range(9):
                 erzeugt.append(i)
                 yield np.full((64, 48, 3), i * 25, np.uint8)
-        ziel = Path(tempfile.mkdtemp()) / "folge.mp4"
+        ziel = _ordner(self) / "folge.mp4"
         VD.schreiben(folge(), ziel, 24)
         self.assertEqual(len(erzeugt), 9)
         self.assertEqual(ziel.read_bytes()[4:8], b"ftyp")
@@ -95,7 +102,7 @@ class Schreiben(unittest.TestCase):
         self.assertEqual(V._mp4_weg(), "windows")
 
     def test_motor_schreibt_ohne_opencv(self):
-        ziel = Path(tempfile.mkdtemp()) / "ohne_cv2.mp4"
+        ziel = _ordner(self) / "ohne_cv2.mp4"
         with mock.patch.dict(sys.modules, {"cv2": None}):           # wie in der exe: kein OpenCV
             V._mp4(np.random.randint(0, 255, (5, 64, 64, 3), dtype=np.uint8), ziel, 24)
         self.assertIn(b"avcC", ziel.read_bytes())

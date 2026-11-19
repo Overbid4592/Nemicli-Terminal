@@ -84,18 +84,24 @@ class MainTests(unittest.TestCase):
     def test_hintergrund_bindet_die_aktion_sofort(self):
         """HG.starten ruft arbeit() erst später auf – in der Schleife muss die Aktion fest gebunden sein."""
         baum = ast.parse((ROOT / "main.py").read_text(encoding="utf-8"))
+        gefunden = 0
         for knoten in ast.walk(baum):
             if (isinstance(knoten, ast.Call) and getattr(knoten.func, "attr", "") == "starten"
                     and len(knoten.args) >= 3 and isinstance(knoten.args[2], ast.Lambda)):
+                gefunden += 1
                 self.assertTrue(knoten.args[2].args.args, "lambda ohne gebundene Aktion")
+                self.assertEqual(len(knoten.args[2].args.args), len(knoten.args[2].args.defaults),
+                                 "Aktion nicht per Vorgabewert gebunden")
+        self.assertGreater(gefunden, 0, "kein HG.starten mit lambda in main.py gefunden")
 
 
 class MotorTests(unittest.TestCase):
     def test_lora_huellen_werden_mit_ausgelagert(self):
         try:
-            import ggufengine.engine as E
-        except Exception as e:                                       # ohne torch
+            import torch                                             # noqa: F401
+        except ImportError as e:                                     # ohne torch
             self.skipTest(str(e))
+        import ggufengine.engine as E
         self.assertIn("loramotor", E._EIGENE_MODULE)
 
 
@@ -103,8 +109,8 @@ class WacheTests(unittest.TestCase):
     def test_bekanntes_ziel_adelt_kein_neues_programm(self):
         from wache import speicher as S
         sp = mock.Mock()
-        ev = mock.Mock(prozess="neu.exe", exe=r"C:\x\neu.exe", eltern="", ziel="1.2.3.4", datei="", text="")
-        bekannt = {"ziel:1.2.3.4": {"x": 1}}
+        ev = mock.Mock(prozess="neu.exe", exe=r"C:\x\neu.exe", eltern="", ziel="192.0.2.4", datei="", text="")
+        bekannt = {"ziel:192.0.2.4": {"x": 1}}
         sp.bekannt = lambda s: bekannt.get(s)
         self.assertFalse(S.Speicher.programm_bekannt(sp, ev))
         self.assertFalse(S.Speicher.ganz_bekannt(sp, ev))

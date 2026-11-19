@@ -25,7 +25,7 @@ class Lokal(unittest.TestCase):
 class Sicher(unittest.TestCase):
     def test_ohne_schema(self):
         self.assertEqual("http://127.0.0.1:8188", N.sicher("127.0.0.1:8188"))
-        self.assertEqual("http://localhost:7860", N.sicher("localhost:7860"))
+        self.assertEqual("http://127.0.0.1:7860", N.sicher("localhost:7860"))     # hosts-Datei kann localhost umbiegen
         self.assertEqual("https://192.168.1.5:8188", N.sicher("192.168.1.5:8188"))
         self.assertEqual("https://pc.local:8188", N.sicher("pc.local:8188"))
 
@@ -40,7 +40,7 @@ class OllamaHost(unittest.TestCase):
     def test_normieren(self):
         self.assertEqual("http://127.0.0.1:11434", P._norm_host(""))
         self.assertEqual("http://127.0.0.1:11434", P._norm_host("http://0.0.0.0:11434"))
-        self.assertEqual("http://localhost:11500", P._norm_host("localhost:11500"))
+        self.assertEqual("http://127.0.0.1:11500", P._norm_host("localhost:11500"))
         self.assertEqual("http://[::1]:11434", P._norm_host("http://[::1]:11434"))
         self.assertEqual("https://192.168.1.9:11434", P._norm_host("192.168.1.9"))      # Port bleibt
         self.assertEqual("https://192.168.1.9:11434", P._norm_host("http://192.168.1.9:11434"))

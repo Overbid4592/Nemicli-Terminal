@@ -1,4 +1,4 @@
-"""Setup-Datei (installer/aufspielen.py): Suche, Aktualisieren nur der Programmteile, Rückweg bei
+"""Setup-Datei (installer/aufspielen.py): fester Programmordner, Aktualisieren nur der Programmteile, Rückweg bei
 Fehlern, laufende Programme, Desktop-Verknüpfung – alles in Temp-Ordnern."""
 import sys
 import tempfile
@@ -43,7 +43,10 @@ class Aufspielen(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp())
         self.addCleanup(__import__("shutil").rmtree, self.tmp, True)
         self.paket = _paket(self.tmp / "nutzlast.zip")
-        self.ziel = self.tmp / ".ncli2"
+        self.ziel = self.tmp / ".nemicli"
+        merkzettel = mock.patch.dict("os.environ", {"LOCALAPPDATA": str(self.tmp / "AppData")})
+        merkzettel.start()                           # nie den echten Merkzettel des Rechners lesen
+        self.addCleanup(merkzettel.stop)
 
     def test_neu_installieren(self):
         rein = A.aufspielen(self.paket, self.ziel)
@@ -106,13 +109,26 @@ class Aufspielen(unittest.TestCase):
             A.aufspielen(boese, self.ziel)
         self.assertFalse((self.tmp / "draussen.txt").exists())
 
-    def test_finden_mit_und_ohne_programm(self):
+    def test_fester_programmordner(self):
+        with mock.patch.object(Path, "home", return_value=self.tmp / "Benutzer"):
+            self.assertEqual(A.zielordner(), self.tmp / "Benutzer" / ".nemicli")
+            self.assertEqual(A.installation(), A.Installation(self.tmp / "Benutzer" / ".nemicli", ""))
         _alte_installation(self.ziel)
-        leer = self.tmp / "E" / ".ncli2"
+        self.assertEqual(A.installation(self.ziel), A.Installation(self.ziel, "7.8.541"))
+        leer = self.tmp / "leer" / ".nemicli"
         leer.mkdir(parents=True)
-        gefunden = A.finden([self.ziel, leer, self.tmp / "gibtsnicht"])
-        self.assertEqual([(i.ordner, i.build) for i in gefunden], [(self.ziel, "7.8.541"), (leer, "")])
+        self.assertEqual(A.installation(leer).build, "")
         self.assertEqual(A.nutzlast_build(self.paket), "7.9.600")
+
+    def test_alter_ordner_wird_weiter_aktualisiert(self):
+        heim = self.tmp / "Benutzer"
+        with mock.patch.object(Path, "home", return_value=heim):
+            _alte_installation(heim / ".ncli2")
+            self.assertEqual(A.installation(), A.Installation(heim / ".ncli2", "7.8.541"))   # nur .ncli2
+            (heim / ".nemicli").mkdir()
+            self.assertEqual(A.installation().ordner, heim / ".ncli2")                       # .nemicli leer
+            _alte_installation(heim / ".nemicli")
+            self.assertEqual(A.installation().ordner, heim / ".nemicli")                     # .nemicli zuerst
 
     def test_laeuft_erkennt_programme_aus_dem_ordner(self):
         _alte_installation(self.ziel)

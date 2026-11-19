@@ -41,8 +41,8 @@ class Grundlagen(unittest.TestCase):
                 AB.schluessel(kaputt)
 
     def test_auftrag_starten_stoppen_erlauben(self):
-        a = AB.starten("Steam", 2, von="Mira", ordner=self.ordner)
-        self.assertEqual(("steam.exe", "Steam", "Mira", False), (a["programm"], a["anzeige"], a["von"], a["aus"]))
+        a = AB.starten("Steam", 2, von="PersonA", ordner=self.ordner)
+        self.assertEqual(("steam.exe", "Steam", "PersonA", False), (a["programm"], a["anzeige"], a["von"], a["aus"]))
         self.assertTrue(AB.lernt(a))
         self.assertTrue(AB.erlauben("steam", "Foo.exe", ordner=self.ordner)["erlaubt"] == ["foo.exe"])
         self.assertTrue(AB.stoppen("steam", ordner=self.ordner)["aus"])
@@ -150,10 +150,10 @@ class Werkzeug(unittest.TestCase):
             self.addCleanup(p.stop)
 
     def test_start_status_liste_stop(self):
-        text = W.programm({"aktion": "start", "programm": "Steam", "tage": "2"}, wer="Mira")
+        text = W.programm({"aktion": "start", "programm": "Steam", "tage": "2"}, wer="PersonA")
         self.assertIn("Ich passe ab jetzt auf Steam (steam.exe) auf", text)
         self.assertIn("Die Wache läuft gerade nicht", text)
-        self.assertEqual("Mira", AB.auftrag("steam.exe")["von"])
+        self.assertEqual("PersonA", AB.auftrag("steam.exe")["von"])
         status = W.programm({"programm": "steam"})
         self.assertIn("lernt noch bis", status)
         self.assertIn("★ neu neu.exe", status)

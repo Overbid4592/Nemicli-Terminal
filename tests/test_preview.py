@@ -23,6 +23,8 @@ class PreviewTests(unittest.TestCase):
             for x in range(w):
                 img.putpixel((x, y), farbe_unten)
         f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+        f.close()
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
         img.save(f.name)
         return Path(f.name)
 
@@ -57,6 +59,7 @@ class PreviewTests(unittest.TestCase):
         self.assertIsNone(ui.image_preview("gibt-es-nicht.png"))
         f = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
         f.write(b"kein bild"); f.close()
+        self.addCleanup(Path(f.name).unlink, missing_ok=True)
         self.assertIsNone(ui.image_preview_text(f.name))
 
     def test_panel_mit_titel(self):

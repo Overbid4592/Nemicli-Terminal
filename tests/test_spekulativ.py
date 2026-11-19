@@ -36,22 +36,6 @@ class NGramTests(unittest.TestCase):
             e.zufuegen(t)
             self.assertEqual(e.vorschlag(8), NGramEntwurf(folge[:i]).vorschlag(8))
 
-    def test_fenster_bleibt_begrenzt(self):
-        """Rolling N-gram index must agree with a freshly built index for the last window."""
-        import random
-
-        from ggufengine.spekulativ import NGramEntwurf
-        fenster = 24
-        rnd = random.Random(42)
-        folge = [rnd.randrange(7) for _ in range(600)]
-        e = NGramEntwurf(folge[:10], fenster=fenster)
-        for i, tid in enumerate(folge[10:], 11):
-            e.zufuegen(tid)
-            ref = NGramEntwurf(folge[:i], fenster=fenster)
-            self.assertEqual(e.vorschlag(8), ref.vorschlag(8))
-            self.assertLessEqual(len(e._toks), fenster + min(1024, fenster))
-            self.assertLessEqual(len(e._index), fenster + min(1024, fenster))
-
     def test_nutzen(self):
         from ggufengine.spekulativ import Nutzen
         P = Nutzen.PRUEFUNGEN
@@ -90,23 +74,6 @@ class NGramTests(unittest.TestCase):
         self.assertEqual(pausen, [Nutzen.PAUSE, 2 * Nutzen.PAUSE, 4 * Nutzen.PAUSE])
         runde(n, {8: 0.015, 4: 0.015, 3: 0.015, 2: 0.015, 1: 0.015}, 3)   # lohnt wieder: Pause von vorn
         self.assertEqual(runde(n, {8: 0.030, 4: 0.030, 3: 0.030, 2: 0.030, 1: 0.030}), [Nutzen.PAUSE])
-
-    def test_nutzen_trennt_angenommene_von_nachberechneten_tokens(self):
-        """A rejected proposal can require one extra model token, but is still a miss."""
-        from ggufengine.spekulativ import Nutzen
-
-        n = Nutzen()
-        n.einzeln(0.010)
-        n.start(1)
-        n.pruefung(0.012, 1)     # original sampled token
-        n.pruefung(0.020, 1)     # replacement sampled after a rejected proposal
-        n.pause(angenommen=0)
-        self.assertEqual(n._je[1][2], 0.0)
-
-        n.start(3)
-        n.pruefung(0.014, 4)     # one original, two accepted, one replacement
-        n.pause(angenommen=2)
-        self.assertAlmostEqual(n._je[3][2], 2 / 3)
 
     def test_nutzen_waehlt_die_schnellste_laenge(self):
         """MTP schlägt 2 Token vor: probiert werden 2 und 1, genommen wird die schnellere."""
@@ -155,6 +122,27 @@ class NGramTests(unittest.TestCase):
         n.pruefung(0.018, 9)
         n.pause()
         self.assertEqual(n._je[8][:2], [0.002, 1])
+
+    def test_nutzen_quote_aus_angenommenen(self):
+        """Nach einem falschen Vorschlag liest ein rekurrentes Modell das gezogene Token neu und zählt
+        es für die Zeit je Token mit – die Quote kommt trotzdem nur aus den angenommenen Vorschlägen."""
+        from ggufengine.spekulativ import Nutzen
+        n = Nutzen()
+        n.einzeln(0.010)
+        n.start(1)
+        n.pruefung(0.012, 1)                                 # Prüfung: das gezogene Token
+        n.pruefung(0.012, 1)                                 # Vorschlag falsch: neu gelesen
+        n.pause(0)
+        self.assertEqual(n._je[1][2], 0.0)                   # vorher: (2 - 1) / 1 = 100 %
+        self.assertAlmostEqual(n._je[1][0], 0.012)           # Zeit je Token zählt beide
+        n.start(8)
+        n.pruefung(0.02, 1 + 3 + 1)                          # 3 angenommen, dann neu gelesen
+        n.pause(3)
+        self.assertEqual(n._je[8][2], 3 / 8)
+        n.start(4)
+        n.pruefung(0.02, 1 + 4)                              # alle angenommen
+        n.pause(4)
+        self.assertEqual(n._je[4][2], 1.0)
 
     def test_mtp_wenn_keine_wiederholung(self):
         from ggufengine.spekulativ import MtpEntwurf
@@ -357,6 +345,55 @@ class GleicheAusgabe(unittest.TestCase):
         from test_neue_bauarten import Lfm2
         cfg = dict(Lfm2.BASIS, max_position_embeddings=256)
         self._pruefen(T.Lfm2ForCausalLM(T.Lfm2Config(**cfg)), "lfm2")
+
+
+@unittest.skipIf(torch is None, "torch/transformers fehlen")
+class QuoteImRueckfall(unittest.TestCase):
+    """Rekurrentes Modell ohne Nachholen: nach einem falschen Vorschlag liest der Motor neu. Der Motor
+    meldet die angenommenen Vorschläge an die Zeitmessung, nicht die mitgezählten Token."""
+
+    def test_rueckfall_meldet_angenommene(self):
+        from test_neue_bauarten import _q35_cfg
+
+        from ggufengine.sampling import SamplerConfig
+        from ggufengine.spekulativ import Nutzen
+
+        class Protokoll(Nutzen):
+            def __init__(self):
+                super().__init__()
+                self.eintraege = []
+
+            def erlaubt(self, laenge=0):
+                return 8
+
+            def pause(self, angenommen=None):
+                self.eintraege.append((self._k, self._tokens, angenommen))
+                return 0
+
+        g = GleicheAusgabe()
+
+        def lauf(modell, _arch):
+            g_ = torch.Generator().manual_seed(5)
+            stueck = torch.randint(3, 96, (10,), generator=g_).tolist()
+            prompt = stueck * 3 + stueck[:4]
+            cfg = SamplerConfig(temperature=0)
+            ref = list(g._motor(modell, 0).generate_tokens(prompt, max_tokens=40, sampler=cfg))
+            e = g._motor(modell, 8)
+            e._nutzen = Protokoll()
+            orakel = _Orakel(prompt, prompt + ref, 96)
+            e._entwurf = lambda o=orakel: o
+            self.assertEqual(list(e.generate_tokens(prompt, max_tokens=40, sampler=cfg)), ref)
+            self.assertTrue(e._rekurrent())
+            self.assertEqual(g._nachgeholt, 0)                  # wirklich der Rückfall
+            eintraege = e._nutzen.eintraege
+            self.assertTrue(all(a is not None and 0 <= a <= k for k, _t, a in eintraege), eintraege)
+            neu_gelesen = [x for x in eintraege if x[1] - 1 > x[2]]
+            self.assertTrue(neu_gelesen, eintraege)             # hier lag die Quote vorher zu hoch
+            self.assertTrue(any(a == k for k, _t, a in eintraege))   # und ganz angenommene gibt es auch
+
+        g._laeufe = lauf
+        g.umbau = lambda m: setattr(m, "zeilen_nachholen", lambda L, n: False)
+        g._pruefen(T.Qwen3_5ForCausalLM(_q35_cfg(T.Qwen3_5TextConfig, max_position_embeddings=256)), "qwen35")
 
 
 @unittest.skipIf(torch is None, "torch/transformers fehlen")

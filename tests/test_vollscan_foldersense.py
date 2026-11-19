@@ -1,4 +1,4 @@
-"""Vollscan-Grenze (höchstens 3 neue in 7 Tagen) und FolderSense bei großen oder kaputten Ordnern."""
+"""Vollscan ohne Startgrenze und FolderSense bei großen oder kaputten Ordnern."""
 
 import json
 import os
@@ -20,41 +20,24 @@ import foldersense as FS  # noqa: E402
 from wache import vollscan as VS  # noqa: E402
 
 
-class VollscanGrenze(unittest.TestCase):
+class VollscanStart(unittest.TestCase):
     def setUp(self):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         self.ordner = Path(tmp.name)
-        for name, wert in (("STARTS", self.ordner / "starts.json"), ("STAND", self.ordner / "stand.json"),
-                           ("STOPP", self.ordner / "stopp")):
+        for name, wert in (("STAND", self.ordner / "stand.json"), ("STOPP", self.ordner / "stopp")):
             p = patch.object(VS, name, wert)
             p.start()
             self.addCleanup(p.stop)
 
-    def test_drei_pro_woche_fortsetzen_zaehlt_nicht(self):
-        jetzt = time.time()
-        self.assertTrue(VS.woche_frei(jetzt)[0])
-        for t in (jetzt - 8 * 86400, jetzt - 3 * 86400, jetzt - 2 * 86400):
-            VS._start_merken(t)
-        self.assertTrue(VS.woche_frei(jetzt)[0])                     # älter als 7 Tage zählt nicht
-        VS._start_merken(jetzt - 3600)
-        frei, ab = VS.woche_frei(jetzt)
-        self.assertFalse(frei)
-        self.assertAlmostEqual(jetzt - 3 * 86400 + VS.WOCHE, ab)    # frei, wenn der älteste herausfällt
-        self.assertIn("Höchstens 3 Vollscans", VS.sperre_text(jetzt))
-        with patch.object(VS, "laeuft", lambda: None), patch.object(VS.subprocess, "Popen") as popen:
-            self.assertIn("Höchstens 3", VS.starten(self.ordner))
-            popen.assert_not_called()
-            VS.STAND.write_text(json.dumps({"phase": "abgebrochen"}), encoding="utf-8")
-            with patch.object(VS.time, "sleep", lambda s: None):
-                VS.starten(self.ordner)                              # Fortsetzen geht immer …
-            popen.assert_called_once()
-        self.assertEqual(3, len(VS.starts_lesen()))                  # … und zählt nicht
-
-    def test_kaputte_startliste(self):
-        VS.STARTS.write_text("{kaputt", encoding="utf-8")
-        self.assertEqual([], VS.starts_lesen())
-        self.assertTrue(VS.woche_frei()[0])
+    def test_ohne_grenze_auch_viele_starts(self):
+        """Keine Wochengrenze: wann und wie oft, entscheidet der Nutzer."""
+        self.assertFalse(hasattr(VS, "woche_frei") or hasattr(VS, "PRO_WOCHE"))
+        with patch.object(VS, "laeuft", lambda: None), patch.object(VS.subprocess, "Popen") as popen, \
+                patch.object(VS.time, "sleep", lambda s: None):
+            for _ in range(5):
+                VS.starten(self.ordner)
+        self.assertEqual(popen.call_count, 5)
 
 
 class FolderSense(unittest.TestCase):

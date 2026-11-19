@@ -252,6 +252,75 @@ class Lauf(unittest.TestCase):
         self.assertEqual(R._json_liste('Text [kein json] dann [{"frage": "a"}]'), [{"frage": "a"}])
         self.assertEqual(R._json_liste("nichts"), [])
 
+    def _bericht_lauf(self, antwort: str):
+        async def ask(prompt, system):
+            return antwort if system == R.BERICHT_SYSTEM else await self.ask(prompt, system)
+        stand = asyncio.run(R.lauf("Was ist X?", R.Umgebung(ask=ask), self.ordner))
+        return stand, stand.pfad.read_text(encoding="utf-8")
+
+    def test_abgeschnittener_bericht_behaelt_die_notizen(self):
+        stand, text = self._bericht_lauf("## Kurzfassung\nAnfang [1]\n\n[System] Antwort abgeschnitten – "
+                                         "Tokenbudget erreicht. Fasse dich kürzer.")
+        self.assertIn("Anfang [1]", text)
+        self.assertNotIn("[System]", text)
+        self.assertIn("## Notizen aus den Quellen", text)
+        self.assertIn("- Fakt A: 42", text)
+        self.assertIn(R.BERICHT_ABGESCHNITTEN, text.splitlines()[2])             # Kopfzeile warnt
+        self.assertIn(R.BERICHT_ABGESCHNITTEN, R.ergebnis_fuers_modell(stand))
+
+    def test_leerer_bericht_behaelt_die_notizen(self):
+        _, text = self._bericht_lauf("\n\n[System] Antwort abgeschnitten – Tokenbudget erreicht.")
+        self.assertIn("- Fakt A: 42", text)
+        _, text = self._bericht_lauf("<think>nur gedacht</think>")
+        self.assertIn("- Fakt A: 42", text)
+
+    def test_fertiger_bericht_ohne_notizen(self):
+        stand, text = self._bericht_lauf("## Kurzfassung\nAlles da [1].")
+        self.assertNotIn("Notizen aus den Quellen", text)
+        self.assertEqual(stand.abgebrochen, "")
+
+    def test_teilfragen_am_wortende_gekuerzt(self):
+        lang = "Welche Releases " + "gibt es heute " * 40
+        tf = R._teilfragen([{"frage": lang, "suche": lang}], 3)[0]
+        self.assertLessEqual(len(tf["frage"]), 300)
+        self.assertTrue(tf["frage"].endswith("heute…"))
+        self.assertLessEqual(len(tf["suche"]), 200)
+        self.assertTrue(tf["suche"].endswith("heute"))
+        self.assertEqual(R._kuerzen("kurz", 300), "kurz")
+
+
+class Protokoll(unittest.TestCase):
+    def test_recherche_schreibt_ins_aktions_protokoll_nicht_in_den_bericht(self):
+        import main
+        import protokoll
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        bericht = Path(tmp.name) / "Recherche_x.md"
+        bericht.write_text("# Bericht\n", encoding="utf-8")
+        log = Path(tmp.name) / "aktionen.log"
+
+        async def lauf(*_a, **_k):
+            stand = R.Stand("X")
+            stand.pfad = bericht
+            return stand
+
+        class Backend:
+            async def ask_messages(self, system, messages):
+                return ""
+
+        with mock.patch.object(protokoll, "PFAD", log), mock.patch.object(R, "lauf", lauf), \
+                mock.patch.object(W, "search_available", return_value=True), \
+                mock.patch.object(main.modes, "decide", return_value="allow"), \
+                mock.patch.object(main.actions, "fremdinhalt"), \
+                mock.patch.object(main, "PS") as ps:
+            ps.active.return_value.name = "test_user"
+            asyncio.run(main._recherche_lauf({"frage": "X"}, Backend(), [], lambda _t: None,
+                                             lambda _t: None))
+        self.assertEqual(bericht.read_text(encoding="utf-8"), "# Bericht\n")
+        zeile = log.read_text(encoding="utf-8")
+        self.assertIn("recherche", zeile)
+        self.assertIn("Recherche_x.md", zeile)
+
 
 if __name__ == "__main__":
     unittest.main()

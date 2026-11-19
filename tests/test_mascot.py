@@ -29,7 +29,7 @@ class MascotTests(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
-        self.p = PS.Persoenlichkeit(key="juna", name="Juna", kurz="", text="Ich bin Juna.", path=None)
+        self.p = PS.Persoenlichkeit(key="personb", name="PersonB", kurz="", text="Ich bin PersonB.", path=None)
         self._patches = [patch.object(PS, "DIR", Path(self.tmp.name)),
                          patch.object(PS, "active", lambda: self.p),
                          patch.object(PS, "nutzername", lambda: "Max")]
@@ -41,16 +41,16 @@ class MascotTests(unittest.TestCase):
 
     def test_ohne_datei_neutraler_gruss_mit_namen(self):
         mascot.greet()
-        self.assertIn("Juna hier. Hallo, Max.", self.gesagt[-1])
-        self.assertIn("💬 Juna", self.gesagt[-1])
+        self.assertIn("PersonB hier. Hallo, Max.", self.gesagt[-1])
+        self.assertIn("💬 PersonB", self.gesagt[-1])
         self.assertFalse(mascot.hat_sprueche())
 
     def test_datei_wird_gelesen_und_platzhalter_ersetzt(self):
-        (Path(self.tmp.name) / "juna.sprueche.md").write_text(
+        (Path(self.tmp.name) / "personb.sprueche.md").write_text(
             "# Kopf\n## Begrüßung\nHey {nutzer}, {name} ist da.\n\n## Sprüche\n- Frag ruhig.\n", encoding="utf-8")
         self.assertTrue(mascot.hat_sprueche())
         mascot.greet()
-        self.assertIn("Hey Max, Juna ist da.", self.gesagt[-1])
+        self.assertIn("Hey Max, PersonB ist da.", self.gesagt[-1])
         with patch.object(mascot, "TIPS", []):
             mascot.bubble()
         self.assertIn("Frag ruhig.", self.gesagt[-1])

@@ -368,5 +368,35 @@ class GrenzfallTests(unittest.TestCase):
         self.assertEqual([t for t, b in teile if b].count("<tool_response>"), 2)
 
 
+class TiefeTests(unittest.TestCase):
+    """Verschachtelte Werte haben eine Grenze (MAX_TIEFE): ValueError statt Rekursionsfehler."""
+    d = W.dialekt("gemma4")
+
+    def test_leser_tief_verschachtelt(self):
+        tief = "a:" + "[" * (W.MAX_TIEFE + 5) + "1" + "]" * (W.MAX_TIEFE + 5) + "}"
+        with self.assertRaises(ValueError):
+            W._GemmaLeser(tief).felder("}")
+        noch_gut = "a:" + "[" * 10 + "1" + "]" * 10 + "}"
+        self.assertEqual(W._GemmaLeser(noch_gut).felder("}")["a"], [[[[[[[[[[1]]]]]]]]]])
+
+    def test_extrem_tief_ohne_rekursionsfehler(self):
+        text = "<|tool_call>call:web_suche{suche:" + "{x:" * 5000 + "1" + "}" * 5000 + "}<tool_call|>"
+        self.assertEqual(self.d.aufrufe_finden(text), [])
+
+    def test_schreiben_tief_verschachtelt(self):
+        wert = 1
+        for _ in range(W.MAX_TIEFE + 2):
+            wert = [wert]
+        with self.assertRaises(ValueError):
+            W._gemma_wert(wert)
+        self.assertTrue(W._gemma_wert([[1]]))
+
+    def test_aktion_block_zu_tief_bleibt_text(self):
+        tief = "[" * 3000 + "]" * 3000
+        text = '```aktion\n{"tool": "web_suche", "suche": ' + tief + '}\n```'
+        self.assertEqual(W.als_text(W.aktion_teile(self.d, text)), text)
+        self.assertEqual(W._wert_lesen("[" * 100000 + "]" * 100000)[:3], "[[[")
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -353,7 +353,7 @@ class TerminalBefehl(unittest.TestCase):
         with mock.patch.object(config, "load", lambda: {"terminal_leuchten": False, "terminal_thema": "mint"}):
             seite = [e for e in einstellseite.seite() if e["befehl"] == "/terminal"]
             aktiv = {o["wert"] for e in seite for o in e["optionen"] if o["aktiv"]}
-            self.assertEqual(aktiv, {"leuchten aus", "geteilt aus", "weich an", "thema mint"})
+            self.assertEqual(aktiv, {"leuchten aus", "geteilt aus", "weich an", "thema mint", "tempo 30"})
             self.assertEqual(einstellseite.befehl_fuer("/terminal", "geteilt an"), "/terminal geteilt an")
             self.assertIsNone(einstellseite.befehl_fuer("/terminal", "geteilt an; /exit"))
 
@@ -505,13 +505,19 @@ class Vollbild(unittest.TestCase):
             try:
                 async with app.run_test(size=(100, 24)) as pilot:
                     await pilot.pause(0.3)
-                    self.assertEqual(befehle[:2], ["grund=0c0d14", "puls=0"])
+                    ohne_sitz = [b for b in befehle if not b.startswith("sitz=")]
+                    self.assertEqual(ohne_sitz[:2], ["grund=0c0d14", "puls=0"])
                     sc.busy = True
                     sc._refresh_chrome()
                     sc.busy = False
                     sc._refresh_chrome()
                     sc._refresh_chrome()
-                    self.assertEqual(befehle[2:], ["puls=1", "puls=0"])
+                    ohne_sitz = [b for b in befehle if not b.startswith("sitz=")]
+                    self.assertEqual(ohne_sitz[2:], ["puls=1", "puls=0"])
+                    # Figur: die Kopfzeile der Eingabe, einmal gemeldet, solange sich nichts verschiebt
+                    sitz = [b for b in befehle if b.startswith("sitz=")]
+                    self.assertEqual(len(sitz), 1)
+                    self.assertEqual(sitz[0], f"sitz={24 - sc._header.region.y}")
                     app.exit()
             finally:
                 sc.uninstall()

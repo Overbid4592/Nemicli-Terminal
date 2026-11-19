@@ -165,6 +165,13 @@ NIE_FREI = [
 
 @unittest.skipUnless(os.name == "nt", "braucht den PowerShell-Parser")
 class Liste(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # Befehle aus dem Programm-Ordner laufen in der Sandbox; fehlt sie, wäre der Ersatz der Temp-Ordner – und
+        # der liegt in der Test-Suite über dem Daten-Ordner.
+        import paths
+        (Path(paths.DATEN) / "NemiSandbox").mkdir(parents=True, exist_ok=True)
+
     def test_die_100_beispiele_sind_frei(self):
         self.assertEqual(100, len(BEISPIELE))
         offen = {c: shellfrei.grund(c) for c in BEISPIELE if shellfrei.grund(c)}

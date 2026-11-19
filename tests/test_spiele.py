@@ -82,8 +82,8 @@ class ZugHolenTests(unittest.TestCase):
         self.assertIn("Kein Zug fällig", msgs[-1]["content"])
 
     def test_system_prompt(self):
-        s = spiele.system_prompt("Ich bin Juna.", "Juna", "Max", "dame", "Schwarz")
-        self.assertIn("Ich bin Juna.", s)
+        s = spiele.system_prompt("Ich bin PersonB.", "PersonB", "Max", "dame", "Schwarz")
+        self.assertIn("Ich bin PersonB.", s)
         self.assertIn("Du spielst Schwarz", s)
         self.assertIn("Schlagzwang", s)
         self.assertIn('"zug"', s)
@@ -97,7 +97,7 @@ class ServerTests(unittest.TestCase):
 
         async def denke(p):
             if p.get("wer"):
-                return {"name": "Juna", "nutzer": "Max"}
+                return {"name": "PersonB", "nutzer": "Max"}
             return {"zug": p["zuege"][0], "text": "ok", "zufall": False}
 
         srv = spiele.SpieleServer(loop, denke)
@@ -116,7 +116,7 @@ class ServerTests(unittest.TestCase):
                 return urllib.request.urlopen(req, timeout=10)
 
             r = post("/zug", {"spiel": "tictactoe", "wer": True})
-            self.assertEqual({"name": "Juna", "nutzer": "Max"}, json.loads(r.read()))
+            self.assertEqual({"name": "PersonB", "nutzer": "Max"}, json.loads(r.read()))
             r = post("/zug", {"spiel": "schach", "zuege": ["e2e4"], "brett": ""})
             self.assertEqual("e2e4", json.loads(r.read())["zug"])
             with self.assertRaises(urllib.error.HTTPError) as cm:
