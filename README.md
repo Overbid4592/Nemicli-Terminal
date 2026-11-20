@@ -371,7 +371,8 @@ Oder frag einfach die KI – sie kennt alle Befehle und öffnet passende Menüs 
 | `/restart` | 🔄 NemiCLI **und** Wache neu starten, im selben Fenster – nach Updates oder als Notbremse, wenn etwas hängt (greift sofort, auch mitten in der Arbeit). Nur über die eigene Eingabe, nie durch die KI. Nach `/update` und Installationen fragt NemiCLI selbst „Jetzt neu starten?“ |
 | `/help` · `/exit` | Hilfe · Beenden |
 
-**Tasten:** `Enter` senden · `Strg+J` neue Zeile · `Esc` abbrechen · `F2` Denktext ·
+**Tasten:** `Enter` senden · `Strg+J` neue Zeile · `Esc` **Not-Stopp** (hat Vorrang vor allem – Antwort, Werkzeug,
+Rückfrage, Helfer, Bild, Video; in jedem Reiter des Fensters; nichts wird gelöscht, „weiter“ setzt fort) · `F2` Denktext ·
 `F8` Änderung freigeben · `F12` ganzes Gespräch sichern · `Shift+Tab` Modus ·
 `Strg+K` **Suche** (alle Befehle, Einstellungen und Modelle; Tippfehler sind okay) · `F3` **Cockpit** ·
 `/kompass an`: beim Tippen von `/` die Befehle als Karten **neben** dem Terminal, Klick setzt den Befehl ein ·
@@ -386,7 +387,8 @@ schließen · `Strg+Bild ↑/↓` wechseln · `Strg+Umschalt+K` Reiter „🤖 K
 **Markieren:** linke Maustaste gedrückt halten und ziehen – am oberen oder unteren Rand (auch über die Eingabe hinaus) rollt der Verlauf von selbst bis zum Textende mit; Loslassen kopiert. Im eigenen NemiCLI-Fenster markiert `Umschalt` + Ziehen nur das Sichtbare.
 
 **Ohne Oberfläche:** `--version` · `--selftest` · `--systemcheck` · `--bild "a fox"` · `--sag "…"` ·
-`--auftrag <name>` (Zeitplan-Auftrag ohne Fenster, Antwort wird Bericht).
+`--auftrag <name>` (Zeitplan-Auftrag ohne Fenster, Antwort wird Bericht; nur Netz lesen und nachschlagen –
+kein Code, keine Befehle, keine Downloads, keine Helfer, keine Dateien –, ohne Rückfragen).
 
 ---
 

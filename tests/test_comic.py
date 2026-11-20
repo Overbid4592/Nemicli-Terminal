@@ -90,7 +90,6 @@ class Werkzeug(unittest.TestCase):
         import notstopp
         self.assertTrue(actions.ACTIONS["comic_malen"].get("hintergrund"))
         self.assertIn("comic_malen", hintergrund.GPU_WERKZEUGE)
-        self.assertIn("comic_malen", notstopp.ZU_ENDE)
         self.assertIn("- comic_malen ", (ROOT / "core" / "persona.py").read_text(encoding="utf-8"))
 
 

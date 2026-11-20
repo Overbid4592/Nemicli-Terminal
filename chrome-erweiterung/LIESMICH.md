@@ -47,5 +47,5 @@ Läuft NemiCLI nicht, sagt die Leiste: „NemiCLI läuft nicht“.
 - `background.js` – Rechtsklick-Menü, Symbol öffnet die Seitenleiste
 - `seitenleiste.html` / `.css` / `.js` – der Chat
 - `markdown.js` – formatiert die Antworten (ohne fremde Bibliotheken)
-- `content.js` – liest die Seite, setzt die Antwort ins Feld, zeigt Hinweise
+- `content.js` – liest die Seite, setzt die Antwort ins Feld, zeigt Hinweise; wird nur bei Bedarf eingespielt (Rechtsklick, offene Seitenleiste)
 - `options.html` / `options.js` – Port und Schlüssel

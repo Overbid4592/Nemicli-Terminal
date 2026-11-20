@@ -315,6 +315,7 @@ _CHAT_GESPERRT = ("Werkzeug „{tool}“ ist im Chat-Modus gesperrt (dort gibt e
                   "„Work“ umzuschalten.")
 _FENSTER_GESPERRT = ("Werkzeug „{tool}“ ist in diesem Fenster nicht freigegeben. Hier gibt es: {liste}. "
                      "Mach es mit diesen Werkzeugen.")
+_NUR_WERKZEUGE: frozenset | None = None   # Terminal-Weg ohne Oberfläche (Zeitplan): nur diese Werkzeuge
 SPIELE_SERVER = None            # /spiel – Brettspiele im Browser (eigener Server)
 APPSTORE_SERVER = None          # /appstore – Brücke zu NemiView (Store, Apps, debugAI)
 # Im Appstore (debugAI, ➕ Neue App): App-Dateien lesen, anlegen und ändern, Seiten ansehen, App-Funktionen nutzen.
@@ -536,7 +537,7 @@ async def _denkwerk_pruefen(backend, denk, antwort: str, records: list, melde,
         return None
     melde("⚖️ Prüfer sieht die Antwort durch …")
     aufgabe = asyncio.create_task(denkwerk.pruefen(backend, denk, antwort))
-    befund = await (_warten_mit_stopp(aufgabe) if mit_stopp else aufgabe)
+    befund = await (_warten_mit_stopp(aufgabe, ersatz=None) if mit_stopp else aufgabe)
     import debugbericht as _DBG
     _DBG.ereignis("Prüfer: " + ("in Ordnung" if befund is None else befund.replace("\n", " | ")), speicher=False)
     if notstopp.ausgeloest():
@@ -728,6 +729,9 @@ def _helfer_executor(records: list, *, zeige_aktion, zeige_ergebnis, frage, prue
 
     async def execute(act: dict, lab: str) -> str:
         tool = act.get("tool")
+        if notstopp.ausgeloest():                   # nach ESC startet auch kein Helfer mehr ein Werkzeug
+            records.append({"tool": tool, "status": "not_run"})
+            return notstopp.GESPERRT_TEXT
 
         async def _pruefe(titel, preview):
             return (await pruefe(f"{lab}: {titel}", preview)) in ("yes", True)
@@ -791,7 +795,16 @@ async def _helfer_lauf(act: dict, backend, records: list, execute, zeige_start, 
                     "Mach die Aufgabe selbst oder frag, wie es weitergehen soll.")
     record = {"tool": "subagenten", "status": "running"}
     records.append(record)
-    res_list = await subagents.run(helfer, backend, execute)
+    lauf = asyncio.ensure_future(subagents.run(helfer, backend, execute))
+    while not lauf.done():                          # ESC bricht alle Helfer sofort ab
+        if _esc_jetzt():
+            lauf.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await lauf
+            record["status"] = "not_run"
+            return "⏹ Die Helfer wurden mit ESC abgebrochen."
+        await asyncio.wait({lauf}, timeout=0.1)
+    res_list = lauf.result()
     record["status"] = "unverified"      # Berichte sind Modelltext; die Aktionen selbst stehen einzeln in records
     teile = []
     for i, (h, bericht) in enumerate(res_list, 1):
@@ -929,9 +942,7 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
     actions.reset_taint(actions.fremd_im_verlauf(getattr(backend, "messages", None)))
     _abbruch_taste()                 # ein liegengebliebenes ESC gilt nicht für die neue Runde
     stop = notstopp.ist_stop(user_text)
-    notstopp.runde_beginnt(stop)
-    if stop:                         # „STOP“ als Nachricht: nichts fortsetzen, nur bestätigen
-        plan.verwerfen()
+    notstopp.runde_beginnt(stop)     # „STOP“ als Nachricht: nur bestätigen; die Todo-Liste bleibt für „weiter“
     denk = None if stop else denkwerk.runde(user_text)   # wie viel nachgedacht wird, nach der Nachricht selbst
     offen = plan.runde_neu()         # offene Todo-Liste läuft weiter, sonst beginnt eine neue
     mitschrift.nutzer(user_text)     # F12 soll das ganze Gespräch sichern können
@@ -948,7 +959,7 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
     _DBG.ereignis(f"Runde: {len(user_text)} Zeichen, {len(images or [])} Bild(er)")
     notstopp.runde_aktiv(True)
     try:
-        await _schleife(backend, user_text, images, records, denk, _terminal_ausgabe())
+        await _mit_notbremse(_schleife(backend, user_text, images, records, denk, _terminal_ausgabe()), backend)
         if notstopp.ausgeloest():
             await _nach_notstopp()
     finally:
@@ -966,33 +977,35 @@ async def converse(backend, user_text: str, images: list[str] | None = None) -> 
 
 
 async def _nach_notstopp() -> None:
-    """Nach ESC/STOP: zeigen, was schon geändert ist; gesicherte Änderungen nur auf Wunsch zurückholen."""
+    """Nach ESC/STOP: zeigen, was schon geändert ist. Nichts wird zurückgedreht und nichts gefragt – nach einem
+    Versehen soll es mit „weiter“ einfach weitergehen; einzeln zurück geht mit /undo."""
     ui.warn(notstopp.bericht())
-    sicher = notstopp.sicherungen_seit(notstopp.runde_start())
-    if not sicher:
-        return
-    liste = "\n".join(f"  • {e['werkzeug']}: {e['original']}" for e in sicher)
-    wahl = await ask_confirm(f"Diese Änderungen dieser Runde liegen gesichert im Papierkorb:\n{liste}\n"
-                             "Den Stand von vorher zurückholen?",
-                             [("nein", "Nein, so lassen"), ("ja", "Ja, zurückholen")])
-    if wahl != "ja":
-        ui.info("Bleibt so. Später geht es einzeln mit /undo.")
-        return
-    for e in sicher:                                     # neueste zuerst
-        try:
-            ziel = snapshot.wiederherstellen(e)
-            ui.success(f"↩ Zurückgeholt: {ziel}")
-            protokoll.schreibe("undo", f"Not-Stopp – zurückgeholt: {ziel}", "success", veraendernd=True,
-                               wer="Nutzer")
-        except Exception as exc:
-            ui.error(f"Zurückholen fehlgeschlagen ({e['original']}): {exc}")
 
 
-async def _warten_mit_stopp(task: "asyncio.Task") -> "actions.ActionResult":
-    """Werkzeug zu Ende laufen lassen und dabei auf ESC/STOP lauschen (Not-Stopp merken)."""
+_NICHT_ABGEWARTET = object()
+
+
+def _loslassen(task: "asyncio.Task", ersatz=_NICHT_ABGEWARTET):
+    """Nach ESC: das Werkzeug nicht mehr abwarten. Sein Faden endet von selbst (Befehle und Sandbox-Code sind
+    schon beendet, Motoren halten beim nächsten Rechenschritt an); sein Ergebnis zählt nicht mehr."""
+    task.add_done_callback(lambda t: t.cancelled() or t.exception())   # Fehler später nicht als „unabgeholt“ melden
+    if ersatz is _NICHT_ABGEWARTET:
+        return actions.ActionResult("⏹ Mit ESC abgebrochen – nicht mehr abgewartet.", ok=False)
+    return ersatz
+
+
+def _esc_jetzt() -> bool:
+    """ESC (oder STOP) während der Runde? Löst den Not-Stopp aus und sagt, ob er gilt."""
+    if _abbruch_taste():
+        notstopp.ausloesen()
+    return notstopp.ausgeloest()
+
+
+async def _warten_mit_stopp(task: "asyncio.Task", ersatz=_NICHT_ABGEWARTET):
+    """Werkzeug abwarten und dabei auf ESC/STOP lauschen – nach ESC wird nicht weiter gewartet."""
     while not task.done():
-        if _abbruch_taste():
-            notstopp.ausloesen()
+        if _esc_jetzt():
+            return _loslassen(task, ersatz)
         await asyncio.sleep(0.1)
     return await task
 
@@ -1004,11 +1017,54 @@ async def _web_live(act: dict) -> "actions.ActionResult":
     beginn = time.monotonic()
     with ui.live_view(ui.web_laeuft(info, 0.0)) as live:
         while not task.done():
-            if _abbruch_taste():
-                notstopp.ausloesen()
+            if _esc_jetzt():
+                return _loslassen(task)
             live.update(ui.web_laeuft(info, time.monotonic() - beginn))
             await asyncio.sleep(0.15)
     return await task
+
+
+async def _mit_notbremse(lauf, backend=None):
+    """ESC hat Vorrang vor allem: Die Runde läuft als eigene Aufgabe, daneben wacht diese Schleife. Nach ESC
+    darf die Runde NOTBREMSE_S lang sauber enden (Antwort, Werkzeug, Rückfrage hören von selbst auf) – wartet
+    sie dann noch auf etwas (Helfer, Modell, Netz), wird sie abgebrochen. Gelöscht wird dabei nichts."""
+    token = notstopp.vordergrund(True)                 # Werkzeug-Fäden dieser Runde erben das
+    try:
+        aufgabe = asyncio.ensure_future(lauf)
+    finally:
+        notstopp.vordergrund_ende(token)
+    try:
+        while not aufgabe.done():
+            if ui.TUI is None and _esc_pressed():         # klassisches Terminal: die Taste selbst lesen
+                notstopp.ausloesen()
+            if notstopp.ausgeloest():
+                fertig, _ = await asyncio.wait({aufgabe}, timeout=notstopp.NOTBREMSE_S)
+                if not fertig:
+                    aufgabe.cancel()
+                    with contextlib.suppress(asyncio.CancelledError, Exception):
+                        await aufgabe
+                    _verlauf_schliessen(backend)
+                    return None
+                break
+            await asyncio.wait({aufgabe}, timeout=0.1)
+    except asyncio.CancelledError:
+        aufgabe.cancel()
+        raise
+    if aufgabe.cancelled():                           # nicht durch ESC: wie bisher weiterreichen
+        raise asyncio.CancelledError()
+    return aufgabe.result()
+
+
+def _verlauf_schliessen(backend) -> None:
+    """Nach dem harten Abbruch: Endet der Verlauf mit einer Nachricht an die KI, bekommt sie eine Antwort –
+    sonst stünden beim nächsten Mal zwei Nutzer-Nachrichten hintereinander."""
+    nachrichten = getattr(backend, "messages", None)
+    if nachrichten and nachrichten[-1].get("role") == "user":
+        nachrichten.append({"role": "assistant", "content": "(mit ESC abgebrochen)"})
+    try:
+        mitschrift.notiz("⎋ Vom Nutzer mit ESC abgebrochen.")
+    except Exception:
+        pass
 
 
 def _ankunft_melden(ankunft: dict, denk_zeichen: int, gesamt: float) -> None:
@@ -1366,7 +1422,7 @@ async def _terminal_antworten(backend, next_input, imgs) -> dict:
             while True:
                 # Auch bei lückenlosem Tokenstrom reagieren. Im Vollbild
                 # liest nur prompt_toolkit die Tastatur, nie parallel msvcrt.
-                if _abbruch_taste():
+                if _abbruch_taste() or notstopp.ausgeloest():
                     aborted = True
                     break
                 try:
@@ -1489,12 +1545,9 @@ def _terminal_ausgabe() -> dict:
                 titel = f"{titel[:1]} Todo {punkt['nr']}: {punkt['text'][:60]}"
             with ui.live_view(ui.progress_panel(titel, "starte …")) as live:
                 while not run_task.done():
-                    if _abbruch_taste():
-                        notstopp.ausloesen()
-                    stand = actions.bild_status() or "arbeite …"
-                    if notstopp.ausgeloest():   # schon bezahlter Strom: zu Ende rechnen, danach nichts mehr
-                        stand = f"⏹ Not-Stopp – rechnet noch zu Ende, danach nichts mehr · {stand}"
-                    live.update(ui.progress_panel(titel, stand))
+                    if _esc_jetzt():            # der Motor hält beim nächsten Rechenschritt an
+                        return _loslassen(run_task)
+                    live.update(ui.progress_panel(titel, actions.bild_status() or "arbeite …"))
                     await asyncio.sleep(0.2)
             return await run_task
         if tool == "befehl" or coding.pruefbefehl(act):
@@ -1548,7 +1601,7 @@ def _terminal_ausgabe() -> dict:
                       "plan_zeigen": lambda tf: ui.console.print(
                           ui.action_request(_recherche_plan_text(tf), confirm=False))},
         "menue": menue, "ausfuehren": ausfuehren, "nach_aktion": nach_aktion,
-        "abbruch": _abbruch_taste, "erlaubt": None, "mit_stopp": True, "mitschrift": True, "diff": True,
+        "abbruch": _abbruch_taste, "erlaubt": _NUR_WERKZEUGE, "mit_stopp": True, "mitschrift": True, "diff": True,
     }
 
 
@@ -1707,8 +1760,12 @@ async def _befehl_live(act: dict) -> "actions.ActionResult":
     try:
         with ui.live_view(ui.befehl_panel(befehl, 0, [])) as live:
             while not run_task.done():
-                if _abbruch_taste():
-                    notstopp.ausloesen()            # beendet auch den Befehl
+                if _esc_jetzt():                    # beendet auch den Befehl samt Unterprozessen
+                    actions.befehl_stoppen()
+                    try:                            # kurz auf die Ausgabe bis zum Abbruch warten
+                        return await asyncio.wait_for(asyncio.shield(run_task), notstopp.NOTBREMSE_S)
+                    except (asyncio.TimeoutError, Exception):
+                        return _loslassen(run_task)
                 st = actions.befehl_status() or {"sekunden": 0, "zeilen": []}
                 live.update(ui.befehl_panel(befehl, st["sekunden"], st["zeilen"]))
                 await asyncio.sleep(0.2)
@@ -1745,9 +1802,7 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
     if fremd:
         actions.fremdinhalt()
     stop = notstopp.ist_stop(user_text)
-    notstopp.runde_beginnt(stop)
-    if stop:
-        plan.verwerfen()
+    notstopp.runde_beginnt(stop)                   # die Todo-Liste bleibt für „weiter“
     denk = None if stop else denkwerk.runde(user_text)
     if plan.runde_neu():
         user_text += _TODO_OFFEN_NOTE.format(liste=plan.text_fuer_modell())
@@ -1757,7 +1812,8 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
     user_text += await _runde_beobachten(lambda t: emit({"t": "note", "text": t}))
     notstopp.runde_aktiv(True)
     try:
-        await _schleife(backend, user_text, images, records, denk, _web_ausgabe(emit, confirm, erlaubt))
+        await _mit_notbremse(_schleife(backend, user_text, images, records, denk,
+                                       _web_ausgabe(emit, confirm, erlaubt)), backend)
     finally:
         notstopp.runde_aktiv(False)
         if hasattr(backend, "denk_hinweis"):

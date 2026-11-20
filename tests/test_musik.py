@@ -204,7 +204,6 @@ class Werkzeug(unittest.TestCase):
         import persona
         self.assertTrue(actions.ACTIONS["musik_machen"].get("hintergrund"))
         self.assertIn("musik_machen", hintergrund.GPU_WERKZEUGE)
-        self.assertIn("musik_machen", notstopp.ZU_ENDE)
         self.assertIn("- musik_machen", persona.base_prompt())
 
     def test_ohne_stil_und_ohne_modelle(self):

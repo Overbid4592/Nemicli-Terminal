@@ -35,6 +35,23 @@ _WERKZEUG = re.compile(r"^Ergebnis von '(\w+)'")
 _PLATZ = re.compile(r"%\{(\w+)\}")              # Platzhalter in den Vorlagen der Datenbank
 _JSON_WERT = re.compile(r"^(?:[\[{].*|true|false|null|-?\d+(?:\.\d+)?(?:[eE][-+]?\d+)?)$", re.DOTALL)
 MAX_TIEFE = 64                                 # Verschachtelung von Werten (Listen, Objekte) beim Lesen und Schreiben
+LESE_ZEIT_S = 1.0                              # je Suche der Datenbank-Muster in einer Antwort
+
+try:                                           # regex kennt timeout=: die Muster stammen aus einer Datendatei und
+    import regex as _rx                        # laufen über Modellausgaben – ein teures Muster darf nicht festhalten
+except ImportError:                            # pragma: no cover
+    _rx = None
+_MUSTER_FEHLER = (re.error,) + ((_rx.error,) if _rx is not None else ())
+
+
+def _muster(text: str, dotall: bool = False):
+    if _rx is not None:
+        return _rx.compile(text, _rx.DOTALL if dotall else 0)
+    return re.compile(text, re.DOTALL if dotall else 0)
+
+
+def _zeit() -> dict:
+    return {"timeout": LESE_ZEIT_S} if _rx is not None else {}
 
 
 def als_text(teile: Teile) -> str:
@@ -106,10 +123,10 @@ class Dialekt:
                   and (aufruf["werte"] == "json_ganz" or "feld" in aufruf)
                   and ("kopf" in lesen if lesen["art"] == "json" else "aufruf" in lesen)
                   and (lesen["art"] != "xml" or "feld" in lesen))
-            self._aufruf_re = re.compile(lesen["aufruf"], re.DOTALL) if "aufruf" in lesen else None
-            self._feld_re = re.compile(lesen["feld"], re.DOTALL) if "feld" in lesen else None
-            self._kopf_re = re.compile(lesen["kopf"]) if "kopf" in lesen else None
-        except (KeyError, TypeError, re.error) as exc:
+            self._aufruf_re = _muster(lesen["aufruf"], dotall=True) if "aufruf" in lesen else None
+            self._feld_re = _muster(lesen["feld"], dotall=True) if "feld" in lesen else None
+            self._kopf_re = _muster(lesen["kopf"]) if "kopf" in lesen else None
+        except (KeyError, TypeError, *_MUSTER_FEHLER) as exc:
             raise ausfuellen.DbFehler(f"Werkzeug-Format {eintrag.get('name', '?')!r}: {exc}") from exc
         if not ok:
             raise ausfuellen.DbFehler(f"Werkzeug-Format {self.name!r}: unbekannte Art oder fehlender Platzhalter")
@@ -171,29 +188,33 @@ class Dialekt:
         return self._fuellen(a["vorlage"], {"name": name, "felder": inhalt})
 
     def aufrufe_finden(self, text: str) -> list[tuple[int, int, str, dict]]:
-        """(Anfang, Ende, Werkzeug, Felder) je vollständigem Aufruf im erzeugten Text."""
+        """(Anfang, Ende, Werkzeug, Felder) je vollständigem Aufruf im erzeugten Text. Läuft ein Muster in
+        die Zeitgrenze, bleibt es bei den bis dahin gefundenen Aufrufen."""
         art, raus = self.e["lesen"]["art"], []
-        if art == "json":
-            for m in self._kopf_re.finditer(text):
-                if (gelesen := self._json_aufruf(text, m.start())) is not None:
-                    raus.append((m.start(), gelesen[2], gelesen[0], gelesen[1]))
-            return raus
-        for m in self._aufruf_re.finditer(text):
-            if art == "gemma":
-                try:
-                    felder = _GemmaLeser(m.group(2) + "}").felder("}")
-                except (ValueError, RecursionError):
-                    continue
-            else:
-                als_text = _text_felder(m.group(1).strip())
-                felder = {k.strip(): v if k.strip() in als_text else _wert_lesen(v)
-                          for k, v in self._feld_re.findall(m.group(2))}
-            raus.append((m.start(), m.end(), m.group(1).strip(), felder))
+        try:
+            if art == "json":
+                for m in self._kopf_re.finditer(text, **_zeit()):
+                    if (gelesen := self._json_aufruf(text, m.start())) is not None:
+                        raus.append((m.start(), gelesen[2], gelesen[0], gelesen[1]))
+                return raus
+            for m in self._aufruf_re.finditer(text, **_zeit()):
+                if art == "gemma":
+                    try:
+                        felder = _GemmaLeser(m.group(2) + "}").felder("}")
+                    except (ValueError, RecursionError):
+                        continue
+                else:
+                    als_text = _text_felder(m.group(1).strip())
+                    felder = {k.strip(): v if k.strip() in als_text else _wert_lesen(v)
+                              for k, v in self._feld_re.findall(m.group(2), **_zeit())}
+                raus.append((m.start(), m.end(), m.group(1).strip(), felder))
+        except TimeoutError:
+            pass
         return raus
 
     def _json_aufruf(self, text: str, start: int):
         """KOPF{json} ab `start`: (Name, Felder, Ende) oder None."""
-        m = self._kopf_re.match(text, start)
+        m = self._kopf_re.match(text, start, **_zeit())
         if m is None:
             return None
         start = m.end()
@@ -227,7 +248,10 @@ class Dialekt:
     def aufruf_laenge(self, text: str) -> int | None:
         """Länge des vollständigen Aufrufs am Anfang von `text` (None: noch nicht fertig)."""
         if not self.ende:
-            gelesen = self._json_aufruf(text, 0)
+            try:
+                gelesen = self._json_aufruf(text, 0)
+            except TimeoutError:
+                return None
             return gelesen[2] if gelesen else None
         j = text.find(self.ende)
         return None if j < 0 else j + len(self.ende)

@@ -215,6 +215,9 @@ async def selbstentwurf_runde(backend) -> tuple[bool, str]:
         if not acts:
             break
         res = await actions.run(acts[0])
+        aendert = bool(acts[0].get("felder")) or str(acts[0].get("aktion") or "") in ("schreiben", "zurueck", "zurück")
+        protokoll.schreibe("selbstentwurf", actions.describe(acts[0]), "success" if res.ok else "failed",
+                           veraendernd=aendert, wer=PS.active().name, ergebnis=res.text)
         if res.ok and acts[0].get("felder"):
             grund = " ".join(str(acts[0].get("grund") or "").split())[:200]
             break

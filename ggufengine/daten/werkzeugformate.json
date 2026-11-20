@@ -218,7 +218,7 @@
    },
    "lesen": {
     "art": "xml",
-    "aufruf": "<tool_call>\\s*([^\\n<]+?)\\s*((?:<arg_key>.*?</arg_value>\\s*)*)</tool_call>",
+    "aufruf": "<tool_call>\\s*([^\\n<]+?)\\s*((?:<arg_key>(?:(?!</arg_value>).)*</arg_value>\\s*)*)</tool_call>",
     "feld": "<arg_key>(.*?)</arg_key>\\s*<arg_value>(.*?)</arg_value>"
    },
    "antwort": {

@@ -213,7 +213,7 @@ def lesen(antwort: str) -> Befund:
 
 
 def _feld(text: str, name: str) -> str:
-    m = re.search(rf"^{name}: (.*)$", text, re.M)
+    m = re.search(rf"^{re.escape(name)}: (.*)$", text, re.M)
     return m.group(1) if m else ""
 
 

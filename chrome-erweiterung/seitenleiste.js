@@ -314,7 +314,7 @@ async function seitenzugriff() {
   }
 }
 
-// Nachricht ans Seiten-Skript; fehlt es (Tab älter als die Erweiterung), wird es eingespritzt.
+// Nachricht ans Seiten-Skript; fehlt es (es wird erst bei Bedarf eingespielt), wird es eingespritzt.
 async function anSeite(tab, msg) {
   try {
     return await chrome.tabs.sendMessage(tab.id, msg);
@@ -625,6 +625,20 @@ $("neu").onclick = async () => {
 setInterval(() => { if (!zustand.beschaeftigt && !document.hidden) laden(); }, 8000);
 document.addEventListener("visibilitychange", () => { if (!document.hidden) laden(); });
 chrome.storage.onChanged.addListener(() => laden());
+
+// Solange die Seitenleiste offen ist, kommt das Seiten-Skript in den sichtbaren Tab: es merkt sich das zuletzt
+// benutzte Textfeld für „Einsetzen“. Ohne offene Seitenleiste und ohne Rechtsklick läuft es auf keiner Seite.
+async function seitenSkript(tabId) {
+  try {
+    const [r] = await chrome.scripting.executeScript({ target: { tabId }, func: () => !!window.__nemiGeladen });
+    if (!r || !r.result) await chrome.scripting.executeScript({ target: { tabId }, files: ["content.js"] });
+  } catch (_) {}                                   // chrome://, Web Store …: dort geht es nicht
+}
+chrome.tabs.onActivated.addListener(({ tabId }) => seitenSkript(tabId));
+chrome.tabs.onUpdated.addListener((tabId, info, tab) => {
+  if (info.status === "complete" && tab.active) seitenSkript(tabId);
+});
+aktiverTab().then((tab) => seitenSkript(tab.id)).catch(() => {});
 
 laden();
 knoepfe();

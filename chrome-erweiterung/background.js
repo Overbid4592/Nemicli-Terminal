@@ -77,8 +77,8 @@ async function anNemi(pfad, daten) {
   return j.antwort || "";
 }
 
-// Nachricht an das Seiten-Skript. Fehlt es (Tab war schon offen, bevor die
-// Erweiterung geladen wurde), wird es eingespritzt und nochmal versucht.
+// Nachricht an das Seiten-Skript. Fehlt es (es wird erst bei Bedarf eingespielt),
+// wird es eingespritzt und nochmal versucht.
 async function sende(tabId, msg) {
   try {
     return await chrome.tabs.sendMessage(tabId, msg);

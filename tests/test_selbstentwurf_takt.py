@@ -140,12 +140,15 @@ class Takt(_Ort, unittest.IsolatedAsyncioTestCase):
             return []
 
         self.reflektiert = False
+        self.protokoll = []
         self.backend = Backend()
         self.ns = {"asyncio": asyncio, "time": time, "TURN_LOCK": asyncio.Lock(), "_LERN_AUFGABEN": set(),
                    "SE_RUHE_S": 120.0, "_FREMD_MARKEN": ("EXTERNER WEB-INHALT",), "lernschleife": LS,
                    "PS": NS(active=lambda: NS(key="test", name="Test")),
                    "sicherheit": NS(vordergrund_grund=lambda: self.vordergrund),
-                   "actions": NS(parse_actions=parse_actions, run=run), "do_reflect": do_reflect,
+                   "actions": NS(parse_actions=parse_actions, run=run, describe=lambda a: f"Selbstentwurf: {a}"),
+                   "protokoll": NS(schreibe=lambda *a, **k: self.protokoll.append((a, k))),
+                   "do_reflect": do_reflect,
                    "ui": NS(info=self.infos.append, warn=self.warn.append, success=self.infos.append,
                             error=self.warn.append, TUI=None,
                             thinking=lambda *a, **k: contextlib.nullcontext(),
@@ -173,6 +176,8 @@ class Takt(_Ort, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.infos, ["🪞 Test hat den Selbstentwurf angepasst: Ich mag Regen inzwischen."])
         self.assertIn("Selbstentwurf angepasst", LS.hinweise_abholen("test"))
         self.assertEqual(self.backend.messages[-1]["content"], "Ruhig.")   # nichts ins Gespräch
+        (tool, _beschreibung, status), art = self.protokoll[0]             # steht im Aktions-Protokoll
+        self.assertEqual((tool, status, art["veraendernd"], art["wer"]), ("selbstentwurf", "success", True, "Test"))
 
     async def test_hoechstens_eine_runde_je_fenster_und_nachholen_nur_einmal(self):
         (self.tmp / "Test").mkdir()

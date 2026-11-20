@@ -114,19 +114,57 @@ def _windash(wert: str) -> list[str]:
     return [wert, wert.replace("-", "/"), wert.replace("-", "–"), wert.replace("-", "—")]
 
 
-def _als_regex(soll: str) -> str:
-    """Sigma-Wert → Regex: nur `*` und `?` sind Platzhalter; `\\*`, `\\?`, `\\\\` stehen für das Zeichen
-    selbst, alles andere (auch `[`) gilt wörtlich."""
-    teile, i = [], 0
+def _stuecke(soll: str) -> list[list[str]]:
+    """Sigma-Wert → Stücke zwischen den `*`, je Zeichen ein Regex-Baustein fester Länge (`?` = `.`).
+    `\\*`, `\\?`, `\\\\` stehen für das Zeichen selbst, alles andere (auch `[`) gilt wörtlich."""
+    stuecke: list[list[str]] = [[]]
+    i = 0
     while i < len(soll):
         c = soll[i]
         if c == "\\" and i + 1 < len(soll) and soll[i + 1] in "*?\\":
-            teile.append(re.escape(soll[i + 1]))
+            stuecke[-1].append(re.escape(soll[i + 1]))
             i += 2
             continue
-        teile.append(".*" if c == "*" else "." if c == "?" else re.escape(c))
+        if c == "*":
+            stuecke.append([])
+        else:
+            stuecke[-1].append("." if c == "?" else re.escape(c))
         i += 1
-    return "".join(teile)
+    return stuecke
+
+
+def _platzhalter(soll: str, art: str, flags: int):
+    """Vergleich mit `*`/`?` ohne Backtracking. Die Stücke zwischen den `*` haben feste Länge; sie werden der
+    Reihe nach am frühesten Ort gesucht, das erste und letzte bei fester Kante. Der Aufwand wächst linear mit
+    dem Text – `.*a.*b.*` mit fullmatch wüchse bei vielen `a` quadratisch (die Befehlszeile bestimmt der
+    beobachtete Prozess)."""
+    stuecke = _stuecke(soll)
+    vorne = art in ("in", "ende") or len(stuecke) > 1 and not stuecke[0]      # davor darf etwas stehen
+    hinten = art in ("in", "anfang") or len(stuecke) > 1 and not stuecke[-1]  # danach darf etwas stehen
+    teile = [(len(s), re.compile("".join(s), flags) if s else None) for s in stuecke]
+    letztes = len(teile) - 1
+
+    def pruefen(ist: str) -> bool:
+        pos, n = 0, len(ist)
+        for j, (laenge, rx) in enumerate(teile):
+            if rx is None:
+                continue
+            if j == 0 and not vorne:
+                if rx.match(ist, 0) is None:
+                    return False
+                pos = laenge
+            elif j == letztes and not hinten:
+                start = n - laenge
+                if start < pos or rx.match(ist, start) is None:
+                    return False
+                pos = n
+            else:
+                m = rx.search(ist, pos)
+                if m is None:
+                    return False
+                pos = m.end()
+        return hinten or pos == n
+    return pruefen
 
 
 def _woertlich(soll: str) -> str | None:
@@ -186,14 +224,12 @@ def _vergleicher(soll, mods: list[str]):
         if text is not None:
             pruefer.append((art, text.lower() if egal else text))
             continue
-        muster = _als_regex(s)
-        muster = {"in": f".*{muster}.*", "anfang": f"{muster}.*", "ende": f".*{muster}"}.get(art, muster)
-        pruefer.append(("rx", re.compile(muster, re.DOTALL | (re.IGNORECASE if egal else 0))))
+        pruefer.append(("rx", _platzhalter(s, art, re.DOTALL | (re.IGNORECASE if egal else 0))))
 
     def pruefen(ist: str) -> bool:
         k = ist.lower() if egal else ist
         for a, w in pruefer:
-            if ((a == "rx" and w.fullmatch(ist) is not None) or (a == "in" and w in k)
+            if ((a == "rx" and w(ist)) or (a == "in" and w in k)
                     or (a == "anfang" and k.startswith(w)) or (a == "ende" and k.endswith(w))
                     or (a == "gleich" and k == w)):
                 return True

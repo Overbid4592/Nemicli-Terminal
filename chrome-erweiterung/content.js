@@ -1,5 +1,5 @@
-// NemiCLI – läuft auf jeder Seite: merkt sich das Textfeld mit dem Cursor,
-// sammelt den Seitentext, setzt die Antwort ein, zeigt Hinweise.
+// NemiCLI – wird erst bei Bedarf in die Seite eingespielt (Rechtsklick-Menü, Seitenleiste):
+// merkt sich das Textfeld mit dem Cursor, sammelt den Seitentext, setzt die Antwort ein, zeigt Hinweise.
 
 if (window.__nemiGeladen) { throw new Error("nemi: schon geladen"); }   // nicht doppelt einspritzen
 window.__nemiGeladen = true;
@@ -20,6 +20,8 @@ function istFeld(el) {
 document.addEventListener("focusin", (e) => {
   if (istFeld(e.target)) letztesFeld = e.target;
 }, true);
+// Eingespielt beim Rechtsklick: das Feld, in dem der Cursor gerade steht, gilt als zuletzt benutzt.
+if (istFeld(document.activeElement)) letztesFeld = document.activeElement;
 
 function feldFinden() {
   const a = document.activeElement;

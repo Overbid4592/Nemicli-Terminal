@@ -37,7 +37,11 @@ def starten(tool: str, titel: str, arbeit, wer: str) -> int:
         finally:
             e["ende"] = time.time()
             _melden(e)
-    e["task"] = asyncio.get_running_loop().create_task(lauf())
+    import contextvars
+    import notstopp
+    kontext = contextvars.copy_context()
+    kontext.run(notstopp.vordergrund, False)          # ESC im Vordergrund hält Hintergrund-Aufgaben nicht an
+    e["task"] = asyncio.get_running_loop().create_task(lauf(), context=kontext)
     return nr
 
 

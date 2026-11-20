@@ -167,7 +167,6 @@ class Werkzeug(unittest.TestCase):
         import persona
         self.assertTrue(actions.ACTIONS["musik_cover"].get("hintergrund"))
         self.assertIn("musik_cover", hintergrund.GPU_WERKZEUGE)
-        self.assertIn("musik_cover", notstopp.ZU_ENDE)
         self.assertIn("- musik_cover", persona.base_prompt())
 
     def test_naehe_und_felder(self):

@@ -2613,6 +2613,10 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
 
         def keyPressEvent(self, ev):
             self.figur_taste = time.monotonic()           # die Figur döst nicht, solange getippt wird
+            if ev.key() == Qt.Key_Escape and not self.haupt:
+                self.fenster.esc_an_nemicli()             # ESC hält die KI an, egal welcher Reiter den Fokus hat
+                if self.nur_lesen:
+                    return
             mods = ev.modifiers()
             shift = bool(mods & Qt.ShiftModifier) or ev.key() == Qt.Key_Backtab
             strg = bool(mods & Qt.ControlModifier)
@@ -3038,6 +3042,7 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             class Suchfeld(QLineEdit):
                 def keyPressEvent(self, ev):
                     if ev.key() == Qt.Key_Escape:
+                        fenster.esc_an_nemicli()
                         fenster.suche_schliessen()
                     elif ev.key() in (Qt.Key_Return, Qt.Key_Enter, Qt.Key_Up, Qt.Key_Down):
                         # Enter und ↑: älterer Treffer; Umschalt+Enter und ↓: neuerer
@@ -3077,6 +3082,13 @@ def starten(befehl: list[str], *, ordner: str | None = None, env: dict | None = 
             self.suchfeld.setFocus()
             self.suchfeld.selectAll()
             self._suche_starten()
+
+        def esc_an_nemicli(self):
+            """ESC außerhalb des Chats (Reiter „KI“, Kommandozeile, Suchleiste): arbeitet NemiCLI gerade, geht es
+            auch an NemiCLI – der Not-Stopp gilt in jedem Bereich des Fensters."""
+            haupt = self.haupt
+            if haupt is not None and haupt.puls and haupt.pty is not None:
+                haupt.pty.schreiben(taste_zu_folge("escape"))
 
         def suche_schliessen(self):
             self.such_warten.stop()

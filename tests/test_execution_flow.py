@@ -141,6 +141,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(lambda: (setattr(sicherheit, "WHITELIST_DATEI", self._wl_alt),
                                  sicherheit.whitelist_neu_laden()))
         self.ns = dict(asyncio=asyncio, itertools=itertools, time=time, ui=ui, MAX_STEPS=4, MAX_LESE_STEPS=7,
+                       contextlib=__import__("contextlib"), _NICHT_ABGEWARTET=object(), _NUR_WERKZEUGE=None,
                        Path=Path, _DIFF_WERKZEUGE=("datei_schreiben", "datei_bearbeiten"), _DIFF_MAX_BYTES=1_000_000,
                        _KOPF_IN_AUSGABE=re.compile(r"(?m)^Ergebnis von '"),
                        SERIE_MAX_STEPS=12, _TODO_OFFEN_NOTE=" [TODO OFFEN] {liste}",
@@ -214,6 +215,7 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                                        "converse", "_schleife", "_antworten_mit_reserve", "_terminal_antworten", "_terminal_ausgabe", "_web_ausgabe",
                                        "_ankunft_melden", "web_converse",
                                        "_nach_notstopp", "_warten_mit_stopp", "_web_live", "_diff_pfad", "_datei_text",
+                                       "_mit_notbremse", "_verlauf_schliessen", "_loslassen", "_esc_jetzt",
                                        "_vorher_stand", "_diff_zeigen"}, self.ns)
         import llamareserve
         self.ns["llamareserve"] = llamareserve
@@ -336,23 +338,72 @@ class FlowTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual([], self.calls)
                 self.assertIn("keine Werkzeuge", self.backend.inputs[0])
 
-    async def test_notstopp_bietet_gesicherte_aenderungen_zum_zurueckholen(self):
+    async def test_notstopp_loescht_nichts_und_fragt_nicht(self):
         self.setup_flow([action("datei_schreiben"), "nie"])
         self.mode_decide = lambda act, need: "run"
         self.taste = lambda: bool(self.calls)
-        geholt, gefragt = [], []
+        geholt, gefragt, verworfen = [], [], []
         notstopp.sicherungen_seit = lambda start: [{"werkzeug": "datei_schreiben", "original": "C:/x/a.py",
                                                     "kopie": "C:/p/a.py", "zeit": ""}]
         self.ns["snapshot"] = NS(wiederherstellen=lambda e: geholt.append(e["original"]) or e["original"])
+        self.ns["plan"].verwerfen = lambda: verworfen.append(True)
 
         async def frage(text, optionen, **kw):
             gefragt.append(text)
             return "ja"
         self.ns["ask_confirm"] = frage
         await self.run_flow(False)
-        self.assertTrue(gefragt and "a.py" in gefragt[0])     # erst fragen …
-        self.assertEqual(["C:/x/a.py"], geholt)                # … dann zurückholen
-        self.assertTrue(any("datei_schreiben" in str(o) for o in self.output))   # Änderung gemeldet
+        self.assertEqual([], gefragt)                          # keine Rückfrage nach dem Stopp …
+        self.assertEqual([], geholt)                           # … nichts zurückgedreht
+        self.assertEqual([], verworfen)                        # … die Todo-Liste bleibt
+        bericht = next(str(o) for o in self.output if "Not-Stopp" in str(o))
+        self.assertIn("gelöscht wurde nichts", bericht)
+        self.assertIn("datei_schreiben", bericht)              # Änderung gemeldet
+        self.assertIn("weiter", bericht)                       # nach einem Versehen geht es weiter
+        self.backend = Backend(["Okay."])
+        self.taste = lambda: False
+        await self.ns["converse"](self.backend, "Sorry, war aus Versehen – mach weiter")
+        self.assertIn("Versehen", self.backend.inputs[0])      # die KI darf dort weitermachen
+
+    async def test_esc_wartet_kein_haengendes_werkzeug_ab(self):
+        self.setup_flow([action("datei_lesen"), "nie"])
+        self.mode_decide = lambda act, need: "run"
+        beginn = time.monotonic()
+        self.taste = lambda: time.monotonic() - beginn > 0.3   # ESC nach 0,3 s
+
+        async def haengt(act):
+            self.calls.append(act)
+            await asyncio.sleep(30)
+        self.ns["actions"].run = haengt
+        rows = await self.run_flow(False)
+        self.assertLess(time.monotonic() - beginn, 3)
+        self.assertEqual(1, len(self.backend.inputs))          # nichts geht mehr ans Modell
+        self.assertNotEqual("success", rows[0]["status"])
+
+    async def test_esc_bricht_offene_rueckfrage_hart_ab(self):
+        self.setup_flow([action("datei_schreiben"), "nie"])
+        self.mode_decide = lambda act, need: "ask"
+        gefragt = asyncio.Event()
+
+        async def haengt(text, optionen, **kw):            # niemand antwortet
+            gefragt.set()
+            await asyncio.sleep(30)
+        self.ns["ask_confirm"] = self.ns["review_action_confirm"] = haengt
+
+        async def esc():                                   # wie die Taste im Fenster: Not-Stopp sofort
+            await gefragt.wait()
+            notstopp.ausloesen()
+        drueck = asyncio.create_task(esc())
+        beginn = time.monotonic()
+        notstopp.runde_aktiv(True)
+        try:
+            await self.ns["converse"](self.backend, "Offline-Test")
+        finally:
+            notstopp.runde_aktiv(False)
+        await drueck
+        self.assertLess(time.monotonic() - beginn, 3)
+        self.assertEqual([], self.calls)                       # nichts ausgeführt
+        self.assertEqual("assistant", self.backend.messages[-1]["role"])   # Verlauf geschlossen
 
     def test_stop_erkennung(self):
         for ja in ("STOP", "stopp!", "Stop.", "abbrechen", "Hör auf", "hoer auf", "Halt"):

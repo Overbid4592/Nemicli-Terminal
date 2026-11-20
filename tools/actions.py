@@ -54,6 +54,7 @@ import foldersense
 import fremddaten
 import learn
 import memory
+import notstopp
 import pdfgen
 import sicherheit
 import snapshot
@@ -105,6 +106,18 @@ def bild_status() -> str | None:
     """Aktuelle Fortschritts-Meldung des Bildmalens (oder None, wenn gerade
     nichts läuft). Wird vom Haupt-Loop gepollt."""
     return _BILD_STATUS["msg"]
+
+
+def _bild_melden(msg) -> None:
+    """Fortschritt der Mal-, Video-, Musik- und Lern-Motoren. Sie melden jeden Rechenschritt – nach ESC im
+    Vordergrund hören sie hier auf (notstopp.Abgebrochen), statt zu Ende zu rechnen."""
+    _BILD_STATUS["msg"] = msg
+    notstopp.pruefen()
+
+
+def _esc() -> bool:
+    """Nach ESC im Vordergrund: Suchläufe und Schleifen der Werkzeuge hören auf."""
+    return notstopp.abbrechen()
 
 
 # ---------------------------------------------------------------------------
@@ -1930,6 +1943,7 @@ SUCHE_TREFFER_MAX = 200
 SUCHE_ZEIT_S = 60.0               # ein Suchlauf hört danach auf und sagt, dass er nicht fertig ist
 INHALT_DATEI_MAX = 20 * 2**20     # größere Dateien durchsucht inhalt_suchen nicht (Modelle, Videos, Abbilder)
 _BINAER_PROBE = 8192              # so viele Bytes am Anfang zeigen, ob eine Datei Text ist
+SUCHE_MUSTER_MAX = 500            # Zeichen je Suchmuster der KI
 
 
 def _such_ende(gestoppt: str) -> str:
@@ -1945,6 +1959,9 @@ def _dateien_suchen(a: dict) -> str | ActionResult:
     for p in base.rglob(muster):
         if time.monotonic() > ende:
             gestoppt = f"nach {SUCHE_ZEIT_S:.0f} s abgebrochen"
+            break
+        if _esc():
+            gestoppt = "mit ESC abgebrochen"
             break
         if p.is_file() and not _skip_system(p, base):
             treffer.append(str(p))
@@ -1984,11 +2001,12 @@ def _recherche(a: dict) -> ActionResult:
 
 def _such_muster(muster: str):
     """Suchfunktion (zeile, ende) für ein Muster der KI. Das Paket regex bricht bei katastrophalem
-    Backtracking zur Zeitgrenze ab (TimeoutError); re kann das nicht und hielte den Prozess fest."""
+    Backtracking zur Zeitgrenze ab (TimeoutError); re kann das nicht und hielte den Prozess fest –
+    ohne regex wird das Muster deshalb wörtlich gesucht."""
     try:
         import regex
     except ImportError:
-        rx = re.compile(muster, re.IGNORECASE)
+        rx = re.compile(re.escape(muster), re.IGNORECASE)
         return lambda zeile, ende: rx.search(zeile)
     rx = regex.compile(muster, regex.IGNORECASE)
     return lambda zeile, ende: rx.search(zeile, timeout=max(0.05, ende - time.monotonic()))
@@ -1998,14 +2016,23 @@ def _inhalt_suchen(a: dict) -> str | ActionResult:
     base = Path(a.get("pfad", "."))
     if (blocked := _read_guard(str(base))):
         return ActionResult(blocked, ok=False)
-    muster = a["muster"]
+    muster = str(a["muster"])
+    if len(muster) > SUCHE_MUSTER_MAX:
+        return ActionResult(f"Fehler: Suchmuster zu lang ({len(muster)} Zeichen, höchstens {SUCHE_MUSTER_MAX}).",
+                            ok=False)
     glob = a.get("glob", "*")
-    suche = _such_muster(muster)
+    try:
+        suche = _such_muster(muster)
+    except Exception as e:                         # re.error bzw. regex.error (erbt nur von Exception)
+        return ActionResult(f"Fehler: ungültiges Suchmuster: {e}", ok=False)
     out, gestoppt, gross, ende = [], "", 0, time.monotonic() + SUCHE_ZEIT_S
     netz = False
     for p in base.rglob(glob):
         if time.monotonic() > ende:
             gestoppt = f"nach {SUCHE_ZEIT_S:.0f} s abgebrochen"
+            break
+        if _esc():
+            gestoppt = "mit ESC abgebrochen"
             break
         if not p.is_file() or _skip_system(p, base):
             continue
@@ -2816,23 +2843,24 @@ def _code_ausfuehren(a: dict) -> ActionResult:
     except (TypeError, ValueError):
         timeout = 60
     lauf = sandbox.ARBEIT / datetime.now().strftime("lauf_%Y%m%d_%H%M%S_%f")
+    _BEFEHL_STOPP.clear()                            # ESC (notstopp.ausloesen) beendet den Lauf
     try:
         lauf.mkdir(parents=True)
         if modul:
             py = sandbox.vorbereiten()
             e = sandbox.ausfuehren([str(py), "-X", "utf8", "-m", modul, *argumente], lauf, timeout,
-                                   pythonpfad=sandbox.projekte())
+                                   stopp=_BEFEHL_STOPP, pythonpfad=sandbox.projekte())
         elif pfad and projekt is not None:
             # beschreibbares Projekt: im Ordner des Skripts (wie `cd …; python x.py`)
             vor_ort = None if sandbox.schreibbar(projekt) else lauf
-            e = sandbox.python_ausfuehren(quelle, timeout, ordner=vor_ort, argumente=argumente)
+            e = sandbox.python_ausfuehren(quelle, timeout, stopp=_BEFEHL_STOPP, ordner=vor_ort, argumente=argumente)
         else:
             ziel = lauf / (quelle.name if pfad else "programm.py")
             if pfad:
                 shutil.copy2(quelle, ziel)
             else:
                 ziel.write_text(code, encoding="utf-8")
-            e = sandbox.python_ausfuehren(ziel, timeout, argumente=argumente)
+            e = sandbox.python_ausfuehren(ziel, timeout, stopp=_BEFEHL_STOPP, argumente=argumente)
     except sandbox.SandboxFehler as exc:
         return ActionResult(f"Fehler: Sandbox – {exc}", ok=False)
     return _sandbox_ergebnis(e, lauf, timeout)
@@ -2911,12 +2939,19 @@ def _zeitplan(a: dict) -> ActionResult:
     was = str(a.get("aktion") or "").strip().lower()
     if was in ("anzeigen", "liste", "zeigen"):
         return ActionResult(zeitplan.liste())
+    if was in ("testen", "probelauf", "jetzt", "starten"):
+        if any(s in sys.argv for s in ("--auftrag", "--wache")):
+            return ActionResult("Fehler: Ein Probelauf geht nur im Gespräch mit dem Nutzer.", ok=False)
+        try:
+            return ActionResult(zeitplan.probelauf(a.get("name", "")))
+        except ValueError as e:
+            return ActionResult(f"Fehler: {e}", ok=False)
     if was in ("anlegen", "neu", "erstellen", "planen", "aendern", "ändern"):
         aktion = "anlegen"
     elif was in ("loeschen", "löschen", "entfernen"):
         aktion = "loeschen"
     else:
-        return ActionResult("Fehler: 'aktion' muss 'anlegen' oder 'loeschen' sein "
+        return ActionResult("Fehler: 'aktion' muss 'anlegen', 'loeschen' oder 'testen' sein "
                             "(zum Ansehen: zeitplan_anzeigen).", ok=False)
     if any(s in sys.argv for s in ("--auftrag", "--wache")):
         return ActionResult("Fehler: Zeitplan-Vorschläge gehen nur im Gespräch mit dem Nutzer.", ok=False)
@@ -3428,7 +3463,7 @@ def _bild_malen(a: dict) -> str | ActionResult:
             steps=_int("steps"),
             size=_parse_size(a.get("size") or a.get("groesse")),
             seed=seed,
-            on_status=lambda m: _BILD_STATUS.__setitem__("msg", m),
+            on_status=_bild_melden,
             vorlage=vorlage,
             staerke=staerke,
             figur=_mit_figur(a),
@@ -3444,7 +3479,7 @@ def _bild_malen(a: dict) -> str | ActionResult:
         text += _kuerzung([f"{zuviel} Token zu viel"])
     try:
         besser = imagegen.gesicht_nachbessern(
-            path, on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
+            path, on_status=_bild_melden)
     except Exception as e:
         besser = None
         text += f"\nGesicht nachbessern übersprungen: {e}"
@@ -3532,7 +3567,7 @@ def _video_erstellen(a: dict) -> str | ActionResult:
         path = imagegen._gpu_fuer_bild(video.generate)(
             prompt, sekunden=sekunden, startbild=startbild, seed=_zahl("seed", int), steps=_zahl("steps", int),
             modell=modell, schluesselbilder=schluessel or None, schaerfe=scharf,
-            on_status=lambda m: _BILD_STATUS.__setitem__("msg", m), motor_extra=motor_extra or None,
+            on_status=_bild_melden, motor_extra=motor_extra or None,
             start_malen=start_malen)
     except Exception as e:
         _BILD_STATUS["msg"] = None
@@ -3576,7 +3611,7 @@ def _video_cloud(a: dict, prompt: str) -> str | ActionResult:
     try:
         path = videobildcloud.video_generate(prompt, sekunden=sekunden, startbild=startbild,
                                              hochkant=bool(a.get("hochkant")),
-                                             on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
+                                             on_status=_bild_melden)
     except Exception as e:
         return ActionResult(f"Fehler beim Cloud-Video: {e}", ok=False)
     finally:
@@ -3682,7 +3717,7 @@ def _portraet_bewegen(a: dict) -> str | ActionResult:
             except Exception:
                 pass
     _BILD_STATUS["msg"] = "Porträt: starte …"
-    melden = lambda m: _BILD_STATUS.__setitem__("msg", m)       # noqa: E731
+    melden = _bild_melden
 
     def arbeit():
         try:                                       # entladen, bevor das Sprachmodell auf die GPU zurückkehrt
@@ -3885,7 +3920,7 @@ def _serie_malen(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResul
     import malsperre
     if malkind.aktiv() or imagegen.backend() == imagegen.CLOUD:   # Wache: ihr Mal-Prozess sperrt selbst
         return _serie_bilder(a, varianten, anzeigen)
-    with malsperre.halten(lambda m: _BILD_STATUS.__setitem__("msg", m), "Serie"):
+    with malsperre.halten(_bild_melden, "Serie"):
         return _serie_bilder(a, varianten, anzeigen)
 
 
@@ -3921,7 +3956,7 @@ def _serie_bilder(a: dict, varianten: list, anzeigen: bool) -> dict | ActionResu
             zu_lang.append(f"Bild {i}: {zuviel} Token zu viel")
         if seed is None:                          # einmal für die ganze Serie
             seed = figur_seed if figur_seed is not None else random.randint(1, 2 ** 31 - 1)
-        melde = (lambda m, i=i: _BILD_STATUS.__setitem__("msg", f"Bild {i}/{n} · {m}"))
+        melde = (lambda m, i=i: _bild_melden(f"Bild {i}/{n} · {m}"))
         melde("starte …")
         try:
             pfad = imagegen.paint(prompt, model=modell, neg=v.get("neg") or a.get("neg"), steps=steps,
@@ -3992,7 +4027,7 @@ def _tagesrueckblick(a: dict) -> ActionResult:
     s = _stimme_falls_da()
     mit_stimme = bool(text) and s is not None and s.modus() != "aus" and s.verfuegbar()
     titel = str(a.get("titel") or "Mein Tag").strip()
-    melden = lambda m: _BILD_STATUS.__setitem__("msg", m)       # noqa: E731
+    melden = _bild_melden
 
     def arbeit():
         ton = _sprechen_aufnehmen(text, melden, rueckblick.MAX_SEKUNDEN) if mit_stimme else None
@@ -4058,7 +4093,7 @@ def _musik_machen(a: dict) -> ActionResult:
     bpm = round(z) if (z := _zahl_aus(a.get("bpm") or a.get("tempo"))) else None
     seed = int(z) if (z := _zahl_aus(a.get("seed"))) is not None else None
     text = str(next((a[k] for k in ("text", "liedtext", "lyrics", "songtext") if a.get(k)), "")).strip()
-    melden = lambda msg: _BILD_STATUS.__setitem__("msg", msg)       # noqa: E731
+    melden = _bild_melden
     try:
         erg = imagegen._gpu_fuer_bild(m.komponieren)(
             stil, text, sekunden, bpm=bpm, tonart=a.get("tonart") or None, takt=a.get("takt") or None,
@@ -4133,7 +4168,7 @@ def _musik_cover(a: dict) -> ActionResult:
         naehe = 0.0 if z is None else (z / 100 if z > 1 else z)
     seed = int(z) if (z := _zahl_aus(a.get("seed"))) is not None else None
     text = str(next((a[k] for k in ("text", "liedtext", "lyrics", "songtext") if a.get(k)), "")).strip() or None
-    melden = lambda msg: _BILD_STATUS.__setitem__("msg", msg)       # noqa: E731
+    melden = _bild_melden
     try:
         erg = imagegen._gpu_fuer_bild(m.covern)(
             vorlage, stil, text, titel=str(a.get("titel") or a.get("title") or "").strip(), naehe=naehe,
@@ -4217,7 +4252,7 @@ def _backup_erstellen(a: dict) -> ActionResult:
     _BILD_STATUS["msg"] = "sammle Dateien …"
     try:
         erg = backup.erstellen(art, _wahr(a.get("modelle")),
-                               melde=lambda m: _BILD_STATUS.__setitem__("msg", m), ganz=_wahr(a.get("ganz")))
+                               melde=_bild_melden, ganz=_wahr(a.get("ganz")))
     except backup.NichtsNeu as e:
         return ActionResult(str(e), ok=True)
     except backup.Abgebrochen:
@@ -4469,7 +4504,7 @@ def _lora_trainieren(a: dict) -> str | ActionResult:
         pfad = imagegen._gpu_fuer_bild(LT.trainieren)(
             bilder=bilder or None, schritte=_zahl("schritte", int, 50, 5000), rang=_zahl("rang", int, 4, 64),
             text=str(a.get("beschreibung") or "").strip() or None,
-            on_status=lambda m: _BILD_STATUS.__setitem__("msg", m), abbruch=LT.ANHALTEN.is_set,
+            on_status=_bild_melden, abbruch=LT.ANHALTEN.is_set,
             motor="bild" if bild else "video")
     except Exception as e:
         return ActionResult(f"LoRA-Training: {e}", ok=False)
@@ -4536,7 +4571,7 @@ def _coding_lora_trainieren(a: dict) -> str | ActionResult:
     try:
         pfad = imagegen._gpu_fuer_bild(LT.trainieren)(
             modell=str(a.get("modell") or "").strip() or None, schritte=_zahl("schritte", 10, 5000, 300),
-            rang=_zahl("rang", 2, 64, 16), on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
+            rang=_zahl("rang", 2, 64, 16), on_status=_bild_melden)
     except Exception as e:
         return ActionResult(f"Coding-LoRA: {e}", ok=False)
     finally:
@@ -4797,7 +4832,7 @@ def _kugel_anziehen(a: dict) -> ActionResult:
             return ActionResult("Fehler: Der Bild-Motor kann gerade nicht malen. " + grund, ok=False)
     try:
         neu = KB.outfit_malen(wer, key, kleidung, motive,
-                              on_status=lambda m: _BILD_STATUS.__setitem__("msg", m))
+                              on_status=_bild_melden)
     except RuntimeError as exc:
         return ActionResult(f"Fehler: {exc}", ok=False)
     finally:
@@ -5945,5 +5980,7 @@ async def run(action: dict) -> ActionResult:
         if isinstance(result, str):
             return ActionResult(result, ok=True)
         return ActionResult("Fehler: Werkzeug lieferte kein gültiges Ergebnis.", ok=False)
+    except notstopp.Abgebrochen:
+        return ActionResult(f"⏹ '{tool}' mit ESC abgebrochen – was schon fertig war, bleibt.", ok=False)
     except Exception as e:
         return ActionResult(f"Fehler bei '{tool}': {e}", ok=False)

@@ -45,6 +45,12 @@ ORDNER = _ROOT / "Zeitplan"          # die Aufträge
 BERICHTE = _ROOT / "Berichte"        # was dabei herauskam
 TASK_PFAD = "\\NemiCLI\\"            # Ordner in der Aufgabenplanung
 MAX_AUFTRAG = 4000                   # Zeichen – ein Auftrag ist eine Anweisung, kein Roman
+# Werkzeuge eines Zeitplan-Laufs: Netz lesen und nachschlagen, sonst nichts – kein Code, keine Befehle, keine
+# Downloads, keine Helfer, keine Dateien und kein Gedächtnis (ohne private Daten im Lauf kann eine Seite auch
+# nichts davon nach draußen lenken). Niemand gibt frei: was nicht darin steht, läuft nicht.
+SICHERE_WERKZEUGE = frozenset({"web_suche", "web_lesen", "web_wiki", "fach_suche", "cve_suchen", "doku_suchen",
+                               "plan"})
+BERICHT_AUSZUG = 4000                # Zeichen des letzten Berichts, die der nächste Lauf mitbekommt
 
 _WOCHENTAGE = {
     "montag": "Monday", "mo": "Monday",
@@ -256,6 +262,20 @@ def aufgabe_xml(name: str, w: dict, beschreibung: str) -> str:
     )
 
 
+def probelauf(name: str) -> str:
+    """Den eingetragenen Auftrag jetzt starten – über die Aufgabenplanung, also genau wie zur geplanten Zeit:
+    im Hintergrund, nur mit SICHERE_WERKZEUGE, ohne Rückfragen."""
+    n = sauberer_name(name)
+    if not n or lade_auftrag(n) is None:
+        raise ValueError(f"Kein Auftrag namens „{name}“ im Zeitplan.")
+    r = _schtasks("/run", "/tn", TASK_PFAD + n)
+    if r.returncode != 0:
+        raise ValueError("Windows hat den Auftrag nicht gestartet: "
+                         + " ".join((r.stderr or r.stdout or "").split())[:200])
+    return (f"▶ Probelauf von „{n}“ gestartet – im Hintergrund wie zur geplanten Zeit. "
+            f"Der Bericht landet in {BERICHTE}.")
+
+
 def _win_arg(name: str) -> str:
     """Der Name als Argument – in Anführungszeichen, weil Leerzeichen drin sein dürfen."""
     return f'"{name}"'
@@ -429,6 +449,19 @@ def letzter_bericht(name: str) -> Path | None:
     muster = re.compile(re.escape(name) + r"_\d{8}-\d{6}\.md")   # nicht auch „backup_woche_…“ für „backup“
     treffer = sorted(p for p in BERICHTE.glob(f"{name}_*.md") if muster.fullmatch(p.name))
     return treffer[-1] if treffer else None
+
+
+def bericht_auszug(name: str) -> str:
+    """Antwortteil des letzten Berichts (ohne Ablauf), gekürzt – leer, wenn es keinen gibt."""
+    pfad = letzter_bericht(name)
+    if pfad is None:
+        return ""
+    try:
+        text = pfad.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    text = re.sub(r"^<!--.*?-->\s*", "", text, flags=re.S).split("\n---\n\n## Ablauf", 1)[0].strip()
+    return text[:BERICHT_AUSZUG]
 
 
 _MARKER = "learned/.berichte.gesehen"

@@ -68,6 +68,23 @@ SPEICHER_BLITZ_S = 1.5        # so lange leuchtet der 100k-Balken nach einer Än
 _ALIVE_SPERRE = threading.Lock()   # Lebenszeichen schreiben und beim Ende löschen nicht gleichzeitig
 
 
+def esc_notstopp(text: str = "⏹ ESC – Abbruch! Die KI hört sofort auf. Gelöscht wird nichts.") -> bool:
+    """ESC (oder STOP) während einer Runde der KI: den Not-Stopp sofort auslösen und sichtbar melden – nicht
+    erst, wenn die Runde das nächste Mal nachsieht. Gilt in jedem Bereich, auch in Rückfragen und Menüs."""
+    try:
+        import notstopp
+    except Exception:
+        return False
+    if not notstopp.runde_laeuft() or notstopp.ausgeloest():
+        return False
+    notstopp.ausloesen()
+    try:
+        ui.warn(text)
+    except Exception:
+        pass
+    return True
+
+
 def _scroll_zeilen() -> int:
     """Zeilen je Mausrad-Raste: Config-Schlüssel "scroll_zeilen" (1–20), sonst SCROLL_ZEILEN."""
     try:
@@ -612,6 +629,8 @@ class _SuchFeld(Input):
         if event.key in ("escape", "ctrl+f"):
             event.stop()
             event.prevent_default()
+            if event.key == "escape":
+                esc_notstopp()                  # auch aus der Suche heraus hält ESC die KI an
             nemi.suche_schliessen()
             return
         if event.key in ("up", "down", "enter"):
@@ -837,6 +856,7 @@ class _SelectScreen(_NemiModal):
         self.dismiss(self.options[self.sel][0])
 
     def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
         self.dismiss(self.options[-1][0])
 
     def on_key(self, event: events.Key) -> None:
@@ -915,6 +935,7 @@ class _PaletteScreen(_NemiModal):
         self.dismiss(self.treffer[self.sel] if self.treffer else None)
 
     def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
         self.dismiss(None)
 
 
@@ -946,6 +967,7 @@ class _TextScreen(_NemiModal):
         self.dismiss(event.value)
 
     def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
         self.dismiss("")
 
 
@@ -1062,6 +1084,8 @@ class _ReaderScreen(_NemiModal):
             super().on_key(event)
 
     def action_close(self, ok: bool) -> None:
+        if not ok:
+            esc_notstopp()
         self.dismiss(bool(ok))
 
     def action_line(self, d: int) -> None:
@@ -1136,6 +1160,7 @@ class _InlineSelect(Vertical, can_focus=True):
         self._done(self.options[self.sel][0])
 
     def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
         self._done(self.options[-1][0])
 
     def on_key(self, event: events.Key) -> None:
@@ -1176,6 +1201,7 @@ class _InlineText(Vertical):
         self._done(event.value)
 
     def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
         self._done("")
 
 
@@ -2475,7 +2501,8 @@ class Screen:
                 self._input.load_text("")
                 self._echo_user(text)
                 self._abort = True
-                ui.warn("⏹ STOP angekommen – die KI hört auf.")
+                if not esc_notstopp("⏹ STOP angekommen – die KI hört sofort auf. Gelöscht wird nichts."):
+                    ui.warn("⏹ STOP angekommen – die KI hört auf.")
             return
         self._input.load_text("")
         self._comp_base = None
@@ -2644,6 +2671,7 @@ class Screen:
             self._stop_practice()
         elif self.busy:
             self._abort = True
+            esc_notstopp()                  # sofort und sichtbar, nicht erst beim nächsten Nachsehen
 
     def _on_ctrl_c(self) -> None:
         if self._modal is not None:
@@ -2652,6 +2680,7 @@ class Screen:
             self._stop_practice()
         elif self.busy:
             self._abort = True
+            esc_notstopp()
         else:
             self.app.exit()
 
