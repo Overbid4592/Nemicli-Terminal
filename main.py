@@ -1812,8 +1812,8 @@ async def web_converse(backend, user_text, images, emit, confirm, erlaubt=None, 
     user_text += await _runde_beobachten(lambda t: emit({"t": "note", "text": t}))
     notstopp.runde_aktiv(True)
     try:
-        await _mit_notbremse(_schleife(backend, user_text, images, records, denk,
-                                       _web_ausgabe(emit, confirm, erlaubt)), backend)
+        lauf = _schleife(backend, user_text, images, records, denk, _web_ausgabe(emit, confirm, erlaubt))
+        await _mit_notbremse(lauf, backend)
     finally:
         notstopp.runde_aktiv(False)
         if hasattr(backend, "denk_hinweis"):
