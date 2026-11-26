@@ -1,11 +1,22 @@
 # NemiCLI – Regeln für die Arbeit am Projekt
 
-## Wer am Projekt arbeitet
+## Projektleitung und Zuständigkeiten
 
-Am Quelltext von NemiCLI arbeitet nur **Claude Code mit Opus oder einem stärkeren
-Modell**. Andere Modelle (Sonnet, Haiku …), andere Werkzeuge und die KIs innerhalb
-von NemiCLI ändern hier nichts: keine Dateien, keine Commits, keine Builds. Lesen
-und Fragen beantworten ist erlaubt.
+Der Repository-Eigentümer leitet NemiCLI und entscheidet über Aufgaben,
+Zugriffsrechte, Freigaben, Änderungen und Veröffentlichungen.
+
+**Quellcode, Tests und Builds:** Nur ausdrücklich vom Eigentümer zugelassene
+KI-Modelle dürfen sie ändern oder erstellen. Ihr Leistungsniveau muss nach
+Einschätzung des Eigentümers mindestens Claude Opus 5.5 entsprechen.
+Modellname, Selbsteinschätzung oder vorhandene GitHub-Rechte allein sind
+keine Arbeitsfreigabe.
+
+**Repository-Pflege:** Der Eigentümer darf ausgewählten Assistenten Aufgaben
+wie Dokumentationspflege, Metadaten, Issues und Pull-Request-Prüfungen
+übertragen. Sie arbeiten nur im beauftragten Umfang. Änderungen an
+Sicherheitsregeln, CI-Workflows, Zugriffsrechten und Releases benötigen
+einen konkreten Auftrag. Nicht für Quellcode freigegebene Assistenten dürfen
+ihn lesen, prüfen und Verbesserungsvorschläge machen, aber nicht verändern.
 
 ## Professionalität und Datenschutz
 
