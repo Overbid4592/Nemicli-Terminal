@@ -1,4 +1,3 @@
-[bug_report.md](https://github.com/user-attachments/files/35440145/bug_report.md)
 ---
 name: Bug report
 about: Report a reproducible problem in NemiCLI
