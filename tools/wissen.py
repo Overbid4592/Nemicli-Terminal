@@ -1,0 +1,253 @@
+"""wissen.py – Ordner „Wissen“ im Daten-Ordner: Dokumente für alle Persönlichkeiten.
+
+PDF, Markdown und Text werden ganz gelesen, an Absatz- und Satzgrenzen in
+Brocken zerlegt und vom Bibliothekar (indexdb.ingest_wissen) vektorisiert.
+
+Doppelte Sätze: Ein Satz, der wortgleich schon in einer älteren Datei oder
+weiter vorn in derselben steht, kommt kein zweites Mal in den Index. Verglichen
+wird der ganze Satz, nur Leerraum wird vereinheitlicht – „Das Auto ist rot.“ und
+„Das Auto ist blau.“ bleiben beide. Sätze mit weniger als MIN_WOERTER Wörtern
+(Überschriften, „Ja.“) werden nie entfernt. Die Dateien selbst bleiben unverändert.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+import stat
+from collections.abc import Callable
+from pathlib import Path
+
+ORDNER = "Wissen"
+ENDUNGEN = {".pdf", ".md", ".markdown", ".txt"}
+MIN_WOERTER = 4
+LISTE_MAX = 40                     # mehr Dateien → im Prompt nur die Ordner mit Anzahl
+VERFAHREN = "2"                    # ändert sich Lesen oder Zerlegung, wird alles neu eingelesen
+STEUER_MAX = 0.05                  # Anteil Steuerzeichen, ab dem ein „Text“ als binär gilt
+
+_SATZENDE = re.compile(r"(?<=[.!?…])\s+")
+_UEBERSCHRIFT = re.compile(r"^#{1,6}\s+(.+)")
+_WORT = re.compile(r"[^\W\d_]{2,}")
+_SEITE = re.compile(r"^(--- Seite \d+ ---)\n", re.M)
+
+
+def ordner() -> Path:
+    import indexdb
+    return Path(indexdb._ROOT) / ORDNER
+
+
+def dateien_stand(basis: Path | None = None) -> list[tuple[Path, str, int, int]]:
+    """(Pfad, Name relativ zu Wissen/, Änderungszeit in ns, Größe) aller lesbaren Dateien, älteste zuerst –
+    ein stat je Datei."""
+    basis = basis or ordner()
+    if not basis.is_dir():
+        return []
+    gefunden = []
+    for p in basis.rglob("*"):
+        try:
+            rel = p.relative_to(basis)
+        except ValueError:
+            continue
+        if any(t.startswith(".") for t in rel.parts) or p.name.upper().startswith("LIES-MICH"):
+            continue
+        if p.suffix.lower() not in ENDUNGEN:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        if stat.S_ISREG(st.st_mode):
+            gefunden.append((p, rel.as_posix(), st.st_mtime_ns, st.st_size))
+    return sorted(gefunden, key=lambda x: (x[2], x[1].casefold()))
+
+
+def dateien(basis: Path | None = None) -> list[Path]:
+    """Lesbare Dateien unter Wissen/, älteste zuerst (sie behalten doppelte Sätze)."""
+    return [p for p, _rel, _m, _g in dateien_stand(basis)]
+
+
+def name(p: Path, basis: Path | None = None) -> str:
+    """Pfad relativ zu Wissen/ mit „/“ – Teil des ref (wissen:<name>)."""
+    return p.relative_to(basis or ordner()).as_posix()
+
+
+def stempel(liste: list[Path], basis: Path | None = None) -> str:
+    """Fingerabdruck des Ordners: ändert sich, sobald eine Datei dazukommt, wegfällt oder sich ändert."""
+    basis = basis or ordner()
+    h = hashlib.sha1(VERFAHREN.encode(), usedforsecurity=False)
+    for p in liste:
+        st = p.stat()
+        h.update(f"{name(p, basis)}\0{st.st_mtime_ns}\0{st.st_size}\n".encode("utf-8"))
+    return h.hexdigest()[:20]
+
+
+def dekodieren(roh: bytes) -> str | None:
+    """Bytes → Text (BOM für UTF-8/UTF-16, sonst UTF-8, sonst cp1252). None = binär."""
+    if roh.startswith(b"\xef\xbb\xbf"):
+        text = roh[3:].decode("utf-8", errors="replace")
+    elif roh[:2] in (b"\xff\xfe", b"\xfe\xff"):
+        text = roh.decode("utf-16", errors="replace")
+    else:
+        try:
+            text = roh.decode("utf-8")
+        except UnicodeDecodeError:
+            text = roh.decode("cp1252", errors="replace")
+    probe = text[:8192]
+    if probe:
+        steuer = sum(1 for c in probe if c < " " and c not in "\t\n\r\f")
+        if "\x00" in probe or steuer / len(probe) >= STEUER_MAX:
+            return None
+    return text
+
+
+def lesen(p: Path) -> str:
+    """Ganzer Text der Datei. Die Art entscheidet der Inhalt, nicht die Endung:
+    eine PDF mit Endung .md wird als PDF gelesen. Binäres und PDF ohne Textebene → ''."""
+    with open(p, "rb") as f:
+        kopf = f.read(5)
+    if kopf == b"%PDF-":
+        import anhang
+        text = anhang.lese_pdf(p, grenze=10**9)[0]
+        return _SEITE.sub(r"\1\n\n", text)            # Seitenmarke als eigener Absatz
+    return dekodieren(p.read_bytes()) or ""
+
+
+def _absaetze(text: str) -> list[list[str]]:
+    """Text → Absätze → Sätze (Zeilenumbrüche im Absatz werden zu Leerzeichen,
+    PDF bricht Sätze mitten im Satz um)."""
+    raus = []
+    for absatz in re.split(r"\n\s*\n", text.replace("\r\n", "\n")):
+        stuecke: list[list[str]] = [[]]
+        for zeile in absatz.split("\n"):            # eine Überschrift ist ein Absatz für sich
+            if _UEBERSCHRIFT.match(zeile.strip()):
+                stuecke += [[zeile], []]
+            else:
+                stuecke[-1].append(zeile)
+        for stueck in stuecke:
+            flach = " ".join(" ".join(stueck).split())
+            if flach:
+                raus.append([s for s in _SATZENDE.split(flach) if s])
+    return raus
+
+
+def _vergleichbar(satz: str) -> bool:
+    return len(_WORT.findall(satz)) >= MIN_WOERTER
+
+
+def entdoppeln(texte: list[str]) -> tuple[list[list[str]], list[int]]:
+    """Für jeden Text (Reihenfolge = Vorrang) die Absätze ohne bereits gesehene Sätze.
+    Rückgabe: (Absätze je Text, Zahl entfernter Sätze je Text)."""
+    gesehen: set[str] = set()
+    alle, entfernt = [], []
+    for text in texte:
+        absaetze, weg = [], 0
+        for saetze in _absaetze(text):
+            bleibt = []
+            for s in saetze:
+                if _vergleichbar(s):
+                    if s in gesehen:
+                        weg += 1
+                        continue
+                    gesehen.add(s)
+                bleibt.append(s)
+            if bleibt:
+                absaetze.append(" ".join(bleibt))
+        alle.append(absaetze)
+        entfernt.append(weg)
+    return alle, entfernt
+
+
+def satz_hash(satz: str) -> str:
+    """Fingerabdruck eines Satzes fürs Entdoppeln (bleibt in memory.db, statt alle Sätze im Speicher)."""
+    return hashlib.sha1(satz.encode("utf-8"), usedforsecurity=False).hexdigest()[:16]
+
+
+def satz_hashes(text: str) -> list[str]:
+    """Fingerabdrücke aller vergleichbaren Sätze, in Reihenfolge, jeder einmal."""
+    raus, gesehen = [], set()
+    for saetze in _absaetze(text):
+        for s in saetze:
+            if _vergleichbar(s) and (h := satz_hash(s)) not in gesehen:
+                gesehen.add(h)
+                raus.append(h)
+    return raus
+
+
+def entdoppeln_eine(text: str, frueher: Callable[[str], bool]) -> list[str]:
+    """Wie entdoppeln für eine Datei: ohne Sätze, die laut `frueher(fingerabdruck)` schon in einer älteren
+    Datei stehen, und ohne Wiederholungen in der Datei selbst."""
+    absaetze, gesehen = [], set()
+    for saetze in _absaetze(text):
+        bleibt = []
+        for s in saetze:
+            if _vergleichbar(s):
+                h = satz_hash(s)
+                if h in gesehen or frueher(h):
+                    continue
+                gesehen.add(h)
+            bleibt.append(s)
+        if bleibt:
+            absaetze.append(" ".join(bleibt))
+    return absaetze
+
+
+def brocken(kopf: str, absaetze: list[str], groesse: int) -> list[str]:
+    """Absätze zu Brocken bis `groesse` Zeichen (mit Kopfzeile). Zu lange Absätze
+    werden an Satzgrenzen geteilt, überlange Sätze hart. Eine Markdown-Überschrift
+    beginnt einen neuen Brocken; die folgenden tragen sie in der Kopfzeile
+    („📚 a.md › Kapitel“)."""
+    teile: list[tuple[str, str]] = []                 # (Text, Überschrift darüber)
+    abschnitt = ""
+    for a in absaetze:
+        if (m := _UEBERSCHRIFT.match(a)):
+            abschnitt = m.group(1).strip()[:80]
+        platz = max(100, groesse - len(kopf) - len(abschnitt) - 4)
+        if len(a) <= platz:
+            teile.append((a, abschnitt))
+            continue
+        for s in _SATZENDE.split(a):
+            while len(s) > platz:
+                teile.append((s[:platz], abschnitt))
+                s = s[platz:]
+            if s:
+                teile.append((s, abschnitt))
+    raus: list[tuple[str, str]] = []
+    aktuell, ueber = "", ""
+    for t, ab in teile:
+        platz = max(100, groesse - len(kopf) - len(ab) - 4)
+        if aktuell and (ab != ueber or len(aktuell) + 2 + len(t) > platz):
+            raus.append((aktuell, ueber))
+            aktuell = ""
+        if not aktuell:
+            ueber = ab
+        aktuell = f"{aktuell}\n\n{t}" if aktuell else t
+    if aktuell:
+        raus.append((aktuell, ueber))
+    return [f"{kopf} › {ab}\n{r}" if ab and not r.startswith("#") else f"{kopf}\n{r}" for r, ab in raus]
+
+
+def prompt_hinweis() -> str:
+    """Titel-Liste für den System-Prompt – nur Namen, kein Inhalt, nur was im Gedächtnis ist."""
+    try:
+        import indexdb
+        namen = indexdb.wissen_namen()
+    except Exception:
+        return ""
+    if not namen:
+        return ""
+    import fremddaten                                  # Dateinamen sind Fremdtext im Systemprompt
+    namen = [fremddaten.entschaerfen(str(n))[:120] for n in namen]
+    if len(namen) <= LISTE_MAX:
+        zeilen = [f"- {n}" for n in namen]
+    else:
+        zaehler: dict[str, int] = {}
+        for n in namen:
+            oben = n.split("/", 1)[0] if "/" in n else "(oberste Ebene)"
+            zaehler[oben] = zaehler.get(oben, 0) + 1
+        zeilen = [f"- {o}/ ({z} Dateien)" if o != "(oberste Ebene)" else f"- {o}: {z} Dateien"
+                  for o, z in sorted(zaehler.items(), key=lambda x: x[0].casefold())]
+    return ("\n\n# 📚 Wissen (für alle Persönlichkeiten)\n"
+            "Diese Dokumente sind schon als Text im Gedächtnis. Suchen: gedaechtnis_suchen mit quelle "
+            "„wissen“; weiterlesen: gedaechtnis_lesen mit ref wissen:<Datei>. Die Dateien im Ordner "
+            "Wissen NICHT mit datei_lesen öffnen – PDFs sind dort nicht lesbar, der Text steht im Gedächtnis.\n"
+            + "\n".join(zeilen) + "\n")
