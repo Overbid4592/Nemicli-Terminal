@@ -1,0 +1,77 @@
+{
+ "version": 1,
+ "beschreibung": "Sampling-Werte je Modellfamilie nach Modellkarte bzw. generation_config des Herstellers. Werte in der Modelldatei (general.sampling.*) gehen vor; 'ohne_denken' geht der Datei vor, weil generation_config meist die Werte fürs Denken trägt. Erkennung wie chatformate.json: 'bauart' oder Teilstücke aus 'fmt:<Chat-Format> <Modellname>'. Der erste passende Eintrag gilt, fehlende Werte kommen aus 'standard'. 'dry': false schaltet die Floskel-Bremse (DRY) für die Familie ab, wenn der Hersteller nur seine eigene Wiederholungsstrafe vorsieht.",
+ "standard": {
+  "temperature": 0.8,
+  "top_p": 0.95,
+  "top_k": 40,
+  "min_p": 0.05
+ },
+ "familien": [
+  {
+   "name": "Gemma",
+   "wenn": [{"bauart": ["gemma", "gemma2", "gemma3", "gemma4"]}],
+   "werte": {"temperature": 1.0, "top_p": 0.95, "top_k": 64}
+  },
+  {
+   "name": "Qwen 3.5",
+   "wenn": [{"bauart": ["qwen35", "qwen35moe"]}],
+   "denken": {"temperature": 1.0, "top_p": 0.95, "top_k": 20},
+   "ohne_denken": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}
+  },
+  {
+   "name": "Qwen 3",
+   "wenn": [{"bauart": ["qwen3", "qwen3moe", "qwen3next", "qwen3vl"]}],
+   "denken": {"temperature": 0.6, "top_p": 0.95, "top_k": 20},
+   "ohne_denken": {"temperature": 0.7, "top_p": 0.8, "top_k": 20}
+  },
+  {
+   "name": "Ling 3.0",
+   "wenn": [{"bauart": ["bailingmoe3"]}],
+   "werte": {"temperature": 1.0, "top_p": 0.95, "top_k": 20}
+  },
+  {
+   "name": "DeepSeek",
+   "wenn": [{"eins": ["fmt:deepseek"]}],
+   "werte": {"temperature": 0.6, "top_p": 0.95, "top_k": 0}
+  },
+  {
+   "name": "gpt-oss",
+   "wenn": [{"bauart": ["gpt-oss"]}],
+   "werte": {"temperature": 1.0, "top_p": 1.0, "top_k": 0}
+  },
+  {
+   "name": "Mistral",
+   "wenn": [{"eins": ["fmt:mistral"]}],
+   "denken": {"temperature": 0.7, "top_p": 0.95, "top_k": 0},
+   "ohne_denken": {"temperature": 0.15, "top_p": 0.95, "top_k": 0}
+  },
+  {
+   "name": "Llama 3/4",
+   "wenn": [{"eins": ["fmt:llama3", "fmt:llama4"]}],
+   "werte": {"temperature": 0.6, "top_p": 0.9, "top_k": 0}
+  },
+  {
+   "name": "Kimi K2",
+   "wenn": [{"eins": ["fmt:kimi_k2"]}],
+   "denken": {"temperature": 1.0, "top_p": 0.95, "top_k": 0},
+   "ohne_denken": {"temperature": 0.6, "top_p": 0.95, "top_k": 0}
+  },
+  {
+   "name": "SmolLM3",
+   "wenn": [{"bauart": ["smollm3"]}],
+   "werte": {"temperature": 0.6, "top_p": 0.95, "top_k": 0}
+  },
+  {
+   "name": "LFM2",
+   "wenn": [{"bauart": ["lfm2", "lfm2moe"]}],
+   "werte": {"temperature": 0.3, "top_p": 1.0, "top_k": 0, "min_p": 0.15, "repeat_penalty": 1.05}
+  },
+  {
+   "name": "LFM3",
+   "wenn": [{"bauart": ["lfm3"]}],
+   "werte": {"temperature": 0.1, "top_p": 1.0, "top_k": 50, "min_p": 0.0, "repeat_penalty": 1.1},
+   "dry": false
+  }
+ ]
+}

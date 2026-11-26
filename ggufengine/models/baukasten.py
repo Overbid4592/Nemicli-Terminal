@@ -1,0 +1,634 @@
+"""
+Baukasten: ein Decoder-Transformer, der sich aus der GGUF-Datei selbst zusammensetzt.
+
+Wie in llama.cpp teilen sich die Bauarten dieselben Bausteine (Norm, Attention, RoPE, FFN,
+MoE). Was eine Bauart ausmacht, ergibt sich aus den vorhandenen Tensoren und Metadaten der Datei
+plus der Bauanleitung je Architektur (daten/bauarten.json: RoPE-Art, Aktivierung, Fenster-Muster,
+Sonderformen). Jede Zahl aus der Datei wird vor Gebrauch auf Plausibilität geprüft.
+
+Ein Token je Schritt läuft, wo die Schicht es zulässt, über verschmolzene Kerne (mmvq);
+Matrizen ohne int8-Weg rechnen dort auf ihrem eigenen Weg mit.
+"""
+from __future__ import annotations
+
+import math
+from typing import List, Optional
+
+import torch
+import torch.nn.functional as F
+
+from .. import ausfuellen, mmvq
+from ..gguf import GGUFError, GGUFFile
+from .common import (GraphDecoder, KVCache, PackedLinear, RoPE, WeightLoader, attention, attention_softcap,
+                     group_rms_norm, layer_norm, letzte_zeilen, logit_zeilen, rms_norm)
+from .moe import Experten
+
+ARCHS = ausfuellen.bauarten_der_klasse("baukasten")
+GATING_SOFTMAX, GATING_SIGMOID = 1, 2
+_OAI_GRENZE, _OAI_ALPHA = 7.0, 1.702
+
+
+def _glu_oai(g: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
+    """gpt-oss: gate und up begrenzt, gate * sigmoid(1.702 gate) * (up + 1)."""
+    g = g.clamp(max=_OAI_GRENZE)
+    return g * torch.sigmoid(_OAI_ALPHA * g) * (u.clamp(-_OAI_GRENZE, _OAI_GRENZE) + 1)
+
+
+def _mal(lin, e: "mmvq.Eingang", x: torch.Tensor, bias: bool = True) -> torch.Tensor:
+    """Ein Token (float32, n_in) -> (n_out) float32: über den int8-Eingang, wenn die Matrix es kann."""
+    if _int8_weg(lin):
+        y = mmvq.mv(lin.name, lin.raw, e, lin.n_out, lin.n_in)
+        return y + lin.b if bias and lin.b is not None else y
+    return lin(x.view(1, -1)).float().view(-1)
+
+
+def _int8_weg(lin) -> bool:
+    return isinstance(lin, PackedLinear) and lin.mmvq and lin.band is None and not lin.im_ram
+
+
+def _zahl(gg: GGUFFile, key: str, default=None, *, ganz: bool = False, lo=None, hi=None):
+    v = gg.get(key, default)
+    if v is None:
+        return None
+    if isinstance(v, (list, str)) or (isinstance(v, bool) and not isinstance(default, bool)):
+        raise GGUFError(f"{key}: unexpected value {v!r}")
+    v = int(v) if ganz else float(v)
+    if (lo is not None and v < lo) or (hi is not None and v > hi) or (not ganz and not math.isfinite(v)):
+        raise GGUFError(f"{key}: implausible value {v!r}")
+    return v
+
+
+class _Schicht:
+    def __init__(self, ld: WeightLoader, i: int, hp: dict, rope: RoPE, n_ctx: int, fenster: int):
+        p = f"blk.{i}."
+        self.hp = hp
+        self.H, self.Hkv, self.D = hp["n_heads"], hp["n_kv_heads"], hp["head_dim"]
+        self.rope = rope
+        self.fenster = fenster
+
+        def norm(name):
+            if not ld.has(p + name + ".weight"):
+                return None
+            b = ld.norm(p + name + ".bias") if ld.has(p + name + ".bias") else None
+            return ld.norm(p + name + ".weight"), b
+        self.attn_norm, self.attn_post = norm("attn_norm"), norm("post_attention_norm")
+        self.ffn_norm, self.ffn_post = norm("ffn_norm"), norm("post_ffw_norm")
+        if hp["ffn_norm_post_attn"] and self.ffn_norm is None:   # eine Datei mit ffn_norm behält beide
+            self.ffn_norm, self.attn_post = self.attn_post, None
+        self.sinks = ld.norm(p + "attn_sinks.weight") if ld.has(p + "attn_sinks.weight") else None
+        if self.sinks is not None and self.sinks.numel() != hp["n_heads"]:
+            raise GGUFError(f"layer {i}: attn_sinks has an unexpected size")
+
+        H, Hkv, D = self.H, self.Hkv, self.D
+        if ld.has(p + "attn_qkv.weight"):
+            self.qkv = ld.linear(p + "attn_qkv.weight", p + "attn_qkv.bias")
+            if self.qkv.n_out != (H + 2 * Hkv) * D:
+                raise GGUFError(f"layer {i}: attn_qkv has an unexpected size")
+            self.q = self.k = self.v = None
+        else:
+            self.qkv = None
+            self.q = ld.linear(p + "attn_q.weight", p + "attn_q.bias")
+            self.k = ld.linear(p + "attn_k.weight", p + "attn_k.bias")
+            self.v = ld.linear(p + "attn_v.weight", p + "attn_v.bias")
+            if (self.q.n_out, self.k.n_out, self.v.n_out) != (H * D, Hkv * D, Hkv * D):
+                raise GGUFError(f"layer {i}: attention projections have unexpected sizes")
+        self.o = ld.linear(p + "attn_output.weight", p + "attn_output.bias")
+        self.q_norm = ld.norm(p + "attn_q_norm.weight") if ld.has(p + "attn_q_norm.weight") else None
+        self.k_norm = ld.norm(p + "attn_k_norm.weight") if ld.has(p + "attn_k_norm.weight") else None
+        for n, w, per_kopf, ganz in (("attn_q_norm", self.q_norm, D, H * D), ("attn_k_norm", self.k_norm, D, Hkv * D)):
+            if w is not None and w.numel() not in (per_kopf, ganz):
+                raise GGUFError(f"layer {i}: {n} has an unexpected size")
+
+        self.moe = ld.has(p + "ffn_gate_inp.weight")
+        if self.moe:
+            self.router = ld.linear(p + "ffn_gate_inp.weight", p + "ffn_gate_inp.bias")
+            self.experten = Experten(ld, p, self._akt, _glu_oai if hp["glu_oai"] else None)
+            n_exp = len(self.experten)
+            # Korrektur nur für die Auswahl, nicht für die Gewichte (ERNIE 4.5)
+            self.wahl_bias = ld.norm(p + "exp_probs_b.bias").reshape(-1) if ld.has(p + "exp_probs_b.bias") else None
+            if self.wahl_bias is not None and self.wahl_bias.numel() != n_exp:
+                raise GGUFError(f"layer {i}: exp_probs_b has an unexpected size")
+            if not (self.experten.pruefen() and n_exp == self.router.n_out and 0 < hp["n_expert_used"] <= n_exp):
+                raise GGUFError(f"layer {i}: inconsistent expert tensors")
+            self.s_gate = self.s_up = self.s_down = self.s_inp = None
+            if ld.has(p + "ffn_up_shexp.weight"):                 # geteilter Experte (Qwen2-MoE)
+                self.s_gate = ld.linear(p + "ffn_gate_shexp.weight")
+                self.s_up = ld.linear(p + "ffn_up_shexp.weight")
+                self.s_down = ld.linear(p + "ffn_down_shexp.weight")
+                if ld.has(p + "ffn_gate_inp_shexp.weight"):
+                    self.s_inp = ld.norm(p + "ffn_gate_inp_shexp.weight").reshape(-1)
+        else:
+            self.gate = ld.linear(p + "ffn_gate.weight") if ld.has(p + "ffn_gate.weight") else None
+            self.up = ld.linear(p + "ffn_up.weight", p + "ffn_up.bias")
+            self.down = ld.linear(p + "ffn_down.weight", p + "ffn_down.bias")
+            self.gate_up = self.gate is None and self.up.n_out == 2 * self.down.n_in
+        self.cache = KVCache(Hkv, D, n_ctx, ld.device, ld.dtype, ld.kv_bits)
+        self._plan = None                 # verschmolzener Ein-Token-Schritt: None = noch nicht geprüft
+
+    # -- Bausteine ---------------------------------------------------------------
+    def _norm(self, x, nw, gruppen=True):
+        w, b = nw
+        hp = self.hp
+        if hp["layernorm"]:
+            return layer_norm(x, w, b, hp["eps"])
+        y = group_rms_norm(x, w, hp["eps"], hp["norm_groups"] if gruppen else 1)
+        return y + b if b is not None else y
+
+    def _akt(self, x):
+        return F.gelu(x, approximate="tanh") if self.hp["gelu"] else F.silu(x)
+
+    def _mlp(self, x, gate, up, down):
+        with mmvq.eingang_teilen():
+            g, u = gate(x).float(), up(x).float()
+        return down(self._akt(g) * u).float()
+
+    def _ffn(self, x):
+        if self.moe:
+            return self._experten(x)
+        if self.gate is not None:
+            return self._mlp(x, self.gate, self.up, self.down)
+        u = self.up(x).float()
+        if self.gate_up:                                          # Phi-3: [gate | up]
+            g, u = u.chunk(2, dim=-1)
+            return self.down(self._akt(g) * u).float()
+        return self.down(self._akt(u)).float()
+
+    def _experten(self, x):
+        logits = self.router(x).float()
+        if self.hp["softmax_nach_auswahl"]:
+            w, idx = logits.topk(self.hp["n_expert_used"], dim=-1)
+            w = torch.softmax(w, dim=-1)
+        else:
+            idx, w = self._auswahl(logits)
+        out = self.experten(x, idx, w)
+        if self.s_up is not None:
+            y = self._mlp(x, self.s_gate, self.s_up, self.s_down)
+            if self.s_inp is not None:
+                y = y * torch.sigmoid(x.float() @ self.s_inp.unsqueeze(-1))
+            out = out + y
+        return out
+
+    def _auswahl(self, logits: torch.Tensor):
+        """Softmax- oder Sigmoid-Router; Auswahl-Korrektur und Gruppen nur für die Wahl (Gruppen
+        nach bestem Experten bzw. Summe der zwei besten, wie DeepSeek V2/V3), Gewichte aus den
+        unkorrigierten Werten, optional normiert, mal expert_weights_scale."""
+        hp = self.hp
+        sigmoid = hp["gating"] == GATING_SIGMOID
+        p = torch.sigmoid(logits) if sigmoid else torch.softmax(logits, dim=-1)
+        wahl = p + self.wahl_bias if self.wahl_bias is not None else p
+        if hp["n_group"] > 1:
+            L, je = p.shape[0], p.shape[1] // hp["n_group"]
+            g = wahl.view(L, hp["n_group"], je)
+            gw = g.topk(min(2, je), dim=-1)[0].sum(-1) if sigmoid else g.amax(-1)
+            maske = torch.zeros(L, hp["n_group"], dtype=torch.bool, device=p.device)
+            maske.scatter_(1, gw.topk(hp["group_used"], dim=-1)[1], True)
+            wahl = wahl.masked_fill(~maske.repeat_interleave(je, dim=1), float("-inf"))
+        idx = wahl.topk(hp["n_expert_used"], dim=-1)[1]
+        w = p.gather(-1, idx)
+        if hp["topk_normieren"]:
+            w = w / (w.sum(-1, keepdim=True) + 1e-20)
+        return idx, w * hp["weights_scale"]
+
+    def _schritt_planen(self):
+        """Was der verschmolzene Ein-Token-Schritt braucht – False, wenn die Schicht etwas hat, das er
+        nicht kennt (dann bleibt der allgemeine Weg)."""
+        hp, c = self.hp, self.cache
+        H, Hkv, D = self.H, self.Hkv, self.D
+        if (self.moe or hp["layernorm"] or hp["norm_groups"] != 1 or hp["parallel"] or hp["attn_softcap"]
+                or self.attn_post is not None or self.ffn_post is not None or self.attn_norm is None
+                or self.ffn_norm is None or self.attn_norm[1] is not None or self.ffn_norm[1] is not None
+                or self.gate_up or not isinstance(c, KVCache) or c.gepackt or c.geteilt
+                or c.k.dtype != torch.bfloat16 or not c.k.is_cuda
+                or any(n is not None and n.numel() != D for n in (self.q_norm, self.k_norm))
+                or (self.rope is not None and self.rope.dim > D)
+                or hp["n_embd"] % 32 or self.down.n_in % 32 or (H * D) % 32
+                or not mmvq.schritt_moeglich(c.k.device, H, Hkv, D)):
+            return False
+        # Bias von Q/K/V im RoPE-Kern, wenn alle drei über den int8-Weg rechnen (sonst in ihrem Weg)
+        bias = (None, None, None)
+        if self.qkv is not None:
+            if _int8_weg(self.qkv) and self.qkv.b is not None:
+                b = self.qkv.b.float()
+                bias = (b[:H * D], b[H * D:(H + Hkv) * D], b[(H + Hkv) * D:])
+        elif all(_int8_weg(lin) for lin in (self.q, self.k, self.v)):
+            bias = tuple(None if lin.b is None else lin.b.float() for lin in (self.q, self.k, self.v))
+        return {"bias": bias, "kern_bias": any(b is not None for b in bias)}
+
+    def _schritt(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int) -> torch.Tensor:
+        """Ein Token über die verschmolzenen Kerne; gleiche Rechnung wie der allgemeine Weg."""
+        hp, p = self.hp, self._plan
+        H, Hkv, D = self.H, self.Hkv, self.D
+        h = h.reshape(-1)
+        xn, e, _ = mmvq.norm_q8(h, self.attn_norm[0], hp["eps"])
+        mit = not p["kern_bias"]
+        if self.qkv is not None:
+            qkv = _mal(self.qkv, e, xn, mit)
+            q, k, v = qkv[:H * D], qkv[H * D:(H + Hkv) * D], qkv[(H + Hkv) * D:]
+        else:
+            q, k, v = (_mal(lin, e, xn, mit) for lin in (self.q, self.k, self.v))
+        qo = mmvq.rope_kv(q, k, v, p["bias"], self.rope, pos_idx, (self.q_norm, self.k_norm), hp["eps"],
+                          hp["q_temp"], self.cache.k, self.cache.v, H, Hkv, D)
+        o, eo = mmvq.attention1(qo, self.cache.k, self.cache.v, pos_idx, kv_len, hp["attn_scale"], self.fenster,
+                                self.sinks, H, Hkv, D)
+        o = _mal(self.o, eo, o)
+        rs = hp["residual_scale"]
+        xn, e, h = mmvq.norm_q8(h, self.ffn_norm[0], hp["eps"], rest=o, rs=rs)
+        if self.gate is not None:
+            a, ea = mmvq.akt_q8(_mal(self.gate, e, xn), _mal(self.up, e, xn), hp["gelu"])
+        else:
+            a, ea = mmvq.akt_q8(_mal(self.up, e, xn), None, hp["gelu"])
+        return torch.add(h, _mal(self.down, ea, a), alpha=rs).view(1, -1)
+
+    def __call__(self, h: torch.Tensor, pos_idx: torch.Tensor, kv_len: int,
+                 rope_pos: Optional[torch.Tensor] = None, segmente: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """pos_idx: Plätze im Cache. Gepackte Folgen (einbetten_stapel): `rope_pos` die Position je Folge ab 0,
+        `segmente` die Folge je Platz."""
+        hp, L = self.hp, h.shape[0]
+        if rope_pos is None:
+            rope_pos = pos_idx
+        if L == 1 and h.is_cuda and h.dtype == torch.float32 and segmente is None:
+            if self._plan is None:
+                self._plan = self._schritt_planen()
+            if self._plan:
+                return self._schritt(h, pos_idx, kv_len)
+        H, Hkv, D = self.H, self.Hkv, self.D
+        x = self._norm(h, self.attn_norm) if self.attn_norm is not None else h
+        if self.qkv is not None:
+            q, k, v = self.qkv(x).float().split([H * D, Hkv * D, Hkv * D], dim=-1)
+        else:
+            with mmvq.eingang_teilen():
+                q, k, v = self.q(x).float(), self.k(x).float(), self.v(x)
+        je_kopf_ln = hp["layernorm"]       # Command-R+: LayerNorm je Kopf mit eigenen Gewichten je Kopf (H·D)
+        if self.q_norm is not None and self.q_norm.numel() != D and not je_kopf_ln:   # über alle Köpfe (OLMo 2)
+            q = rms_norm(q, self.q_norm, hp["eps"])
+        if self.k_norm is not None and self.k_norm.numel() != D and not je_kopf_ln:
+            k = rms_norm(k, self.k_norm, hp["eps"])
+        q, k, v = q.reshape(L, H, D), k.reshape(L, Hkv, D), v.reshape(L, Hkv, D)
+        if self.q_norm is not None and self.q_norm.numel() == D:       # je Kopf (Qwen3, Gemma 3)
+            q = rms_norm(q, self.q_norm, hp["eps"])
+        elif self.q_norm is not None and je_kopf_ln:
+            q = layer_norm(q, None, None, hp["eps"]) * self.q_norm.reshape(H, D)
+        if self.k_norm is not None and self.k_norm.numel() == D:
+            k = rms_norm(k, self.k_norm, hp["eps"])
+        elif self.k_norm is not None and je_kopf_ln:
+            k = layer_norm(k, None, None, hp["eps"]) * self.k_norm.reshape(Hkv, D)
+        if self.rope is not None:
+            q, k = self.rope(q, rope_pos), self.rope(k, rope_pos)
+        if hp["q_temp"] is not None:                                 # Ministral 3: 1 + β·ln(1 + ⌊pos/n⌋)
+            beta, n = hp["q_temp"]
+            q = q * (1 + beta * torch.log1p(torch.div(rope_pos, n, rounding_mode="floor").float())).view(L, 1, 1)
+        self.cache.write(k, v, pos_idx)
+        if hp["attn_softcap"]:
+            if segmente is not None:
+                raise ValueError("packed sequences: no softcap attention")
+            o = attention_softcap(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, hp["attn_scale"],
+                                  hp["attn_softcap"], self.fenster)
+        else:
+            o = attention(self.cache.q_drehen(q), *self.cache.kv(kv_len), pos_idx, kv_len, hp["attn_scale"], self.fenster,
+                          sinks=self.sinks, segmente=segmente)
+        o = self.o(self.cache.o_zurueck(o).reshape(L, -1)).float()
+        if hp["parallel"]:
+            return h + o + self._ffn(x)
+        if self.attn_post is not None:
+            o = self._norm(o, self.attn_post, gruppen=False)
+        h = h + o * hp["residual_scale"]
+        x = self._norm(h, self.ffn_norm) if self.ffn_norm is not None else h
+        y = self._ffn(x)
+        if self.ffn_post is not None:
+            y = self._norm(y, self.ffn_post, gruppen=False)
+        return h + y * hp["residual_scale"]
+
+
+def parameter(gg: GGUFFile) -> tuple[dict, dict, int]:
+    """(hp, Bauanleitung, rope_dim) einer Baukasten-Bauart – geprüft, ohne Gewichte zu laden."""
+    a = gg.architecture
+    if a not in ARCHS:
+        raise GGUFError(f"architecture {a!r} not handled by the Baukasten")
+    b = ausfuellen.bauart(a) or {}
+    k = lambda s: f"{a}.{s}"
+    n_layer = _zahl(gg, k("block_count"), ganz=True, lo=1, hi=512)
+    # Zusatzschichten für Mehr-Token-Vorhersage (GLM-4.5) am Ende: beim Erzeugen nicht gebraucht
+    n_layer -= _zahl(gg, k("nextn_predict_layers"), 0, ganz=True, lo=0, hi=n_layer - 1)
+    n_embd = _zahl(gg, k("embedding_length"), ganz=True, lo=1, hi=65536)
+    n_heads = _zahl(gg, k("attention.head_count"), ganz=True, lo=1, hi=1024)
+    n_kv = _zahl(gg, k("attention.head_count_kv"), n_heads, ganz=True, lo=1, hi=1024)
+    head_dim = _zahl(gg, k("attention.key_length"), n_embd // n_heads, ganz=True, lo=1, hi=1024)
+    if _zahl(gg, k("attention.value_length"), head_dim, ganz=True) != head_dim:
+        raise GGUFError("different key and value head sizes are not supported")
+    if n_heads % n_kv:
+        raise GGUFError("head_count must be a multiple of head_count_kv")
+    rms_eps = gg.get(k("attention.layer_norm_rms_epsilon"))
+    eps = _zahl(gg, k("attention.layer_norm_rms_epsilon") if rms_eps is not None
+                else k("attention.layer_norm_epsilon"), 1e-5, lo=0, hi=1)
+    rope_dim = _zahl(gg, k("rope.dimension_count"), head_dim, ganz=True, lo=2, hi=head_dim)
+    if rope_dim % 2:
+        raise GGUFError("rope.dimension_count must be even")
+    groesse = "27b" if n_layer == b.get("gross_27b_bei_schichten") else ""
+    attn_scale = _zahl(gg, k("attention.scale"), None, lo=0, hi=100)
+    if attn_scale is None:                     # Gemma 2/3 27B: 1/sqrt(n_embd/n_head) (query_pre_attn_scalar)
+        attn_scale = (n_embd / n_heads) ** -0.5 if groesse else head_dim ** -0.5
+    hp = dict(
+        arch=a, n_layer=n_layer, n_embd=n_embd, n_heads=n_heads, n_kv_heads=n_kv, head_dim=head_dim, eps=eps,
+        layernorm=rms_eps is None and gg.get(k("attention.layer_norm_epsilon")) is not None,
+        norm_groups=_zahl(gg, k("attention.group_norm_groups"), 1, ganz=True, lo=1, hi=n_embd),
+        gelu=b.get("aktivierung") == "gelu",
+        attn_scale=attn_scale,
+        attn_softcap=_zahl(gg, k("attn_logit_softcapping"), 0.0, lo=0, hi=1e4) or 0.0,
+        final_softcap=_zahl(gg, k("final_logit_softcapping"), 0.0, lo=0, hi=1e4) or 0.0,
+        residual_scale=_zahl(gg, k("residual_scale"), 1.0, lo=0, hi=100),
+        logit_scale=_zahl(gg, k("logit_scale"), 1.0, lo=1e-6, hi=1e4),
+        embedding_scale=(n_embd ** 0.5 if b.get("einbettung_wurzel")
+                         else _zahl(gg, k("embedding_scale"), 1.0, lo=0, hi=1e4)),
+        n_expert_used=_zahl(gg, k("expert_used_count"), 0, ganz=True, lo=0, hi=1024),
+        topk_normieren=bool(gg.get(k("expert_weights_norm"), b.get("topk_normieren", True))),
+        gating=_zahl(gg, k("expert_gating_func"), GATING_SOFTMAX, ganz=True, lo=1, hi=2),
+        n_group=_zahl(gg, k("expert_group_count"), 1, ganz=True, lo=1, hi=1024),
+        group_used=_zahl(gg, k("expert_group_used_count"), 1, ganz=True, lo=1, hi=1024),
+        weights_scale=_zahl(gg, k("expert_weights_scale"), 1.0, lo=0, hi=1e4),
+        parallel=bool(b.get("parallel")),
+        logits_mal=bool(b.get("logits_mal_skala")),
+        q_temp=None,
+        ffn_norm_post_attn=bool(b.get("ffn_norm_heisst_post_attn")),
+        softmax_nach_auswahl=bool(b.get("softmax_nach_auswahl")),
+        glu_oai=bool(b.get("glu_oai")),
+    )
+    temp = _zahl(gg, k("attention.temperature_scale"), 0.0, lo=0, hi=10) if b.get("temperatur_skala") else 0.0
+    if temp:
+        n = (_zahl(gg, k("rope.scaling.original_context_length"), 0, ganz=True, lo=0, hi=1 << 26)
+             or _zahl(gg, k("context_length"), 0, ganz=True, lo=0, hi=1 << 26))
+        if not n:
+            raise GGUFError("attention.temperature_scale needs an original context length")
+        hp["q_temp"] = (temp, n)
+    if n_embd % hp["norm_groups"]:
+        raise GGUFError("group_norm_groups must divide embedding_length")
+    return hp, b, rope_dim
+
+
+def rope_plan(gg: GGUFFile, ld, hp: dict, b: dict, rope_dim: int, n_ctx: int, device) -> list:
+    """Je Schicht (RoPE oder None, Fenstergröße oder 0). `ld` braucht nur has() und norm()."""
+    a, n_layer = hp["arch"], hp["n_layer"]
+    k = lambda s: f"{a}.{s}"
+    neox = not b.get("rope_paare")
+    global_rope = BaukastenModel._rope(gg, ld, a, b, rope_dim, neox, n_ctx, device)
+    fenster = _zahl(gg, k("attention.sliding_window"), 0, ganz=True, lo=0, hi=1 << 24) or 0
+    muster = gg.get(k("attention.sliding_window_pattern"), b.get("fenster_muster"))
+    if isinstance(muster, bool) or (muster is not None and not isinstance(muster, (int, list))):
+        raise GGUFError("invalid attention.sliding_window_pattern")
+    if isinstance(muster, list) and (len(muster) != n_layer or any(not isinstance(m, bool) for m in muster)):
+        raise GGUFError("attention.sliding_window_pattern has the wrong length")
+    if isinstance(muster, int) and not 1 <= muster <= n_layer:
+        raise GGUFError("implausible attention.sliding_window_pattern")
+    fenster_rope = global_rope
+    if fenster and b.get("fenster_rope_schlicht"):
+        fenster_rope = RoPE(rope_dim, _zahl(gg, k("rope.freq_base"), 10000.0, lo=1, hi=1e12), device,
+                            max_pos=n_ctx, neox=neox)
+    if fenster and "fenster_basis" in b:
+        basis = _zahl(gg, k("rope.freq_base_swa"), float(b["fenster_basis"]), lo=1, hi=1e12)
+        fenster_rope = RoPE(rope_dim, basis, device, max_pos=n_ctx, neox=neox)
+
+    def ist_fenster(i):
+        if not fenster:
+            return False
+        if muster is None:
+            return True                         # Fenster in allen Schichten (Mistral)
+        if isinstance(muster, list):
+            return muster[i]
+        return (i % muster) != muster - 1
+    ohne_rope_jede = b.get("ohne_rope_jede")
+
+    def rope_von(i):
+        if ist_fenster(i):
+            return fenster_rope
+        if ohne_rope_jede and (i + 1) % ohne_rope_jede == 0:
+            return None
+        return None if fenster and b.get("global_ohne_rope") else global_rope
+    return [(rope_von(i), fenster if ist_fenster(i) else 0) for i in range(n_layer)]
+
+
+class BaukastenModel:
+    alle_logits = False      # Logits jeder Zeile statt nur der letzten (spekulatives Prüfen)
+    arch_names = ARCHS
+    schnell = None           # Leser für lange Stücke (trtmotor.chat), liefert Logits oder None
+    prefill_chunk = 2048            # full KV caches only: long chunks read faster (qlinear)
+
+    def __init__(self, gg: GGUFFile, device: torch.device, dtype: torch.dtype, n_ctx: int = 8192, progress=None,
+                 quant: bool = True, kv_bits: int = 16, experten_vram: Optional[int] = None):
+        hp, b, rope_dim = parameter(gg)
+        self.hp = hp
+        self.n_ctx = n_ctx
+        self.device = device
+        ld = WeightLoader(gg, device, dtype, progress, quant=quant, kv_bits=kv_bits, experten_vram=experten_vram)
+        tied = not ld.has("output.weight")
+        self.embed, head = ld.embedding("token_embd.weight", tied_head=tied)
+        self.out_norm = ld.norm("output_norm.weight")
+        self.out_norm_b = ld.norm("output_norm.bias") if ld.has("output_norm.bias") else None
+        self.lm_head = head if tied else ld.linear("output.weight", "output.bias")
+
+        plan = rope_plan(gg, ld, hp, b, rope_dim, n_ctx, device)
+        self.layers: List[_Schicht] = [
+            _Schicht(ld, i, hp, r, n_ctx, f) for i, (r, f) in enumerate(plan)]
+        self.moe = any(l.moe for l in self.layers)
+        if self.moe and not 0 < hp["n_expert_used"]:
+            raise GGUFError("expert_used_count missing for a mixture-of-experts model")
+        self.n_vocab = self.embed.n_vocab
+        self.n_quant = ld.n_quant
+        # single steps as CUDA graph: possible when every MoE layer picks its experts on the GPU
+        ohne_sync = all(l.experten.graphfaehig for l in self.layers if l.moe)
+        self.graph = GraphDecoder(self, n_ctx) if device.type == "cuda" and ohne_sync else None
+
+    @staticmethod
+    def _rope(gg, ld, a, b, dim, neox, n_ctx, device) -> RoPE:
+        k = lambda s: f"{a}.{s}"
+        basis = _zahl(gg, k("rope.freq_base"), 10000.0, lo=1, hi=1e12)
+        art = gg.get(k("rope.scaling.type"), "none")
+        faktor = _zahl(gg, k("rope.scaling.factor"), 1.0, lo=1e-3, hi=1e4)
+        orig = _zahl(gg, k("rope.scaling.original_context_length"), 0, ganz=True, lo=0, hi=1 << 26)
+        mscale = _zahl(gg, k("rope.scaling.attn_factor"), None, lo=0, hi=100)
+        freq = ld.norm("rope_freqs.weight") if ld.has("rope_freqs.weight") else None
+        if ld.has("rope_factors_long.weight"):                    # LongRoPE (Phi-3/4)
+            lang = n_ctx > orig if orig else False
+            freq = ld.norm("rope_factors_long.weight" if lang else "rope_factors_short.weight")
+            ctx = _zahl(gg, k("context_length"), 0, ganz=True, lo=0, hi=1 << 26)
+            if mscale is None:
+                s = ctx / orig if orig else 1.0
+                mscale = math.sqrt(1 + math.log(s) / math.log(orig)) if s > 1 else 1.0
+        yarn, scale = None, 1.0
+        if art == "yarn" and not orig:                            # wie llama.cpp: sonst die Trainingslänge
+            orig = _zahl(gg, k("context_length"), 0, ganz=True, lo=0, hi=1 << 26)
+        if art == "linear" and faktor != 1.0:
+            scale = faktor
+        elif art == "yarn" and faktor > 1.0 and orig:
+            yarn = (faktor, orig,
+                    _zahl(gg, k("rope.scaling.yarn_beta_fast"), 32.0, lo=0, hi=1e4),
+                    _zahl(gg, k("rope.scaling.yarn_beta_slow"), 1.0, lo=0, hi=1e4), not b.get("yarn_ungerundet"))
+            log_mul = _zahl(gg, k("rope.scaling.yarn_log_multiplier"), None, lo=0, hi=100)
+            if mscale is None and b.get("yarn_log_mul_all_dim") and log_mul is not None:
+                mscale = (0.1 * math.log(faktor) + 1.0) / (0.1 * log_mul * math.log(faktor) + 1.0)
+            if mscale is None:
+                mscale = 0.1 * math.log(faktor) + 1.0
+        elif art not in ("none", "linear", "yarn", "longrope", None):
+            raise GGUFError(f"unsupported rope.scaling.type {art!r}")
+        return RoPE(dim, basis, device, max_pos=n_ctx, neox=neox, freq_factors=freq, scale=scale,
+                    yarn=yarn, mscale=mscale or 1.0)
+
+    # -- Zustand (nur KV-Caches: Plätze werden je Position überschrieben) ----------------
+    def reset(self):
+        pass
+
+    def snapshot_state(self):
+        return None
+
+    def restore_state(self, snap):
+        pass
+
+    def resume_from(self, common: int, old_len: int) -> Optional[int]:
+        return common
+
+    def checkpoint_state(self):
+        return None
+
+    def restore_checkpoint(self, snap):
+        pass
+
+    # -- Rechnen ---------------------------------------------------------------------
+    def _verborgen(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, alle: bool = False,
+                   inject=None) -> torch.Tensor:
+        """Zustand nach der Schluss-Norm: letzte Zeile oder (alle=True) jede Zeile.
+        inject: (Zeilen, Einbettungen) – Bild-Einbettungen ersetzen dort die Token-Einbettung."""
+        h = self.einbettung(tok, inject)
+        for layer in self.layers:
+            h = layer(h, pos_idx, kv_len)
+        return self.schluss_norm(h if alle else letzte_zeilen(self, h))
+
+    def einbettung(self, tok: torch.Tensor, inject=None) -> torch.Tensor:
+        """Eingang der ersten Schicht (Token-Einbettung, Skala, Bild-Zeilen)."""
+        h = self.embed(tok)
+        if self.hp["embedding_scale"] != 1.0:
+            h = h * self.hp["embedding_scale"]
+        if inject is not None:
+            rows, emb = inject
+            h = h.index_copy(0, rows, emb.to(h.device, h.dtype))
+        return h
+
+    def schluss_norm(self, x: torch.Tensor) -> torch.Tensor:
+        hp = self.hp
+        if hp["layernorm"]:
+            return layer_norm(x, self.out_norm, self.out_norm_b, hp["eps"])
+        return group_rms_norm(x, self.out_norm, hp["eps"], hp["norm_groups"])
+
+    def kopf(self, x: torch.Tensor) -> torch.Tensor:
+        """Logits aus dem Zustand nach der Schluss-Norm (Skala, Softcap)."""
+        hp = self.hp
+        logits = logit_zeilen(self, self.lm_head(x)).float()
+        if hp["logit_scale"] != 1.0:                   # Granite teilt die Logits, Cohere multipliziert
+            logits = logits * hp["logit_scale"] if hp["logits_mal"] else logits / hp["logit_scale"]
+        if hp["final_softcap"]:
+            c = hp["final_softcap"]
+            logits = torch.tanh(logits / c) * c
+        return logits
+
+    def _run(self, tok: torch.Tensor, pos_idx: torch.Tensor, kv_len: int, inject=None) -> torch.Tensor:
+        return self.kopf(self._verborgen(tok, pos_idx, kv_len, inject=inject))
+
+    @torch.inference_mode()
+    def einbetten(self, tokens: List[int], pooling: str = "last") -> torch.Tensor:
+        """Ein Vektor für die ganze Folge (Embedding-Modelle): letztes Token, Mittel
+        oder erstes Token des Zustands nach der Schluss-Norm, in float32."""
+        if not 0 < len(tokens) <= self.n_ctx:
+            raise RuntimeError(f"text must have 1..{self.n_ctx} tokens")
+        if any(not 0 <= t < self.n_vocab for t in tokens):
+            raise ValueError("token id out of range")
+        if pooling not in ("last", "mean", "cls"):
+            raise ValueError(f"unknown pooling {pooling!r}")
+        summe, erstes, x = None, None, None
+        for start in range(0, len(tokens), self.prefill_chunk):
+            teil = tokens[start:start + self.prefill_chunk]
+            tok = torch.tensor(teil, device=self.device, dtype=torch.long)
+            pos_idx = torch.arange(start, start + len(teil), device=self.device, dtype=torch.long)
+            x = self._verborgen(tok, pos_idx, start + len(teil), alle=pooling != "last").float()
+            if erstes is None:
+                erstes = x[0]
+            if pooling == "mean":
+                summe = x.sum(0) if summe is None else summe + x.sum(0)
+        if pooling == "mean":
+            return summe / len(tokens)
+        return erstes if pooling == "cls" else x[-1]
+
+    def stapel_platz(self) -> int:
+        """So viele Token passen zusammen in einen Durchgang von `einbetten_stapel` – 0: nur einzeln."""
+        art = type(self)
+        if (self.hp["attn_softcap"] or art._verborgen is not BaukastenModel._verborgen
+                or art.einbettung is not BaukastenModel.einbettung
+                or not all(type(s) is _Schicht and type(s.cache) is KVCache for s in self.layers)):
+            return 0
+        return min(self.n_ctx, self.prefill_chunk)
+
+    @torch.inference_mode()
+    def einbetten_stapel(self, folgen: List[List[int]], pooling: str = "last") -> List[torch.Tensor]:
+        """Mehrere Folgen in einem Durchgang: hintereinander im Cache, RoPE-Positionen je Folge ab 0, und
+        jede Folge sieht nur sich selbst – dieselben Vektoren wie `einbetten` einzeln, aber die Gewichte
+        werden einmal für alle gelesen."""
+        laengen = [len(f) for f in folgen]
+        if not folgen or min(laengen) < 1:
+            raise ValueError("empty sequence")
+        if pooling not in ("last", "mean", "cls"):
+            raise ValueError(f"unknown pooling {pooling!r}")
+        platz = self.stapel_platz()
+        if len(folgen) == 1 or not platz:
+            return [self.einbetten(f, pooling) for f in folgen]
+        gesamt = sum(laengen)
+        if gesamt > platz:
+            raise RuntimeError(f"packed sequences must have at most {platz} tokens")
+        if any(not 0 <= t < self.n_vocab for f in folgen for t in f):
+            raise ValueError("token id out of range")
+        dev = self.device
+        tok = torch.tensor([t for f in folgen for t in f], device=dev, dtype=torch.long)
+        plaetze = torch.arange(gesamt, device=dev, dtype=torch.long)
+        rope_pos = torch.cat([torch.arange(n, device=dev, dtype=torch.long) for n in laengen])
+        segmente = torch.repeat_interleave(torch.arange(len(folgen), device=dev),
+                                           torch.tensor(laengen, device=dev))
+        h = self.einbettung(tok)
+        for schicht in self.layers:
+            h = schicht(h, plaetze, gesamt, rope_pos=rope_pos, segmente=segmente)
+        x = self.schluss_norm(h).float()
+        raus, start = [], 0
+        for n in laengen:
+            teil = x[start:start + n]
+            raus.append(teil.mean(0) if pooling == "mean" else teil[0] if pooling == "cls" else teil[-1])
+            start += n
+        return raus
+
+    def _in_stuecken(self, tokens: List[int], pos: int, inject, grenze: int) -> torch.Tensor:
+        logits = None
+        for s in range(0, len(tokens), grenze):
+            teil, ij = tokens[s:s + grenze], None
+            if inject is not None:
+                rows, emb = inject
+                drin = (rows >= s) & (rows < s + len(teil))
+                if bool(drin.any()):
+                    ij = (rows[drin] - s, emb[drin])
+            tok = torch.tensor(teil, device=self.device, dtype=torch.long)
+            pos_idx = torch.arange(pos + s, pos + s + len(teil), device=self.device, dtype=torch.long)
+            logits = self._run(tok, pos_idx, pos + s + len(teil), ij)
+        return logits
+
+    supports_images = True          # Bild-Einbettungen über `inject` (Pixtral bei Mistral/Ministral 3)
+
+    @torch.inference_mode()
+    def forward(self, tokens: List[int], pos: int, inject=None) -> torch.Tensor:
+        if pos < 0 or pos + len(tokens) > self.n_ctx:
+            raise RuntimeError(f"context window of {self.n_ctx} tokens exceeded")
+        if any(not 0 <= t < self.n_vocab for t in tokens):
+            raise ValueError("token id out of range")
+        if len(tokens) == 1 and self.graph is not None and inject is None:
+            return self.graph(tokens[0], pos)
+        if self.schnell is not None and len(tokens) >= self.schnell.ab and not self.alle_logits:
+            logits = self.schnell(self, tokens, pos, inject)       # trtmotor: langes Stück über TensorRT
+            if logits is not None:
+                return logits
+        grenze = BaukastenModel.prefill_chunk
+        if len(tokens) > grenze:                  # langes Stück für den Leser, das er nicht nahm
+            return self._in_stuecken(tokens, pos, inject, grenze)
+        tok = torch.tensor(tokens, device=self.device, dtype=torch.long)
+        pos_idx = torch.arange(pos, pos + len(tokens), device=self.device, dtype=torch.long)
+        return self._run(tok, pos_idx, pos + len(tokens), inject)
