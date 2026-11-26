@@ -1,0 +1,3209 @@
+"""main_befehle.py – Downloads, Update, Eingabezeile und Slash-Befehle (erster Teil).
+
+Teil von main.py: läuft im selben Namensraum wie main.py (main._teil_laden) – eine Datei,
+nur auf vier verteilt. Namen aus den anderen Teilen sind hier also da, ohne Import."""
+# ruff: noqa: F821
+
+
+async def hf_downloader() -> str | None:
+    """Modell von Hugging Face holen: Größe → MoE → Modell → Quantisierung → Sehen →
+    Steckbrief → Download mit SHA-256-Prüfung. Gibt die gguf-Referenz zurück, wenn das
+    Modell gleich verwendet werden soll."""
+    import extlibs
+    import gguflokal
+    import hfladen as H
+    abbruch = ("__cancel__", "↩  Abbrechen")
+    import systemprofil as SP
+    with ui.thinking("schaue mir deinen PC an"):
+        profil = await asyncio.to_thread(SP.erkennen)
+        motor = await asyncio.to_thread(lambda: bool(extlibs.enable().get("aktiv")))
+    vram = profil.nvidia.vram_mb if profil.nvidia else 0      # AMD/Intel: der Motor rechnet auf der CPU
+    ram = profil.ram_mb
+    ui.hf_willkommen(profil, H.gb(H.frei_auf_platte(gguflokal.ORDNER)), motor)
+
+    hinweise = {"klein": "Team kleiner Spezialisten", "4-8": "klein & flott", "8-15": "ausgewogen",
+                "15-35": "stark", "35+": "sehr groß"}
+    opts = []
+    for key, (von, _, text) in H.GROESSEN.items():
+        ab = int(max(von, 1.0) * 1e9 * 4.9 / 8)
+        opts.append((key, f"{H.passt(ab, vram, ram)[0]}  {text}  ·  {hinweise[key]}  ·  ab ≈ {H.gb(ab)}"))
+    legende = ("✅ passt in die Grafikkarte · ⚠ knapp · 🐢 teils im RAM · ❌ zu groß" if vram
+               else "🐢 läuft auf der CPU · ❌ zu groß für den Arbeitsspeicher")
+    groesse = await ask_confirm(f"Wie groß soll das Modell sein?  ({legende})", opts + [abbruch])
+    if groesse == "__cancel__":
+        return None
+    moe = await ask_confirm("Mixture of Experts (MoE)?", [
+        ("egal", "🔀  Egal – alle zeigen"),
+        ("ja", "🧩  Nur MoE – viele Experten, je Wort rechnet nur ein Teil: schnell trotz Größe"),
+        ("nein", "🧱  Nur klassisch – alles rechnet immer mit"),
+        abbruch])
+    if moe == "__cancel__":
+        return None
+    with ui.thinking("frage Hugging Face nach passenden Modellen"):
+        try:
+            liste = await asyncio.to_thread(H.suchen, groesse, {"ja": True, "nein": False}.get(moe))
+        except Exception as e:
+            ui.error(f"{e} – ist das Internet da?")
+            return None
+    if not liste:
+        ui.warn("Dazu gibt es gerade nichts Passendes. Probier eine andere Größe oder „Egal“ bei MoE.")
+        return None
+    vorhanden = set(gguflokal.modelle())
+    opts = []
+    for m in liste:
+        da = "  ·  ✔ schon da" if m.name in vorhanden else ""
+        sieht = "  ·  👁" if m.sieht else ""
+        opts.append((m.repo, f"{H.passt(m.q4_schaetzung, vram, ram)[0]}  {m.name}  ·  {m.groesse_text}  ·  "
+                             f"≈ {H.gb(m.q4_schaetzung)}{sieht}{da}"))
+    repo = await ask_confirm(f"{len(liste)} Modelle, meistgeladene zuerst – welches?", opts + [abbruch])
+    if repo == "__cancel__":
+        return None
+    modell = next(m for m in liste if m.repo == repo)
+
+    with ui.thinking(f"schaue in {modell.name}"):
+        try:
+            sprach, bild = await asyncio.to_thread(H.dateien, repo)
+        except Exception as e:
+            ui.error(f"Dateiliste nicht abrufbar: {e}")
+            return None
+    tipp = H.empfohlen(sprach)
+    if tipp is None:
+        ui.warn(f"{modell.name} hat keine einzelne GGUF-Datei mit Prüfsumme – das lässt sich nicht sicher laden.")
+        return None
+    opts = [(tipp.pfad, f"⭐ {tipp.quant}  ·  {H.gb(tipp.groesse)}  ·  {H.passt(tipp.groesse, vram, ram)[0]}  ·  empfohlen")]
+    opts += [(d.pfad, f"   {d.quant}  ·  {H.gb(d.groesse)}  ·  {H.passt(d.groesse, vram, ram)[0]}")
+             for d in sprach if d is not tipp]
+    wahl = await ask_confirm("Welche Quantisierung?  (weniger Bit: kleiner und schneller · mehr Bit: genauer)",
+                             opts + [abbruch])
+    if wahl == "__cancel__":
+        return None
+    datei = next(d for d in sprach if d.pfad == wahl)
+    mm = H.mmproj_wahl(bild)
+    if mm is not None:
+        sehen = await ask_confirm("👁 Dieses Modell kann Bilder ansehen. Die Sehen-Datei dazu laden?", [
+            ("ja", f"👁  Ja, mit Sehen  ·  +{H.gb(mm.groesse)}"), ("nein", "Nein, nur Text")])
+        if sehen != "ja":
+            mm = None
+
+    ziel = gguflokal.ORDNER / modell.name
+    andere = [p for p in ziel.glob("*.gguf") if not gguflokal._ist_beiwerk(p) and p.name != datei.name]
+    if andere:                                 # andere Quantisierung schon da: eigener Ordner
+        ziel = gguflokal.ORDNER / f"{modell.name}-{datei.quant}"
+    noetig = datei.groesse + (mm.groesse if mm else 0)
+    frei = H.frei_auf_platte(ziel)
+    ui.hf_modell(modell, datei, mm, H.passt(datei.groesse, vram, ram), H.gb(frei), str(ziel))
+    if frei < noetig + 2**30:
+        ui.error(f"Nicht genug Platz: gebraucht {H.gb(noetig)}, frei {H.gb(frei)}.")
+        return None
+    los = await ask_confirm(f"{H.gb(noetig)} herunterladen?", [("ja", "⬇  Ja, herunterladen"), abbruch])
+    if los != "ja":
+        return None
+
+    teile = [datei] + ([mm] if mm else [])
+    for nr, d in enumerate(teile, 1):
+        try:
+            await _hf_datei_laden(H, repo, d, ziel, nr, len(teile))
+        except H.Abbruch:
+            ui.info("⏸ Angehalten. Starte den Download einfach nochmal – er macht an derselben Stelle weiter.")
+            return None
+        except H.PruefFehler as e:
+            ui.error(f"🔐 {e}")
+            return None
+        except Exception as e:
+            ui.error(f"Download fehlgeschlagen: {e} – nochmal starten setzt fort.")
+            return None
+    ui.success(f"✅ {ziel.name} ist da. SHA-256 geprüft: stimmt mit Hugging Face überein.")
+    if not motor:
+        ui.info("Zum Verwenden fehlt noch torch – /einrichten installiert es, danach /model → Lokal.")
+        return None
+    jetzt = await ask_confirm("Gleich verwenden?", [("ja", f"🧠  Ja, {ziel.name} laden"),
+                                                    ("nein", "Später  ·  /model → Lokal")])
+    return M.make_ref("gguf", ziel.name) if jetzt == "ja" else None
+
+
+def _cloud_modell(ctx) -> bool:
+    """Läuft gerade ein Cloud-Modell (mit Key) – kein lokales?"""
+    anbieter = M.split_ref(ctx.model or "")[0]
+    prov = P.get(anbieter) if anbieter else None
+    return ctx.backend is not None and prov is not None and not prov.keyless and anbieter not in ("gguf", "ollama")
+
+
+async def update_befehl(ctx, arg: str = "") -> str | None:
+    """/update: Programm per Git (nur Quelltext mit Remote), dann das venv prüfen und auf Stand
+    bringen – Nötiges (Lücken, Schadpakete, fehlt, Version passt nicht, torch-Bau) und erlaubte
+    Updates. Gibt eine Nachricht an die KI zurück, wenn sie die Lücken erklären soll. Braucht etwas
+    einen Neustart, kommt am Ende die Frage danach. „/update torch“: nur PyTorch, ohne Menü."""
+    gruende: list[str] = []
+    if arg.strip().lower() in ("torch", "pytorch"):
+        await torch_aktualisieren(gruende)
+        if gruende:
+            await neu_starten_anbieten(" ".join(gruende))
+        return None
+    antwort = await _update_ablauf(ctx, gruende)
+    if gruende and antwort is None:
+        await neu_starten_anbieten(" ".join(gruende))
+    return antwort
+
+
+async def _update_ablauf(ctx, gruende: list[str]) -> str | None:
+    import venvpflege as V
+    grund = updater.why_not()
+    if grund is None:
+        try:
+            res = await _run_with_status("⬇ Programm", updater.run)
+        except Exception as e:
+            res = {"ok": False, "output": str(e)}
+        if not res["ok"]:
+            ui.warn("⬇ Programm-Update nicht durchgeführt.")
+            ui.text_panel("Git sagt", res["output"] or "(keine Ausgabe)")
+        elif res["changed"]:
+            ui.success(f"⬇ Programm: {res['before']} → {res['after']}  ({len(res['files'])} Datei(en)).")
+            gruende.append("Der neue Programmcode läuft erst nach einem Neustart.")
+        else:
+            ui.info(f"⬇ Programm ist aktuell ({res['before']}).")
+    else:
+        ui.info("⬇ Programm: " + ("exe – neue Versionen kommen als neuer Ordner." if getattr(sys, "frozen", False)
+                                 else "kein Git-Remote, übersprungen."))
+
+    import llamareserve
+    import luecken
+    if llamareserve.eingerichtet():                      # nur, wenn die llama.cpp-Reserve eingerichtet ist
+        try:
+            with ui.thinking("prüfe den llama.cpp-Build auf bekannte Lücken (OSV.dev)"):
+                erg = await asyncio.to_thread(luecken.llamacpp_pruefen)
+            zeilen = luecken.llamacpp_zeilen(erg)
+            (ui.warn if erg.get("luecken") else ui.info)("\n".join(zeilen))
+        except OSError as e:
+            ui.warn(f"🛡 llama.cpp nicht geprüft: {e}")
+
+    if V.site_packages() is None:
+        import uvsetup
+        if uvsetup.VENV_DIR.exists() and not uvsetup.venv_passt():
+            ui.warn(f"📦 Das venv ist für Python {uvsetup.venv_version()}, NemiCLI läuft mit {uvsetup.PYVER} – "
+                    "/update kann es nicht umbauen. /einrichten legt es neu an (das alte bleibt umbenannt liegen).")
+        else:
+            ui.warn("📦 Noch kein venv neben NemiCLI – /einrichten legt es an.")
+        return None
+    with ui.thinking("prüfe das venv: Pakete, Versionen, torch, bekannte Sicherheitslücken"):
+        liste = await asyncio.to_thread(V.pruefen)
+    if V.STAND["luecken"]:
+        ui.warn(f"🛡 {V.STAND['luecken']} – Lücken diesmal nicht geprüft.")
+    if V.STAND["torch"]:
+        ui.warn(f"🔥 PyTorch-Index nicht geprüft: {V.STAND['torch']}")
+    if not liste:
+        ui.success("📦 venv ist aktuell, keine bekannten Lücken – nichts zu tun.")
+        return None
+    ui.update_tabelle(liste)
+    torch_neu = [e for e in liste if e.grund == "torch-update"]       # eigener Punkt, nie in „alles“
+    machbar = [e for e in liste if e.machbar and e.grund != "torch-update"]
+    noetig = [e for e in machbar if e.noetig]
+    updates = [e for e in machbar if not e.noetig]
+    mit_luecken = [e for e in liste if e.luecken]
+    opts = []
+    if noetig and updates:
+        opts += [("alles", f"🔧  Nötiges reparieren + {len(updates)} Update(s)"),
+                 ("noetig", f"🔧  Nur Nötiges ({len(noetig)})")]
+    elif noetig:
+        opts.append(("noetig", f"🔧  Reparieren ({len(noetig)})"))
+    elif updates:
+        opts.append(("alles", f"⬆  {len(updates)} Update(s) installieren"))
+    if torch_neu:
+        t = torch_neu[0]
+        opts.append(("torch", f"🔥  Nur PyTorch: {t.installiert} → {t.neu} (rund 3 GB)"))
+        if machbar:
+            opts.append(("alles_torch", "⬆  Alles oben + PyTorch"))
+    erklaeren = bool(mit_luecken) and _cloud_modell(ctx)
+    offen = [e for e in liste if not e.machbar]
+    if not machbar and not torch_neu and not erklaeren:
+        ui.info("🛡 Offen (nicht automatisch behebbar): "
+                + ", ".join(f"{e.name} – {e.hinweis or 'selbst im venv-Fenster (/venv)'}" for e in offen))
+        return None
+    if erklaeren:
+        opts.append(("ki", "🤖  Erst erklären lassen: wie gefährlich sind die Lücken?"))
+    opts.append(("__cancel__", "↩  Nicht jetzt"))
+    wahl = await ask_confirm("Was soll ich tun?", opts)
+    if wahl == "ki":
+        return _luecken_frage(mit_luecken)
+    if wahl == "__cancel__":
+        return None
+    auswahl = {"noetig": noetig, "torch": torch_neu, "alles_torch": machbar + torch_neu}.get(wahl, machbar)
+    try:
+        res = await _run_with_status("📦 venv aktualisieren", lambda on_status: V.einspielen(auswahl, on_status))
+    except Exception as e:
+        ui.error(f"📦 Update fehlgeschlagen: {e}")
+        return None
+    if res["jetzt"]:
+        ui.success(f"📦 Aktualisiert und geprüft (lädt): {', '.join(res['jetzt'])}.")
+        gruende.append("Ein Neustart nimmt die neuen Fassungen.")
+    if res["entfernt"]:
+        ui.success(f"🚫 Schadpaket entfernt: {', '.join(res['entfernt'])}.")
+    if res["aufgeraeumt"]:
+        ui.success(f"🧹 Nicht mehr gebraucht, entfernt: {', '.join(res['aufgeraeumt'])}.")
+    for name, fehler in res["zurueck"]:
+        ui.warn(f"↩ {name} lud nach dem Update nicht mehr – alte Version zurückgeholt: {fehler}")
+    if res["spaeter"]:
+        ui.info(f"⏳ Gerade in Benutzung, kommt beim nächsten Start: {', '.join(res['spaeter'])}.")
+    if res["neustart"]:
+        gruende.append(f"{', '.join(res['neustart'])} ist geladen – nach dem Neustart gleich /update tippen.")
+    for name, grund in res["abgelehnt"]:
+        ui.warn(f"⏭ {name} übersprungen, nichts verändert: {grund}")
+    t = res.get("torch") or {}
+    if t.get("text"):
+        (ui.success if t.get("jetzt") or t.get("start") else ui.warn)(f"🔥 {t['text']}")
+        if t.get("jetzt"):
+            gruende.append("Ein Neustart nimmt die neue PyTorch-Fassung.")
+        elif t.get("start"):
+            gruende.append("Beim Neustart wird PyTorch eingespielt (dauert ein paar Minuten).")
+    if offen:
+        ui.info("🛡 Offen (nicht automatisch behebbar): "
+                + ", ".join(f"{e.name} – {e.hinweis or 'selbst im venv-Fenster (/venv)'}" for e in offen))
+    return None
+
+
+async def torch_aktualisieren(gruende: list[str]) -> None:
+    """/update torch: PyTorch direkt auf den neuesten Bau, den Karte und Treiber können – mit Prüfung vorher und
+    nachher (sonst die alte Fassung zurück); ist torch geladen, beim nächsten Start."""
+    import venvpflege as V
+    site = V.site_packages()
+    if site is None:
+        ui.warn("🔥 Noch kein venv neben NemiCLI – /einrichten legt es an.")
+        return
+    inst = V.installiert(site)
+    if "torch" not in inst:
+        ui.warn("🔥 PyTorch ist noch nicht installiert – /einrichten zeigt den Befehl für deine Grafikkarte.")
+        return
+    if (bau := V._torch_eintrag(inst)) is not None:
+        ui.warn(f"🔥 {bau.hinweis}")
+        return
+    try:
+        with ui.thinking("frage den PyTorch-Index nach dem neuesten passenden Bau"):
+            neu = await asyncio.to_thread(V._torch_update, inst)
+    except Exception as e:
+        ui.warn(f"🔥 PyTorch-Index nicht erreichbar: {e}")
+        return
+    if neu is None:
+        ui.success(f"🔥 PyTorch ist aktuell: {inst['torch']} – neuer geht es mit deinem Treiber gerade nicht.")
+        return
+    ui.info(f"🔥 PyTorch: {neu.installiert} → {neu.neu} ({neu.hinweis})")
+    try:
+        res = await _run_with_status("🔥 PyTorch aktualisieren", lambda on_status: V.einspielen([neu], on_status))
+    except Exception as e:
+        ui.error(f"🔥 PyTorch-Update fehlgeschlagen: {e}")
+        return
+    t = res.get("torch") or {}
+    if t.get("text"):
+        (ui.success if t.get("jetzt") or t.get("start") else ui.warn)(f"🔥 {t['text']}")
+    if t.get("jetzt"):
+        gruende.append("Ein Neustart nimmt die neue PyTorch-Fassung.")
+    elif t.get("start"):
+        gruende.append("Beim Neustart wird PyTorch eingespielt (dauert ein paar Minuten).")
+    for name, fehler in res.get("zurueck") or []:
+        ui.warn(f"↩ {name} lud nach dem Update nicht mehr – alte Version zurückgeholt: {fehler}")
+
+
+def _luecken_frage(eintraege) -> str:
+    """Nachricht an die KI: Funde als Daten, Bitte um eine verständliche Einordnung."""
+    import fremddaten
+    zeilen = []
+    for e in eintraege:
+        for l in e.luecken:
+            zeilen.append(f"{e.name} {e.installiert}: {l.kennung} · Schwere {l.schwere} · "
+                          f"behoben in {l.behoben or '–'} · {l.text}")
+        if e.hinweis:
+            zeilen.append(f"{e.name}: {e.hinweis}")
+    return ("/update hat in meinem NemiCLI-venv diese bekannten Sicherheitslücken gefunden (Daten aus OSV.dev). "
+            "Erklär mir kurz und verständlich, wie gefährlich sie für meine Nutzung sind und ob ich sofort "
+            "handeln sollte. Nichts installieren oder ändern – nur einordnen.\n\n"
+            + fremddaten.rahmen("\n".join(zeilen), "ausgabe", "OSV.dev"))
+
+
+async def setup_ollama() -> None:
+    """Ollama-Modell laden: erst GRÖSSE wählen, dann ein Modell dieser Größe aus
+    der LIVE-Liste von ollama.com (immer aktuell, nichts vorgegeben). Bei nicht
+    installiertem/laufendem Ollama: Hinweis."""
+    if not S.ollama_installed():
+        ui.warn("🦙 " + S.ollama_install_hint())
+        return
+    if not S.ollama_running():
+        ui.warn("🦙 Ollama ist installiert, läuft aber nicht. Starte die Ollama-App "
+                "und versuch es nochmal.")
+        return
+
+    with ui.thinking("hole die aktuelle Ollama-Modell-Liste"):
+        catalog = await asyncio.to_thread(S.ollama_catalog)
+    with ui.thinking("erkenne deine Grafikkarte"):
+        gpu = await asyncio.to_thread(S.gpu_info)
+    ui.setup_panel(gpu, S.hardware_hint(gpu),
+                   links=[("🦙 Ollama-Bibliothek:", S.OLLAMA_LIBRARY_URL)])
+
+    # Netz weg / Liste leer -> wenigstens manuell eingeben lassen.
+    if not catalog:
+        ui.warn(f"Konnte die Live-Liste nicht laden. Stöbere selbst: {S.OLLAMA_LIBRARY_URL}")
+        name = (await ask_text("Modellname zum Laden (Format name:größe, leer = abbrechen):")).strip()
+        if name:
+            await _ollama_pull_and_done(name)
+        return
+
+    # --- Stufe A: Größe wählen (ab 4B; alles darunter ist zu schwach für Logik) ---
+    sizes = S.ollama_sizes(catalog, lo=4.0, hi=14.0)        # 4B … 14B
+    big = S.ollama_models_for(catalog, min_b=14.0, limit=99)    # > 14B
+    opts: list[tuple[str, str]] = []
+    opts += [(s, f"{s.upper()}  ·  {n} Modell(e)") for s, n in sizes]
+    if big:
+        opts.append(("__big__", f"groß  > 14B  ·  {len(big)} Modell(e)"))
+    opts.append(("__manual__", "Name selbst eingeben"))
+    opts.append(("__cancel__", "Abbrechen"))
+    pick = await ask_confirm("Welche Größe?  (Ollama lädt standardmäßig Q4_K_M)", opts)
+    if pick == "__cancel__":
+        return
+    if pick == "__manual__":
+        name = (await ask_text("Modellname (Format name:größe, leer = abbrechen):")).strip()
+        if name:
+            await _ollama_pull_and_done(name)
+        return
+
+    # --- Stufe B: konkretes Modell dieser Größe wählen ---
+    if pick == "__big__":
+        models = S.ollama_models_for(catalog, min_b=14.0, limit=18)
+        titel = "Modelle größer als 14B  ·  Q4_K_M"
+    else:
+        models = S.ollama_models_for(catalog, size=pick, limit=18)
+        titel = f"{pick.upper()}-Modelle  ·  Q4_K_M"
+    mopts = [(m, m) for m in models]
+    mopts.append(("__cancel__", "Abbrechen / zurück"))
+    chosen = await ask_confirm(titel, mopts)
+    if chosen == "__cancel__":
+        return
+    await _ollama_pull_and_done(chosen)
+
+
+# Sitzungs-Zähler für den Übungsmodus (wie viele Runden bisher gelaufen sind)
+PRACTICE_STATE = {"count": 0}
+_RESERVE_MARKE = "llamacpp|"             # Auswahl im /model-Menü: dasselbe Modell über die Reserve
+
+
+def _practice_emit(kind: str, payload) -> None:
+    """Übersetzt die Schritt-Ereignisse einer Übungsrunde in hübsche Ausgaben."""
+    if kind == "start":
+        ui.console.print(ui.practice_header(payload))
+    elif kind == "code":
+        path, code = payload
+        ui.console.print(ui.practice_code(path.name, code))
+    elif kind == "run":
+        ui.info(f"▶ {payload}")
+    elif kind == "ok":
+        ui.console.print(ui.action_result(payload, ok=True))
+    elif kind == "fail":
+        ui.console.print(ui.action_result(payload, ok=False))
+    elif kind == "learned":
+        ui.success(payload)
+    elif kind == "error":
+        ui.error(payload)
+    elif kind in ("giveup", "cancelled"):
+        ui.warn(payload)
+
+
+async def practice_round(ctx: "Ctx", should_stop) -> str:
+    """Eine freigegebene Übungsrunde im Arbeitsordner.
+    Teilt sich den TURN_LOCK mit echten Chats – nie beides gleichzeitig."""
+    if ctx.backend is None:
+        return "abgebrochen"
+
+    async def approve(path, code):
+        if should_stop():
+            return False
+        preview = (f"Ziel: {path}\n\n"
+                   "Diesen Code als Datei speichern und danach mit Python ausführen.\n"
+                   "Ausgeführt wird in der Sandbox (AppContainer): nur NemiSandbox "
+                   "und Internet, kein Zugriff auf deine Dateien.\n\n" + code)
+        return await review_action_confirm("Übung: Code prüfen und freigeben", preview)
+
+    async with TURN_LOCK:
+        if should_stop():
+            return "abgebrochen"
+        PRACTICE_STATE["count"] += 1
+        return await PRAC.one_round(ctx.backend, _practice_emit, should_stop,
+                                    n=PRACTICE_STATE["count"], approve=approve)
+
+
+async def chatgpt_anmelden() -> bool:
+    """ChatGPT-Konto verbinden: im Browser anmelden und der Nutzung des Plans zustimmen (Sign in with ChatGPT)."""
+    import threading
+
+    import chatgpt_login
+    ui.info("🔐 Gleich öffnet sich dein Browser: bei ChatGPT anmelden und zustimmen. NemiCLI bekommt dabei kein "
+            "Passwort und keinen API-Schlüssel – nur die Erlaubnis, deinen ChatGPT-Plan (Plus/Pro) zu nutzen. "
+            "Ich warte bis zu 5 Minuten – ESC bricht ab.")
+    stopp = threading.Event()
+    try:
+        with ui.thinking("warte auf die Anmeldung im Browser"):
+            task = asyncio.create_task(asyncio.to_thread(chatgpt_login.anmelden, abbruch=stopp.is_set))
+            try:
+                while not task.done():
+                    if _abbruch_taste():
+                        stopp.set()
+                    await asyncio.wait({task}, timeout=0.25)
+            except asyncio.CancelledError:
+                stopp.set()                        # der Faden beendet das Warten und schließt den Empfänger
+                task.add_done_callback(lambda t: t.cancelled() or t.exception())
+                raise
+            stand = task.result()
+    except chatgpt_login.AnmeldungAbgebrochen as e:
+        ui.info(f"ChatGPT-Anmeldung: {e}")
+        return False
+    except Exception as e:
+        ui.error(f"ChatGPT-Anmeldung: {e}")
+        return False
+    if not stand["plan"]:
+        ui.warn("Angemeldet, aber die Nutzung deines Plans wurde nicht freigegeben – ohne sie kann NemiCLI das Konto "
+                "nicht für Antworten nutzen. Nochmal: /model chatgpt anmelden")
+        return False
+    ui.success(f"✅ ChatGPT-Konto verbunden{': ' + stand['email'] if stand['email'] else ''} – "
+               "Zugang verschlüsselt gespeichert.")
+    return True
+
+
+async def pick_model(current: str | None) -> str | None:
+    """Zweistufige Auswahl: erst Cloud-Anbieter ODER Lokal, dann das Modell.
+    Gibt eine Modell-Referenz zurück oder None (abgebrochen)."""
+    provs = {pid: p for pid, p in P.detected().items() if not p.keyless}
+    ollama_on = P.get("ollama").available()
+    # Anbieter ohne Key, die man einrichten kann (keyless wie Ollama ausgenommen).
+    keyless = [p for pid, p in P.PROVIDERS.items() if not p.available() and not p.keyless]
+
+    # --- Stufe 1: Wohin? ---
+    stufe1: list[tuple[str, str]] = []
+    for pid, p in provs.items():            # Anbieter MIT Key: einzeln wählbar
+        extra = f"  ·  {p.note}" if p.note else ""
+        stufe1.append((f"cloud:{pid}", f"☁  {p.label}{extra}"))
+    if keyless:                             # Anbieter OHNE Key: hinzufügen (Key eintippen)
+        stufe1.append(("cloudadd",
+                       f"☁  Cloud-Anbieter hinzufügen  ·  Key eintragen ({len(keyless)})"))
+    import gguflokal
+    lokale = gguflokal.modelle()
+    if lokale:                              # eigener GGUF-Motor: Modelle aus KI-Modelle/KI-Chat/Chatmodell/
+        stufe1.insert(0, ("gguf", f"🧠  Lokal (eigener Motor)  ·  {len(lokale)} Modell(e)  ·  "
+                                  "ohne Server, kein Key"))
+    P.lokale_vorpruefen()
+    for pid, p in P.PROVIDERS.items():      # weitere lokale Server (LM Studio, Jan, llama.cpp, vLLM), wenn sie laufen
+        if p.keyless and pid != "ollama" and p.available():
+            stufe1.append((f"cloud:{pid}", f"💻  {p.label}  ·  {p.note}"))
+    if ollama_on:                           # lokales Ollama läuft -> eigener Zweig
+        n = len(P.ollama_models())
+        stufe1.append(("ollama", f"🦙  Ollama  ·  {n} Modell(e)  ·  lokal, kein Key"))
+    # Ollama-Modell laden – bzw. einrichten, wenn Ollama noch nicht da/aus ist.
+    stufe1.append(("ollama_get",
+                   "🦙  Ollama-Modell herunterladen" if ollama_on
+                   else "🦙  Ollama einrichten  ·  installieren & Modell laden"))
+    hf = ("hf", "🤗  Modell von Hugging Face holen  ·  lokal, Größe und MoE wählen")
+    if current:
+        stufe1.append(hf)
+        stufe1.append(("__cancel__", "Abbrechen"))
+        frage = "Cloud-Anbieter oder Lokal?"
+    else:                                   # noch kein Modell: die zwei Einstiege zuerst
+        oben = [o for o in stufe1 if o[0] == "cloudadd"] + [hf]
+        stufe1 = oben + [o for o in stufe1 if o[0] != "cloudadd"] + [("__cancel__", "Später")]
+        frage = ("👋 Willkommen! Womit soll NemiCLI denken?  Cloud: API-Key eintragen · "
+                 "Lokal: ein Modell auf diesen PC holen")
+
+    wahl = await ask_suche(frage, stufe1)
+    if wahl == "__cancel__":
+        return None
+
+    # --- Einrichtungs-Zweige (laden/installieren, dann zurück ins /model) ---
+    if wahl == "hf":
+        return await hf_downloader()
+    if wahl == "ollama_get":
+        await setup_ollama()
+        return None
+    # Neuen Anbieter einrichten: auswählen -> Key eintippen -> speichern -> weiter
+    if wahl == "cloudadd":
+        opts = [(pid, f"☁  {p.label}" + (f"  ·  {p.note}" if p.note else ""))
+                for pid, p in P.PROVIDERS.items()
+                if not p.available() and not p.keyless]
+        opts.append(("__cancel__", "Abbrechen"))
+        pid = await ask_suche("Welchen Anbieter möchtest du einrichten?", opts)
+        if pid == "__cancel__":
+            return None
+        prov = P.get(pid)
+        if prov.kind == "chatgpt":                # kein Schlüssel: Anmeldung im Browser
+            if not await chatgpt_anmelden():
+                return None
+            wahl = f"cloud:{pid}"
+        else:
+            wahl = "__schluessel__"
+    if wahl == "__schluessel__":
+        ui.info(f"{prov.label}: Key holen unter  {P.KEY_URLS.get(pid, '(siehe Anbieter-Website)')}")
+        await tresor_zeigen(ctx_global(), prov.env, prov.label)    # Schlüssel nur im Controllcenter (🔐 Tresor)
+        return None
+
+    # --- Stufe 2: konkretes Modell ---
+    if wahl == "gguf":
+        import llamareserve
+        reserve = llamareserve.eingerichtet()
+        opts = []
+        for name in lokale:
+            opts.append((M.make_ref("gguf", name), gguflokal.beschreibung(name)))
+            if reserve:                      # dasselbe Modell über die festgenagelte llama.cpp-Reserve
+                opts.append((_RESERVE_MARKE + M.make_ref("gguf", name),
+                             f"🦙 {name}  ·  über llama.cpp {llamareserve.aktiv()} (Reserve"
+                             + (", 👁 sieht Bilder)" if gguflokal.sieht(name) else ")")))
+        opts.append(("__cancel__", "Zurück / Abbrechen"))
+        n = gguflokal.kontext() if gguflokal.kontext_einstellung() > 0 else 0
+        ref = await ask_suche(f"Welches lokale Modell?  (Kontext {f'{n:,} Token' if n else 'max'}, "
+                              f"höchstens {gguflokal.tok_s() or '∞'} Token/s)".replace(",", "."), opts)
+        if ref == "__cancel__":
+            return None
+        ueber_reserve = ref.startswith(_RESERVE_MARKE)
+        ref = ref.removeprefix(_RESERVE_MARKE)
+        gguflokal.motor_setzen(M.split_ref(ref)[1], gguflokal.LLAMACPP if ueber_reserve else gguflokal.EIGEN)
+        return ref
+    if wahl == "ollama":
+        ids = P.ollama_models()
+        if not ids:
+            ui.warn("Ollama läuft, hat aber keine Chat-Modelle (nur Embeddings?). "
+                    "Mit  ollama pull <modell>  eins holen.")
+            return None
+        opts = [(M.make_ref("ollama", mid),
+                 mid + ("  👁 Vision" if P.ollama_is_vision(mid) else ""))
+                for mid in ids]
+        opts.append(("__cancel__", "Zurück / Abbrechen"))
+        ref = await ask_suche("Welches Ollama-Modell?", opts)
+        return None if ref == "__cancel__" else ref
+
+    pid = wahl.split(":", 1)[1]
+    prov = P.get(pid)
+    try:
+        with ui.thinking(f"frage {prov.label} nach verfügbaren Modellen"):
+            ids = await P.list_models(pid, limit=P.LISTE_MAX)
+    except Exception as e:
+        ui.error(f"Modell-Liste von {prov.label} fehlgeschlagen: {e}")
+        return None
+    if not ids:
+        ui.warn(f"{prov.label} hat keine passenden Chat-Modelle geliefert.")
+        return None
+
+    opts = [(M.make_ref(pid, mid), mid) for mid in ids]
+    opts.append(("__cancel__", "Zurück / Abbrechen"))
+    ref = await ask_suche(f"Welches Modell von {prov.label}?", opts)
+    return None if ref == "__cancel__" else ref
+
+
+def _video_opts(text: str) -> dict:
+    """`/video <prompt> [--sekunden 10] [--start pfad] [--figur] [--seed 1] [--steps 30] [--schaerfe mittel]`."""
+    opts: dict = {}
+    if re.search(r"(?<!\S)--figur(?!\S)", text):
+        opts["figur"] = True
+        text = re.sub(r"(?<!\S)--figur(?!\S)", "", text)
+    muster = re.compile(r'--(sekunden|start|seed|steps|schaerfe)\s+("[^"]+"|\S+)')
+    for m in muster.finditer(text):
+        wert = m.group(2).strip('"')
+        opts[m.group(1)] = wert
+    opts["prompt"] = muster.sub("", text).strip()
+    for k, art in (("sekunden", float), ("seed", int), ("steps", int)):
+        if k in opts:
+            try:
+                opts[k] = art(opts[k])
+            except ValueError:
+                del opts[k]
+    return opts
+
+
+async def ersatzbank_waehlen(ctx) -> None:
+    """/model ersatz: bis zu zwei Cloud-Modelle, die einspringen, wenn das aktive herausgefiltert wird."""
+    bank = ersatzbank.liste()
+    zeilen = [f"  1. aktiv:  {ctx.model or '—'}"] + [f"  {i}. Ersatz: {r}" for i, r in enumerate(bank, 2)]
+    ui.info("🪑 Ersatzbank\n" + "\n".join(zeilen))
+    opts = []
+    if len(bank) < ersatzbank.MAX_ERSATZ:
+        opts.append(("dazu", "➕ Ersatz hinzufügen (nur Cloud)"))
+    if bank:
+        opts.append(("leeren", "🗑 Ersatzbank leeren"))
+    opts.append(("__cancel__", "Fertig"))
+    wahl = await ask_confirm("Ersatzbank – was tun?", opts)
+    if wahl == "leeren":
+        ersatzbank.setzen([])
+        ui.success("Ersatzbank geleert.")
+        return
+    while wahl == "dazu" and len(bank) < ersatzbank.MAX_ERSATZ:
+        ref = await pick_model(ctx.model)
+        if not ref:
+            return
+        if not ersatzbank.ist_cloud(ref):
+            ui.warn("Auf die Ersatzbank kommen nur Cloud-Modelle – lokale belegen die Grafikkarte.")
+        elif ref == ctx.model or ref in bank:
+            ui.warn("Das Modell ist schon dabei.")
+        else:
+            bank = ersatzbank.setzen(bank + [ref])
+            ui.success(f"🪑 Auf der Bank: {', '.join(bank)}")
+        if len(bank) >= ersatzbank.MAX_ERSATZ:
+            break
+        wahl = await ask_confirm("Noch einen Ersatz?", [("dazu", "Ja"), ("__cancel__", "Nein, fertig")])
+
+
+async def _rauswurf_uebernehmen(ctx) -> None:
+    """Herausgefiltertes Modell – auch von einem anderen Prozess: Ersatz übernehmen oder ohne Modell weiter."""
+    ersatzbank.abholen()
+    if not ctx.model or ctx.model not in ersatzbank.rausgeflogen():
+        return
+    neu = config.load().get("model")
+    if neu and neu != ctx.model:
+        ui.info(f"🔄 Ersatz springt ein: {neu}")
+        ctx.backend, ctx.model = await switch_model(neu, ctx.backend, ctx.model, ctx.strength)
+        if ctx.model == neu:
+            ctx.sync_session()
+            return
+    if (schliessen := getattr(ctx.backend, "schliessen", None)) is not None:
+        await schliessen()
+    ctx.backend, ctx.model = None, None
+    ctx.sync_session()
+    ui.warn("Kein Ersatz auf der Bank. Wähle ein neues Modell mit /model.")
+
+
+async def _llamacpp_holen_mit_balken(art: str, namen: list[str], aufgabe=None) -> None:
+    """llamareserve.holen (oder `aufgabe(fortschritt, stopp)`) im Thread, mit Ladebalken je Paket;
+    Esc bricht ab (fortsetzbar)."""
+    import threading
+    import llamareserve
+    stopp = threading.Event()
+    namen = list(namen)
+    st = {"name": namen[0] if namen else "llama.cpp", "erledigt": 0, "gesamt": 1, "tempo": 0.0, "letzt": None}
+
+    def fortschritt(name: str, erledigt: int, gesamt: int) -> None:
+        if name not in namen:
+            namen.append(name)
+        jetzt = time.monotonic()
+        if name != st["name"] or st["letzt"] is None:
+            st["letzt"], st["tempo"] = (jetzt, erledigt), 0.0
+        elif jetzt - st["letzt"][0] >= 0.5:
+            momentan = (erledigt - st["letzt"][1]) / (jetzt - st["letzt"][0])
+            st["tempo"] = momentan if not st["tempo"] else 0.7 * st["tempo"] + 0.3 * momentan
+            st["letzt"] = (jetzt, erledigt)
+        st.update(name=name, erledigt=erledigt, gesamt=gesamt)
+
+    def panel():
+        nr = namen.index(st["name"]) + 1 if st["name"] in namen else 1
+        return ui.hf_fortschritt(st["name"], "lade", st["erledigt"], st["gesamt"], st["tempo"], nr,
+                                 max(len(namen), 1))
+
+    if aufgabe is None:
+        task = asyncio.create_task(asyncio.to_thread(llamareserve.holen, art, fortschritt, stopp))
+    else:
+        task = asyncio.create_task(asyncio.to_thread(aufgabe, fortschritt, stopp))
+    try:
+        with ui.live_view(panel()) as live:
+            while not task.done():
+                if ui.TUI.consume_abort() if ui.TUI is not None else _esc_pressed():
+                    stopp.set()
+                live.update(panel())
+                await asyncio.wait({task}, timeout=0.25)
+    except asyncio.CancelledError:
+        stopp.set()
+        task.add_done_callback(lambda t: t.exception())
+        raise
+    ok, zeilen = task.result()
+    for z in zeilen:
+        ui.info(z)
+    if ok and aufgabe is None:
+        ui.success("🦙 Im /model-Menü steht jedes lokale Modell jetzt auch mit 🦙 (über llama.cpp).")
+
+
+async def bewegung_befehl(arg: str) -> None:
+    """/bewegung: Strichmännchen-Figur mit SprongMotion – Stand · holen · einrichten [pfad] · an · aus · probe <text>."""
+    import bewegung
+    import figur
+    teile = arg.strip().split(maxsplit=1)
+    was = teile[0].lower() if teile else ""
+    rest = teile[1].strip() if len(teile) > 1 else ""
+    if was in ("holen", "laden"):
+        with ui.thinking(f"lade SprongMotion {bewegung.VERSION} von GitHub und prüfe die SHA-256"):
+            ok, zeilen = await asyncio.to_thread(bewegung.holen)
+    elif was == "einrichten":
+        with ui.thinking("prüfe die Modelldatei (SHA-256)"):
+            ok, zeilen = await asyncio.to_thread(bewegung.modell_einrichten, Path(rest) if rest else None)
+    elif was in ("an", "aus"):
+        config.update(figur_strich=was == "an")
+        ok, zeilen = True, ["🕺 Strichmännchen " + ("an" if was == "an" else "aus – die Figur zeigt wieder Bilder")]
+    elif was == "probe":
+        try:
+            ok, zeilen = True, [figur.bewegen(rest or "waves with both hands", "froh")]
+        except Exception as exc:
+            ok, zeilen = False, [str(exc)]
+    else:
+        ok, zeilen = True, bewegung.stand()["zeilen"] + [
+            "   /bewegung holen · einrichten [pfad] · an · aus · probe <englischer Satz>"]
+    for z in zeilen:
+        (ui.info if ok else ui.warn)(z)
+    if was in ("holen", "laden", "einrichten", "an", "aus") and ok:
+        figur._STAND["posen"] = None              # neu melden: Strichmännchen oder Bilder-Figur
+        figur.melden()
+        if bewegung.stand()["bereit"] and config.load().get("figur_strich", True):
+            ui.success("🕺 Alles da – im eigenen Terminal-Fenster steht jetzt das Strichmännchen. Sag ihr z. B. "
+                       "„dreh dich mal“.")
+
+
+async def llamacpp_befehl(ctx, arg: str) -> None:
+    """/llamacpp: Stand der Reserve · holen · einrichten · aktualisieren · wechseln <build> · vergleich [frage]."""
+    import llamareserve
+    teile = arg.strip().split(maxsplit=1)
+    was = teile[0].lower() if teile else ""
+    if was in ("aktualisieren", "update", "updaten"):
+        ui.info("🦙 Frage GitHub nach dem neuesten llama.cpp-Build · Esc bricht das Laden ab, ein neuer Aufruf "
+                "setzt fort.")
+        await _llamacpp_holen_mit_balken("auto", [], aufgabe=llamareserve.aktualisieren)
+        return
+    if was in ("wechseln", "nutzen"):
+        build = teile[1].strip().lower() if len(teile) > 1 else ""
+        if not build:
+            ui.info(f"🦙 Aktiv: {llamareserve.aktiv()} · eingerichtet: "
+                    f"{', '.join(llamareserve.installiert()) or 'keiner'} – /llamacpp wechseln <build>")
+            return
+        try:
+            ui.success(await asyncio.to_thread(llamareserve.aktivieren, build))
+        except (ValueError, OSError) as exc:
+            ui.error(f"Wechsel nicht möglich: {exc}")
+        return
+    if was in ("holen", "laden"):
+        art = teile[1].strip().lower() if len(teile) > 1 else "auto"
+        try:
+            namen, grund = await asyncio.to_thread(llamareserve.passende_pakete, None, art)
+        except ValueError as exc:
+            ui.error(str(exc))
+            return
+        kat = llamareserve.katalog()
+        mb = sum(kat[n][1] for n in namen) / 2**20
+        ui.info(f"🦙 Für diesen Rechner: {', '.join(namen)} ({grund}) · {mb:.0f} MB von GitHub · Esc bricht ab, "
+                "ein neuer Aufruf setzt fort.")
+        await _llamacpp_holen_mit_balken(art, namen)
+        return
+    if was == "einrichten":
+        llamareserve.ablage().mkdir(parents=True, exist_ok=True)
+        with ui.thinking("prüfe die llama.cpp-Pakete (SHA-256) und entpacke"):
+            ok, zeilen = await asyncio.to_thread(llamareserve.einrichten)
+        for z in zeilen:
+            ui.info(z)
+        if ok:
+            ui.success("🦙 Im /model-Menü steht jedes lokale Modell jetzt auch mit 🦙 (über llama.cpp).")
+        return
+    if was in ("vergleich", "vergleichen"):
+        prov, name = M.split_ref(ctx.model or "")
+        if prov != "gguf":
+            ui.warn("Der Vergleich braucht ein lokales Modell im eigenen Motor (/model → Lokal).")
+            return
+        import gguflokal
+        try:
+            with ui.thinking(f"stelle {name} dieselbe Frage im eigenen Motor und in llama.cpp"):
+                ergebnis = await asyncio.to_thread(gguflokal.motorvergleich, name, teile[1] if len(teile) > 1 else "")
+        except Exception as exc:
+            ui.error(f"Motorvergleich: {exc}")
+            return
+        for z in gguflokal.vergleich_zeilen(ergebnis):
+            ui.info(z)
+        ui.info("Das Gespräch wird bei der nächsten Nachricht einmal neu gelesen.")
+        return
+    llamareserve.ablage().mkdir(parents=True, exist_ok=True)
+    zeilen = await asyncio.to_thread(llamareserve.status_zeilen)
+    for z in zeilen:
+        ui.info(z)
+    if not llamareserve.eingerichtet() and llamareserve.pakete_in_ablage():
+        ui.info("📦 Pakete liegen bereit – /llamacpp einrichten prüft und entpackt sie.")
+
+
+_ZIP_TEXT = {"an": "an – NemiCLI fragt „Entpacken?“", "auto": "auto – Archive im Profilordner sofort entpacken",
+             "aus": "aus – nichts wird entpackt, die KI kann es nicht"}
+
+
+async def zip_befehl(arg: str) -> None:
+    """/zip: Stand · an · auto · aus · <pfad> (der Nutzer entpackt selbst nach DATEN/Entpackt)."""
+    import entpacken
+    roh = arg.strip()
+    was = roh.lower()
+    if was in entpacken.MODI:
+        entpacken.modus_setzen(was)
+        ui.info(f"📦 /zip {_ZIP_TEXT[was]} (gespeichert)")
+        return
+    if not roh:
+        ui.info(f"📦 /zip {_ZIP_TEXT[entpacken.modus()]}  ·  /zip an · auto · aus · <pfad>")
+        ui.info(f"   Ziel für /zip <pfad> und die KI: {Path(paths.DATEN) / 'Entpackt'}")
+        import profilordner
+        ui.info(f"   Archive im Profilordner ({PS.active().name}): nach "
+                f"Profile/{profilordner.ordnername(PS.active().name)}/Entpackt")
+        return
+    quelle = Path(os.path.expandvars(roh.strip('"').strip("'"))).expanduser()
+    if not quelle.is_file():
+        ui.warn(f"📦 Keine Datei: {quelle}  ·  /zip an · auto · aus · <pfad>")
+        return
+    if not entpacken.ist_archiv(quelle):
+        ui.warn(f"📦 {quelle.name} ist kein bekanntes Archiv.")
+        return
+    ziel = entpacken.ziel_fuer_chat(quelle)
+    ui.info("📦 Entpacke im eigenen Fenster – dort siehst du den Fortschritt und kannst abbrechen.")
+    ergebnis = await asyncio.to_thread(entpacken.fenster_starten, quelle, ziel, profil=None, einlesen=False)
+    ui.info("📦 " + actions.entpacken_ergebnis_text(ergebnis))
+
+
+_CVE_NUTZUNG = "/cve · /cve laden <ordner> [voll] · /cve stopp · /cve suchen <text|CVE-ID|produkt version>"
+
+
+async def cve_befehl(arg: str) -> None:
+    """/cve: Stand · laden <ordner> [voll] · stopp · suchen … – Gefahrenwissen aus der CVE-Liste (tools/gefahren.py).
+    Laden startet nur der Nutzer; der Import läuft im eigenen Prozess."""
+    import gefahren
+    teile = arg.strip().split(None, 1)
+    was = teile[0].lower() if teile else ""
+    rest = teile[1].strip() if len(teile) > 1 else ""
+    if was in ("", "status", "stand"):
+        _cve_status(gefahren)
+    elif was in ("laden", "import", "importieren"):
+        voll = rest.lower().endswith(" voll")
+        ordner = (rest[:-5] if voll else rest).strip().strip('"').strip("'")
+        if not ordner:
+            ui.warn("Welcher Ordner? /cve laden <ordner> – der entpackte cvelistV5-Ordner (mit Unterordner cves).")
+            return
+        try:
+            ui.info(await asyncio.to_thread(gefahren.starten, ordner, voll))
+        except ValueError as e:
+            ui.warn(f"⚠ {e}")
+    elif was in ("stopp", "stop", "abbrechen"):
+        ui.info(gefahren.stoppen())
+    elif was in ("suchen", "suche", "finde"):
+        if not rest:
+            ui.warn("Was suchen? /cve suchen <text|CVE-ID|produkt version>")
+            return
+        erg = await asyncio.to_thread(_cve_suche_nutzer, gefahren, rest)
+        if not erg["geladen"]:
+            ui.info("Die CVE-Liste ist noch nicht geladen – /cve laden <ordner>.")
+        elif not erg["treffer"]:
+            ui.info("Keine Treffer in der CVE-Liste." + (f" ({erg['hinweis']})" if erg.get("hinweis") else ""))
+        else:
+            kopf = [gefahren.KOPF, f"{erg['gesamt']} Treffer, gezeigt {len(erg['treffer'])} (höchste CVSS zuerst)"
+                    + (f" · {erg['hinweis']}" if erg.get("hinweis") else "")]
+            ui.text_panel("⚠ CVE-Liste", "\n".join(kopf + gefahren.treffer_zeilen(erg, 400)))
+    else:
+        ui.warn(f"Unbekannt. {_CVE_NUTZUNG}")
+
+
+def _cve_suche_nutzer(gefahren, text: str) -> dict:
+    """CVE-ID exakt; „produkt version“ mit Versionsfilter; sonst Produkt, dann Volltext."""
+    worte = text.split()
+    if len(worte) == 1 and gefahren.cve_id_norm(text) == text.strip().upper():
+        return gefahren.suchen(cve_id=text, limit=20)
+    if len(worte) >= 2 and gefahren.version_lesen(worte[-1]) is not None:
+        erg = gefahren.suchen(produkt=" ".join(worte[:-1]), version=worte[-1], limit=20)
+        if erg["treffer"] or not erg["geladen"]:
+            return erg
+    erg = gefahren.suchen(produkt=text, limit=20)
+    if erg["treffer"] or not erg["geladen"]:
+        return erg
+    return gefahren.suchen(text=text, limit=20)
+
+
+def _cve_status(gefahren) -> None:
+    st = gefahren.status()
+    lauf = gefahren.stand_lesen()
+    if st["geladen"]:
+        zeilen = [("Einträge", f"{st['anzahl']} ({st['hoch']} mit CVSS ≥ 7)"),
+                  ("Stand der Liste", (st.get("quelle_stand") or "?")[:19].replace("T", " ")),
+                  ("Letzter Import", st.get("letzter_import") or "?"),
+                  ("Datenbank", f"learned/gefahren.db · {st['groesse_mb']} MB")]
+    else:
+        zeilen = [("Liste", "noch nicht geladen – /cve laden <ordner>")]
+    if lauf:
+        zahl = (f"{lauf.get('dateien', 0)} / {lauf.get('gesamt', 0)} Dateien · neu {lauf.get('neu', 0)} · "
+                f"aktualisiert {lauf.get('aktualisiert', 0)} · unverändert {lauf.get('unveraendert', 0)} · "
+                f"REJECTED {lauf.get('abgelehnt', 0)} · zu groß {lauf.get('zu_gross', 0)} · "
+                f"kaputt {lauf.get('kaputt', 0)} · fremd {lauf.get('fremd', 0)} · Links {lauf.get('links', 0)}")
+        phase = lauf.get("phase") or "?"
+        if gefahren.laeuft():
+            zeilen.append(("Import", f"läuft ({phase}) – {zahl}"))
+        elif phase == "fehler":
+            zeilen.append(("Letzter Import", f"Fehler: {lauf.get('fehler', '?')}"))
+        elif phase in ("fertig", "abgebrochen"):
+            ende = "abgebrochen" if phase == "abgebrochen" else "fertig"
+            zeilen.append(("Letzter Lauf", f"{ende} ({lauf.get('art', '')}, {lauf.get('sekunden', 0)} s) – {zahl}"))
+            w = lauf.get("wache") or {}
+            if w.get("fehler"):
+                zeilen.append(("Wache CVE-001", f"Abgleich fehlgeschlagen: {w['fehler']}"))
+            elif not w.get("fehlt") and "treffer" in w:
+                zeilen.append(("Wache CVE-001", f"{w['treffer']} Programm(e) betroffen, {w.get('alarme', 0)} neue "
+                                                f"Alarme ({w.get('geprueft', 0)} geprüft)"))
+    try:
+        from wache import zugang as _WZ
+        betroffen = _WZ.speicher().gefahr_liste()
+    except Exception:
+        betroffen = []
+    if betroffen:
+        zeilen.append(("Betroffen laut Wache", "; ".join(
+            f"{g['name']} {g['version']} – {g['anzahl']}× bis CVSS {g['max_cvss']:.1f}" for g in betroffen[:5])
+            + (f" (+{len(betroffen) - 5})" if len(betroffen) > 5 else "")))
+    zeilen.append(("Befehle", _CVE_NUTZUNG))
+    ui.kv_panel("⚠ CVE-Liste (Gefahrenwissen)", zeilen)
+
+
+async def profil_zips_pruefen() -> None:
+    """Archive direkt im Profilordner der aktiven Persönlichkeit: je nach /zip fragen, sofort entpacken
+    (sichtbares Fenster, danach ins Gedächtnis) oder nichts. Nur im Vordergrund."""
+    if sicherheit.vordergrund_grund():
+        return
+    try:
+        import entpacken
+        modus = entpacken.modus()
+        if modus == "aus":
+            return
+        profil = PS.active().name
+        funde = await asyncio.to_thread(entpacken.neue_zips, profil)
+    except Exception:
+        return
+    for quelle in funde:
+        if modus != "auto":
+            wahl = await ask_confirm(f"📦 Neues Archiv im Profilordner von {profil}: {quelle.name} – entpacken?",
+                                     [("ja", "Ja, entpacken (Fenster mit Fortschritt, danach ins Gedächtnis)"),
+                                      ("nein", "Nein, nicht entpacken")])
+            if wahl != "ja":
+                _zip_erledigt(entpacken, profil, quelle, "abgelehnt")
+                ui.info("📦 Nicht entpackt – NemiCLI fragt bei diesem Archiv nicht mehr.")
+                continue
+        ziel = entpacken.ziel_fuer_profil(profil, quelle)
+        ui.info(f"📦 Entpacke {quelle.name} im eigenen Fenster …")
+        ergebnis = await asyncio.to_thread(entpacken.fenster_starten, quelle, ziel, profil=profil, einlesen=True)
+        code = ergebnis.get("code") if isinstance(ergebnis, dict) else 2
+        _zip_erledigt(entpacken, profil, quelle, "entpackt" if code in entpacken.CODES_FERTIG else
+                      "abgelehnt" if code == 3 else "fehler")
+        ui.info("📦 " + actions.entpacken_ergebnis_text(ergebnis if isinstance(ergebnis, dict) else {"code": 2}))
+        if code in entpacken.CODES_FERTIG:
+            ui.info("📦 Das Einlesen ins Gedächtnis läuft im Fenster weiter – dort siehst du jede Datei.")
+
+
+def _zip_erledigt(entpacken, profil: str, quelle: Path, wie: str) -> None:
+    try:
+        entpacken.als_erledigt(profil, quelle, wie)
+    except (OSError, ValueError) as exc:
+        ui.warn(f"📦 Konnte nicht vermerken, dass {quelle.name} behandelt ist: {exc}")
+
+
+async def switch_model(ref: str, backend, model, strength):
+    """Wechselt das aktive Modell. Gibt (backend, model) zurück (alt bei Fehler)."""
+    carry = backend.messages if backend else None
+    if (schliessen := getattr(backend, "schliessen", None)) is not None:
+        await schliessen()                       # Hintergrund-Arbeit hält sonst das alte Modell im Grafikspeicher
+    try:
+        new_backend = await make_backend(ref, carry, strength)
+    except Exception as e:
+        ui.error(str(e))
+        return backend, model
+    if getattr(backend, "stand", "") and hasattr(new_backend, "stand"):
+        new_backend.stand = backend.stand        # der Stand des Gesprächs geht mit
+    config.update(model=ref)
+    ersatzbank.begnadigen(ref)                   # selbst gewählt: zählt wieder als gutes Modell
+    ersatzbank.setzen(ersatzbank.liste())        # das aktive Modell sitzt nicht zugleich auf der Bank
+    if M.split_ref(ref)[0] == "ollama":
+        where = "lokal über Ollama"
+    elif M.split_ref(ref)[0] == "gguf":
+        import gguflokal
+        if gguflokal.motor_wahl(M.split_ref(ref)[1]) == gguflokal.LLAMACPP:
+            import llamareserve
+            where = f"lokal über die Reserve llama.cpp {llamareserve.aktiv()}"
+        else:
+            where = "lokal im eigenen Motor – das erste Laden dauert ein paar Sekunden"
+    else:
+        where = "in der Cloud"
+    ui.success(f"Modell aktiv: {ref}  ({where})")
+    if carry:
+        ui.info("Das Gespräch geht mit dem neuen Modell weiter (es liest den Verlauf neu). "
+                "Frisch anfangen: /reset")
+    return new_backend, ref
+
+
+async def neue_persoenlichkeit() -> "PS.Persoenlichkeit | None":
+    """Fragt Name, Kurzbeschreibung, Geschlecht und Tonfall ab und legt die
+    Datei an. Gibt die neue Persönlichkeit zurück (oder None bei Abbruch)."""
+    name = await ask_text("Wie soll die Persönlichkeit heißen? (leer = abbrechen)")
+    if not name:
+        ui.info("Abgebrochen.")
+        return None
+    kurz = await ask_text("In ein paar Worten: wie ist sie? (z.B. „ruhig, nüchtern, präzise“)")
+    geschlecht = await ask_confirm("Wie spricht sie von sich?",
+                                   PS.GESCHLECHT_OPTIONEN + [("__cancel__", "Abbrechen")])
+    if geschlecht == "__cancel__":
+        ui.info("Abgebrochen.")
+        return None
+    ton = await ask_confirm("Welcher Tonfall?",
+                            PS.TON_OPTIONEN + [("__cancel__", "Abbrechen")])
+    if ton == "__cancel__":
+        ui.info("Abgebrochen.")
+        return None
+    pfad = PS.create(name, kurz, geschlecht, ton)
+    neu = PS.list_all().get(pfad.stem)
+    if neu is None:
+        ui.error("Die Datei konnte nicht gelesen werden – seltsam. Schau in Persoenlichkeiten/.")
+        return None
+    PS.set_active(neu.key)
+    ui.success(f"🎭 {neu.name} angelegt und aktiv – ab der nächsten Nachricht.")
+    _neuer_chat_nach_wechsel()
+    ui.info(f"Datei: {pfad}")
+    oeffnen = await ask_confirm("Die Datei jetzt im Editor öffnen und weiter ausfeilen?",
+                                [("ja", "Ja – öffnen"),
+                                 ("nein", "Nein – erstmal so lassen")])
+    if oeffnen == "ja":
+        try:
+            os.startfile(pfad)
+        except Exception:
+            ui.info(str(pfad))
+        ui.info("Änderungen in der Datei gelten sofort – kein Neustart, kein /reset nötig.")
+    return neu
+
+
+def _ps_kurz(s: str, n: int = 70) -> str:
+    s = s.strip()
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+async def _ps_bearbeiten(p: "PS.Persoenlichkeit") -> None:
+    """Untermenü „Bearbeiten": Kopfzeilen, Geschlecht, Tonfall, Zeilen, Editor."""
+    while True:
+        p = PS.list_all().get(p.key)              # nach jeder Änderung frisch lesen
+        if p is None:
+            return
+        wahl = await ask_confirm(f"✏️ {p.name} bearbeiten – was?", [
+            ("name", f"Name ändern           ({p.name})"),
+            ("kurz", f"Kurzbeschreibung      ({_ps_kurz(p.kurz or '–', 40)})"),
+            ("geschlecht", "Geschlecht            (weiblich · männlich · neutral)"),
+            ("ton", "Tonfall               (locker · sachlich · förmlich · verspielt)"),
+            ("add", "Zeile hinzufügen      (z.B. „Du nennst mich Boss“)"),
+            ("del", "Zeile entfernen"),
+            ("editor", "Im Editor öffnen      (für größere Umbauten)"),
+            ("__back__", "Zurück"),
+        ])
+        if wahl == "__back__":
+            return
+        try:
+            if wahl == "name":
+                neu = await ask_text(f"Neuer Name (leer = bleibt „{p.name}“):")
+                if neu:
+                    import profilordner
+                    alt_ordner = profilordner.wurzel() / profilordner.ordnername(p.name)
+                    neu_ordner = profilordner.wurzel() / profilordner.ordnername(neu)
+                    # Der Profil-Ordner hängt am Namen: ein Name, dessen Ordner schon einer anderen gehört
+                    # (auch „Lüna“/„Luena“), würde ihre Chats, Bilder und Skills teilen.
+                    belegt = neu_ordner != alt_ordner and (neu_ordner.exists() or any(
+                        profilordner.ordnername(q.name) == neu_ordner.name
+                        for k, q in PS.list_all().items() if k != p.key))
+                    if belegt:
+                        ui.warn(f"„{neu.strip()}“ geht nicht – der Profil-Ordner {neu_ordner.name} gehört schon "
+                                "einer anderen Persönlichkeit. Bitte einen anderen Namen.")
+                        return None
+                    if alt_ordner.is_dir() and not neu_ordner.exists():
+                        alt_ordner.rename(neu_ordner)               # Chats, Bilder … ziehen mit
+                    PS.set_name(p, neu)
+                    if PS.active().key == p.key:
+                        PS.set_active(p.key)
+                    ui.success(f"🎭 Heißt jetzt {neu.strip()}.")
+            elif wahl == "kurz":
+                neu = await ask_text("Kurzbeschreibung fürs Menü (leer = entfernen):")
+                PS.set_kurz(p, neu)
+                ui.success("Kurzbeschreibung gespeichert.")
+            elif wahl == "geschlecht":
+                g = await ask_confirm("Wie spricht sie/er von sich?",
+                                      PS.GESCHLECHT_OPTIONEN + [("__cancel__", "Abbrechen")])
+                if g != "__cancel__":
+                    PS.set_geschlecht(p, g)
+                    ui.success("Geschlecht gesetzt.")
+            elif wahl == "ton":
+                tn = await ask_confirm("Welcher Tonfall?",
+                                       PS.TON_OPTIONEN + [("__cancel__", "Abbrechen")])
+                if tn != "__cancel__":
+                    PS.set_ton(p, tn)
+                    ui.success("Tonfall gesetzt.")
+            elif wahl == "add":
+                zeile = await ask_text("Neue Zeile (leer = abbrechen):")
+                if zeile:
+                    PS.add_line(p, zeile)
+                    ui.success("Zeile angehängt.")
+            elif wahl == "del":
+                zeilen = PS.body_lines(p)
+                if not zeilen:
+                    ui.info("Da ist noch keine Zeile zum Entfernen.")
+                    continue
+                opts = [(str(i), _ps_kurz(text)) for i, text in zeilen[:40]]
+                opts.append(("__cancel__", "Abbrechen"))
+                z = await ask_confirm("Welche Zeile soll weg?", opts)
+                if z != "__cancel__":
+                    PS.remove_line(p, int(z))
+                    ui.success("Zeile entfernt.")
+            elif wahl == "editor":
+                try:
+                    os.startfile(p.path)
+                except Exception:
+                    ui.info(str(p.path))
+                ui.info("Speichern genügt – gilt ab der nächsten Nachricht.")
+                return
+        except Exception as e:
+            ui.error(f"Bearbeiten fehlgeschlagen: {e}")
+
+
+async def _ps_profil(p: "PS.Persoenlichkeit") -> None:
+    """Untermenü für ein einzelnes Profil: aktivieren, bearbeiten, kopieren, löschen."""
+    aktiv = PS.active().key == p.key
+    opts = [("on", "Aktivieren" + ("   (ist schon aktiv)" if aktiv else ""))]
+    if p.eingebaut:
+        opts.append(("copy", "Als Kopie anlegen     (die Eingebaute ist schreibgeschützt)"))
+    else:
+        opts += [("edit", "Bearbeiten"),
+                 ("copy", "Als Kopie anlegen"),
+                 ("del", "Löschen")]
+    opts.append(("__back__", "Zurück"))
+    wahl = await ask_confirm(f"🎭 {p.label}", opts)
+    if wahl == "on":
+        wechsel = p.key != PS.active().key
+        PS.set_active(p.key)
+        ui.success(f"🎭 Persönlichkeit: {p.name} – gilt ab der nächsten Nachricht.")
+        _sprueche_im_hintergrund()
+        if wechsel:
+            _neuer_chat_nach_wechsel()
+            await profil_zips_pruefen()
+    elif wahl == "edit":
+        await _ps_bearbeiten(p)
+    elif wahl == "copy":
+        name = await ask_text(f"Name der Kopie (leer = „{p.name} Kopie“):")
+        pfad = PS.duplicate(p, name)
+        neu = PS.list_all().get(pfad.stem)
+        ui.success(f"🎭 Kopie angelegt: {neu.name if neu else pfad.name}")
+        if neu is not None:
+            await _ps_bearbeiten(neu)
+    elif wahl == "del":
+        sicher = await ask_confirm(f"{p.name} wirklich löschen? (Datei {p.path.name})",
+                                   [("ja", "Ja, löschen"), ("nein", "Nein")])
+        if sicher == "ja":
+            beiseite = PS.delete(p)
+            ui.success(f"🎭 {p.name} gelöscht." + ("  Nemi übernimmt." if aktiv else ""))
+            if beiseite is not None:
+                ui.info(f"📁 Chats, Bilder und Eigenes liegen weiter unter {beiseite}.")
+
+
+async def persoenlichkeiten_menu(arg: str) -> None:
+    """/persönlichkeiten [name | neu] – Menü, direkt setzen oder neue anlegen."""
+    arg = arg.strip()
+    if arg.lower() in ("neu", "new", "anlegen", "+"):
+        await neue_persoenlichkeit()
+        return
+    if arg:                                      # direkt gesetzt: /persönlichkeiten <name>
+        p = PS.resolve(arg)
+        if p is None:
+            ui.warn(f"Keine Persönlichkeit gefunden, die zu '{arg}' passt. "
+                    "/persönlichkeiten zeigt die Liste.")
+            return
+        wechsel = p.key != PS.active().key
+        PS.set_active(p.key)
+        ui.success(f"🎭 Persönlichkeit: {p.name} – gilt ab der nächsten Nachricht.")
+        _sprueche_im_hintergrund()
+        if wechsel:
+            _neuer_chat_nach_wechsel()
+            await profil_zips_pruefen()
+        return
+
+    while True:
+        alle = PS.list_all()
+        aktiv = PS.active().key
+        opts = [(k, p.label + ("  ✔️" if k == aktiv else "")) for k, p in alle.items()]
+        opts.append(("__neu__", "➕  Neue Persönlichkeit anlegen (ein paar Fragen)"))
+        opts.append(("__ordner__", "📂  Ordner öffnen (Dateien von Hand bearbeiten)"))
+        opts.append(("__cancel__", "Fertig"))
+        wahl = await ask_confirm("Wer soll sprechen?  (Profil wählen → aktivieren · bearbeiten · löschen)", opts)
+        if wahl == "__cancel__":
+            return
+        if wahl == "__neu__":
+            await neue_persoenlichkeit()
+            continue
+        if wahl == "__ordner__":
+            PS.ensure_dir()
+            try:
+                os.startfile(PS.DIR)
+            except Exception:
+                ui.info(str(PS.DIR))
+            ui.info("Eine .md-Datei pro Persönlichkeit – erste Überschrift = Name, "
+                    "erste „> Zeile“ = Kurzbeschreibung. Platzhalter wie {{user}} und "
+                    "{{current_time}} werden eingesetzt.")
+            return
+        await _ps_profil(alle[wahl])
+
+
+def model_completions() -> dict[str, str]:
+    """Vorschläge für /model: die Anbieter, für die ein Key gesetzt ist."""
+    out: dict[str, str] = {}
+    for pid, p in P.detected().items():
+        out[pid] = p.label
+    return out
+
+
+async def _einlesen_starten(ctx: "Ctx") -> None:
+    """/einlesen: den Einlese-Speicher jetzt abarbeiten; hat die GPU keinen Platz, wartet der Durchgang."""
+    import einlesen
+    token = await asyncio.to_thread(einlesen.stand)
+    if token is None:
+        ui.warn("Kein Embedding-Modell da – mit /embeddings eins wählen.")
+        return
+    kann, grund = await asyncio.to_thread(memory.gpu_platz)
+    if not kann:
+        ui.info(f"📦 Gerade geht es nicht: {grund}. Der Speicher wartet und startet von selbst, sobald es geht.")
+        einlesen_vormerken(ctx.current_chat, gewuenscht=True)
+        return
+    ui.info(f"📦 {einlesen.kurz(token)} abgetrennt, wird jetzt eingelesen"
+            + (". Was ab jetzt dazukommt, sammelt der nächste Speicher." if ui.TUI is not None else " …"))
+    await bibliothekar(ctx.current_chat, alles=True)
+
+
+CTX_FRIST_S = 2.0                # Kontextgröße (Statusleiste): so lange gilt die gemerkte
+CTX_FRIST_EIGEN_S = 30.0         # … beim eigenen Motor; Modell, Einstellung und geladener Motor gelten sofort
+
+
+def _ctx_schluessel(model) -> tuple:
+    """Wovon die Kontextgröße abhängt: Modell und gemessener Wert, beim eigenen Motor (gguf) dazu `gguf_kontext`,
+    `gguf_motor` und das geladene Modell."""
+    try:
+        art = M.split_ref(model or "")[0]
+    except Exception:
+        art = ""
+    gemessen = getattr(pricing, "_GEMESSEN", {}).get(model or "")
+    if art != "gguf":
+        return (art, model, gemessen)
+    import gguflokal
+    c = config.load()
+    motor = getattr(gguflokal, "_motor", None)
+    geladen = (str(motor[0]), str(motor[1]), id(motor[2])) if motor else None
+    return (art, model, gemessen, repr(c.get("gguf_kontext")), repr(c.get("gguf_motor")), geladen)
+
+
+class Ctx:
+    """Veränderlicher Sitzungs-Status, den sich Klassik-Loop und TUI teilen."""
+
+    def __init__(self, backend, model, strength, current_chat, current_prompts):
+        self.backend = backend
+        self.model = model
+        self.strength = strength
+        self.current_chat = current_chat
+        self.current_prompts = current_prompts
+
+    def strength_active(self) -> bool:
+        """Nur tatsächlich angebundene Denk- oder Budgetsteuerung anzeigen."""
+        return self.backend is not None and M.strength_supported(self.model)
+
+    def sync_session(self) -> None:
+        """Statusleisten-Daten (SESSION) an den aktuellen Stand angleichen."""
+        import persona
+        persona.chat_gewechselt(self.current_chat)          # Kern-Gedächtnis: neue Momentaufnahme je Chat
+        # Die Oberfläche ruft das 5× je Sekunde; beim eigenen Motor kostet die Kontextgröße einen Ordnerscan.
+        # Neu gefragt wird, wenn sich etwas ändert, wovon sie abhängt – sonst erst nach einer Frist.
+        jetzt = time.monotonic()
+        merk = getattr(self, "_ctx_merk", None)
+        schluessel = _ctx_schluessel(self.model)
+        frist = CTX_FRIST_EIGEN_S if schluessel[0] == "gguf" else CTX_FRIST_S
+        if merk is not None and merk[0] == schluessel and jetzt - merk[1] < frist:
+            ctx_max = merk[2]
+        else:
+            ctx_max = pricing.context_window(self.model)
+            self._ctx_merk = (schluessel, jetzt, ctx_max)
+        try:
+            import actions
+            actions.KONTEXT_TOKEN = int(ctx_max or 0)           # datei_lesen liest so viel, wie passt
+        except Exception:
+            pass
+        SESSION.update(model=self.model or "—",
+                       strength=self.strength if self.strength_active() else None,
+                       chat=self.current_chat,
+                       ctx_max=ctx_max)
+
+
+def _untermenue_eintraege(ctx: Ctx, cmd: str) -> list[tuple[str, str, str | None]]:
+    """Auswahl für einen Befehl ohne Zusatz – fest aus commands.UNTERMENUES oder
+    nach aktuellem Stand (Modus, Theme, Denkstufe)."""
+    import commands as C
+    haken = lambda an: "✓ " if an else "   "
+    if cmd == "/startart":
+        jetzt = config.load().get("startart", "terminal")
+        return [(k, f"{haken(k == jetzt)}{t}", None) for k, t in (("terminal", "🖥 Im Terminal"),
+                                                                   ("fenster", "🪟 Im Desktop-Fenster"))]
+    if cmd == "/terminal":                           # Schalter-Paare wie fest, beim Thema der Haken
+        thema = str(config.load().get("terminal_thema") or "auto").lower()
+        return [(z, f"{haken(z == 'thema ' + thema)}{t}" if z.startswith("thema ") else t, f)
+                for z, t, f in C.UNTERMENUES[cmd]]
+    if cmd in C.UNTERMENUES:
+        return C.UNTERMENUES[cmd]
+    if cmd == "/ablauf":
+        return _ablauf_menue()
+    if cmd == "/modus":
+        import coding as _coding
+        import config as _config
+        frei_c = str(_config.load().get(_coding.FREIGABE_SCHALTER) or "") != "vorsicht"
+        frei_b = modes.bild_stufe() == "frei"
+        return ([(k, f"{haken(k == modes.current())}{sym} {name}", None) for k, sym, name in modes.MODES]
+                + [("coding frei", f"{haken(frei_c)}🟦 Coding frei – im Projekt durcharbeiten", None),
+                   ("coding vorsicht", f"{haken(not frei_c)}🟦 Coding vorsicht – fragt wie der Modus", None),
+                   ("bild frei", f"{haken(frei_b)}🎨 Bilder frei – malen ohne Rückfrage", None),
+                   ("bild fragen", f"{haken(not frei_b)}🎨 Bilder fragen – vor jedem Bild", None)])
+    if cmd == "/emoji":
+        import emojistufe
+        jetzt = emojistufe.stufe()
+        return ([(k, f"{haken(k == jetzt)}{emojistufe.TEXT[k]}", None) for k in (*emojistufe.STUFEN, emojistufe.FREI)]
+                + [("kuerzel", "   ⌨ Kürzel-Liste (Smileys & :kürzel:)", None)])
+    if cmd == "/denken":
+        import denkweise
+        jetzt = denkweise.stufe()
+        return [(k, f"{haken(k == jetzt)}{denkweise.TEXT[k]}", None) for k in denkweise.STUFEN]
+    if cmd == "/theme":
+        return [(k, f"{haken(k == ui.current_theme())}{k}  · {p.get('label', k)}"
+                 + ("  ✨ eigenes" if k not in ui.EINGEBAUT else ""), None) for k, p in ui.THEMES.items()]
+    if cmd == "/kontext":
+        prov, name = M.split_ref(ctx.model or "")
+        if prov != "gguf":
+            schlank = persona.anleitung_schlank()
+            return [("anzeigen", "   📊 Anzeigen – womit ist der Kontext gefüllt?", None),
+                    ("anleitung schlank", f"{haken(schlank)}📘 Anleitung schlank – Details kommen passend zur "
+                                          "Runde  (Vorgabe)", None),
+                    ("anleitung voll", f"{haken(not schlank)}📚 Anleitung voll – alles bei jeder Nachricht", None)]
+        import gguflokal
+        pro_token, grenze = gguflokal.kv_bytes_pro_token(name), gguflokal.kontext_max(name)
+        aktuell = gguflokal.kontext(name)
+        kosten = lambda n: f"  ·  Gesprächsspeicher ~{n * pro_token / 2**30:.1f} GB" if pro_token else ""
+        stufen = [n for n in gguflokal.KONTEXT_STUFEN if not grenze or n < grenze]
+        eintraege = [("anzeigen", "   📊 Anzeigen – womit ist der Kontext gefüllt?", None)]
+        eintraege += [(str(n), f"{haken(n == aktuell)}{n // 1024}k{kosten(n)}", None) for n in stufen]
+        if grenze:
+            eintraege.append(("max", f"{haken(grenze == aktuell)}max ({grenze // 1024}k){kosten(grenze)}  (Vorgabe)",
+                              None))
+        return eintraege
+    if cmd == "/embeddings":
+        aktiv = memory.modell_name()
+        eintraege = [(d.name, f"{haken(d.name == aktiv)}{d.name}  ·  {_embedding_art(d)}", None)
+                     for d in memory.modelle()]
+        return eintraege + [("huggingface", "   🤗 Weitere Modelle auf Hugging Face", None)]
+    if cmd == "/staerke" and ctx.strength_active():
+        return [(k, f"{haken(k == ctx.strength)}{k} – {text}", None)
+                for k, text in M.strength_menu(ctx.model).items()]
+    if cmd == "/video":
+        frage = "Was soll im Video passieren? (am besten englisch)"
+        eintraege = [("", "   🎬 Stand: Modell, Größe, Ordner", None),
+                     ("{}", "   🎬 Video erzeugen – 5 s", frage),
+                     ("{} --sekunden 10", "   🎬 Video erzeugen – 10 s", frage),
+                     ("{} --sekunden 20", "   🎬 Video erzeugen – 20 s", frage)]
+        try:
+            import video
+            import videomotoren
+            motor = videomotoren.gewaehlt() if videomotoren.aktiv() else None
+            eintraege += [(f"modell {n}", f"{haken(n == motor)}🎞 Modell: {n} ({videomotoren.merkmal(n)})", None)
+                          for n in videomotoren.modelle()]
+            akt = None if motor else video.gewaehlt()
+            eintraege += [(f"modell {n}", f"{haken(n == akt)}🎞 Modell: {n}", None) for n in video.modelle()]
+            if videomotoren.modelle():
+                eintraege.append(("einstellungen", "   ⚙ Video-Einstellungen (Auflösung, Ton, Kacheln …)", None))
+            eintraege.append(("motorordner", "   📂 Video-Modelle-Ordner (LTX-2.5, SD-Video … ablegen)", None))
+        except Exception:
+            pass
+        try:
+            import videobildcloud as VC
+            wolke = VC.gewaehlt("video") if VC.video_aktiv() else None
+            eintraege += [(f"cloud {a}", f"{haken(a == wolke)}☁ Cloud: {VC.VIDEO[a]['titel']}", None)
+                          for a in VC.bereit("video")]
+            if wolke:
+                eintraege.append(("cloud aus", "   💻 Zurück auf lokal (Wan 2.2)", None))
+            if VC.ohne_schluessel("video"):
+                eintraege.append(("cloud neu", "   ☁ Cloud-Anbieter hinzufügen · Key eintragen", None))
+        except Exception:
+            pass
+        return eintraege + [("ordner", "   📂 Video-Ordner öffnen", None)]
+    if cmd == "/vision":
+        import bildbeschreiber as BB
+        akt = BB.aktiv()
+        return ([("", "   👁 Stand anzeigen", None)]
+                + [(n, f"{haken(n == akt)}{n}", None) for n, _, _ in BB.kandidaten()]
+                + [("restart", "   🔄 Neu laden (entladen und wieder laden)", None),
+                   ("protokoll", "   📜 Seh-Protokoll – welche Bilder beschrieben wurden", None),
+                   ("debug", "   🐞 Fehlerbericht schreiben (Debugbericht/vision_bericht.txt)", None),
+                   ("ordner", "   📂 Vision-Ordner öffnen", None)])
+    if cmd in ("/compact", "/kompakt"):
+        return [("jetzt", "   📌 Jetzt zusammenfassen – Älteres in den Stand des Gesprächs", None),
+                ("zeigen", "   📜 Stand des Gesprächs zeigen", None)]
+    if cmd == "/debug":
+        import debugbericht as _DBG
+        an, motor = _DBG.an(), _DBG.motor_log_an()
+        return [("", "   🐞 Stand anzeigen", None),
+                ("an", f"{haken(an)}Debugbericht an – die KI kann hineinsehen (Cloud)", None),
+                ("aus", f"{haken(not an)}Debugbericht aus", None),
+                ("motor an", f"{haken(motor)}Motor-Log an – jeder Prompt des lokalen Motors (groß, privat)", None),
+                ("motor aus", f"{haken(not motor)}Motor-Log aus", None)]
+    return []
+
+
+_KONTEXT_FARBEN = {"Persönlichkeit": "magenta", "Regeln & Werkzeuge": "bright_black", "Hinweise": "cyan",
+                   "Gedächtnis": "bright_red", "Skills": "yellow", "Stand des Gesprächs": "green",
+                   "Nachrichten": "blue"}
+
+
+def _kontext_teile(ctx: "Ctx") -> tuple[list, int, int, bool]:
+    """Womit der Kontext des aktiven Modells gefüllt ist: (Bereiche mit Token, Fenster,
+    Platz für die Antwort, genau gezählt). Genau mit dem Tokenizer eines geladenen lokalen
+    Modells, sonst geschätzt."""
+    import persona
+    prov, name = M.split_ref(ctx.model or "")
+    lokal = prov == "gguf"
+    fenster = max(1, pricing.context_window(ctx.model))
+    zaehlen, genau = (lambda t: pricing.est_tokens(t) if t else 0), False
+    reserve = 0
+    if lokal:
+        import gguflokal
+        reserve = gguflokal.antwort_reserve(fenster)
+        motor = gguflokal._motor
+        if motor is not None and motor[0] == gguflokal.modelle().get(name):    # nur der Motor DIESES Modells
+            tok = motor[2].tokenizer
+            zaehlen, genau = (lambda t: len(tok.encode(t)) if t else 0), True
+    kompakt = (lokal or bool(getattr(ctx.backend, "kompakter_prompt", False))    # lokales Ollama: wie der Motor
+               or persona.anleitung_schlank())                                   # Cloud: schlanke Anleitung
+    teile = [(n, zaehlen(t)) for n, t in persona.prompt_bilanz(kompakt)]
+    sichtbar = getattr(ctx.backend, "sichtbar", None)
+    verlauf = list(sichtbar() if callable(sichtbar) else (getattr(ctx.backend, "messages", None) or []))
+    if (stand := getattr(ctx.backend, "stand", "")):
+        teile.append(("Stand des Gesprächs", zaehlen(stand)))
+    teile.append(("Nachrichten", sum(pricing.est_tokens(m.get("content")) for m in verlauf)))
+    return teile, fenster, reserve, genau
+
+
+def _kontext_neu_zaehlen(ctx: "Ctx", vorbereiten: bool = True) -> None:
+    """Nach einem Modellwechsel die Füllung für das neue Modell zählen – sonst stünde bis zur
+    nächsten Antwort der letzte Wert des alten Modells (mit dessen Tokenizer) in der Leiste.
+    Lokal und zu voll: gleich im Hintergrund aufräumen (Cloud-Modelle bleiben unberührt)."""
+    try:
+        teile, fenster, reserve, _ = _kontext_teile(ctx)
+    except Exception:
+        SESSION["ctx"] = 0
+        return
+    SESSION["ctx"] = sum(n for _, n in teile)
+    SESSION["ctx_max"] = fenster
+    starten = getattr(ctx.backend, "vorbereiten", None)
+    if (vorbereiten and callable(starten) and SESSION["ctx"] + reserve > fenster
+            and starten(fertig=lambda: _kontext_neu_zaehlen(ctx, vorbereiten=False))):
+        ui.info(f"📌 Der Verlauf passt nicht in {fenster // 1024}k – ich lade das Modell und räume im "
+                "Hintergrund auf (Älteres kommt in den Stand des Gesprächs und ins Gedächtnis).")
+
+
+def kontext_zahl(wahl: str) -> int:
+    """Kontext-Eingabe → Token. „32k“ = 32768 (ganze Zahl mit k, wie bei Modell-Kontexten üblich);
+    „25.6k“ = 25600 (mit Nachkomma, so wie die Anzeige rechnet); „32768“ und „32.768“ = 32768."""
+    wahl = wahl.strip().lower().replace(",", ".").replace(" ", "")
+    if wahl.endswith("k"):
+        zahl = wahl[:-1]
+        return int(round(float(zahl) * (1000 if "." in zahl else 1024)))
+    return int(wahl.replace(".", ""))
+
+
+def _kontext_anzeige(ctx: "Ctx") -> None:
+    """/kontext: womit der Kontext gefüllt ist – Raster und Liste wie /context bei Claude Code."""
+    from rich.text import Text
+    teile, fenster, reserve, genau = _kontext_teile(ctx)
+    lokal = M.split_ref(ctx.model or "")[0] == "gguf"
+    belegt = sum(n for _, n in teile)
+    frei = max(0, fenster - belegt - reserve)
+    zellen, raster = 200, Text()
+    for bereich, n in teile:
+        k = max(1, round(n / fenster * zellen)) if n else 0
+        raster.append("■ " * k, style=_KONTEXT_FARBEN.get(bereich, "white"))
+    rest = zellen - len(raster.plain) // 2
+    k_res = min(rest, round(reserve / fenster * zellen))
+    raster.append("· " * max(0, rest - k_res), style="dim")
+    raster.append("× " * k_res, style="dim")
+    zeilen = [Text(raster.plain[i:i + 40]) for i in range(0, len(raster.plain), 40)]
+    pos = 0
+    for z in zeilen:                                  # Farben je Zeile übernehmen
+        for span in raster.spans:
+            a, b = max(span.start, pos), min(span.end, pos + 40)
+            if a < b:
+                z.stylize(span.style, a - pos, b - pos)
+        pos += 40
+    fmt = ui.fmt_tokens
+    pct = lambda n: f"{n / fenster * 100:.1f} %"
+    ui.info(f"📊 Kontext · {ctx.model or 'kein Modell'} · {fmt(belegt)} von {fmt(fenster)} Token ({pct(belegt)})"
+            + ("" if genau else "  ·  geschätzt"))
+    liste = []
+    for bereich, n in teile:
+        liste.append(Text.assemble(("■ ", _KONTEXT_FARBEN.get(bereich, "white")), f"{bereich}: {fmt(n)} ({pct(n)})"))
+    liste.append(Text.assemble(("· ", "dim"), f"Frei: {fmt(frei)} ({pct(frei)})"))
+    if reserve:
+        liste.append(Text.assemble(("× ", "dim"), f"Platz für die Antwort: {fmt(reserve)} ({pct(reserve)})"))
+    for i in range(max(len(zeilen), len(liste))):
+        links = zeilen[i] if i < len(zeilen) else Text(" " * 40)
+        ui.console.print(Text("  ") + links + Text("   ") + (liste[i] if i < len(liste) else Text("")))
+    if lokal:
+        import gguflokal
+        ui.info(f"🧱 Modell: {gguflokal.modell_ort(M.split_ref(ctx.model)[1])}")
+        ui.info("Wird es voll, wandern die ältesten Nachrichten ins Gedächtnis (vektorisiert, auffindbar); "
+                f"die KI holt sich zurück, was zur Frage passt. Größe einstellen: /kontext (jetzt {fmt(fenster)}).")
+    elif M.split_ref(ctx.model or "")[0] == "ollama":
+        import gespraechsstand as GS
+        budget = int(fenster * pricing.HISTORY_SHARE)
+        ui.info(f"Ab etwa {fmt(int(budget * GS.PUFFER_AB))} Token Verlauf schreibt die KI im Hintergrund den Stand des "
+                "Gesprächs, die ältesten Nachrichten wandern ins Gedächtnis (auffindbar). Jetzt gleich: /compact.")
+    else:
+        ui.info(f"Der Verlauf wird aufgeräumt ab etwa {fmt(int(fenster * pricing.HISTORY_SHARE))} Token – "
+                "das Wichtigste geht ins Gedächtnis. Vorher zusammenfassen: /compact.")
+
+
+HF_EMBEDDINGS = "https://huggingface.co/models?library=gguf&pipeline_tag=feature-extraction&sort=trending"
+
+
+def _embedding_art(ordner) -> str:
+    import embedder
+    return "GGUF, gepackt auf der GPU" if embedder.gguf_datei(ordner) is not None else "safetensors (transformers)"
+
+
+# /terminal: Schalter -> (Config-Schlüssel, Vorgabe, Name)
+TERMINAL_SCHALTER = {"leuchten": ("terminal_leuchten", True, "✨ Leuchten im Hintergrund"),
+                     "weich": ("terminal_weich", True, "🌊 Weiches Rollen"),
+                     "geteilt": ("terminal_geteilt", False, "🪟 Reiter „KI“ neben dem Chat"),
+                     "figur": ("terminal_figur", True, "🐾 Figur der Persönlichkeit rechts")}
+TERMINAL_THEMEN = ("auto", "breeze", "mint")
+TERMINAL_TEMPO = ("30", "60")          # Bildrate der Oberfläche (terminal_fps), die erste ist die Vorgabe
+
+
+def terminal_befehl(arg: str) -> None:
+    """/terminal: Schalter des eigenen Terminal-Fensters. Leuchten, weiches Rollen und geteilte Ansicht gehen
+    als Steuerbefehl sofort ans Fenster, die Farben gelten ab dem nächsten Start."""
+    teile = arg.strip().lower().split()
+    eigenes = os.environ.get("NEMICLI_FENSTER") == "1"
+    if len(teile) == 2 and teile[0] in TERMINAL_SCHALTER and teile[1] in ("an", "aus"):
+        schluessel, _vorgabe, name = TERMINAL_SCHALTER[teile[0]]
+        an = teile[1] == "an"
+        config.update(**{schluessel: an})
+        _fenster_steuern(f"{teile[0]}={int(an)}")
+        if teile[0] == "weich" and ui.TUI is not None and hasattr(ui.TUI, "_weich"):
+            ui.TUI._weich = an                       # das Blättern im Verlauf gleich mit
+        ui.success(f"{name}  {'✔️' if an else '🛑'}"
+                   + ("" if eigenes else "  ·  gilt im eigenen Terminal-Fenster (NemiCLI.exe)"))
+        if teile[0] == "figur" and an:
+            _figur_hinweis()
+    elif len(teile) == 2 and teile[0] == "thema" and teile[1] in TERMINAL_THEMEN:
+        config.update(terminal_thema=teile[1])
+        ui.success(f"🎨 Farben des Terminal-Fensters: {teile[1]} – ab dem nächsten Start.")
+    elif len(teile) == 2 and teile[0] == "tempo" and teile[1] in TERMINAL_TEMPO:
+        config.update(terminal_fps=int(teile[1]))
+        ui.success(f"🎞 Bildrate der Oberfläche: {teile[1]} Bilder je Sekunde – ab dem nächsten Start (/restart).")
+    else:
+        c = config.load()
+        stand = "  ·  ".join(f"{name} {'✔️' if c.get(schluessel, vorgabe) else '🛑'}"
+                             for schluessel, vorgabe, name in TERMINAL_SCHALTER.values())
+        tempo = str(c.get("terminal_fps") or "")
+        tempo = tempo if tempo in TERMINAL_TEMPO else TERMINAL_TEMPO[0]
+        ui.info(f"🖥 {stand}  ·  🎨 {c.get('terminal_thema') or 'auto'}  ·  🎞 {tempo}")
+        ui.info("   /terminal leuchten|weich|geteilt|figur an|aus  ·  /terminal thema auto|breeze|mint"
+                "  ·  /terminal tempo 30|60")
+
+
+def _figur_hinweis() -> None:
+    """Woher die Figur ihre Bilder hat – und wie sie ganz und sitzend wird."""
+    try:
+        import figur
+        import persoenlichkeiten as PS
+        name = PS.active().name
+        art, _bilder = figur.bilder(name)
+    except Exception:
+        return
+    if art == "figur":
+        ui.info(f"🐾 {name} sitzt ganz rechts auf der Eingabe – mit allen Posen.")
+    elif art == "buste":
+        ui.info(f"🐾 {name} zeigt sich mit ihren Kugel-Bildern. Ganz und sitzend: /kugel malen figur")
+    else:
+        ui.info(f"🐾 Für die Figur braucht {name} Bilder: erst /kugel malen, dann /kugel malen figur.")
+
+
+def _schalter_an(cmd: str, basis: str) -> bool | None:
+    """Stand eines An/Aus-Schalters im Menü – None, wenn es keiner ist (dann bleiben beide Einträge)."""
+    try:
+        if cmd == "/kugel":
+            from wache import lebendig as LB
+            return {"auto": lambda: LB.auto_stand() is True, "vorne": LB.vorne_an}[basis]()
+        if cmd == "/debug":
+            import debugbericht as _DBG
+            return {"": _DBG.an, "motor": _DBG.motor_log_an}[basis]()
+        if (cmd, basis) == ("/reflektieren", "auto"):
+            import lernschleife
+            return lernschleife.an()
+        if (cmd, basis) == ("/reflektieren", "selbst"):
+            import lernschleife
+            return lernschleife.selbstentwurf_an()
+        if (cmd, basis) == ("/skills", "selbst"):
+            import skills
+            return skills.selbst()
+        if (cmd, basis) == ("/ablauf", "vorschlaege"):
+            import ablauf
+            return ablauf.vorschlaege_an()
+        if (cmd, basis) == ("/lernen", ""):
+            from loramotor import lernlora
+            return lernlora.an()
+        if (cmd, basis) == ("/kontextmenue", ""):
+            import kontextmenue
+            st = kontextmenue.status()
+            return bool(st.get("bildschirm") and st.get("bild"))
+        if (cmd, basis) == ("/uebung", ""):
+            return bool(config.load().get("uebung", True))
+        if (cmd, basis) == ("/auto", ""):
+            return bool(config.load().get("auto_stark"))
+        if (cmd, basis) == ("/bild", "gesicht"):
+            import krea
+            return krea.gesicht_an()
+        if (cmd, basis) == ("/web", "schutz"):
+            import schutzliste
+            return schutzliste.an()
+        if cmd == "/terminal" and basis in TERMINAL_SCHALTER:
+            schluessel, vorgabe, _name = TERMINAL_SCHALTER[basis]
+            return bool(config.load().get(schluessel, vorgabe))
+    except Exception:
+        return None
+    return None
+
+
+_SCHALTER_NAME = {("/kugel", "auto"): "✨ AUTO", ("/kugel", "vorne"): "📌 Immer vorne",
+                  ("/debug", ""): "🐞 Debugbericht – die KI kann hineinsehen (Cloud)",
+                  ("/debug", "motor"): "⚙ Motor-Log – jeder Prompt des lokalen Motors (groß, privat)",
+                  ("/reflektieren", "auto"): "🔁 Automatisch reflektieren (nach Korrekturen, Fehlern, größeren Aufgaben)",
+                  ("/reflektieren", "selbst"): "🍽 Selbstentwurf 3× am Tag ansehen (morgens, mittags, abends)",
+                  ("/skills", "selbst"): "🧩 Selbst anlegen/ändern ohne Rückfrage",
+                  ("/ablauf", "vorschlaege"): "💡 Wiederkehrende Folgen als Ablauf vorschlagen",
+                  ("/lernen", ""): "🌙 Lern-LoRA (nachts lernen, passendes Thema anklinken)",
+                  ("/kontextmenue", ""): "🖱 Im Rechtsklick-Menü", ("/uebung", ""): "🎓 Übungsmodus",
+                  ("/auto", ""): "🧠 Auto-Stark", ("/bild", "gesicht"): "✨ Gesichts-Korrektur",
+                  ("/web", "schutz"): "⛔ Schutzliste (Schad- und Phishing-Adressen)",
+                  ("/terminal", "leuchten"): "✨ Leuchten im Hintergrund",
+                  ("/terminal", "weich"): "🌊 Weiches Rollen", ("/terminal", "geteilt"): "🪟 Reiter „KI“ neben dem Chat",
+                  ("/terminal", "figur"): "🐾 Figur der Persönlichkeit rechts"}
+_SCHALTER_ZEICHEN = {}   # sonst ✔️ / 🛑
+
+
+def _wahl_stand(cmd: str) -> str | None:
+    """Aktive Stufe eines Menüs mit mehr als zwei Stufen (Wert wie im Menü) – None, wenn es keins ist."""
+    try:
+        if cmd == "/voice":
+            import stimme
+            return stimme.modus()
+        if cmd == "/zip":
+            import entpacken
+            return entpacken.modus()
+        if cmd == "/subagenten":
+            import subagents
+            stufe = subagents.stufe()
+            return "off" if stufe in ("aus", "off") else stufe
+        if cmd == "/web":
+            import webfetch
+            return f"fremdseiten {webfetch.fremdseiten_modus()}"
+    except Exception:
+        return None
+    return None
+
+
+def _menue_aufbereiten(cmd: str, eintraege: list) -> list:
+    """Fürs Terminal-Menü, einheitlich: ein Eintrag je Schalter statt „… an“ und „… aus“ – ✔️ an, 🛑 aus, die
+    Wahl schaltet um; in Auswahl- und Stufen-Menüs steht ✔️ hinter dem Aktiven (statt „✓“ davor). Hinter „Motive
+    malen“ steht, wie viele Motive schon gemalt sind. Andere Stellen (⚙-Seite, Befehlsliste, menue_oeffnen)
+    bekommen die Einträge unverändert."""
+    werte = {z for z, _, _ in eintraege}
+    stufe = _wahl_stand(cmd)
+    raus, gesehen = [], set()
+    for z, t, frage in eintraege:
+        m = re.fullmatch(r"(?:(.*?) )?(an|aus|on|off)", z or "") if stufe is None else None
+        if m:
+            basis = m.group(1) or ""
+            paar = {f"{basis} {w}".strip() for w in ("an", "aus")}
+            stand = _schalter_an(cmd, basis) if paar <= werte else None
+            if stand is not None:
+                if basis not in gesehen:
+                    gesehen.add(basis)
+                    name = _SCHALTER_NAME.get((cmd, basis), t)
+                    an, aus = _SCHALTER_ZEICHEN.get((cmd, basis), ("✔️", "🛑"))
+                    raus.append((f"{basis} {'aus' if stand else 'an'}".strip(),
+                                 f"{name}  {an if stand else aus}", None))
+                continue
+        if cmd == "/kugel" and z == "motive {}":
+            t = t + _motive_stand()
+        if t.startswith("✓"):                       # Auswahl-Menü: aktiv
+            t = t[1:].strip() + "  ✔️"
+        elif stufe is not None and z == stufe:
+            t = t.strip() + "  ✔️"
+        else:
+            t = t.strip()                               # die Einrückung stand nur für das „✓“ davor
+        raus.append((z, t, frage))
+    return raus
+
+
+def _motive_stand() -> str:
+    try:
+        import kugelmotive as KM
+        from wache import steuerung as ST
+        da = set(ST.bilder(PS.active().name, outfit=False)) & set(KM.MOTIVE)
+        return f"  ·  {len(da)} von {len(KM.MOTIVE)} fertig"
+    except Exception:
+        return ""
+
+
+async def _untermenue(ctx: Ctx, cmd: str) -> str | None:
+    """Zeigt die Auswahl und gibt den Zusatz zurück – None, wenn abgebrochen
+    oder der Befehl keine Auswahl hat ("" = Befehl ohne Zusatz ausführen)."""
+    import commands as C
+    eintraege = _menue_aufbereiten(cmd, _untermenue_eintraege(ctx, cmd))
+    if not eintraege:
+        return ""
+    optionen = [(str(i), anzeige) for i, (_, anzeige, _) in enumerate(eintraege)]
+    optionen.append((C.ZURUECK, "↩ Zurück"))
+    wahl = await ask_confirm(f"{cmd} – was möchtest du?  (↑/↓ oder 1–9, Enter)", optionen)
+    if wahl == C.ZURUECK or not str(wahl).isdigit():
+        return None
+    zusatz, _, frage = eintraege[int(wahl)]
+    if "{}" in zusatz:
+        antwort = (await ask_text(frage or "Angabe?")).strip()
+        if not antwort and not zusatz.startswith("malen"):
+            return None
+        zusatz = zusatz.replace("{}", antwort)
+    return " ".join(zusatz.split())
+
+
+_SCHRIFT_ROLLE = {"oberflaeche": "fenster", "oberfläche": "fenster", "fenster": "fenster", "alles": "fenster",
+                  "ki": "ki", "du": "du", "ich": "du", "terminal": "terminal", "control": "control"}
+
+
+async def schriftgroesse_befehl(arg: str) -> None:
+    """/schriftgröße [rolle] <px> · zurück – ohne Zusatz erst die Rolle, dann die Größe wählen."""
+    import commands as C
+    import design
+    teile = arg.strip().lower().split()
+    werte = dict(config.load().get("schriftgroesse") or {})
+    if teile and teile[0] in ("zurück", "zurueck", "reset", "vorgabe"):
+        config.update(schriftgroesse={})
+        ui.success("🔠 Alle Schriftgrößen wieder auf der Vorgabe.")
+        return
+    rolle = _SCHRIFT_ROLLE.get(teile[0]) if teile else None
+    zahl = next((t for t in teile if t.removesuffix("px").isdigit()), None)
+    if teile and rolle is None and zahl is None:
+        ui.warn("🔠 Rollen: oberflaeche · ki · du · terminal – z. B. /schriftgröße ki 18")
+        return
+    if rolle is None and zahl is not None:
+        rolle = "fenster"
+    if rolle is None:
+        optionen = [(r, f"{z} {t}  ·  {design.px(r)} px") for r, (z, t, _v) in design.ROLLEN.items()]
+        optionen.append(("zurueck_alle", "↺ Alles auf die Vorgabe"))
+        optionen.append((C.ZURUECK, "↩ Zurück"))
+        rolle = await ask_confirm("🔠 Welche Schrift möchtest du größer oder kleiner?", optionen)
+        if rolle == "zurueck_alle":
+            config.update(schriftgroesse={})
+            ui.success("🔠 Alle Schriftgrößen wieder auf der Vorgabe.")
+            return
+        if rolle not in design.ROLLEN:
+            return
+    zeichen, titel, vorgabe = design.ROLLEN[rolle]
+    if zahl is None:
+        jetzt = design.px(rolle)
+        optionen = [(str(g), f"{g} px" + ("  ✔️" if g == jetzt else "") + ("  (Vorgabe)" if g == vorgabe else ""))
+                    for g in design.GROESSEN]
+        optionen.append((C.ZURUECK, "↩ Zurück"))
+        wahl = await ask_confirm(f"{zeichen} {titel} – wie groß?  (jetzt {jetzt} px)", optionen)
+        if not str(wahl).isdigit():
+            return
+        zahl = wahl
+    px = max(design.KLEINSTE, min(design.GROESSTE, int(str(zahl).removesuffix("px"))))
+    werte[rolle] = px
+    config.update(schriftgroesse=werte)
+    wann = ("ab dem nächsten Start" if rolle == "terminal" else
+            "neue Nachrichten sofort, schon offene Fenster beim nächsten Öffnen")
+    ui.success(f"🔠 {zeichen} {titel}: {px} px – {wann}.")
+
+
+async def einstellungen_menue(ctx: Ctx) -> None:
+    """/einstellungen: die ⚙-Seite des Desktop-Fensters im Terminal – erst der Punkt, dann der Wert. Jede Wahl
+    ist ein vorhandener Befehl; das Menü bleibt offen, bis „Zurück“ gewählt wird."""
+    import commands as C
+    import einstellseite
+    bereich = einstellseite.EINFACH
+    while True:
+        eintraege = [e for e in einstellseite.seite() if e["bereich"] == bereich]
+        optionen = []
+        for i, e in enumerate(eintraege):
+            aktiv = next((o["text"] for o in e["optionen"] if o["aktiv"]), "")
+            optionen.append((str(i), f"{e['titel']}" + (f"  ·  {aktiv} ✔️" if aktiv else "")))
+        if bereich == einstellseite.EINFACH:
+            optionen.append(("profi", "🔧 Für Profis …"))
+        optionen.append((C.ZURUECK, "↩ Zurück"))
+        titel = "⚙ Einstellungen" if bereich == einstellseite.EINFACH else "🔧 Für Profis"
+        wahl = await ask_confirm(f"{titel} – was möchtest du ändern?  (↑/↓, Enter)", optionen)
+        if wahl == "profi":
+            bereich = einstellseite.PROFI
+            continue
+        if wahl == C.ZURUECK or not str(wahl).isdigit():
+            if bereich == einstellseite.PROFI:
+                bereich = einstellseite.EINFACH
+                continue
+            return
+        e = eintraege[int(wahl)]
+        werte = [(o["wert"], o["text"] + ("  ✔️" if o["aktiv"] else "")) for o in e["optionen"]]
+        wert = await ask_confirm(f"{e['titel']} – {e['erklaerung']}", werte + [(C.ZURUECK, "↩ Zurück")])
+        if wert == C.ZURUECK or not (befehl := einstellseite.befehl_fuer(e["befehl"], str(wert))):
+            continue
+        await handle_line(ctx, befehl)
+
+
+async def nutzer_zeile(ctx: Ctx, text: str) -> str | None:
+    """Eine vom Nutzer getippte Zeile: wie handle_line, zählt aber für den Befehlsverlauf (/ablauf)."""
+    ablauf.markieren()
+    return await handle_line(ctx, text)
+
+
+def _ablauf_merken(zeile: str, slash: bool) -> list[str]:
+    try:
+        return ablauf.aufzeichnen(zeile, slash=slash)
+    except Exception as e:
+        try:
+            import debugbericht
+            debugbericht.fehler("Befehlsverlauf merken", e)
+        except Exception:
+            pass
+        return []
+
+
+PROMPT_VEKTOREN_JE_RUNDE = 16       # so viele fehlende Vektoren der Prompt-Bibliothek je Chat-Runde
+
+import contextvars as _contextvars
+
+# Ist die laufende Zeile von Hand getippt? Je asyncio-Aufgabe getrennt: ein Aufruf aus einem Werkzeug der KI,
+# einem Ablauf oder einer anderen Aufgabe gilt nie als Eingabe des Nutzers.
+VOM_NUTZER: _contextvars.ContextVar[bool] = _contextvars.ContextVar("vom_nutzer", default=False)
+
+
+async def _prompt_vektoren_nachrechnen() -> None:
+    """Nach der Runde, solange das Gedächtnis-Modell noch geladen ist: ein paar fehlende Vektoren der
+    Prompt-Bibliothek nachrechnen. Lädt das Modell nie extra (das kostete ein paar Sekunden)."""
+    try:
+        import promptbank
+        if memory.encoder_loaded() and promptbank.DB.is_file():
+            await asyncio.to_thread(promptbank.vektorisieren, None, False, PROMPT_VEKTOREN_JE_RUNDE)
+    except Exception:
+        pass
+
+
+def _waechter(ctx: Ctx, arg: str) -> None:
+    """/wächter + | - [Grund]: die letzte Antwort des aktiven Modells werten. Die KI erfährt nur ➕ oder ➖."""
+    import kiwertung
+    from rich.markup import escape
+    teile = arg.split(maxsplit=1)
+    wert = kiwertung.wert_lesen(teile[0]) if teile else None
+    if wert is None:
+        ui.info("🛡 Wächter: /wächter + (gut) oder /wächter - (nicht optimal), gern mit Grund dahinter. "
+                "Die Rangliste steht in /control unter 🏆 Toplist-KI.")
+        return
+    if ctx.backend is None or not ctx.model:
+        ui.warn("🛡 Wächter: Es ist kein Modell aktiv – gewertet wird die letzte Antwort eines Modells.")
+        return
+    antwort = next((m.get("content") for m in reversed(getattr(ctx.backend, "messages", None) or [])
+                    if isinstance(m, dict) and m.get("role") == "assistant"), "")
+    try:
+        themen = list(persona._runde.get("frisch") or persona._runde.get("themen") or [])
+    except Exception:
+        themen = []
+    try:
+        punkte = kiwertung.werten(wert, ctx.model, PS.active().name, teile[1] if len(teile) > 1 else "",
+                                  themen, len(antwort) if isinstance(antwort, str) else 0)
+    except Exception as e:
+        ui.warn(f"🛡 Wächter: nicht gespeichert ({e}).")
+        return
+    zeichen = "➕" if wert > 0 else "➖"
+    ui.console.print(f"[bold red]🛡 Wächter: {zeichen} für {escape(ctx.model)} · Punkte jetzt {punkte:+d}[/bold red]")
+
+
+async def _web_eigene(ctx: Ctx, arg: str) -> None:
+    """/web erlauben|sperren <seite> und /web eigen: eigene Einträge der Allowlist. Ändern nur von Hand getippt –
+    die KI hat dafür einstellung_aendern (mit Rückfrage, nie nach Netz-Text)."""
+    import einstellungen
+    teile = arg.strip().split(maxsplit=1)
+    art, wert = teile[0].lower(), (teile[1].strip() if len(teile) > 1 else "")
+    if art == "eigen":
+        ui.info(einstellungen.eigene_text())
+        return
+    if not VOM_NUTZER.get():
+        ui.warn("🌐 /web erlauben und /web sperren gehen nur, wenn du sie selbst tippst.")
+        return
+    if not wert:
+        ui.info("Nutzung:  /web erlauben <seite>  ·  /web sperren <seite>  ·  /web eigen   "
+                "(z. B. /web erlauben example.org)")
+        return
+    was = "internet_erlauben" if art == "erlauben" else "internet_sperren"
+    try:
+        domain = einstellungen.domain(wert)
+        if was == "internet_erlauben" and (warnung := einstellungen.warnung(domain)):
+            ui.warn(warnung)
+            if await ask_confirm(f"{domain} trotzdem erlauben?", [("ja", "Ja, erlauben"), ("nein", "Nein")]) != "ja":
+                ui.info("🌐 Nicht erlaubt.")
+                return
+        satz = einstellungen.aendern(was, domain, "von Hand", vom_nutzer=True)
+    except ValueError as e:
+        ui.warn(f"🌐 {e}")
+        return
+    ui.success(f"🌐 {satz}")
+
+
+async def handle_line(ctx: Ctx, text: str) -> str | None:
+    """Verarbeitet EINE Eingabezeile (Befehl oder Chat). Gibt 'exit' zurück,
+    wenn NemiCLI beendet werden soll – sonst None. Von Klassik-Loop UND TUI genutzt."""
+    von_nutzer = ablauf.nimm()           # verschachtelte Aufrufe (Menüs, KI, Abläufe) zählen nicht
+    VOM_NUTZER.set(von_nutzer)
+    _LETZTER_CTX[0] = ctx
+    if von_nutzer:
+        lernen_unterbrechen()            # nächtliches Lern-Training gibt GPU und Malsperre frei
+    # „Nemi antwortet" (Rechtsklick): Auftrag trägt das Zielfenster im Präfix –
+    # nach der Antwort wird der Text dort eingefügt.
+    import kontextmenue
+    einfuegen_hwnd, text = kontextmenue.antwort_tag(text)
+    if einfuegen_hwnd is not None:
+        n_vorher = len(ctx.backend.messages) if ctx.backend is not None else 0
+        ergebnis = await handle_line(ctx, text)
+        await _antwort_einfuegen(ctx, einfuegen_hwnd, n_vorher)
+        return ergebnis
+    cmd, arg = parse(text)
+
+    # --- Slash-Befehle ----------------------------------------------------
+    if cmd in ("/wächter", "/waechter"):     # vor Statistik und /ablauf: davon lernt nichts mit
+        _waechter(ctx, arg)
+        return None
+    if cmd is not None:
+        import commands as _C
+        if von_nutzer and cmd in _C._BEKANNT and not _C.im_terminal(cmd):
+            ui.info("🎛 " + _C.ausgeblendet_text(cmd))  # nur getippt: Controllcenter, Menüs und Abläufe dürfen alles
+            return None
+        try:
+            stats.record_command(cmd)
+        except Exception:
+            pass
+        if not arg.strip():
+            zusatz = await _untermenue(ctx, cmd)
+            if zusatz is None:
+                return None
+            if zusatz:                                       # gewählter Punkt bleibt im Verlauf sichtbar
+                from rich.markup import escape
+                ui.console.print(f"[muted]  ↳ {cmd} {escape(zusatz)}[/muted]")
+            arg = zusatz
+        hinweise = _ablauf_merken(f"{cmd} {arg}", True) if von_nutzer else []
+        try:
+            weiter = await _befehl_ausfuehren(ctx, cmd, arg, text)
+        finally:
+            for h in hinweise:
+                ui.info(h)
+        if not isinstance(weiter, tuple):
+            return weiter
+        cmd, text = weiter
+        if cmd is not None:
+            if GUI_BRUECKE is not None:
+                _gui_spiegeln(ctx)
+            return None
+
+    # --- Normaler Chat ----------------------------------------------------
+    if not text.strip():
+        return None
+    await profil_zips_pruefen()          # Archiv im Profilordner: vor der Antwort fragen bzw. entpacken
+    await _rauswurf_uebernehmen(ctx)
+    if ctx.backend is None:
+        ui.warn("Kein Modell aktiv. Wähle eins mit /model (z.B. /model gemma-12b).")
+        return None
+
+    if von_nutzer and ablauf.aufnahme_laeuft():         # gezielte Aufnahme: auch Chat-Nachrichten
+        for h in _ablauf_merken(text, False):
+            ui.info(h)
+    text = emoji.expand(text)   # =)  <3  :feuer:  ->  echte Emojis
+    getippt = text              # fürs GUI-Fenster: wie eingegeben, ohne angehängte Datenblöcke
+
+    # Drag & Drop: Windows Terminal setzt nur den PFAD in die Eingabe. Text,
+    # Markdown, Quelltext, PDF haengen wir als Daten an; Bilder holt sich
+    # vision gleich danach; Binaeres (exe, zip, safetensors) bleibt liegen.
+    dateien = await asyncio.to_thread(anhang.anhaengen, text, anhang.budget(ctx.model))   # PDF lesen kann dauern
+    text = dateien["text"]
+    if (h := anhang.hinweis(dateien)):
+        for zeile in h.splitlines():
+            (ui.warn if "übersprungen" in zeile else ui.info)(zeile)
+
+    angehaengt = vision.find_images(text)
+    text, imgs, hinweis = await _bilder_fuer_chat(ctx.model, text)
+    if hinweis:
+        (ui.warn if "fehlt" in hinweis or "Helfer:" in hinweis else ui.info)(hinweis)
+    for _p in angehaengt[:3]:
+        _bild_vorschau(str(_p), title=f"angehängt: {_p.name}")
+
+    if VON_SICH_AUS:                 # Antwort auf etwas, das sie von sich aus schrieb
+        text = vonsichaus.kontext(VON_SICH_AUS) + text
+        VON_SICH_AUS.clear()
+    try:
+        async with TURN_LOCK:        # nur ein Zug gleichzeitig (Terminal oder Browser)
+            if GUI_BRUECKE is not None:
+                GUI_BRUECKE.senden({"t": "nutzer", "text": getippt, "quelle": "terminal"})
+                GUI_BRUECKE.senden({"t": "busy", "on": True})
+            records = await converse(ctx.backend, text, images=imgs)
+            if ersatzbank.wechsel_offen():
+                await _rauswurf_uebernehmen(ctx)
+            aus_dem_netz = actions.web_tainted()
+            ctx.current_prompts.append(text)
+            await _chat_speichern(ctx)
+            n_code = learn.capture_from_answer(text, ctx.backend.messages, ctx.current_chat)
+            await bibliothekar(ctx.current_chat, erzwingen=_chat_jetzt(ctx))
+            await _prompt_vektoren_nachrechnen()
+            memory.release_encoder()
+        lernen_planen(ctx, getippt, records, aus_dem_netz, pricing.weggefallen_holen(ctx.backend))
+        pflege_planen(ctx)
+        selbstentwurf_planen(ctx)
+        if n_code:
+            ui.info(f"🐍 {n_code} Code-Snippet(s) in den Wissensspeicher gelernt.")
+        # Terminal-Antwort auch im offenen Browser spiegeln (Status & Hinweis)
+        if WEB_BRIDGE is not None:
+            WEB_BRIDGE.broadcast({"t": "info", "text": "(im Terminal beantwortet)"})
+            WEB_BRIDGE.broadcast({"t": "state", "model": ctx.model or "—",
+                                  "chat": ctx.current_chat, "tokens": SESSION["tokens"],
+                                  "strength": ctx.strength if ctx.strength_active() else None})
+        mascot.maybe()
+    except Exception as e:
+        ui.error(f"Fehler bei der Antwort: {e}")
+    finally:                         # auch nach Esc (CancelledError) oder Fehler
+        if GUI_BRUECKE is not None:
+            GUI_BRUECKE.senden({"t": "busy", "on": False})
+            _gui_spiegeln(ctx)
+    return None
+
+
+async def _chat_speichern(ctx: "Ctx") -> None:
+    """Verlauf speichern – im Faden: JSON aller Nachrichten + SHA-256 jedes Bildes brauchen bei langen Chats
+    spürbar Zeit. Hat ein anderes Fenster denselben Chat weitergeschrieben, geht es als neuer Chat weiter."""
+    nr = await asyncio.to_thread(chatstore.save, ctx.current_chat, list(ctx.backend.messages),
+                                 list(ctx.current_prompts), ctx.model or "—",
+                                 stand=getattr(ctx.backend, "stand", None))
+    if nr != ctx.current_chat:
+        ui.info(f"📒 Chat {ctx.current_chat} wurde in einem anderen Fenster weitergeschrieben – "
+                f"dieses Gespräch geht als Chat {nr} weiter.")
+        ctx.current_chat = nr
+        ctx.sync_session()
+
+
+def _ablauf_menue() -> list[tuple[str, str, str | None]]:
+    """/ablauf ohne Zusatz: gespeicherte Abläufe zum Abspielen, darunter Aufnehmen und Verwalten."""
+    eintraege = [(n, f"▶ {n} · {len(ablauf.schritte(n))} Schritte", None) for n in ablauf.namen()]
+    if ablauf.aufnahme_laeuft():
+        eintraege += [("stopp", "⏹ Aufnahme beenden und speichern", None),
+                      ("abbrechen", "✖ Aufnahme verwerfen", None)]
+    else:
+        eintraege.append(("aufnehmen {}", "⏺ Neuen Ablauf aufnehmen", "Name des Ablaufs (z. B. morgen)?"))
+    eintraege += [("speichern {}", "💾 Letzten Vorschlag als Ablauf speichern", "Name des Ablaufs?"),
+                  ("liste", "📋 Alle Abläufe mit Schritten", None),
+                  ("anhaengen {}", "➕ Häufigen Befehl danach anhängen", "Welcher Ablauf?"),
+                  ("loeschen {}", "🗑 Ablauf löschen", "Welcher Ablauf?"),
+                  ("vorschlaege an", "💡 Vorschläge an", None), ("vorschlaege aus", "💡 Vorschläge aus", None),
+                  ("vergessen", "🧹 Befehlsverlauf leeren (Abläufe bleiben)", None)]
+    return eintraege
+
+
+async def ablauf_befehl(ctx: "Ctx", arg: str) -> None:
+    """/ablauf [<name> · aufnehmen <name> · stopp · abbrechen · speichern <name> · liste · anhaengen <name> ·
+    loeschen <name> · vorschlaege an|aus · vergessen]"""
+    was, _, rest = arg.strip().partition(" ")
+    w, rest = was.lower(), rest.strip()
+    try:
+        if w in ("", "liste", "zeigen"):
+            zeilen = ablauf.liste_zeilen()
+            if not zeilen:
+                ui.info("▶ Noch keine Abläufe. Selbst aufnehmen: /ablauf aufnehmen <name> … /ablauf stopp – "
+                        "oder warten: Machst du dieselbe Befehlsfolge öfter, schlage ich sie vor.")
+            for z in zeilen:
+                ui.console.print("  " + z, markup=False, highlight=False)
+        elif w == "aufnehmen":
+            name = ablauf.aufnehmen(rest)
+            ui.info(f"⏺ Aufnahme „{name}“ läuft – ab jetzt merke ich jede Eingabe, auch Chat-Nachrichten. "
+                    "/ablauf stopp speichert, /ablauf abbrechen verwirft.")
+        elif w in ("stopp", "stop"):
+            name, folge = ablauf.stopp()
+            if folge:
+                ui.success(f"Ablauf „{name}“ gespeichert ({len(folge)} Schritte) – abspielen: /ablauf {name}")
+            else:
+                ui.info(f"⏹ Aufnahme „{name}“ beendet – sie war leer, nichts gespeichert.")
+        elif w == "abbrechen":
+            ui.info(f"✖ Aufnahme „{ablauf.abbrechen()}“ verworfen.")
+        elif w == "speichern":
+            folge = ablauf.speichern(rest)
+            ui.success(f"Ablauf „{ablauf.name_pruefen(rest)}“ gespeichert: {' → '.join(folge)}")
+        elif w in ("anhaengen", "anhängen"):
+            zeile = ablauf.anhaengen(rest)
+            ui.success(f"An „{rest.lower()}“ angehängt: {zeile}")
+        elif w in ("loeschen", "löschen"):
+            if ablauf.loeschen(rest):
+                ui.success(f"Ablauf „{rest.lower()}“ gelöscht.")
+            else:
+                ui.warn(f"Keinen Ablauf „{rest}“ – /ablauf liste zeigt alle.")
+        elif w in ("vorschlaege", "vorschläge"):
+            if rest.lower() in ("an", "aus"):
+                ablauf.vorschlaege_setzen(rest.lower() == "an")
+            ui.info("💡 Vorschläge für wiederkehrende Befehlsfolgen: " + ("an" if ablauf.vorschlaege_an() else "aus"))
+        elif w == "vergessen":
+            ui.success(f"Befehlsverlauf geleert ({ablauf.vergessen()} Einträge) – gespeicherte Abläufe bleiben.")
+        elif arg.strip().lower() in ablauf.namen():
+            await _ablauf_abspielen(ctx, arg.strip().lower())
+        else:
+            ui.warn(f"Keinen Ablauf „{arg.strip()}“ – /ablauf liste zeigt alle.")
+    except ValueError as e:
+        ui.warn(f"▶ {e}")
+
+
+def lern_gguf(ctx: "Ctx") -> Path | None:
+    """Die GGUF-Datei des aktiven lokalen Modells (eigener Motor), sonst None."""
+    prov, name = M.split_ref(ctx.model or "")
+    if prov != "gguf":
+        return None
+    try:
+        import gguflokal
+        return gguflokal.modelle().get(name)
+    except Exception:
+        return None
+
+
+def lernen_unterbrechen() -> None:
+    """Eine Eingabe des Nutzers hält ein nächtliches Lern-Training an (der Zwischenstand bleibt)."""
+    if not LERNEN["nacht"]:
+        return
+    try:
+        from loramotor import training as T
+        if T.laeuft() and not T.ANHALTEN.is_set():
+            T.ANHALTEN.set()
+            ui.info("🌙 Nacht-Lernen pausiert – du bist wieder da. Es macht in der nächsten Nacht weiter.")
+    except Exception:
+        pass
+
+
+def _lern_status(text: str) -> None:
+    LERNEN["text"] = text
+
+
+async def lernen_ausfuehren(ctx: "Ctx", gguf: Path, nacht: bool) -> dict:
+    """Lern-LoRA trainieren (im Faden, GPU wie beim Malen). Abbruch: /lernen anhalten; im Vordergrund (nicht
+    nachts) auch Esc wie in einer Runde der KI – der Zwischenstand bleibt, nichts wird gelöscht."""
+    import imagegen
+    from loramotor import lernlora as LL
+    from loramotor import training as T
+    T.ANHALTEN.clear()
+    LERNEN["nacht"] = nacht
+    if nacht:
+        abbruch = T.ANHALTEN.is_set
+    else:
+        notstopp.runde_beginnt()
+        notstopp.runde_aktiv(True)
+        abbruch = lambda: T.ANHALTEN.is_set() or notstopp.ausgeloest()   # noqa: E731
+    try:
+        return await asyncio.to_thread(imagegen._gpu_fuer_bild(LL.trainieren), gguf, on_status=_lern_status,
+                                       abbruch=abbruch)
+    except asyncio.CancelledError:
+        T.ANHALTEN.set()                       # abgebrochen: der Faden hält nach dem laufenden Schritt an
+        raise
+    finally:
+        LERNEN["nacht"] = False
+        if not nacht:
+            notstopp.runde_aktiv(False)
+
+
+async def lernen_befehl(ctx: "Ctx", arg: str) -> None:
+    """/lernen [an|aus · jetzt · anhalten · nacht <stunde>|aus · staerke <0–2> · vergessen]"""
+    import config as _cfg
+    from loramotor import lernlora as LL
+    from loramotor import training as T
+    was, _, rest = arg.strip().lower().partition(" ")
+    rest = rest.strip()
+    gguf = lern_gguf(ctx)
+    if was in ("an", "aus"):
+        _cfg.update(**{LL.SCHALTER: was == "an"})
+        ui.info("🌙 Lern-LoRA " + ("AN – lernt nachts aus den Gesprächen dieser Persönlichkeit und klinkt "
+                                  "das passende Thema an (nur eigener GGUF-Motor)." if was == "an"
+                                  else "AUS – kein Training, nichts angeklinkt. Gelernte Dateien bleiben."))
+    elif was == "nacht":
+        if rest in ("aus", "off"):
+            _cfg.update(**{LL.NACHT: "aus"})
+        elif rest.isdigit() and 0 <= int(rest) <= 23:
+            _cfg.update(**{LL.NACHT: int(rest)})
+        else:
+            ui.warn("🌙 /lernen nacht <0–23> oder /lernen nacht aus")
+            return
+        for z in LL.stand_zeilen(gguf)[:1]:
+            ui.info(z)
+    elif was in ("staerke", "stärke"):
+        try:
+            wert = min(2.0, max(0.0, float(rest.replace(",", "."))))
+        except ValueError:
+            ui.warn("🌙 /lernen staerke <0–2>, z. B. 0.7")
+            return
+        _cfg.update(**{LL.STAERKE: wert})
+        ui.info(f"🌙 Stärke des Lern-LoRA: {wert:g}")
+    elif was == "anhalten":
+        if T.laeuft():
+            T.ANHALTEN.set()
+            ui.info("🌙 Training hält nach dem laufenden Schritt an – der Zwischenstand bleibt.")
+        else:
+            ui.info("🌙 Es läuft kein Training.")
+    elif was == "vergessen":
+        if T.laeuft():
+            ui.warn("🌙 Erst /lernen anhalten – gerade läuft ein Training.")
+            return
+        if await ask_confirm("Alle Lern-LoRAs dieser Persönlichkeit löschen? (Gespräche und Gedächtnis bleiben)",
+                             [("ja", "🗑 Ja, löschen"), ("nein", "↩ Nein")]) != "ja":
+            return
+        ui.success(f"Lern-LoRA vergessen: {LL.vergessen()} Datei(en) gelöscht.")
+    elif was == "jetzt":
+        if gguf is None:
+            ui.warn("🌙 Das Lern-LoRA gilt für lokale GGUF-Modelle im eigenen Motor – wähle eins mit /model.")
+            return
+        if T.laeuft():
+            ui.warn("🌙 Es läuft schon ein LoRA-Training – /lernen anhalten oder abwarten.")
+            return
+        ui.info(f"🌙 Lerne aus den Gesprächen von {PS.active().name} für {gguf.name} … "
+                "(Esc oder /lernen anhalten hält an, der Zwischenstand bleibt)")
+        aufgabe = asyncio.get_running_loop().create_task(_lern_melden())
+        try:
+            erg = await lernen_ausfuehren(ctx, gguf, nacht=False)
+        except (ValueError, RuntimeError) as e:
+            ui.warn(f"🌙 {e}")
+            return
+        finally:
+            aufgabe.cancel()
+        LL.versucht()
+        ui.success(f"Lern-LoRA fertig: {erg['beispiele']} Beispiele, "
+                   + ", ".join(f"{n} ({b})" for n, b in erg["themen"]))
+        if not LL.an():
+            ui.info("🌙 Angeklinkt wird es erst mit /lernen an.")
+    else:
+        for z in LL.stand_zeilen(gguf):
+            ui.console.print(z, markup=False, highlight=False)
+        if T.laeuft():
+            ui.info(f"🌙 läuft: {LERNEN.get('text') or T.status().get('text') or '…'}")
+
+
+async def _lern_melden() -> None:
+    """Fortschritt des Trainings alle paar Sekunden als eine Zeile."""
+    zuletzt = ""
+    while True:
+        await asyncio.sleep(15)
+        text = LERNEN.get("text") or ""
+        if text and text != zuletzt:
+            ui.info(f"🌙 {text}")
+            zuletzt = text
+
+
+async def _ablauf_abspielen(ctx: "Ctx", name: str) -> None:
+    """Die Schritte nacheinander wie getippt. Esc gilt wie in einer Runde der KI (notstopp): der laufende
+    Schritt hört auf, der nächste startet nicht. Schritte mit Fehlermeldung zählen in der Strichliste."""
+    from rich.markup import escape
+    folge = [z for z in ablauf.schritte(name) if ablauf.abspielbar(z)]
+    ui.info(f"▶ Ablauf „{name}“: {len(folge)} Schritte · Esc bricht ab")
+    fehler: list[int] = []
+    notstopp.runde_beginnt()
+    notstopp.runde_aktiv(True)
+    try:
+        for i, zeile in enumerate(folge):
+            if notstopp.ausgeloest():
+                ui.warn(f"⏹ Ablauf „{name}“ angehalten vor Schritt {i + 1} – gelöscht wird nichts.")
+                return
+            ui.console.print(f"[muted]  ▶ {i + 1}/{len(folge)}: {escape(zeile)}[/muted]")
+            vorher = ui.FEHLER_ZAHL
+            try:
+                if await handle_line(ctx, zeile) == "exit":
+                    break
+            except Exception as e:
+                ui.error(f"Schritt {i + 1}: {e}")
+            if ui.FEHLER_ZAHL > vorher:
+                fehler.append(i)
+    finally:
+        notstopp.runde_aktiv(False)
+    if notstopp.ausgeloest():
+        ui.warn(f"⏹ Ablauf „{name}“ angehalten – gelöscht wird nichts.")
+        return
+    ablauf.lauf_ende(name, fehler)
+    ui.success(f"Ablauf „{name}“ fertig" + (f" – {len(fehler)} Schritt(e) mit Fehler" if fehler else ""))
+
+
+async def reflektieren_befehl(ctx: "Ctx", arg: str) -> None:
+    """/reflektieren [auto an|aus · selbst [verlauf|zurueck|an|aus]] – ohne Zusatz: Reflexion, danach die
+    Selbstentwurf-Runde."""
+    import lernschleife as LS
+    was, wahl = (arg.lower().split() + ["", ""])[:2]
+    if was == "auto":
+        if wahl in ("an", "aus"):
+            LS.setzen(wahl == "an")
+        ui.info("🪞 Automatisch reflektieren: " + (
+            "AN – nach Korrekturen, Fehlern und größeren Aufgaben (nie nach Web-Inhalt)"
+            if LS.an() else "AUS – nur noch mit /reflektieren"))
+        return
+    if was == "selbst":
+        import selbstentwurf as SE
+        if wahl in ("an", "aus"):
+            LS.selbstentwurf_setzen(wahl == "an")
+            ui.info("🪞 Selbstentwurf im Takt: " + (
+                "AN – morgens, mittags und abends einmal ansehen (nur mit erlaubtem Modell)"
+                if LS.selbstentwurf_an() else "AUS – nur noch mit /reflektieren"))
+        elif wahl == "verlauf":
+            staende = SE.verlauf()
+            if not staende:
+                ui.info("🪞 Noch keine früheren Stände.")
+            for e in staende:
+                ui.console.print(f"  {e.get('nr')}. {e.get('zeit') or '?'} – {e.get('grund') or '–'}: "
+                                 f"{e.get('felder') or ''}", markup=False, highlight=False)
+        elif wahl in ("zurueck", "zurück"):
+            try:
+                ui.success(SE.zurueck())
+            except ValueError as e:
+                ui.warn(f"🪞 Nicht zurückgesetzt: {e}.")
+        else:
+            for zeile in SE.stand_zeilen():
+                ui.console.print(zeile, markup=False, highlight=False)
+            ui.info("🪞 Im Takt (3× am Tag): " + ("an" if LS.selbstentwurf_an() else "aus")
+                    + " · /reflektieren selbst verlauf · /reflektieren selbst zurueck")
+        return
+    if ctx.backend is None:
+        ui.warn("Kein Modell aktiv – mit /model eins wählen.")
+        return
+    saved = await do_reflect(ctx)
+    if saved:
+        ui.success(f"🪞 {len(saved)} Lehre(n) gemerkt:")
+        for art, t in saved:
+            ui.console.print(f"  [muted]{art}[/muted]  {t}")
+    else:
+        ui.info("🪞 Nichts Bleibendes zum Lernen gefunden – alles gut.")
+    await selbstentwurf_jetzt(ctx)
+
+
+async def _befehl_ausfuehren(ctx: "Ctx", cmd: str, arg: str, text: str):
+    """Die Slash-Befehle aus handle_line, erster Teil der Kette (der Rest: _befehl_ausfuehren_2).
+    Rückgabe wie handle_line – oder (cmd, text), wenn es danach normal weitergeht."""
+    if cmd in ("/exit", "/quit"):
+        return "exit"
+    elif neustart.ist_befehl(cmd):
+        # Nur die Eingabe des Nutzers startet neu (abgefangen vor handle_line); hier landen Menüs, Inbox, KI.
+        ui.info("🔄 /restart geht nur über deine eigene Eingabe im NemiCLI-Fenster.")
+    elif cmd == "/help":
+        ui.help_panel(arg)
+    elif cmd == "/clear":
+        # Wie beim Start: Banner + Status-Zeile + Chat-Hinweis + Maskottchen
+        if ui.TUI is not None:
+            ui.TUI.clear()
+        else:
+            ui.console.clear()
+        ui.banner(animate=False)
+        ui.welcome(model=ctx.model or "—", mode="Chat",
+                   strength=ctx.strength if ctx.strength_active() else None)
+        mascot.greet()
+        ui.console.print()
+    elif cmd == "/wissen":
+        ui.knowledge_menu(learn.list_skills(), learn.list_snippets())
+    elif cmd == "/gedaechtnis":
+        sub = arg.strip().lower()
+        if sub in ("indexieren", "index", "vektorisieren"):      # früherer Name von /einlesen
+            await _einlesen_starten(ctx)
+        elif sub in ("leeren", "loeschen", "clear"):
+            if not memory.count():
+                ui.info("Das Langzeitgedächtnis ist schon leer.")
+            else:
+                ja = await ask_confirm(
+                    f"Wirklich ALLE {memory.count()} Erinnerungen löschen?",
+                    [("nein", "Nein, behalten"), ("ja", "Ja, alles löschen")])
+                if ja == "ja":
+                    ui.success(f"{memory.clear()} Erinnerung(en) gelöscht.")
+                else:
+                    ui.info("Abgebrochen – nichts gelöscht.")
+        elif sub in ("archiv", "papierkorb"):
+            archiv = memory.archiv_liste(30)
+            if not archiv:
+                ui.info("Das Archiv ist leer.")
+            else:
+                ui.info(f"🗄 Archiv – die {len(archiv)} jüngsten (ersetzt, vergessen, zusammengelegt):")
+                for a in archiv:
+                    ui.console.print(f"  [muted]#{a.get('id')} · {a.get('archiviert', '?')} · {a.get('grund', '')}[/muted]"
+                                     f"  {a.get('text', '')}")
+                ui.info("Zurückholen: /gedaechtnis zurueck <nummer>")
+        elif sub.split()[:1] in (["zurueck"], ["zurück"], ["wiederherstellen"]):
+            rest = sub.split(maxsplit=1)
+            nr = rest[1].lstrip("#") if len(rest) > 1 else ""
+            e = memory.zurueckholen(int(nr)) if nr.isdigit() else None
+            if e is not None:
+                ui.success(f"Erinnerung #{nr} ist zurück: {e.get('text', '')}")
+                await bibliothekar(sofort=True)
+            else:
+                ui.warn("Nicht im Archiv. Nutzung: /gedaechtnis zurueck <nummer> (Nummern: /gedaechtnis archiv)")
+        elif sub.startswith("vergiss") or sub.startswith("vergessen"):
+            rest = sub.split(maxsplit=1)
+            if len(rest) > 1 and rest[1].isdigit() and memory.vergessen(int(rest[1]), "von Hand vergessen"):
+                ui.success(f"Erinnerung #{rest[1]} vergessen (liegt im Archiv).")
+            else:
+                ui.warn("Konnte das nicht. Nutzung: /gedaechtnis vergiss <nummer>")
+        else:
+            entries = memory.all_entries()
+            smart = (f"🧠 Stichworte + Bedeutung ({memory.encoder_status()})"
+                     if memory.embedding_ready()
+                     else f"🔤 nur Stichworte – {memory.encoder_status()}")
+            ui.info(f"🧠 Langzeitgedächtnis: {len(entries)} Erinnerung(en)  ·  Suche: {smart}")
+            if (statistik := persona.gedaechtnis_statistik()):
+                ui.info(f"⏱ {statistik}")
+            if not entries:
+                ui.info("Noch nichts gemerkt. Sag z.B. 'merk dir, ich mag knappe Antworten' "
+                        "oder NemiCLI merkt sich Wichtiges von selbst.")
+            else:
+                for e in entries:
+                    ui.console.print(f"  [muted]#{e['id']} · {e['ts']} · {e['kind']}[/muted]  {e['text']}"
+                                     + (f"  [muted]📎 {e['detail']}[/muted]" if e.get("detail") else ""))
+                ui.info("Löschen: /gedaechtnis vergiss <nummer>  ·  alles: /gedaechtnis leeren  ·  "
+                        "Archiv: /gedaechtnis archiv")
+            try:
+                o = indexdb.offen()
+                ui.info(f"📚 Vektor-DB: {o['brocken']} Brocken · {o['ohne_vektor']} ohne Vektor · "
+                        f"{o['berichte_offen']} Berichte offen"
+                        + (f" · {o['alt_geschnitten']} Quellen werden noch neu geschnitten"
+                           if o.get("alt_geschnitten") else "")
+                        + "  →  /einlesen holt alles nach")
+            except Exception:
+                pass
+    elif cmd == "/aufraeumen":
+        import ersatzbank
+        n = memory.count()
+        if n < 2:
+            ui.info("Zu wenig im Gedächtnis zum Aufräumen (mindestens 2 Notizen).")
+        elif ctx.backend is not None and ersatzbank.ist_cloud(ctx.model):
+            import gedaechtnispflege as GP
+            with ui.thinking("die KI prüft ähnliche und alte Notizen"):
+                erg = await GP.pflegen(ctx.backend, ctx.model, bauen=cloud_backend)
+            if erg.get("zusammen") or erg.get("veraltet"):
+                await bibliothekar(sofort=True)
+            ui.info("🗜 " + GP.bericht_text(erg))
+            for z in erg.get("zusammen") or []:
+                ui.console.print(f"  [muted]#{z['behalten']} + {', '.join('#' + str(w) for w in z['weg'])}[/muted]  "
+                                 f"{z['text']}")
+            for v in erg.get("veraltet") or []:
+                ui.console.print(f"  [muted]#{v['nr']} archiviert[/muted]  {v['grund']}")
+        else:
+            with ui.thinking("räume das Gedächtnis auf"):
+                r = await asyncio.to_thread(memory.consolidate)
+            await bibliothekar(sofort=True)
+            memory.release_encoder()
+            if r["merged"]:
+                ui.success(f"🗜️ Aufgeräumt: {r['merged']} ähnliche Notiz(en) verschmolzen "
+                           f"({r['before']} → {r['after']}). Zurückholen: /gedaechtnis archiv")
+            else:
+                ui.info(f"Alles schon ordentlich – nichts zu verschmelzen ({n} Notizen).")
+    elif cmd == "/reflektieren":
+        await reflektieren_befehl(ctx, arg)
+    elif cmd == "/ablauf":
+        await ablauf_befehl(ctx, arg)
+    elif cmd == "/lernen":
+        await lernen_befehl(ctx, arg)
+    elif cmd == "/start":
+        await run_reich()
+    elif cmd == "/einrichten" and arg.strip().lower() in ("modelle", "models", "modell"):
+        await modelle_einrichten()
+    elif cmd == "/einrichten":
+        for befehl in await run_wizard():                 # z. B. /model nach der Wahl Cloud/lokal
+            await handle_line(ctx, befehl)
+    elif cmd == "/systemcheck":
+        import syscheck
+        import systemprofil as SP
+        ui.info("🩺 Schaue mir deinen PC an … (ein paar Sekunden)")
+        ui.steckbrief_panel(await asyncio.to_thread(SP.erkennen, True))
+        rep = await asyncio.to_thread(syscheck.report, True)
+        ui.system_panel(rep, syscheck.todo(rep))
+    elif cmd == "/ml":
+        import foldersense
+        ui.ml_panel(foldersense.stats(arg or os.getcwd()))
+    elif cmd == "/ordner":
+        import foldersense
+        ziel = arg or os.getcwd()
+        r = foldersense.classify(ziel)
+        ui.info(f"📂 {ziel}")
+        if r["empty"]:
+            ui.warn("Leerer oder nicht lesbarer Ordner – keine Merkmale.")
+        else:
+            ui.success(f"Ordner-Typ (ML): {r['name']}  "
+                       f"· {round(r['confidence']*100)} % sicher  "
+                       f"· {r['tokens']} Merkmale")
+        ui.info("Bekannte Typen: " + ", ".join(foldersense.labels().values()))
+    elif cmd == "/emoji":
+        import emojistufe
+        wahl = arg.strip().lower()
+        if wahl in ("kuerzel", "kürzel", "liste"):
+            ui.emoji_menu(emoji.EMOTICONS, emoji.SHORTCODES)
+        elif emojistufe.normal(wahl):
+            try:
+                ui.success(f"Emojis: {emojistufe.TEXT[emojistufe.setzen(wahl)]} – gilt ab der nächsten Antwort.")
+            except ValueError as exc:
+                ui.error(str(exc))
+        else:
+            ui.info(f"Emojis: {emojistufe.TEXT[emojistufe.stufe()]} · /emoji low · middle · strong · frei · kuerzel")
+    elif cmd == "/denken":
+        import denkweise
+        wer = PS.active().name
+        if denkweise.normal(arg):
+            try:
+                ui.success(f"Denkweise von {wer}: {denkweise.TEXT[denkweise.setzen(arg)]} – gilt ab der nächsten "
+                           "Antwort.")
+            except ValueError as exc:
+                ui.error(str(exc))
+        else:
+            ui.info(f"Denkweise von {wer}: {denkweise.TEXT[denkweise.stufe()]} · /denken auto · an · aus")
+    elif cmd == "/einlesen":
+        teile = arg.lower().split()
+        if teile[:1] in (["stand"], ["status"]):
+            await speicher_pruefen()
+            import einlesen
+            ui.info("📦 Einlese-Speicher: " + (einlesen.kurz(_BIB["speicher"]) if _BIB["speicher"] is not None
+                                               else "kein Embedding-Modell da"))
+        else:
+            await _einlesen_starten(ctx)
+    elif cmd == "/llamacpp":
+        await llamacpp_befehl(ctx, arg)
+    elif cmd == "/zip":
+        await zip_befehl(arg)
+    elif cmd == "/bewegung":
+        await bewegung_befehl(arg)
+    elif cmd == "/name":
+        await name_befehl(arg)
+    elif cmd == "/skills":
+        await skills_befehl(arg)
+    elif cmd == "/gui":
+        global GUI_BRUECKE  # noqa: PLW0603
+        if GUI_BRUECKE is None:
+            GUI_BRUECKE = await start_gui(ctx)
+        if GUI_BRUECKE.verbunden():
+            GUI_BRUECKE.senden({"t": "vorne"})
+            ui.info("🖥 Das GUI-Fenster ist schon offen.")
+        else:
+            gui_oeffnen(GUI_BRUECKE)
+            ui.success("🖥 Das GUI-Fenster öffnet sich – es ist mit dieser Sitzung verbunden.")
+    elif cmd == "/einstellungen":
+        await einstellungen_menue(ctx)
+    elif cmd in ("/schriftgröße", "/schriftgroesse"):
+        await schriftgroesse_befehl(arg)
+    elif cmd == "/terminal":
+        terminal_befehl(arg)
+    elif cmd == "/startart":
+        sub = arg.strip().lower()
+        if sub in ("terminal", "fenster"):
+            config.update(startart=sub)
+            ui.success("🚀 Ab dem nächsten Start öffnet sich gleich das Desktop-Fenster." if sub == "fenster"
+                       else "🚀 NemiCLI startet wieder im Terminal.")
+        else:
+            ui.info(f"🚀 Startart: {config.load().get('startart', 'terminal')} – /startart terminal oder fenster.")
+    elif cmd == "/control":
+        global CONTROL_BRUECKE  # noqa: PLW0603
+        if CONTROL_BRUECKE is None:
+            CONTROL_BRUECKE = await start_control(ctx)
+        if CONTROL_BRUECKE.verbunden():
+            CONTROL_BRUECKE.senden({"t": "vorne"})
+            ui.info("🎛 Das Nemi Controllcenter ist schon offen.")
+        else:
+            gui_oeffnen(CONTROL_BRUECKE, "--control")
+            ui.success(f"🎛 Das Nemi Controllcenter öffnet sich – {PS.active().name} hilft dir beim Einstellen.")
+    elif cmd == "/office":
+        global OFFICE_BRUECKE  # noqa: PLW0603
+        if OFFICE_BRUECKE is None:
+            OFFICE_BRUECKE = await start_office(ctx)
+        if OFFICE_BRUECKE.verbunden():
+            OFFICE_BRUECKE.senden({"t": "vorne"})
+            ui.info("🗂 Nemi Office ist schon offen.")
+        else:
+            gui_oeffnen(OFFICE_BRUECKE, "--office")
+            ui.success("🗂 Nemi Office öffnet sich: ✍️ Schreiben und 📊 Tabelle – "
+                       f"{PS.active().name} hilft an der Seite.")
+    elif cmd == "/musik":
+        global MUSIK_BRUECKE  # noqa: PLW0603
+        from musik import gewichte as _musik_gewichte
+        if (grund := _musik_gewichte.fehlt()):
+            ui.warn("🎵 " + grund)
+            return
+        if MUSIK_BRUECKE is None:
+            MUSIK_BRUECKE = await start_musik(ctx)
+        if MUSIK_BRUECKE.verbunden():
+            MUSIK_BRUECKE.senden({"t": "vorne"})
+            ui.info("🎵 Das Musik-Fenster ist schon offen.")
+        else:
+            gui_oeffnen(MUSIK_BRUECKE, "--musik")
+            ui.success("🎵 Das Musik-Fenster öffnet sich: Wunsch eintippen, ausarbeiten lassen, komponieren.")
+    elif cmd == "/kern":
+        await kern_befehl(arg, ctx)
+    elif cmd == "/lora":
+        global LORA_BRUECKE  # noqa: PLW0603
+        if LORA_BRUECKE is None:
+            LORA_BRUECKE = await start_lora(ctx)
+        if LORA_BRUECKE.verbunden():
+            LORA_BRUECKE.senden({"t": "vorne"})
+            ui.info("🧬 Die LoRA-Werkstatt ist schon offen.")
+        else:
+            gui_oeffnen(LORA_BRUECKE, "--lora")
+            ui.success("🧬 Die LoRA-Werkstatt öffnet sich: Bilder hineinziehen, prüfen, auswählen, trainieren.")
+    elif cmd in ("/charaktere", "/galerie"):
+        global CHARAKTER_BRUECKE  # noqa: PLW0603
+        if CHARAKTER_BRUECKE is None:
+            CHARAKTER_BRUECKE = await start_charaktere(ctx)
+        if CHARAKTER_BRUECKE.verbunden():
+            CHARAKTER_BRUECKE.senden({"t": "vorne"})
+            ui.info("🎭 Die Charakter-Galerie ist schon offen.")
+        else:
+            gui_oeffnen(CHARAKTER_BRUECKE, "--charaktere")
+            ui.success("🎭 Die Charakter-Galerie öffnet sich: Charaktere von der KI erfinden lassen oder eine eigene "
+                       "erschaffen.")
+    elif cmd == "/web":
+        import webfetch
+        if arg.strip().lower() == "key":      # /web key -> Ollama-API-Key: nur im Controllcenter (🔐 Tresor)
+            ui.info("Ollama-API-Key holen unter  https://ollama.com/settings/keys")
+            await tresor_zeigen(ctx, webfetch.SEARCH_ENV, "Ollama")
+        elif arg.strip().lower().split()[:1] == ["fremdseiten"]:
+            wert = {"an": "frei"}.get((arg.strip().lower().split() + [""])[1],
+                                      (arg.strip().lower().split() + [""])[1])
+            if wert in webfetch.FREMD_MODI:
+                config.update(**{webfetch.FREMD_SCHALTER: wert})
+            modus = webfetch.fremdseiten_modus()
+            ui.info("◐ Seiten außerhalb der Allowlist: " + {
+                "frei": "über Ollama lesbar, aus Suchtreffern ohne Rückfrage (niedrigstes Vertrauen)",
+                "fragen": "über Ollama lesbar, jede fragt vorher",
+                "aus": "gesperrt"}[modus]
+                + ("" if webfetch.search_available() else "  ·  ⚠ ohne Ollama-Schlüssel (/web key) aus")
+                + "  ·  /web fremdseiten frei|fragen|aus")
+        elif arg.strip().lower().split()[:1] in (["erlauben"], ["sperren"], ["eigen"]):
+            await _web_eigene(ctx, arg)
+        elif arg.strip().lower().split()[:1] == ["lokal"]:
+            import netzzwang
+            teile = arg.strip().lower().split()[1:]
+            weg = bool(teile) and teile[0] in ("weg", "entfernen", "aus")
+            zahl = teile[1] if weg and len(teile) > 1 else (teile[0] if teile and not weg else "")
+            eigene = [p for p in (config.load().get(netzzwang.EINSTELLUNG) or []) if isinstance(p, int)]
+            if zahl:
+                if not zahl.isdigit() or not 0 < int(zahl) < 65536:
+                    ui.warn(f"'{zahl}' ist kein Port (1–65535).")
+                    return None
+                port = int(zahl)
+                eigene = [p for p in eigene if p != port] if weg else sorted(set(eigene) | {port})
+                config.update(**{netzzwang.EINSTELLUNG: eigene})
+                if weg and port in netzzwang.STANDARD:
+                    ui.warn(f"Port {port} ({netzzwang.STANDARD[port]}) ist ein bekannter Dienst und bleibt frei.")
+            ui.info("🔒 Netz-Zwang: ins Netz nur https://, unverschlüsselt nur zu 127.0.0.1 auf diesen Ports – "
+                    f"{netzzwang.ports_text()}\n   Die KI schreibt dafür lokal:PORT.  "
+                    "/web lokal <port> gibt frei · /web lokal weg <port> nimmt zurück")
+        elif arg.strip().lower().split()[:1] == ["schutz"]:
+            import schutzliste
+            wert = (arg.strip().lower().split() + [""])[1]
+            if wert in ("an", "aus"):
+                config.update(**{schutzliste.SCHALTER: wert == "an"})
+            elif wert in ("aktualisieren", "neu", "update"):
+                ui.info("⛔ Lade die Schutzlisten neu …")
+                try:
+                    await asyncio.to_thread(schutzliste.aktualisieren)
+                except Exception as e:
+                    ui.error(f"Schutzliste nicht aktualisiert: {e}")
+            ui.info(schutzliste.status_text())
+        else:
+            status = ("🔎 Web-Suche (Ollama): aktiv" if webfetch.search_available()
+                      else "🔎 Web-Suche (Ollama): aus – mit  /web key  einrichten")
+            status += (f"  ·  ◐ Fremdseiten über Ollama: {webfetch.fremdseiten_modus()}"
+                       if webfetch.fremdseiten_an() else "  ·  ◐ Fremdseiten: aus")
+            import schutzliste
+            status += "  ·  ⛔ Schutzliste: " + ("an" if schutzliste.an() else "aus") + " (/web schutz)"
+            ui.info(status)
+            eintraege = webfetch.entries()
+            filt = arg.strip().lower()
+            # deutsche Suchwörter auf die Kategorie-Namen der Liste abbilden
+            filt = {"presse": "press", "behörde": "gov", "behoerde": "gov", "recht": "law",
+                    "doku": "docs", "wissenschaft": "science", "sicherheit": "sec"}.get(filt, filt)
+            if filt:                       # /web python  → nur passende Domains/Notizen
+                eintraege = [e for e in eintraege
+                             if filt in e.get("domain", "").lower()
+                             or filt in e.get("note", "").lower()
+                             or filt in e.get("category", "").lower()]
+                if not eintraege:
+                    ui.warn(f"Keine Domain passt zu '{arg.strip()}'. /web zeigt alle "
+                            f"{len(webfetch.entries())}.")
+                    return None
+                ui.info(f"{len(eintraege)} von {len(webfetch.entries())} Domains passen zu "
+                        f"'{arg.strip()}'.")
+            else:
+                ui.info(f"{len(eintraege)} Domains · Filter: /web <wort>  (z.B. /web python, /web presse)")
+            ui.web_menu(eintraege)
+    elif cmd == "/vision":
+        import bildbeschreiber as BB
+        sub = arg.strip().lstrip("-")
+        wort = sub.split(None, 1)[0].lower() if sub else ""
+        if wort in ("restart", "neustart", "neu"):
+            if BB.finden() is None:
+                ui.warn(f"Kein Seh-Modell unter {BB.ORDNER} – nichts zu laden.")
+            else:
+                ui.info("👁 Bildbeschreiber wird entladen und neu geladen …")
+                try:
+                    name, sek = await asyncio.to_thread(BB.neustart)
+                    ui.success(f"👁 {name} neu geladen in {sek:.1f} s – wartet im RAM, ganz entladen nach "
+                               f"{BB.NACHLAUF_S // 60} Min. ohne Bild.")
+                except Exception as e:
+                    ui.error(f"Neu laden fehlgeschlagen: {e} – /vision debug schreibt einen Bericht.")
+        elif wort == "debug":
+            try:
+                pfad = BB.bericht_schreiben(ctx.model, _modell_sieht(ctx.model))
+                ui.success(f"🐞 Vision-Bericht geschrieben: {pfad}")
+            except Exception as e:
+                ui.error(f"Vision-Bericht nicht geschrieben: {e}")
+        elif wort == "protokoll":
+            import sehprotokoll as SP
+            eintraege = SP.lesen()
+            if not eintraege:
+                ui.info("👁 Seh-Protokoll leer – für diese Persönlichkeit wurde noch kein Bild beschrieben.")
+            else:
+                for zeile in SP.zeilen(eintraege[-15:]):
+                    ui.console.print(zeile, markup=False, highlight=False)
+                ui.info(f"👁 {len(eintraege)} Einträge (neueste oben, gezeigt höchstens 15) · {SP.datei(anlegen=False)}")
+        elif sub.lower() in ("ordner", "oeffnen", "öffnen"):
+            try:
+                BB.ORDNER.mkdir(parents=True, exist_ok=True)
+                os.startfile(str(BB.ORDNER))
+            except Exception as e:
+                ui.warn(f"Konnte den Vision-Ordner nicht öffnen: {e}")
+        elif sub:
+            try:
+                name = BB.waehlen(sub)
+            except OSError as e:
+                ui.warn(f"Nicht gespeichert: {e}")
+            else:
+                if name:
+                    ui.success(f"👁 Bildbeschreiber: {name} – dauerhaft gespeichert. Er hilft jedem Modell, "
+                               "das selbst nicht sieht.")
+                else:
+                    ui.warn(f"Kein Seh-Modell „{sub}“ unter {BB.ORDNER} (Ordner mit .gguf + mmproj-*.gguf).")
+        else:
+            alle, akt = BB.kandidaten(), BB.aktiv()
+            if not alle:
+                ui.info(f"👁 Kein Bildbeschreiber – leg ein Seh-Modell (.gguf + mmproj-*.gguf) in einen "
+                        f"eigenen Ordner unter {BB.ORDNER}.")
+            else:
+                for n, _, _ in alle:
+                    ui.info(f"   {n}{'  ✔️' if n == akt else ''}")
+                zustand = "im Speicher" if BB.geladen() else "nicht geladen"
+                ui.info(f"👁 Bildbeschreiber: {akt} ({zustand}, ganz entladen nach {BB.NACHLAUF_S // 60} Min. "
+                        "ohne Bild) · wählen: /vision <ordner> · restart · debug · protokoll · ordner")
+    elif cmd == "/voice":
+        import stimme
+        sub = arg.strip().lower()
+        if sub in ("an", "on", "ein", "knopf", "button"):
+            if not stimme.verfuegbar():
+                ui.warn("Kein Stimm-Modell gefunden – Qwen3-TTS-Talker und 12-Hz-Tokenizer (GGUF) "
+                        "in einen Ordner unter KI-Modelle/KI-Stimme/Stimmmodell/ legen.")
+            elif sub in ("knopf", "button"):
+                stimme.modus_setzen("knopf")
+                ui.success("🔊 Stimme auf Knopf – spricht nur auf Anfrage (/voice jetzt, Vorlese-Werkzeug, "
+                           "Kugel) und gibt den Grafikspeicher danach sofort wieder frei.")
+            else:
+                stimme.modus_setzen("an")
+                ui.success("🔊 Sprachmodus an – du hörst jede Antwort, auf dem Bildschirm steht nur der "
+                           "Anfang. Esc stoppt, /voice text zeigt alles, /voice knopf oder aus beendet.")
+        elif sub in ("aus", "off"):
+            stimme.modus_setzen("aus")
+            ui.info("🔇 Stimme aus – bleibt aus, bis du /voice an oder /voice knopf sagst. "
+                    "Nichts lädt mehr in den Grafikspeicher, auch nicht auf Wunsch der KI.")
+        elif sub in ("jetzt", "now", "vorlesen"):
+            if stimme.modus() == "aus":
+                ui.info("🔇 Die Stimme ist aus – /voice knopf schaltet sie für solche Anfragen ein.")
+            elif not _LETZTE_ANTWORT[0]:
+                ui.info("Noch keine Antwort in dieser Sitzung.")
+            else:
+                stimme.stopp()
+                stimme.sagen(_LETZTE_ANTWORT[0])
+                ui.info("🔊 Ich lese die letzte Antwort vor – Esc stoppt. Danach ist der Grafikspeicher "
+                        "wieder frei.")
+        elif sub in ("text", "lesen", "zeigen"):
+            if _LETZTE_ANTWORT[0]:
+                ui.console.print(_render("", _LETZTE_ANTWORT[0], done=True))
+            else:
+                ui.info("Noch keine Antwort in dieser Sitzung.")
+        else:
+            m = stimme.modus()
+            erklaert = {"aus": "aus – nichts spricht, nichts lädt",
+                        "knopf": "Knopf – nur auf Anfrage, danach sofort entladen",
+                        "an": "an – jede Antwort wird vorgelesen"}[m]
+            ui.info(f"🔊 Stimme: {erklaert} · Modell: {stimme.ordner_info()} · "
+                    "/voice an · knopf · aus · jetzt · text")
+    elif cmd == "/debug":
+        import debugbericht as _DBG
+        sub = arg.strip().lower()
+        if sub in ("an", "on"):
+            _DBG.setzen(True)
+            pfad = _DBG.starten("haupt")
+            _DBG.schleife(asyncio.get_running_loop())
+            ui.info(f"🐞 Debugbericht an – schreibt wieder mit (die Wache ab ihrem nächsten Start).\n   {pfad}")
+        elif sub in ("aus", "off"):
+            _DBG.setzen(False)
+            _DBG.beenden()
+            ui.info("🐞 Debugbericht aus – bleibt aus, bis du /debug an sagst. Die KI kann dann nicht hineinsehen.")
+        elif sub.startswith("motor"):
+            an = sub.split()[-1] in ("an", "on") if " " in sub else not _DBG.motor_log_an()
+            config.update(debug_motor=an)
+            if an:
+                _DBG.motor_log()
+            ui.info("🐞 Motor-Log " + ("an – jeder Prompt und jede Antwort des lokalen Motors landen neben dem "
+                                       "Debugbericht (groß, privat)." if an else "aus."))
+        else:
+            stand = f"läuft – {_DBG.datei()}" if _DBG.laeuft() else ("aus" if not _DBG.an() else "noch nicht gestartet")
+            ki = ("die KI kann ihn lesen (Cloud-Modell)" if _DBG.cloud_modell()
+                  else "die KI liest ihn nur mit einem Cloud-Modell")
+            ui.info(f"🐞 Debugbericht: {stand} · {ki} · Motor-Log {'an' if _DBG.motor_log_an() else 'aus'}"
+                    f"\n   Ordner: {_DBG.ordner()}\n   /debug aus · an · motor an|aus")
+    elif cmd == "/uebung":
+        sub = arg.strip().lower()
+        if sub in ("aus", "off", "stop"):
+            if ui.TUI is not None:
+                ui.TUI.practice_on = False
+                ui.TUI._stop_practice()
+            config.update(uebung=False)                  # bleibt aus, auch nach Neustart
+            ui.info("🎓 Übungsmodus aus – dauerhaft, bis du /uebung an sagst.")
+        elif sub in ("an", "on"):
+            if ui.TUI is not None:
+                ui.TUI.practice_on = True
+                ui.TUI._practice_consent = None      # Cloud-Frage neu stellen
+            config.update(uebung=True)
+            ui.info("🎓 Übungsmodus an – nach ~10 min Ruhe wird eine Übung vorbereitet. "
+                    "Schreiben und Ausführen erst nach deiner Codefreigabe. Bleibt gespeichert.")
+        elif sub in ("jetzt", "now"):
+            if ctx.backend is None:
+                ui.warn("Kein Modell aktiv – erst mit /model eins wählen.")
+            else:
+                if ui.TUI is not None:
+                    await ui.TUI.run_practice_once(ctx, practice_round)
+                else:
+                    await practice_round(ctx, _esc_pressed)
+        else:
+            an = (ui.TUI.practice_on if ui.TUI is not None
+                  else bool(config.load().get("uebung", True)))
+            ui.info(f"🎓 Übungsmodus ist {'an' if an else 'aus'} (gespeichert in der Config). "
+                    "Nach ~10 min Ruhe bereitet NemiCLI Programme vor; vor jedem "
+                    "Schreiben und Ausführen prüfst du den vollständigen Code. "
+                    "/uebung an · aus · jetzt")
+    elif cmd == "/sandbox":
+        import sandbox
+        teile = arg.strip().split(maxsplit=1)
+        sub = teile[0].lower() if teile else ""
+        ziel = teile[1].strip().strip('"') if len(teile) > 1 else ""
+        try:
+            if sub in ("freigeben", "frei", "add"):
+                if not ziel:
+                    ui.warn("Welcher Ordner? /sandbox freigeben <Ordner>")
+                else:
+                    schreiben = False
+                    m = re.match(r'^(.*?)\s+(schreiben|rw)$', ziel, re.IGNORECASE)
+                    if m:
+                        ziel, schreiben = m.group(1).strip().strip('"'), True
+                    if (grund := actions._read_guard(ziel) or
+                            (actions._guard(ziel) if schreiben else None)):
+                        ui.warn(grund)
+                    else:
+                        p = sandbox.projekt_freigeben(Path(ziel), schreiben=schreiben)
+                        if schreiben:
+                            ui.success(f"🧪 Freigegeben (lesen + schreiben): {p} – Code aus diesem "
+                                       "Projekt läuft dort in der Sandbox und darf darin ändern.")
+                        else:
+                            ui.success(f"🧪 Freigegeben (nur lesen): {p} – Code aus diesem Projekt "
+                                       "läuft dort in der Sandbox; schreiben kann er nur in seinen "
+                                       "Lauf-Ordner. Mit '… schreiben' darf er auch dort ändern.")
+            elif sub in ("entziehen", "weg", "remove"):
+                if not ziel:
+                    ui.warn("Welcher Ordner? /sandbox entziehen <Ordner>")
+                else:
+                    ui.success(f"🧪 Freigabe entzogen: {sandbox.projekt_entziehen(Path(ziel))}")
+            else:
+                try:
+                    py = str(sandbox.interpreter()[0])
+                except sandbox.SandboxFehler as exc:
+                    py = f"– ({exc})"
+                projekte = [f"{p} ({'lesen + schreiben' if sandbox.schreibbar(p) else 'nur lesen'})"
+                            for p in sandbox.projekte()]
+                pakete_dir = sandbox.ARBEIT / sandbox.PAKETE_ORDNER
+                pakete = sorted(d.name.split("-")[0] for d in pakete_dir.glob("*.dist-info")) \
+                    if pakete_dir.is_dir() else []
+                ui.info("🧪 Sandbox (Windows-AppContainer „NemiCLI.Sandbox“): Code der KI läuft "
+                        "isoliert – Internet ja, deine Dateien, Registry und andere Programme nein.\n"
+                        f"  Arbeitsordner: {sandbox.ARBEIT}\n"
+                        f"  Python:        {py}\n"
+                        "  Projekte:     " + (", ".join(map(str, projekte)) or "keine") + "\n"
+                        "  Pakete:        " + (", ".join(pakete) or "keine") + "\n"
+                        "  /sandbox freigeben <Ordner> [schreiben] · /sandbox entziehen <Ordner>")
+        except sandbox.SandboxFehler as exc:
+            ui.warn(f"🧪 {exc}")
+    elif cmd == "/embeddings":
+        wahl = arg.strip()
+        if wahl.lower() in ("huggingface", "hf"):
+            webbrowser.open(HF_EMBEDDINGS)
+            ui.info("🤗 Hugging Face ist offen. Ein Modell kommt als eigener Ordner nach "
+                    f"{memory.EMBED_ORDNER} – und vor dem ersten Laden die SHA-256 der Datei "
+                    "mit der Angabe auf der Seite vergleichen.")
+        elif not wahl:
+            ui.info(f"🧬 Embedding-Modell: {memory.encoder_status()}")
+        else:
+            ordner = {d.name.lower(): d for d in memory.modelle()}.get(wahl.lower())
+            if ordner is None:
+                ui.warn(f"🧬 Kein vollständiges Modell „{wahl}“ in {memory.EMBED_ORDNER}.")
+                return None
+            alt = memory.modell_kennung()
+            config.update(embedding_modell=ordner.name)
+            memory.unload_encoder()
+            neu = memory.modell_kennung()
+            ui.success(f"🧬 Embedding-Modell: {ordner.name} ({_embedding_art(ordner)}) – lädt bei Bedarf.")
+            if alt and neu != alt:
+                ui.info("Andere Vektoren als bisher: der Bibliothekar rechnet das Gedächtnis nach und "
+                        "nach neu um (/einlesen = sofort). Bis dahin hilft die Stichwortsuche.")
+    elif cmd == "/kontext":
+        prov, name = M.split_ref(ctx.model or "")
+        wahl = arg.strip().lower().replace(",", ".").replace(" ", "")
+        if wahl.startswith("anleitung"):
+            art = wahl.removeprefix("anleitung")
+            if art in ("schlank", "voll"):
+                config.update(anleitung=art)
+            schlank = persona.anleitung_schlank()
+            ui.info("📘 Anleitung für Cloud-Modelle: " + ("schlank – Werkzeug-Zeilen, die Details kommen passend zur "
+                    "Runde oder per anleitung_lesen." if schlank else "voll – alles bei jeder Nachricht.")
+                    + ("" if art in ("schlank", "voll") else "  ·  /kontext anleitung schlank|voll"))
+            return None
+        if prov != "gguf" or wahl in ("", "anzeigen"):
+            _kontext_anzeige(ctx)
+            return None
+        import gguflokal
+        if wahl == "max":
+            token = 0
+        else:
+            try:
+                token = kontext_zahl(wahl)
+            except ValueError:
+                ui.warn("Kontext als Zahl (32768), mit k (32k) oder „max“ angeben.")
+                return None
+        gguflokal.setze_kontext(token)
+        neu = gguflokal.kontext(name)
+        ui.success(f"📏 Kontext: {neu:,} Token".replace(",", ".") +
+                   ("  ·  das Modell wird beim nächsten Senden neu geladen." if gguflokal.geladen() else ""))
+    elif cmd in ("/compact", "/kompakt"):
+        sub = arg.strip().lower()
+        kompakt = getattr(ctx.backend, "kompakt", None)
+        if sub in ("zeigen", "anzeigen", "stand"):
+            stand = getattr(ctx.backend, "stand", "")
+            if stand:
+                ui.info("📜 Stand des Gesprächs (steht vor der ersten Nachricht im Kontext):")
+                ui.console.print(stand, markup=False, highlight=False)
+            else:
+                ui.info("📜 Noch kein Stand des Gesprächs – bisher wurde nichts zusammengefasst.")
+        elif sub not in ("", "jetzt"):
+            ui.warn("/compact jetzt · /compact zeigen")
+        elif ctx.backend is None:
+            ui.warn("Kein Modell aktiv – /model wählt eins.")
+        elif not callable(kompakt):
+            ui.warn("Mit diesem Modell geht /compact nicht – mit dem eigenen Motor, Ollama und "
+                    "OpenAI-kompatiblen Anbietern schon.")
+        else:
+            ui.info("📌 Ich fasse das Gespräch zusammen …")
+            try:
+                async with TURN_LOCK:
+                    ergebnis = await kompakt()
+            except Exception as e:
+                ui.error(f"Zusammenfassen ging nicht: {e}")
+            else:
+                if ergebnis:
+                    ui.success(ergebnis)
+                    await _chat_speichern(ctx)
+                    _kontext_neu_zaehlen(ctx, vorbereiten=False)
+                else:
+                    ui.info("📌 Noch nichts zusammenzufassen – das Gespräch ist kurz genug.")
+    elif cmd == "/kontextmenue":
+        sub = arg.strip().lower()
+        import kontextmenue
+        try:
+            if sub in ("an", "on", "ein"):
+                labels = kontextmenue.installieren()
+                ui.success("🖱 Eingetragen: " + "  ·  ".join(labels))
+                ui.info("Windows 11 zeigt sie unter „Weitere Optionen anzeigen“ (Shift+F10). "
+                        "Ein Klick öffnet NemiCLI und schickt „Schau dir dieses Bild an“ gleich ab. "
+                        "„🛡 Wächter-Scan“ prüft markierte Dateien, Ordner oder Laufwerke mit Ampel.")
+            elif sub in ("aus", "off"):
+                n = kontextmenue.entfernen()
+                ui.info(f"🖱 Rechtsklick-Einträge entfernt ({n} Schlüssel)." if n
+                        else "🖱 Es war nichts eingetragen.")
+            else:
+                st = kontextmenue.status()
+                an = st["bildschirm"] and st["bild"]
+                ui.info(f"🖱 Rechtsklick-Menü ist {'an' if an else 'aus'}.  "
+                        "/kontextmenue an · aus")
+                if an and not st.get("waechterscan"):
+                    ui.info("🛡 „Wächter-Scan“ fehlt noch im Menü – /kontextmenue an trägt ihn dazu ein.")
+        except Exception as e:
+            ui.warn(f"Rechtsklick-Menü: {e}")
+    elif cmd == "/subagenten":
+        sub = arg.strip().lower()
+        texte = {"an": "🤝 Helfer an – vor jedem Losschicken wirst du gefragt.",
+                 "auto": "🤝 Helfer auto – Helfer nach Bedarf, ohne Frage.",
+                 "off": "🤝 Helfer aus – das Werkzeug ist gesperrt."}
+        if sub:
+            neu = subagents.set_stufe(sub)
+            if neu is None:
+                ui.warn("Unbekannte Stufe. /subagenten an · auto · off")
+            else:
+                ui.info(texte[neu] + " (gespeichert)")
+        else:
+            st = subagents.stufe()
+            n = subagents.aktiv()
+            laufen = f"  ·  gerade aktiv: {n}" if n else ""
+            ui.info(f"{texte[st]}{laufen}  /subagenten an · auto · off")
+    elif cmd == "/auto":
+        sub = arg.strip().lower()
+        if sub in ("an", "on", "aus", "off"):
+            an = sub in ("an", "on")
+            config.update(auto_stark=an)
+            # am laufenden Backend sofort wirksam machen (kein Neustart nötig)
+            if ctx.backend is not None and getattr(ctx.backend, "provider_id", "") == "ollama":
+                ziel = P.gemma_upgrade_ziel(ctx.backend.model_id) if an else None
+                ctx.backend.auto_stark = bool(an and ziel)
+                ctx.backend.auto_ziel = ziel
+            if not an:
+                ui.info("🧠 Auto-Stark aus – es antwortet immer das gewählte Modell.")
+            else:
+                ziel = (P.gemma_upgrade_ziel(ctx.backend.model_id)
+                        if ctx.backend is not None
+                        and getattr(ctx.backend, "provider_id", "") == "ollama" else None)
+                if ziel:
+                    ui.info(f"🧠 Auto-Stark an – bei schweren Fragen übernimmt {ziel}.")
+                else:
+                    ui.info("🧠 Auto-Stark an (gespeichert). Greift, sobald ein leichtes "
+                            "Gemma aktiv ist, zu dem ein größeres installiert ist.")
+        else:
+            an = bool(config.load().get("auto_stark"))
+            aktiv = (ctx.backend is not None
+                     and getattr(ctx.backend, "auto_stark", False))
+            zusatz = f" · aktiv → {ctx.backend.auto_ziel}" if aktiv else ""
+            ui.info(f"🧠 Auto-Stark ist {'an' if an else 'aus'}{zusatz}.  "
+                    "Schwere Frage → automatisch großes Gemma.  /auto an · aus")
+    elif cmd in PERSONA_CMDS:
+        await persoenlichkeiten_menu(arg)
+    elif cmd == "/modus":
+        import coding as _coding
+        import config as _config
+        sub = arg.strip().lower()
+        if not sub:
+            beschreibung = {"chat": "Gespräch & Planen – jede Aktion fragt, Merken frei",
+                            "lesen": "alles lesen, nichts anrühren – Ändern gesperrt",
+                            "normal": "Lesen sofort, Ändern mit Rückfrage (F8)",
+                            "auto": f"ohne Rückfragen im aktuellen Ordner · Zünder {modes.AUTO_FUSE_S // 60} min",
+                            "autoan": "ohne Rückfragen im aktuellen Ordner, ohne Zünder"}
+            zeilen = [(f"{sym} {n}" + ("  ✔️" if k == modes.current() else ""), beschreibung.get(k, ""))
+                      for k, sym, n in modes.MODES]
+            coding_stufe = ("vorsicht" if str(_config.load().get(_coding.FREIGABE_SCHALTER) or "") == "vorsicht"
+                            else "frei")
+            zeilen += [("🟦 Coding: " + coding_stufe,
+                        "eigene Stufe im Coding-Assistenten (Shift+Tab im Coding) – /modus coding frei|vorsicht"),
+                       ("🎨 Bilder: " + modes.bild_stufe(), "eigene Stufe fürs Malen – /modus bild frei|fragen")]
+            ui.kv_panel(f"Arbeitsmodus: {modes.anzeige()}   ·   Shift+Tab schaltet weiter", zeilen)
+            return None
+        teile = sub.split()
+        if teile[0] == "bild" and len(teile) == 2:
+            stufe = modes.bild_stufe_setzen(teile[1])
+            ui.success("🎨 Bilder: " + ("malen ohne Rückfrage, in jedem Bereich" if stufe == "frei"
+                                        else "vor jedem Bild wird gefragt"))
+            return None
+        if teile[0] == "coding" and len(teile) == 2 and teile[1] in ("frei", "vorsicht"):
+            _config.update(**{_coding.FREIGABE_SCHALTER: teile[1]})
+            ui.success("🟦 Coding: " + ("frei – arbeitet im Projekt durch" if teile[1] == "frei"
+                                         else "vorsicht – fragt wie der Arbeitsmodus"))
+            return None
+        key = modes.resolve(sub)
+        if key is None:
+            ui.warn("Unbekannter Modus. Zur Wahl: chat · lesen · normal · auto · autoan")
+            return None
+        modes.set_mode(key)
+        ui.success(f"Modus: {modes.label()}" + (
+            f"  ·  Zünder läuft: nach {modes.AUTO_FUSE_S // 60} min zurück in Chatten"
+            if key == "auto" else ""))
+    elif cmd == "/statistik":
+        if arg.strip().lower() in ("reset", "leeren", "loeschen", "löschen"):
+            sicher = await ask_confirm("Wirklich alle gesammelten Zahlen löschen? "
+                                       "(die Chats selbst bleiben)",
+                                       [("ja", "Ja, zurücksetzen"), ("nein", "Nein")])
+            if sicher == "ja":
+                stats.reset()
+                ui.success("📊 Statistik zurückgesetzt – wir fangen frisch an.")
+            return None
+        ui.stats_panel(stats.report())
+    elif cmd == "/protokoll":
+        n = int(arg) if arg.strip().isdigit() else 30
+        zeilen = protokoll.letzte(n)
+        if not zeilen:
+            ui.info(f"📜 Noch keine Einträge. Datei: {protokoll.PFAD}")
+        else:
+            ui.text_panel(f"📜 Aktions-Protokoll – letzte {len(zeilen)}",
+                          "\n".join(zeilen))
+            ui.info(f"Datei: {protokoll.PFAD}")
+    elif cmd == "/wache" and arg.strip().lower() in ("fenster", "zentrale"):
+        global WACHE_FENSTER_BRUECKE  # noqa: PLW0603
+        if WACHE_FENSTER_BRUECKE is None:
+            WACHE_FENSTER_BRUECKE = await start_wachefenster(ctx)
+        if WACHE_FENSTER_BRUECKE.verbunden():
+            WACHE_FENSTER_BRUECKE.senden({"t": "vorne"})
+            ui.info("🛡 Das Wache-Fenster ist schon offen.")
+        else:
+            gui_oeffnen(WACHE_FENSTER_BRUECKE, "--wachefenster")
+            ui.success("🛡 Das Wache-Fenster öffnet sich – Alarme mit Belegen ansehen, die Wache-KI hilft beim Einordnen.")
+    elif cmd == "/wache":
+        await _wache_befehl(ctx, arg.strip())
+        wache_karte_auffrischen()
+    elif cmd == "/kompass":
+        import kompass
+        wahl = arg.strip().lower()
+        if wahl in ("an", "ein", "on"):
+            kompass.setzen(True)
+            ui.success("🧭 Kompass an – tipp / und schau neben das Terminal.")
+        elif wahl in ("aus", "off"):
+            kompass.setzen(False)
+            ui.info("🧭 Kompass aus.")
+        else:
+            ui.info(f"🧭 Kompass ist {'an' if kompass.an() else 'aus'} – /kompass an|aus.")
+    elif cmd == "/zeitplan":
+        import zeitplan
+        if arg.strip().lower() in ("liste", "list", "status"):
+            ui.info(zeitplan.liste())
+        else:
+            zeitplan.fenster_oeffnen()
+            ui.info("📅 Das Zeitplan-Fenster geht auf.")
+    elif cmd == "/backup":
+        await _backup_befehl(arg.strip())
+    elif cmd == "/cve":
+        await cve_befehl(arg)
+    elif cmd == "/eigenes":
+        await _eigenes_befehl(arg)
+    elif cmd == "/doku":
+        import doku
+        teile = arg.lower().split()
+        if teile[:1] == ["laden"] and len(teile) > 1 and teile[1] in doku.QUELLEN:
+            laden = doku.laden_python if teile[1] == "python" else doku.laden_mdn
+            try:
+                ergebnis = await _run_with_status(
+                    f"📚 lade Doku: {teile[1]}", lambda on_status: laden(melde=on_status))
+                ui.success(ergebnis)
+            except Exception as e:
+                ui.error(f"Doku laden fehlgeschlagen: {e}")
+        elif teile[:1] == ["loeschen"] and len(teile) > 1:
+            ui.info(doku.loeschen(teile[1]))
+        elif teile:
+            ui.warn("Nutzung: /doku · /doku laden python|mdn · /doku loeschen python|mdn")
+        else:
+            ui.info(doku.status_text())
+    elif cmd == "/charakter" and arg.strip().lower() in ("kopf", "gesicht"):
+        await kopf_oeffnen(ctx)
+    elif cmd == "/charakter":
+        import charakter
+        pfad = charakter.datei()
+        if arg.strip().lower() in ("oeffnen", "öffnen", "edit"):
+            if not pfad.is_file():
+                ui.warn(f"Noch keine Charakter-Datei: {pfad}")
+                ui.info("Bitte die Persönlichkeit, sie anzulegen – oder lege die JSON selbst an "
+                        "(kern, seed_referenz, stil, outfits, posen, regeln).")
+            else:
+                try:
+                    os.startfile(str(pfad))
+                except Exception as e:
+                    ui.warn(f"Öffnen fehlgeschlagen: {e}")
+        else:
+            ui.info(charakter.zeigen(charakter.laden()))
+            ui.info(f"📄 {pfad}")
+    elif cmd == "/kugel":
+        await _kugel_befehl(ctx, arg.strip())
+    else:
+        return await _befehl_ausfuehren_2(ctx, cmd, arg, text)
+    return cmd, text

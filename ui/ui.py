@@ -1,0 +1,2438 @@
+"""
+ui.py - Das komplette Aussehen der CLI an einer Stelle.
+
+Hier wohnt alles Visuelle: Farben/Themes, Logo-Banner, Panels, Spinner, Prompt.
+main.py und agent.py rufen nur diese Funktionen auf und bleiben dadurch sauber.
+
+Themes lassen sich zur Laufzeit per ui.set_theme(name) wechseln  (Befehl /theme).
+"""
+
+from __future__ import annotations
+
+import random
+import re
+import time
+from contextlib import contextmanager
+
+from rich.console import Console, Group
+from rich.live import Live
+from rich.panel import Panel
+from rich.text import Text
+from rich.style import Style
+from rich.markdown import Markdown, CodeBlock
+from rich.syntax import Syntax
+from rich.theme import Theme
+from rich.align import Align
+from rich.rule import Rule
+from rich.columns import Columns
+from rich.table import Table
+from rich.spinner import Spinner
+from rich.box import ROUNDED, HEAVY, Box
+from rich.markup import escape
+
+from prompt_toolkit.styles import Style as PTStyle
+from prompt_toolkit.formatted_text import to_formatted_text
+from prompt_toolkit.formatted_text.utils import fragment_list_width
+from prompt_toolkit.utils import get_cwidth
+
+# ---------------------------------------------------------------------------
+# Name
+# ---------------------------------------------------------------------------
+
+APP_NAME = "NemiCLI"
+APP_SUBTITLE = "deine eigene KI · Code · Bilder · Video · Wache"
+
+# ---------------------------------------------------------------------------
+# Themes  -  jede Palette: brand, brand_dim, accent, accent_dim + Logo-Verlauf
+# ---------------------------------------------------------------------------
+
+THEMES: dict[str, dict] = {
+    "cyan": {
+        "label": "Cyan / Violett",
+        "brand": "#8b7cff", "brand_dim": "#5b54a8",
+        "accent": "#41e0d0", "accent_dim": "#2a8f86",
+        "gradient": ["#41e0d0", "#5fd1e0", "#7cbef0", "#8badff", "#8b9cff", "#8b7cff"],
+    },
+    "matrix": {
+        "label": "Grün / Matrix",
+        "brand": "#22d267", "brand_dim": "#0a7a3a",
+        "accent": "#7cffb2", "accent_dim": "#2a8f5a",
+        "gradient": ["#7cffb2", "#5cf59a", "#39e87e", "#22d267", "#15b554", "#0a9444"],
+    },
+    "amber": {
+        "label": "Orange / Bernstein",
+        "brand": "#ff9f1c", "brand_dim": "#a8650a",
+        "accent": "#ffd89b", "accent_dim": "#a87f3a",
+        "gradient": ["#ffd89b", "#ffc46b", "#ffb347", "#ff9f1c", "#f08700", "#d97400"],
+    },
+    "cyber": {
+        "label": "Pink / Cyberpunk",
+        "brand": "#ff2bd6", "brand_dim": "#a01a8a",
+        "accent": "#2de2e6", "accent_dim": "#1a8f92",
+        "gradient": ["#2de2e6", "#6fd0ee", "#b07bf0", "#e25fe0", "#ff45c8", "#ff2bd6"],
+    },
+    # Diese färben auch alle Fenster (ui/design.py PALETTEN, gleicher Name).
+    "nachtglas": {
+        "label": "🌌 Nachtglas – Terminal und alle Fenster",
+        "brand": "#9d7bff", "brand_dim": "#5f4fa8",
+        "accent": "#5ee7ff", "accent_dim": "#2f8ea3",
+        "gradient": ["#5ee7ff", "#6dd2ff", "#7dbcff", "#8ca5ff", "#958fff", "#9d7bff"],
+    },
+    "pastell": {
+        "label": "🌸 Pastell-Nacht – Terminal und alle Fenster",
+        "brand": "#f5a6d0", "brand_dim": "#9c6487",
+        "accent": "#8be3c9", "accent_dim": "#4f8f7e",
+        "gradient": ["#8be3c9", "#a3d9cc", "#bccfcf", "#d4c4d0", "#e5b6d0", "#f5a6d0"],
+    },
+    "neon": {
+        "label": "⚡ Neon-Klar – Terminal und alle Fenster",
+        "brand": "#ff2fd0", "brand_dim": "#9c1a80",
+        "accent": "#00f0ff", "accent_dim": "#00909a",
+        "gradient": ["#00f0ff", "#33c8f6", "#669fec", "#9977e3", "#cc4fd9", "#ff2fd0"],
+    },
+    # Violett und Cyan, dazu Rosé und Gold sparsam; eigene Text- und Meldungsfarben.
+    "tigra": {
+        "label": "🐯 Tigra – Violett / Cyan, Terminal und alle Fenster",
+        "brand": "#c084fc", "brand_dim": "#7b4fae",
+        "accent": "#67e8f9", "accent_dim": "#2f8a96",
+        "gradient": ["#67e8f9", "#8ec9fb", "#a9a8fc", "#c084fc", "#e082d9", "#ff80b5"],
+        "text": "#f6f2f7", "leise": "#c5bfd0", "assistant": "#efe7fb",
+        "ok": "#67e8aa", "warn": "#ffd166", "err": "#ff7b8e", "zeichen": ("♥", "#ff80b5"),
+    },
+}
+
+EINGEBAUT = frozenset(THEMES)
+
+# Leiser Text (Hinweise, Zeitangaben, Beschriftungen). Abgeschaltetes und Durchgestrichenes bleibt AUS.
+AUS = "#7d8590"
+_SCHIRM = "#0c0d14"                   # Grundfarbe des Vollbilds (ui/screen_tx.py)
+
+
+def _kontrast():
+    """ui/kontrast.py – auch wenn ui.py ohne den Ordner ui/ im Suchpfad geladen wird."""
+    try:
+        import kontrast
+    except ImportError:
+        import importlib.util
+        import sys
+        from pathlib import Path
+        spec = importlib.util.spec_from_file_location("kontrast", Path(__file__).with_name("kontrast.py"))
+        kontrast = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(kontrast)
+        sys.modules["kontrast"] = kontrast
+    return kontrast
+
+
+LEISE = _kontrast().lesbar(AUS, _SCHIRM)   # fest, für Stile, die beim Import entstehen
+
+
+def _grund(name: str) -> str:
+    """Hintergrund, auf dem der Text eines Themes steht: der hellere aus Vollbild und Fenster-Palette."""
+    try:
+        import design
+        grund = design.PALETTEN.get(name, design.PALETTEN["klassik"])["grund"]
+    except Exception:
+        return _SCHIRM
+    return max((_SCHIRM, grund), key=_kontrast().helligkeit)
+
+
+_FARBEN_CACHE: dict[tuple, dict[str, str]] = {}
+
+
+def _farben(name: str) -> dict[str, str]:
+    """Textfarben eines Themes, jede mit mindestens 4,5 : 1 (ui/kontrast.py). Die gedämpften Töne
+    brand_dim/accent_dim bleiben für Rahmen und Flächen (brand.rand, accent.rand)."""
+    kontrast = _kontrast()
+    p, grund = THEMES[name], _grund(name)
+    roh = {"brand": p["brand"], "brand.dim": p["brand_dim"], "accent": p["accent"],
+           "accent.dim": p["accent_dim"], "leise": p.get("leise", AUS), "assistant": p.get("assistant", "#c8c4ff"),
+           "ok": p.get("ok", "#4ade80"), "warn": p.get("warn", "#fbbf24"), "err": p.get("err", "#f87171")}
+    schluessel = (grund, *roh.values())
+    if schluessel not in _FARBEN_CACHE:
+        _FARBEN_CACHE[schluessel] = {k: kontrast.lesbar(v, grund) for k, v in roh.items()}
+    return _FARBEN_CACHE[schluessel]
+
+
+def leise() -> str:
+    """Leiser Text im aktuellen Theme – für Stellen, die Farben als Wert brauchen (Statusleiste, Listen)."""
+    try:
+        return _farben(_active)["leise"]
+    except Exception:
+        return LEISE
+
+
+def eigene_themes_laden() -> None:
+    """Eigene Themes (themes_eigen.json, Werkzeug theme_erstellen) zu den eingebauten holen."""
+    try:
+        import themes_eigen
+        THEMES.update({k: v for k, v in themes_eigen.laden().items() if k not in EINGEBAUT})
+    except Exception:
+        pass
+
+
+eigene_themes_laden()
+
+_active = "cyan"          # aktuelles Theme
+_gradient: list[str] = THEMES[_active]["gradient"]
+
+
+def _build_theme(name: str) -> Theme:
+    p, f = THEMES[name], _farben(name)
+    return Theme(
+        {
+            "brand":      f"bold {f['brand']}",
+            "brand.dim":  f["brand.dim"],
+            "brand.rand": p["brand_dim"],
+            "accent":     f["accent"],
+            "accent.dim": f["accent.dim"],
+            "accent.rand": p["accent_dim"],
+            "ok":         f"bold {f['ok']}",
+            "warn":       f"bold {f['warn']}",
+            "err":        f"bold {f['err']}",
+            "muted":      f["leise"],
+            "user":       f"bold {f['accent']}",
+            "assistant":  f["assistant"],
+            "assistant.fett": f"bold {f['assistant']}",
+            "tool":       f"bold {f['warn']}",
+            "diff.add":   "#c3f5cd on #17351f",
+            "diff.del":   "#ffc2c6 on #3e1b1f",
+            "diff.nr":    f["leise"],
+        }
+    )
+
+
+console = Console(theme=_build_theme(_active))
+_theme_pushed = False
+
+
+def set_theme(name: str) -> bool:
+    """Wechselt das aktive Theme. Gibt True zurück, wenn der Name existiert."""
+    global _active, _gradient, PROMPT_STYLE, _theme_pushed
+    if name not in THEMES:
+        return False
+    _active = name
+    _gradient = THEMES[name]["gradient"]
+    if _theme_pushed:
+        console.pop_theme()
+    console.push_theme(_build_theme(name))
+    _theme_pushed = True
+    PROMPT_STYLE = _make_prompt_style()
+    return True
+
+
+def current_theme() -> str:
+    return _active
+
+
+# ---------------------------------------------------------------------------
+# Mini Block-Font  -  damit das Logo zu jedem Namen passt
+# ---------------------------------------------------------------------------
+
+_FONT: dict[str, list[str]] = {
+    " ": ["  ", "  ", "  ", "  ", "  "],
+    "A": [" ███ ", "█   █", "█████", "█   █", "█   █"],
+    "B": ["████ ", "█   █", "████ ", "█   █", "████ "],
+    "C": [" ████", "█    ", "█    ", "█    ", " ████"],
+    "D": ["████ ", "█   █", "█   █", "█   █", "████ "],
+    "E": ["█████", "█    ", "████ ", "█    ", "█████"],
+    "F": ["█████", "█    ", "████ ", "█    ", "█    "],
+    "G": [" ████", "█    ", "█  ██", "█   █", " ████"],
+    "H": ["█   █", "█   █", "█████", "█   █", "█   █"],
+    "I": ["███", " █ ", " █ ", " █ ", "███"],
+    "J": ["  ███", "   █ ", "   █ ", "█  █ ", " ██  "],
+    "K": ["█   █", "█  █ ", "███  ", "█  █ ", "█   █"],
+    "L": ["█    ", "█    ", "█    ", "█    ", "█████"],
+    "M": ["█   █", "██ ██", "█ █ █", "█   █", "█   █"],
+    "N": ["█   █", "██  █", "█ █ █", "█  ██", "█   █"],
+    "O": [" ███ ", "█   █", "█   █", "█   █", " ███ "],
+    "P": ["████ ", "█   █", "████ ", "█    ", "█    "],
+    "Q": [" ███ ", "█   █", "█   █", "█  ██", " ████"],
+    "R": ["████ ", "█   █", "████ ", "█  █ ", "█   █"],
+    "S": [" ████", "█    ", " ███ ", "    █", "████ "],
+    "T": ["█████", "  █  ", "  █  ", "  █  ", "  █  "],
+    "U": ["█   █", "█   █", "█   █", "█   █", " ███ "],
+    "V": ["█   █", "█   █", "█   █", " █ █ ", "  █  "],
+    "W": ["█   █", "█   █", "█ █ █", "██ ██", "█   █"],
+    "X": ["█   █", " █ █ ", "  █  ", " █ █ ", "█   █"],
+    "Y": ["█   █", " █ █ ", "  █  ", "  █  ", "  █  "],
+    "Z": ["█████", "   █ ", "  █  ", " █   ", "█████"],
+}
+
+
+def _logo_rows(text: str) -> list[str]:
+    """Die 5 Zeilen des Block-Logos. Der Abstand (2 Spalten) steht nur ZWISCHEN
+    den Buchstaben – nicht hinter dem letzten. Sonst zählt rich die Nachlauf-
+    Leerzeichen als Breite mit und das Logo sitzt beim Zentrieren schief."""
+    glyphs = [_FONT.get(ch, _FONT[" "]) for ch in text.upper()]
+    return ["  ".join(g[r] for g in glyphs) for r in range(5)]
+
+
+def _logo_text() -> Text:
+    """Linksbündig, ohne Umbruch (bei zu schmalem Fenster wird abgeschnitten
+    statt umgebrochen – ein umgebrochenes Block-Logo ist Salat). Zentriert wird
+    der Block als Ganzes über Align.center in _banner_panel: justify="center"
+    würde jede Zeile einzeln zentrieren und dabei Nachlauf-Leerzeichen der
+    Glyphen streichen – Zeilen mit " █ " am Ende rutschten dann um 1 Spalte."""
+    return Text(justify="left", no_wrap=True, overflow="crop")
+
+
+def _render_logo(text: str) -> Text:
+    """Setzt den Namen aus dem Block-Font zusammen und färbt ihn mit dem Verlauf."""
+    rows = _logo_rows(text)
+    out = _logo_text()
+    n = len(rows)
+    for r, line in enumerate(rows):
+        # Verlaufsfarbe je Zeile aus der Palette samplen
+        idx = int(r / max(n - 1, 1) * (len(_gradient) - 1))
+        out.append(line + "\n", style=_gradient[idx])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Banner & Willkommen
+# ---------------------------------------------------------------------------
+
+def _logo_frame(text: str, phase: int) -> Text:
+    """Logo, dessen Verlaufsfarben horizontal fließen (für die Schimmer-Animation)."""
+    rows = _logo_rows(text)
+    out = _logo_text()
+    n = len(_gradient)
+    for line in rows:
+        for col, ch in enumerate(line):
+            if ch == " ":
+                out.append(" ")
+            else:
+                idx = int(col * 0.5 + phase) % n
+                out.append(ch, style=_gradient[idx])
+        out.append("\n")
+    return out
+
+
+_BANNER_PAD = 4          # Wunsch-Seitenabstand im Rahmen
+_BANNER_PAD_MIN = 1      # wenn das Fenster dafür zu schmal ist
+
+
+def _banner_pad(width: int | None) -> int:
+    """Seitenabstand so, dass das Logo noch in die Innenbreite passt.
+    Innenbreite = Terminal − 2 (Rahmen) − 2·Padding."""
+    if width is None:
+        return _BANNER_PAD
+    logo_w = max(len(r) for r in _logo_rows(APP_NAME))
+    return _BANNER_PAD if width - 2 - 2 * _BANNER_PAD >= logo_w else _BANNER_PAD_MIN
+
+
+def _banner_panel(logo: Text, width: int | None = None) -> Panel:
+    """Logo (als starrer Block via Align.center), Untertitel und Autorenzeile
+    (per justify) zentrieren sich alle auf derselben Innenbreite des Panels und
+    runden gleich (Überhang // 2 nach links) – eine gemeinsame Mittelachse.
+    Rahmen und Padding rechnet rich dabei selbst mit ein."""
+    tagline = Text(justify="center")
+    tagline.append("✦ ", style="accent")
+    tagline.append(APP_SUBTITLE, style="muted")
+    tagline.append(" ✦", style="accent")
+    credit = Text(justify="center")
+    credit.append("von D. Hoffmann (Vibecoder) · gebaut mit Claude Opus 5.5", style="brand.dim")
+    inner = Group(Align.center(logo), Text(""), tagline, credit)
+    return Panel(inner, box=HEAVY, border_style="brand.rand",
+                 padding=(1, _banner_pad(width)))
+
+
+BANNER_KOMPAKT = False   # True, sobald im Vollbild die erste Nachricht abgeschickt ist
+
+
+def _banner_kompakt() -> Panel:
+    """Schmale Kopfzeile statt Block-Logo: Name im Verlauf der Palette, Hauptversion, dazu der Untertitel."""
+    zeile = Text(justify="center", no_wrap=True, overflow="ellipsis")
+    for i, ch in enumerate(APP_NAME):
+        zeile.append(ch, style=f"bold {_gradient[int(i / max(len(APP_NAME) - 1, 1) * (len(_gradient) - 1))]}")
+    try:
+        from version import VERSION
+        zeile.append(f" {VERSION.split()[0]}", style=f"bold {_gradient[-1]}")
+    except Exception:
+        pass
+    zeile.append("  ✦  ", style="accent")
+    zeile.append(APP_SUBTITLE, style="muted")
+    return Panel(zeile, box=HEAVY, border_style="brand.rand", padding=(0, 1))
+
+
+def banner_renderable(width: int | None = None) -> Panel:
+    """Der ruhige Standard-Banner in der AKTUELLEN Konsolenbreite (oder `width`).
+    Wird vom TUI bei jeder Breitenänderung neu abgerufen (Reflow); nach der ersten
+    Nachricht als schmale Kopfzeile (BANNER_KOMPAKT), damit der Chat Platz hat."""
+    if hasattr(TUI, "reflow_auffrischen"):  # Vollbild (Textual): Startseite – bleibt über dem Chat stehen
+        import startseite
+        return startseite.renderable(_banner_kompakt(), width or console.width)
+    if BANNER_KOMPAKT:
+        return _banner_kompakt()
+    return _banner_panel(_render_logo(APP_NAME), width or console.width)
+
+
+def leiste_renderable(width: int | None = None):
+    """Feste Leiste über dem Chat im Vollbild (nach der ersten Nachricht)."""
+    import startseite
+    return startseite.leiste(width or console.width)
+
+
+def banner(animate: bool = False) -> None:
+    console.print()
+    if TUI is not None:
+        # Vollbild: als Reflow-Block in den Verlauf – das TUI rendert ihn bei
+        # jeder Änderung der Terminalbreite neu, statt alte Zeilen stehen zu lassen.
+        TUI.print_reflow(banner_renderable)
+        return
+    if animate and console.is_terminal:
+        # Schimmer-Animation, die sich beim Verlassen löscht …
+        with Live(console=console, refresh_per_second=24, transient=True) as live:
+            for f in range(26):
+                live.update(_banner_panel(_logo_frame(APP_NAME, f), console.width))
+                time.sleep(0.04)
+        # … danach der ruhige Standard-Banner, der stehen bleibt
+        console.print(banner_renderable())
+    else:
+        console.print(banner_renderable())
+
+
+def welcome(model: str, mode: str = "Normal", strength: str | None = None) -> None:
+    """Kurzbefehle unter dem Banner. Modell, Modus und Stärke zeigt die Statusleiste
+    unter der Eingabe – hier stünden sie doppelt und blieben als alter Stand im Verlauf."""
+    if TUI is None:                        # klassisch: keine feste Statusleiste
+        status = Text("  ")
+        status.append("⌬ ", style="muted")
+        status.append(model, style="accent")
+        if strength:
+            status.append("   ·   ", style="brand.dim")
+            status.append("⚡ ", style="muted")
+            status.append(strength, style="brand")
+        console.print(status)
+    else:                                  # Vollbild: die Startseite zeigt, was wichtig ist
+        return
+
+    hints = [
+        _hint("/control", "Einstellungen & Befehle"),
+        _hint("/model", "Modell wechseln"),
+        _hint("/exit", "Beenden"),
+    ]
+    console.print(Columns(hints, padding=(0, 3), align="left"))
+    console.print(Rule(style="brand.rand"))
+
+
+def _hint(cmd: str, desc: str) -> Text:
+    t = Text()
+    t.append(f"{cmd}", style="accent")
+    t.append(f"  {desc}", style="muted")
+    return t
+
+
+def verlauf_text(text: str, fett: bool = True) -> Text:
+    """Text im Farbverlauf des aktiven Themes – für Überschriften und Rahmen-Titel."""
+    t = Text(no_wrap=True, overflow="ellipsis")
+    n = max(len(text) - 1, 1)
+    for i, ch in enumerate(text):
+        farbe = _gradient[int(i / n * (len(_gradient) - 1))]
+        t.append(ch, style=f"bold {farbe}" if fett else farbe)
+    return t
+
+
+def help_panel(arg: str = "") -> None:
+    """/help: ohne Zusatz die Themen-Übersicht, „oft“ oder ein Thema dessen Befehle, „/befehl“ dessen
+    Erklärung, „alle“ die ganze Liste. Befehle kommen nur aus commands.py."""
+    import commands
+    arg = (arg or "").strip()
+    wort = commands._fold(arg)
+    if not arg:
+        return _hilfe_uebersicht()
+    if wort == "alle":
+        return _hilfe_alle()
+    if wort in ("oft", "haeufig"):
+        return _hilfe_liste("⭐ Oft gebraucht", commands.oft_gebraucht())
+    nach_name = {c.name: c for c in commands.COMMAND_LIST}
+    name = "/" + arg.lstrip("/").split()[0].lower()
+    if name in nach_name:
+        return _hilfe_befehl(nach_name[name])
+    if (thema := commands.thema_finden(arg)) is not None:
+        z, t, befehle = thema
+        return _hilfe_liste(f"{z} {t}", befehle)
+    treffer = [nach_name[n] for n, _ in commands.find_commands("/" + arg.lstrip("/"), ausfuehrlich=True)
+               if n in nach_name][:12]
+    if len(treffer) == 1:
+        return _hilfe_befehl(treffer[0])
+    if treffer:
+        return _hilfe_liste(f"🔍 „{arg}“", treffer)
+    warn(f"Zu „{arg}“ gibt es kein Thema und keinen Befehl – /help zeigt alle Themen.")
+
+
+def _hilfe_rahmen(inhalt, titel: str) -> None:
+    console.print(Panel(inhalt, title=verlauf_text(titel), title_align="left",
+                        box=ROUNDED, border_style="brand.rand", padding=(1, 1)))
+
+
+def _hilfe_uebersicht() -> None:
+    import commands
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Thema", no_wrap=True)
+    table.add_column("Wort", style="accent", no_wrap=True)
+    table.add_column("Befehle", style="muted")
+    zeilen = [("⭐ Oft gebraucht", "oft", commands.oft_gebraucht())]
+    zeilen += [(f"{z} {t}", commands.THEMA_KURZ.get(t, ""), b) for z, t, b in commands.nach_themen()]
+    for titel, kurz, befehle in zeilen:
+        table.add_row(verlauf_text(titel), escape(f"/help {kurz}"), escape(" ".join(c.name for c in befehle)))
+    _hilfe_rahmen(table, "❓ Hilfe – Befehle nach Thema")
+    console.print("  👉 /help erschaffen zeigt ein Thema · /help /bild erklärt einen Befehl · /help alle zeigt alles.",
+                  style="muted")
+    console.print('  💡 Am einfachsten: sag der KI, was du möchtest („mal mir einen Fuchs“, „was kann ich hier machen?“).',
+                  style="muted")
+    console.print('  ⚙ /einstellungen zeigt die wichtigsten Schalter · Tippe "/" für die Themen, weitertippen sucht.',
+                  style="muted")
+
+
+def _hilfe_liste(titel: str, befehle) -> None:
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Befehl", style="accent", no_wrap=True)
+    table.add_column("Was es tut", style="muted")
+    for c in befehle:                     # nur der Name: lange Argument-Hinweise stehen bei /help /befehl
+        table.add_row(escape(c.name), escape(c.short))
+    _hilfe_rahmen(table, titel)
+    console.print("  👉 /help /befehl erklärt einen Befehl genauer · /help zeigt alle Themen.", style="muted")
+
+
+def _hilfe_befehl(c) -> None:
+    import commands
+    z, t = commands.thema_von(c.name)
+    teile = [Text(c.usage, style="accent"), Text(c.help_text, style="muted")]
+    try:
+        eintraege = commands.auswahl(c.name)
+    except Exception:
+        eintraege = []
+    if eintraege:
+        teile.append(Text("\nOhne Zusatz kommt eine Auswahl:", style="muted"))
+        for zusatz, anzeige, _ in eintraege[:20]:
+            zeile = Text("  ")
+            zeile.append(f"{c.name} {zusatz}".replace("{}", "…").strip(), style="accent")
+            zeile.append(f"  {anzeige.strip()}", style="muted")
+            teile.append(zeile)
+    _hilfe_rahmen(Group(*teile), f"❓ {c.name}  ·  {z} {t}")
+
+
+def _hilfe_alle() -> None:
+    import commands
+
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column("Befehl", style="accent", no_wrap=True)
+    table.add_column("Was es tut", style="muted")
+    for i, (ueberschrift, zeilen) in enumerate(commands.help_gruppen()):
+        if i:
+            table.add_row("", "")
+        table.add_row(verlauf_text(ueberschrift), "")
+        for usage, beschreibung in zeilen:
+            # escape: sonst hält Rich "[name]" für eine Style-Angabe und schluckt es
+            table.add_row(escape(usage), escape(beschreibung))
+    _hilfe_rahmen(table, "❓ Hilfe – alle Befehle")
+    # Tipps hier statt beim Start: der Start bleibt knapp
+    console.print("  📒 Das Gespräch geht beim Start weiter, wo ihr aufgehört habt – /reset fängt neu an.",
+                  style="muted")
+    try:
+        import keyvault
+        if keyvault.available():
+            console.print("  🔒 Deine API-Keys sind durch den Windows-Umschlag geschützt.",
+                          style="muted")
+    except Exception:
+        pass
+
+
+def _mini_bar(value: int, peak: int, width: int = 12) -> str:
+    """Kleiner Balken aus █/░ für Verteilungen (Stunden, Wochentage)."""
+    if peak <= 0:
+        return "░" * width
+    n = round(value / peak * width)
+    return "█" * n + "░" * (width - n)
+
+
+def stats_panel(rep: dict) -> None:
+    """Nutzungs-Statistik (/statistik): was du mit NemiCLI so machst."""
+    from datetime import datetime
+
+    def _tag(iso):
+        try:
+            return datetime.fromisoformat(iso).strftime("%d.%m.%Y")
+        except Exception:
+            return "–"
+
+    ov = Table.grid(padding=(0, 3))
+    ov.add_column(style="muted", no_wrap=True); ov.add_column(style="accent", no_wrap=True)
+    ov.add_column(style="muted", no_wrap=True); ov.add_column(style="accent", no_wrap=True)
+    ov.add_row("Seit", _tag(rep["first_seen"]), "Sitzungen", str(rep["sessions"]))
+    ov.add_row("Gesamtzeit", fmt_duration(rep["total_seconds"]), "Nachrichten", str(rep["messages"]))
+    ov.add_row("Befehle", str(rep["commands_total"]), "Bilder gemalt", str(rep["images"]))
+    ov.add_row("Tokens rein", fmt_tokens(rep["tokens_in"]), "Tokens raus", fmt_tokens(rep["tokens_out"]))
+    ov.add_row("Kosten gesamt", fmt_cost(rep["cost"]), "Zuletzt", _tag(rep["last_seen"]))
+
+    def _section(title: str) -> Text:
+        return Text(f"\n{title}\n", style="brand")
+
+    parts = [ov]
+
+    if rep["top_models"]:
+        t = Table(show_header=True, header_style="muted", box=None, padding=(0, 2))
+        t.add_column("Modell", style="accent", no_wrap=True); t.add_column("Runden", justify="right")
+        t.add_column("Tokens", justify="right"); t.add_column("Kosten", justify="right")
+        for name, turns, tok, cost in rep["top_models"][:6]:
+            t.add_row(escape(name), str(turns), fmt_tokens(tok), fmt_cost(cost) if cost else "–")
+        parts += [_section("🤖 Modelle"), t]
+
+    if rep["top_tools"]:
+        t = Table(show_header=True, header_style="muted", box=None, padding=(0, 2))
+        t.add_column("Werkzeug", style="accent", no_wrap=True); t.add_column("gesamt", justify="right")
+        t.add_column("✓", justify="right", style="green"); t.add_column("✗", justify="right", style="red")
+        for name, total, ok, fail in rep["top_tools"]:
+            t.add_row(escape(name), str(total), str(ok), str(fail) if fail else "")
+        parts += [_section("🛠 Werkzeuge"), t]
+
+    if rep["top_commands"]:
+        line = "   ".join(f"[accent]{escape(c)}[/accent] [muted]{n}[/muted]"
+                          for c, n in rep["top_commands"])
+        parts += [_section("⌨ Befehle"), line]
+
+    if rep["top_personas"] and len(rep["top_personas"]) > 0:
+        line = "   ".join(f"[accent]{escape(n)}[/accent] [muted]{c}[/muted]"
+                          for n, c in rep["top_personas"])
+        parts += [_section("🎭 Persönlichkeiten"), line]
+
+    if rep.get("modes"):
+        line = "   ".join(f"[accent]{escape(m)}[/accent] [muted]{c}[/muted]"
+                          for m, c in sorted(rep["modes"].items(), key=lambda kv: kv[1], reverse=True))
+        parts += [_section("🎛 Modi"), line]
+
+    hours = rep["hours"]
+    if any(hours):
+        peak = max(hours)
+        busiest = max(range(24), key=lambda h: hours[h])
+        blocks = []
+        for lo in (0, 6, 12, 18):
+            seg = "".join("▁▂▃▄▅▆▇█"[min(7, round(hours[h] / peak * 7))] if peak else "▁"
+                          for h in range(lo, lo + 6))
+            blocks.append(f"[muted]{lo:02d}[/muted] {seg}")
+        parts += [_section(f"🕒 Aktivste Zeit: {busiest:02d} Uhr"), "   ".join(blocks)]
+
+    wd = rep["weekdays"]
+    if any(wd):
+        peak = max(wd)
+        namen = ["Mo", "Di", "Mi", "Do", "Fr", "Sa", "So"]
+        line = "   ".join(f"[muted]{namen[i]}[/muted] {_mini_bar(wd[i], peak, 6)}" for i in range(7))
+        parts += [_section("📅 Wochentage"), line]
+
+    renderables = []
+    for part in parts:
+        renderables.append(part if not isinstance(part, str) else Text.from_markup(part))
+    console.print(Panel(Group(*renderables),
+                        title="[brand]📊 Deine NemiCLI-Statistik[/brand]  ·  alles lokal in learned/stats.json",
+                        title_align="left", box=ROUNDED, border_style="brand.rand", padding=(1, 2)))
+
+
+def kv_panel(title: str, rows: list[tuple[str, str]]) -> None:
+    """Zweispaltige Übersicht (Bezeichnung · Wert), z.B. für /version."""
+    table = Table(show_header=False, box=None, padding=(0, 2))
+    table.add_column(style="accent", no_wrap=True)
+    table.add_column(style="muted")
+    for k, v in rows:
+        table.add_row(escape(str(k)), escape(str(v)))
+    console.print(Panel(table, title=verlauf_text(str(title)), title_align="left",
+                        box=ROUNDED, border_style="brand.rand", padding=(1, 1)))
+
+
+def text_panel(title: str, text: str) -> None:
+    """Mehrzeiliger Rohtext (Berichte, Befehlsausgaben) im Rahmen – ohne Markup-Deutung."""
+    console.print(Panel(escape(text.rstrip()) or "(leer)", title=verlauf_text(str(title)),
+                        title_align="left", box=ROUNDED, border_style="brand.rand",
+                        padding=(0, 1)))
+
+
+def web_menu(entries: list) -> None:
+    """Zeigt die Allowlist nach Vertrauens-Tier (nur https, lesend)."""
+    _tier_label = {
+        1: "🟢 Tier 1 · kanonisch", 2: "🟡 Tier 2 · user-generated",
+        3: "🟠 Tier 3 · Presse", 4: "🔵 Tier 4 · Behörde/Recht",
+    }
+    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
+    table.add_column("Vertrauen", style="muted", no_wrap=True)
+    table.add_column("Domain", style="accent", no_wrap=True)
+    table.add_column("Notiz", style="muted")
+    last = None
+    for e in entries:
+        t = e.get("tier")
+        label = _tier_label.get(t, f"Tier {t}") if t != last else ""
+        last = t
+        table.add_row(label, e.get("domain", ""), e.get("note", ""))
+    console.print(
+        Panel(table, title="[brand]🌐 Internet-Allowlist[/brand]  ·  nur https, lesend",
+              title_align="left", box=ROUNDED, border_style="brand.rand", padding=(1, 1))
+    )
+
+
+def emoji_menu(emoticons: list, shortcodes: dict) -> None:
+    """Zeigt die verfügbaren Smileys und :kürzel:."""
+    smileys = Text()
+    for token, emo in emoticons[:14]:
+        smileys.append(f"{token} ", style="accent")
+        smileys.append(f"{emo}   ", style="assistant")
+    codes = Text()
+    for name, emo in list(shortcodes.items())[:24]:
+        codes.append(f":{name}: ", style="accent")
+        codes.append(f"{emo}   ", style="assistant")
+    body = Group(
+        Text("Smileys (einfach so tippen):", style="brand"),
+        smileys,
+        Text(""),
+        Text("Kürzel zwischen Doppelpunkten:", style="brand"),
+        codes,
+    )
+    console.print(
+        Panel(body, title="[brand]😊 Emojis[/brand]  ·  tippe sie einfach in den Chat",
+              title_align="left", box=ROUNDED, border_style="brand.rand", padding=(1, 2))
+    )
+
+
+def knowledge_menu(skills: list, snippets: list) -> None:
+    """Zeigt den Wissensspeicher: gelernte Skills + Code-Snippets."""
+    if not skills and not snippets:
+        info("Noch nichts gelernt. Sobald NemiCLI Code schreibt oder sich etwas merkt, "
+             "taucht es hier auf. 🌱")
+        return
+    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
+    table.add_column("Art", style="muted", no_wrap=True)
+    table.add_column("Inhalt", style="assistant")
+    table.add_column("Datei", style="muted", no_wrap=True)
+    for path, desc in skills:
+        table.add_row("📘 Skill", escape(str(desc)), escape(path.name))
+    for path, title in snippets:
+        table.add_row("🐍 Code", escape(str(title)), escape(path.name))
+    console.print(
+        Panel(table, title="[brand]🧠 Wissensspeicher[/brand]  ·  gelernt aus früheren Chats",
+              title_align="left", box=ROUNDED, border_style="brand.rand", padding=(1, 1))
+    )
+
+
+def strength_menu(strengths: dict, current: str | None = None) -> None:
+    """Zeigt die Denk-Stärken für den /staerke-Befehl."""
+    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
+    table.add_column("Stärke", style="accent", no_wrap=True)
+    table.add_column("Bedeutung", style="muted")
+    for key, desc in strengths.items():
+        marker = "  ← aktiv" if key == current else ""
+        table.add_row(key, desc + marker)
+    console.print(
+        Panel(table, title="[brand]Denken[/brand]  ·  /staerke <name>",
+              title_align="left", box=ROUNDED, border_style="brand.rand", padding=(1, 1))
+    )
+
+
+def theme_menu() -> None:
+    """Zeigt die verfügbaren Themes für den /theme-Befehl."""
+    table = Table(show_header=True, header_style="brand", box=None, padding=(0, 2))
+    table.add_column("Name", style="accent", no_wrap=True)
+    table.add_column("Palette", style="muted")
+    table.add_column("", style="muted")
+    for key, p in THEMES.items():
+        swatch = Text()
+        for c in p["gradient"]:
+            swatch.append("██", style=c)
+        marker = "  ← aktiv" if key == _active else ""
+        table.add_row(key, p["label"] + marker, swatch)
+    console.print(
+        Panel(table, title="[brand]Themes[/brand]  ·  /theme <name>", title_align="left",
+              box=ROUNDED, border_style="brand.rand", padding=(1, 1))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Nachrichten-Panels
+# ---------------------------------------------------------------------------
+
+_PERSONA_NAME: list = [0.0, ""]       # (Zeit, Name): die Kopfzeile fragt 5× je Sekunde, jedes Mal mit Ordnerscan
+
+
+def persona_name() -> str:
+    """Name der aktiven Persönlichkeit – für Titel und Kopfzeile.
+    Fällt auf „Nemi" zurück, wenn das Profil-Modul (noch) nicht erreichbar ist."""
+    import time
+    jetzt = time.monotonic()
+    if _PERSONA_NAME[1] and jetzt - _PERSONA_NAME[0] < 1.5:
+        return _PERSONA_NAME[1]
+    try:
+        import persoenlichkeiten
+        name = persoenlichkeiten.active().name or "Nemi"
+    except Exception:
+        return "Nemi"
+    _PERSONA_NAME[:] = [jetzt, name]
+    return name
+
+
+
+# ---------------------------------------------------------------------------
+# Code im Chat: eigener Rahmen statt nackter Syntax-Block
+# ---------------------------------------------------------------------------
+# Rich rendert ```-Bloecke von Haus aus als farbigen Kasten ohne Kopf und ohne
+# Zeilennummern. Im Gespraech geht Code dadurch im Fliesstext unter, und bei
+# einem Fehler kann man nicht sagen "Zeile 12".
+#
+# Deshalb hier ein eigener Block: Kopfzeile mit Dateiname bzw. Sprache,
+# Zeilennummern ab einer gewissen Laenge, Rahmen in der Theme-Farbe und ein
+# durchsichtiger Hintergrund, damit er sich ins Terminal einfuegt statt einen
+# fremdfarbigen Klotz zu setzen.
+#
+# Der Dateiname kommt aus der Info-Zeile des Zauns - beides geht:
+#     ```python main.py
+#     ```python:main.py
+
+# Zu jedem Theme ein passender Syntax-Stil (alle in Pygments enthalten).
+_CODE_THEMES = {
+    "cyan": "one-dark",
+    "matrix": "monokai",
+    "amber": "gruvbox-dark",
+    "cyber": "dracula",
+    "tigra": "dracula",
+}
+
+# Ab so vielen Zeilen lohnen Zeilennummern. Bei einem Zweizeiler sind sie Krach.
+_LINE_NUMBER_FROM = 4
+
+_CODE_SPRACHEN = {
+    "python": "Python", "py": "Python", "js": "JavaScript",
+    "javascript": "JavaScript", "ts": "TypeScript", "typescript": "TypeScript",
+    "html": "HTML", "css": "CSS", "json": "JSON", "yaml": "YAML", "yml": "YAML",
+    "bash": "Bash", "sh": "Shell", "powershell": "PowerShell", "ps1": "PowerShell",
+    "sql": "SQL", "md": "Markdown", "markdown": "Markdown", "text": "Text",
+    "c": "C", "cpp": "C++", "cs": "C#", "java": "Java", "go": "Go",
+    "rust": "Rust", "rs": "Rust", "toml": "TOML", "ini": "INI", "xml": "XML",
+    "diff": "Diff", "aktion": "Aktion",
+}
+
+
+def code_theme_name() -> str:
+    """Syntax-Stil passend zum aktuellen NemiCLI-Theme."""
+    return _CODE_THEMES.get(_active, "one-dark")
+
+
+def _code_kopf(info: str) -> tuple[str, str, str]:
+    """Aus der Zaun-Info wird (Lexer, Titel, Sprachname).
+
+    'python main.py' und 'python:main.py' ergeben beide main.py als Titel.
+    Ohne Dateinamen ist der Titel die Sprache – dann bleibt der Untertitel
+    leer, damit nicht zweimal dasselbe dasteht."""
+    roh = (info or "").strip()
+    if not roh:
+        return "text", "Text", "Text"
+    erst, _, rest = roh.partition(" ")
+    if ":" in erst and not rest:                 # ```python:main.py
+        erst, _, rest = erst.partition(":")
+    lexer = erst.strip().lower() or "text"
+    datei = rest.strip()
+    sprache = _CODE_SPRACHEN.get(lexer) or lexer.capitalize() or "Text"
+    return lexer, (datei or sprache), sprache
+
+
+class NemiCodeBlock(CodeBlock):
+    """Code-Block mit Kopfzeile, Zeilennummern und Theme-Rahmen."""
+
+    @classmethod
+    def create(cls, markdown, token):
+        block = cls((token.info or "").partition(" ")[0] or "text",
+                    markdown.code_theme)
+        block.info = token.info or ""
+        return block
+
+    def __rich_console__(self, console, options):
+        code = str(self.text).rstrip("\n")
+        lexer, titel, sprache = _code_kopf(
+            getattr(self, "info", "") or self.lexer_name)
+        zeilen = code.count("\n") + 1
+        p = THEMES[_active]
+        syntax = Syntax(
+            code, lexer, theme=code_theme_name(), word_wrap=True,
+            line_numbers=zeilen >= _LINE_NUMBER_FROM,
+            background_color="default",          # fuegt sich ins Terminal ein
+            indent_guides=zeilen >= _LINE_NUMBER_FROM,
+        )
+        untertitel = sprache if titel != sprache else None
+        yield Panel(
+            syntax,
+            title=f"[bold]{escape(titel)}[/bold]", title_align="left",
+            subtitle=(f"[muted]{escape(untertitel)}[/muted]" if untertitel else None),
+            subtitle_align="right",
+            box=ROUNDED, border_style=p["accent_dim"], padding=(0, 1),
+        )
+
+
+class NemiMarkdown(Markdown):
+    """Markdown wie bei Rich - nur mit unserem Code-Block.
+
+    Eigene `elements`-Kopie, damit Rich selbst unangetastet bleibt: andere
+    Programme im selben Prozess (und Rich-interne Markdown-Nutzung) sollen
+    weiter den Standard bekommen."""
+
+    elements = {**Markdown.elements,
+                "fence": NemiCodeBlock, "code_block": NemiCodeBlock}
+
+    def __init__(self, markup: str, *args, **kwargs):
+        import pfadschutz                                # Windows-Pfade nicht als Markdown lesen
+        super().__init__(pfadschutz.schuetzen(markup), *args, **kwargs)
+
+
+CODING_BLAU = "#3b82f6"
+TODO_GELB = "#facc15"
+_TODO_FARBEN = {"offen": "#f87171", "frage": "#fb923c", "fertig": "#4ade80", "gestrichen": AUS}
+
+
+def _coding_an() -> bool:
+    try:
+        import coding
+        return coding.aktiv()
+    except Exception:
+        return False
+
+
+# Nur eine Leiste links (Zeilen: oben, Kopf, Kopftrenner, Mitte, Zeile, Fußtrenner, Fuß, unten –
+# je links, waagrecht, Kreuzung, rechts). Der Titel steht auf der leeren oberen Kante.
+LEISTE = Box("    \n▎  ▎\n▎  ▎\n▎   \n▎   \n▎   \n▎   \n    \n")
+
+# Feste Farbe je Persönlichkeit, aus ihrem Namen abgeleitet – gleicher Name, gleiche Farbe.
+PERSONA_FARBEN = ["#41e0d0", "#8b7cff", "#f472b6", "#fbbf24", "#4ade80", "#60a5fa", "#fb923c", "#c084fc"]
+
+
+def persona_farbe(name: str | None = None) -> str:
+    import zlib
+    name = (name if name is not None else persona_name()).strip().lower()
+    return PERSONA_FARBEN[zlib.crc32(name.encode("utf-8")) % len(PERSONA_FARBEN)]
+
+
+def assistant_panel(text: str):
+    """Antwort mit Leiste links in der Farbe der Persönlichkeit; im Coding-Assistenten blau."""
+    name = persona_name()
+    if _coding_an():
+        titel = f"[bold {CODING_BLAU}]🟦 Coding · {escape(name)}[/bold {CODING_BLAU}]"
+        rahmen = CODING_BLAU
+    else:
+        rahmen = persona_farbe(name)
+        titel = f"[bold {rahmen}]🐈 {escape(name)}[/bold {rahmen}]"
+    return Panel(
+        NemiMarkdown(text or " ", code_theme=code_theme_name()),
+        title=titel, title_align="left",
+        box=LEISTE, border_style=rahmen, padding=(0, 1, 0, 1),
+    )
+
+
+def todo_panel(daten: dict):
+    """Gelber Kasten: Auftrag und Todo-Liste mit 🔴 offen · 🟠 Frage · 🟢 geprüft · ⚪ gestrichen."""
+    import coding
+    gepr, gesamt = coding.zaehlen(daten)
+    body = Text()
+    body.append("Ziel: ", style="muted")
+    body.append(daten.get("ziel", ""), style="assistant")
+    aktuell = daten.get("aktuell")
+    for p in daten.get("punkte", []):
+        farbe = _TODO_FARBEN.get(p["status"], leise())
+        body.append("\n")
+        body.append("▶ " if p["nr"] == aktuell else "  ", style=f"bold {CODING_BLAU}")
+        body.append(f"{coding.ZEICHEN.get(p['status'], '?')} {p['nr']}. ", style=f"bold {farbe}")
+        body.append(p["text"], style=f"strike {AUS}" if p["status"] == "gestrichen" else "assistant")
+        if p["status"] == "frage" and p.get("frage"):
+            body.append(f"\n      ? {p['frage']}", style=_TODO_FARBEN["frage"])
+        elif p["status"] == "gestrichen":
+            body.append(f"\n      gestrichen: {p.get('notiz', '')}", style="muted")
+        else:
+            body.append(f"\n      ✓ {p['pruefung']}", style="muted")
+            if p["status"] == "fertig" and p.get("geprueft"):
+                body.append(f"  · {p['geprueft']}", style=_TODO_FARBEN["fertig"])
+    titel = Text(f"🟨 Todo · {gepr}/{gesamt} geprüft", style=f"bold {TODO_GELB}")
+    return Panel(body, title=titel, title_align="left", box=ROUNDED,
+                 border_style=TODO_GELB, padding=(0, 2))
+
+
+def plan_panel(daten: dict):
+    """Gelber Kasten der Todo-Liste einer Runde: 🔴 offen · 🟠 in Arbeit · 🟢 erledigt · ⚪ gestrichen."""
+    import plan
+    erl, gesamt = plan.zaehlen(daten)
+    aktuell = plan.aktuell(daten)
+    farben = {plan.OFFEN: _TODO_FARBEN["offen"], plan.ERLEDIGT: _TODO_FARBEN["fertig"],
+              plan.GESTRICHEN: _TODO_FARBEN["gestrichen"]}
+    body = Text()
+    for i, p in enumerate(daten.get("punkte", [])):
+        dran = aktuell is not None and p["nr"] == aktuell["nr"]
+        farbe = _TODO_FARBEN["frage"] if dran else farben.get(p["status"], leise())
+        if i:
+            body.append("\n")
+        body.append("▶ " if dran else "  ", style=f"bold {TODO_GELB}")
+        body.append(f"{plan.zeichen(p, daten)} {p['nr']}. ", style=f"bold {farbe}")
+        body.append(p["text"], style=f"strike {AUS}" if p["status"] == plan.GESTRICHEN else "assistant")
+        if p["status"] == plan.GESTRICHEN and p.get("notiz"):
+            body.append(f"\n      gestrichen: {p['notiz']}", style="muted")
+    titel = Text(f"🟨 Todo · {erl}/{gesamt} erledigt", style=f"bold {TODO_GELB}")
+    return Panel(body, title=titel, title_align="left", box=ROUNDED,
+                 border_style=TODO_GELB, padding=(0, 2))
+
+
+# ---------------------------------------------------------------------------
+# Lebendige Arbeits-Anzeige  (verspieltes Verb · Laufzeit · Token-Zähler)
+# ---------------------------------------------------------------------------
+
+# Quatsch-Verben, die während des Nachdenkens durchrotieren – wie bei Claude Code,
+# aber auf NemiCLI-Deutsch. 😄
+WHIMSY = [
+    "grübelt", "tüftelt", "wuselt", "köchelt", "brütet", "zaubert", "werkelt",
+    "bastelt", "knobelt", "sinniert", "brutzelt", "schnurpst", "klügelt",
+    "fummelt", "spinnt Ideen", "sortiert Gedanken", "kramt im Hirn",
+    "mischt Farben", "jongliert Bits", "faltet Gedanken", "poliert Wörter",
+    "sammelt Funken", "rührt um", "lauscht den Bytes", "knetet Logik",
+]
+
+
+def new_verb_seed() -> int:
+    """Zufälliger Startpunkt, damit jede Runde mit einem anderen Verb beginnt."""
+    return random.randrange(len(WHIMSY))
+
+
+def verb_at(seed: int, elapsed: float) -> str:
+    """Wählt das aktuelle Verb – wechselt alle ~3 Sekunden durch."""
+    return WHIMSY[(seed + int(elapsed // 3)) % len(WHIMSY)]
+
+
+def fmt_elapsed(s: float) -> str:
+    s = int(s)
+    return f"{s}s" if s < 60 else f"{s // 60}m {s % 60:02d}s"
+
+
+def fmt_tokens(n: int) -> str:
+    """Token kurz: 950 · 82.2k · 1.05M (dezimal: k = 1.000, M = 1.000.000)."""
+    if n >= 1_000_000:
+        return f"{n / 1_000_000:.2f}".rstrip("0").rstrip(".") + "M"
+    return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+
+
+def _meter_text(verb: str, elapsed: float, tokens: int) -> Text:
+    t = Text("  ")
+    t.append("✦ ", style="accent")
+    t.append(f"{APP_NAME} {verb} … ", style="muted")
+    t.append(f"({fmt_elapsed(elapsed)} · ↓ {fmt_tokens(tokens)} Tokens)", style="brand.dim")
+    t.append("   esc bricht ab", style="brand.dim")
+    return t
+
+
+def working_meter(verb: str, elapsed: float, tokens: int):
+    """Panel mit Spinner + Verb/Zeit/Token – solange noch keine Antwort da ist."""
+    spinner = Spinner("dots", text=_meter_text(verb, elapsed, tokens), style="accent")
+    return Panel(spinner, box=ROUNDED, border_style="brand.rand", padding=(0, 2))
+
+
+def stream_meter(verb: str, elapsed: float, tokens: int) -> Text:
+    """Dezente Zeile unter der Antwort, während sie noch strömt."""
+    try:
+        import cockpit
+        cockpit.tempo_live(tokens, elapsed)
+    except Exception:
+        pass
+    return _meter_text(verb, elapsed, tokens)
+
+
+def done_meter(elapsed: float, tokens: int, tps: float | None = None,
+               in_tokens: int = 0) -> Text:
+    """Kompakte Zusammenfassung nach der Antwort: Tokens · Zeit · Tempo."""
+    try:
+        import cockpit
+        cockpit.tempo_merken(tps)
+    except Exception:
+        pass
+    t = Text("  ")
+    t.append("⌁ ", style="accent.dim")
+    parts = []
+    if in_tokens:
+        parts.append(f"↑ {fmt_tokens(in_tokens)}")
+    parts.append(f"↓ {fmt_tokens(tokens)} Tokens")
+    parts.append(fmt_elapsed(elapsed))
+    if tps:
+        parts.append(f"{tps:.0f} tok/s")
+    t.append("  ·  ".join(parts), style="brand.dim")
+    return t
+
+
+THINK_TAIL = 4        # gerenderte Textzeilen; mit Rahmen höchstens 6 Zeilen
+THINK_EXPANDED = 10   # erweiterte Ansicht; mit Rahmen höchstens 12 Zeilen
+
+
+def _kurz(n: int) -> str:
+    return f"{n/1000:.1f}k".replace(".0k", "k") if n >= 1000 else str(n)
+
+
+class _ThinkingLines:
+    """Begrenzt erst NACH dem Umbruch auf die tatsächliche Panel-Innenbreite."""
+
+    def __init__(self, text: str, limit: int):
+        self.text = text
+        self.limit = limit
+
+    def __rich_console__(self, render_console, options):
+        # Frühere logische Zeilen können nicht mehr in den sichtbaren Schluss
+        # passen. Eine lange letzte Zeile wird danach nach Terminalzellen gefaltet.
+        tail = "\n".join(self.text.split("\n")[-self.limit:])
+        # Nur die Vorschau umbrechen; der vollständige Text bleibt für F2 im RAM.
+        tail = tail[-max(1024, options.max_width * self.limit * 4):]
+        plain = Text(tail or "…", style="muted", tab_size=4)
+        lines = plain.wrap(render_console, max(1, options.max_width),
+                           overflow="fold", no_wrap=False)
+        yield from lines[-self.limit:]
+
+
+def thinking_panel(text: str, collapsed: bool = False,
+                   seconds: float | None = None, *, done: bool = False,
+                   expanded: bool = False):
+    """Ruhige Vorschau echter Denk-Ausgabe; eingeklappt genau eine Textzeile.
+
+    Der Inhalt bleibt Plain Text. Die verfügbare Breite bestimmt den Umbruch,
+    statt dass ein fester Zeichenausschnitt die Panelhöhe schwanken lässt.
+    """
+    try:
+        name = persona_name()
+    except Exception:
+        name = ""
+    if name:
+        heading = f"{name} hat nachgedacht" if done or collapsed else f"{name} denkt nach …"
+    else:
+        heading = "Nachgedacht" if done or collapsed else "Denkt nach"
+    details = []
+    if seconds is not None:
+        details.append(fmt_elapsed(max(0, seconds)))
+    details.append(f"{_kurz(len(text))} Zeichen")
+    if collapsed:
+        summary = Text("  ◇ ", style="accent.dim", no_wrap=True,
+                       overflow="ellipsis")
+        summary.append(heading, style="muted")
+        summary.append("  ·  " + "  ·  ".join(details), style="brand.dim")
+        if TUI is not None:
+            summary.append("  ·  F2 anzeigen", style="accent.dim")
+        # Group bewahrt no_wrap auch bei einem direkten console.print-Aufruf;
+        # Rich würde einzelne Text-Objekte sonst mit den Print-Defaults verbinden.
+        return Group(summary)
+
+    title = Text("◇ ", style="accent")
+    title.append(heading, style="muted bold")
+    title.append("  ·  " + "  ·  ".join(details), style="brand.dim")
+    subtitle = Text("Ausschnitt" if done else "Live-Ausschnitt", style="brand.dim")
+    if TUI is not None:
+        reading = done and not getattr(TUI, "_thinking_live", False)
+        subtitle.append("  ·  F2 " + ("lesen" if reading else "weniger" if expanded else "mehr"),
+                        style="accent.dim")
+    return Panel(
+        _ThinkingLines(text, THINK_EXPANDED if expanded else THINK_TAIL),
+        title=title, title_align="left", subtitle=subtitle, subtitle_align="right",
+        box=ROUNDED, border_style="brand.rand", padding=(0, 2),
+    )
+
+
+class Klapp:
+    """Ein Block, der im Vollbild als eine Zeile erscheint und per Klick aufgeht (screen_tx._KlappBlock);
+    überall sonst wird er voll gedruckt."""
+
+    def __init__(self, kurz, lang, offen: bool = False):
+        self.kurz, self.lang, self.offen = kurz, lang, offen
+
+    def __rich_console__(self, console, options):
+        yield self.lang
+
+
+def _erste_zeile(text: str) -> tuple[str, int]:
+    """(erste nicht leere Zeile, Zahl der übrigen Zeilen)."""
+    zeilen = [z.strip() for z in str(text).splitlines() if z.strip()]
+    return (zeilen[0] if zeilen else ""), max(0, len(zeilen) - 1)
+
+
+def _chip(symbol: str, stil: str, text: str, rest: int, zusatz: str = "") -> Text:
+    t = Text("  ", no_wrap=True, overflow="ellipsis")
+    t.append(f"{symbol} ", style=stil)
+    t.append(text, style="assistant")
+    if zusatz:
+        t.append(f"  ·  {zusatz}", style="brand.dim")
+    t.append(f"  ▸ {rest} Zeile{'n' if rest != 1 else ''} mehr" if rest else "  ▸", style="accent.dim")
+    return t
+
+
+# ---------------------------------------------------------------------------
+# Werkzeug-Anzeige: kompakt („● Befehl(git status)“ / „⎿ Ergebnis“) oder mit Rahmen
+# ---------------------------------------------------------------------------
+ANZEIGE_STILE = ("kompakt", "rahmen")
+_anzeige: str | None = None
+_KOMPAKT_ZEILEN = 3              # eingeklappt im Vollbild
+_DIFF_ZEILEN = 40                # ausgeklappt; der Rest steht in der Datei
+
+_WERKZEUG_NAMEN = {
+    "befehl": "Befehl", "datei_lesen": "Lesen", "datei_schreiben": "Schreiben",
+    "datei_bearbeiten": "Ändern", "loeschen": "Löschen", "verschieben": "Verschieben",
+    "datei_kopieren": "Kopieren", "ordner_erstellen": "Ordner", "ordner_auflisten": "Ordner ansehen",
+    "dateien_suchen": "Finden", "inhalt_suchen": "Suchen", "web_lesen": "Web", "web_suche": "Websuche",
+    "web_wiki": "Wiki", "fach_suche": "Fachsuche", "bild_malen": "Malen", "bild_ansehen": "Bild ansehen",
+    "merken": "Merken", "gedaechtnis_suchen": "Gedächtnis", "cve_suchen": "CVE-Liste", "code_pruefen": "Code prüfen",
+    "seite_ansehen": "Seite ansehen", "pdf_erstellen": "PDF", "todo": "Todo", "plan": "Plan",
+}
+_ZIEL_FELDER = ("pfad", "von", "url", "query", "suche", "muster", "frage", "was", "name", "prompt", "text")
+
+
+def anzeige() -> str:
+    """'kompakt' (Vorgabe) oder 'rahmen' – aus der Konfiguration, einmal gelesen."""
+    global _anzeige
+    if _anzeige is None:
+        try:
+            import config
+            wert = str(config.load().get("anzeige", ANZEIGE_STILE[0]))
+        except Exception:
+            wert = ANZEIGE_STILE[0]
+        _anzeige = wert if wert in ANZEIGE_STILE else ANZEIGE_STILE[0]
+    return _anzeige
+
+
+def anzeige_setzen(stil: str) -> bool:
+    global _anzeige
+    if stil not in ANZEIGE_STILE:
+        return False
+    _anzeige = stil
+    try:
+        import config
+        config.update(anzeige=stil)
+    except Exception:
+        pass
+    return True
+
+
+def _kurzpfad(roh: str) -> str:
+    import os
+    try:
+        rel = os.path.relpath(roh)
+        return rel if not rel.startswith("..") else roh
+    except ValueError:                           # anderes Laufwerk
+        return roh
+
+
+def werkzeug_zeile(act: dict | None, desc: str = "") -> Text:
+    """„● Name(Ziel)“ – Ziel ist der Befehl, Pfad, die Adresse oder Suche der Aktion."""
+    zeile = Text(no_wrap=True, overflow="ellipsis")
+    zeile.append("● ", style="accent")
+    if not act:
+        zeile.append(_erste_zeile(desc)[0], style="assistant")
+        return zeile
+    tool = str(act.get("tool") or "?")
+    zeile.append(_WERKZEUG_NAMEN.get(tool, tool), style="bold")
+    ziel = ""
+    if tool == "befehl":
+        try:
+            import actions
+            ziel = actions._befehl_text(act)
+        except Exception:
+            ziel = str(act.get("befehl") or "")
+    else:
+        for f in _ZIEL_FELDER:
+            wert = act.get(f)
+            if isinstance(wert, str) and wert.strip():
+                ziel = _kurzpfad(wert) if f in ("pfad", "von") else wert
+                if f == "von" and isinstance(act.get("nach"), str):
+                    ziel += " → " + _kurzpfad(act["nach"])
+                break
+    ziel = " ".join(ziel.split())
+    if ziel:
+        zeile.append("(", style="muted")
+        zeile.append(ziel if len(ziel) <= 100 else ziel[:99] + "…", style="assistant")
+        zeile.append(")", style="muted")
+    return zeile
+
+
+def _haengend(zeichen: str, inhalt, stil: str = "muted") -> Table:
+    """Einzug wie „  ⎿  …“: umbrochene Zeilen bleiben unter dem Text, nicht unter dem Zeichen."""
+    t = Table.grid(padding=0)
+    t.add_column(width=5, no_wrap=True)
+    t.add_column(ratio=1)
+    t.add_row(Text(zeichen, style=stil), inhalt)
+    return t
+
+
+def _ergebnis_kompakt(result: str, ok: bool | None, sekunden: float | None, kurz: bool) -> Table:
+    zeilen = str(result).rstrip().splitlines() or [""]
+    stil = "err" if ok is False else "assistant"
+    rest = 0
+    if kurz and len(zeilen) > _KOMPAKT_ZEILEN:
+        rest = len(zeilen) - _KOMPAKT_ZEILEN
+        zeilen = zeilen[:_KOMPAKT_ZEILEN]
+    body = Text("\n".join(zeilen), style=stil)
+    fuss = Text()
+    if rest:
+        fuss.append(f"… +{rest} Zeile{'n' if rest != 1 else ''}  ▸", style="accent.dim")
+    if ok is None:
+        status, sstil = "◇ Status ungeprüft", "muted"
+    else:
+        status, sstil = ("✓", "ok") if ok else ("✗ Fehler", "err")
+    fuss.append(("   " if rest else "") + status, style=sstil)
+    if sekunden is not None:
+        fuss.append((" " if ok else "  ·  ") + fmt_elapsed(sekunden), style="brand.dim")
+    return _haengend("  ⎿  ", Group(body, fuss))
+
+
+def diff_anzeige(pfad: str, alt: str | None, neu: str | None):
+    """Rot/grüner Diff einer Dateiänderung mit Zeilennummern; None ohne Unterschied."""
+    import difflib
+    if neu is None or alt == neu:
+        return None
+    a, b = (alt or "").splitlines(), neu.splitlines()
+    plus = minus = 0
+    zeilen: list[tuple[str, int | None, str]] = []
+    for gruppe in difflib.SequenceMatcher(None, a, b, autojunk=False).get_grouped_opcodes(2):
+        if zeilen:
+            zeilen.append(("…", None, ""))
+        for op, i1, i2, j1, j2 in gruppe:
+            if op == "equal":
+                zeilen += [(" ", j1 + k + 1, b[j1 + k]) for k in range(j2 - j1)]
+                continue
+            if op in ("replace", "delete"):
+                zeilen += [("-", i1 + k + 1, a[i1 + k]) for k in range(i2 - i1)]
+                minus += i2 - i1
+            if op in ("replace", "insert"):
+                zeilen += [("+", j1 + k + 1, b[j1 + k]) for k in range(j2 - j1)]
+                plus += j2 - j1
+    if not zeilen:
+        return None
+    breite = max(len(str(n)) for _, n, _ in zeilen if n) if any(n for _, n, _ in zeilen) else 1
+    text = Text(no_wrap=True, overflow="ellipsis")
+    gezeigt = zeilen[:_DIFF_ZEILEN]
+    for idx, (zeichen, nr, inhalt) in enumerate(gezeigt):
+        if idx:
+            text.append("\n")
+        if zeichen == "…":
+            text.append(" " * breite + "  ⋮", style="diff.nr")
+            continue
+        stil = {"+": "diff.add", "-": "diff.del"}.get(zeichen)
+        text.append(f"{nr:>{breite}} ", style="diff.nr")
+        text.append(f"{zeichen} {inhalt.expandtabs(4)}", style=stil or "muted")
+    if len(zeilen) > len(gezeigt):
+        text.append(f"\n… +{len(zeilen) - len(gezeigt)} Zeilen", style="accent.dim")
+    neu_datei = alt is None
+    kopf = Text()
+    if neu_datei:
+        kopf.append(f"{len(b)} Zeile{'n' if len(b) != 1 else ''} geschrieben", style="assistant")
+    else:
+        kopf.append(f"{plus} hinzugefügt", style="ok")
+        kopf.append(", ", style="muted")
+        kopf.append(f"{minus} entfernt", style="err")
+    kopf.append(f"  ·  {_kurzpfad(pfad)}", style="brand.dim")
+    return _haengend("     ", Group(kopf, text))     # gehört zum Ergebnis darüber
+
+
+def action_request(desc: str, confirm: bool, kopf: str | None = None, risiko: bool = False,
+                   act: dict | None = None):
+    """Panel: NemiCLI möchte eine Aktion ausführen.
+    risiko=True (löschen, fremder Befehl, Zeitplan, ganzer Ordner): roter Rahmen
+    und roter Titel – damit man bei der zehnten Frage nicht blind drückt.
+    Ohne Rückfrage und im Stil kompakt: eine Zeile „● Name(Ziel)“."""
+    if not confirm and anzeige() == "kompakt":
+        zeile = werkzeug_zeile(act, desc)
+        rest = "" if act else "\n".join(str(desc).splitlines()[1:]).strip("\n")
+        if TUI is not None:
+            voll = Group(zeile, Text(str(desc), style="muted")) if act or rest else zeile
+            kurz = zeile.copy()
+            kurz.append("  ▸", style="accent.dim")
+            return Klapp(kurz, voll)
+        return Group(zeile, Text(rest, style="muted")) if rest else zeile
+    head = kopf or ("🔐 NemiCLI möchte ausführen" if confirm else "⚙ NemiCLI führt aus")
+    border = "warn" if confirm else "accent.rand"
+    title = f"[tool]{head}[/tool]"
+    if risiko and confirm:
+        border = "bold red"
+        title = f"[bold red]{head}[/bold red]"
+    panel = Panel(
+        Text(desc, style="bold red" if (risiko and confirm) else "assistant"),
+        title=title, title_align="left",
+        box=ROUNDED, border_style=border, padding=(0, 2),
+    )
+    if TUI is None or confirm:                 # Rückfragen bleiben groß: da soll man hinsehen
+        return panel
+    erste, rest = _erste_zeile(desc)
+    return Klapp(_chip("⚙", "accent", erste, rest), panel)
+
+
+def subagent_panel(idx: int, rolle: str, task: str, result: str):
+    """Panel für den Bericht eines Helfer-Agenten (Rolle im Titel)."""
+    preview = result if len(result) <= 1500 else result[:1500] + "\n… (gekürzt)"
+    return Panel(
+        Text(preview, style="assistant"),
+        title=f"[brand]🤝 Helfer {idx} · {escape(rolle[:30])}[/brand]  [muted]{escape(task[:60])}[/muted]",
+        title_align="left", box=ROUNDED, border_style="accent.rand", padding=(0, 2),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Bild-Vorschau im Terminal: jede Zelle zeigt ZWEI Pixel übereinander – das
+# Zeichen ▀ hat die obere Farbe als Vordergrund, die untere als Hintergrund.
+# Braucht nur PIL (ist für die Bild-Pipeline ohnehin da) und ein Terminal mit
+# Truecolor (Windows Terminal, cmd/PowerShell darin: ja).
+# ---------------------------------------------------------------------------
+PREVIEW_MAX_COLS = 60        # Breite der Vorschau in Zeichen
+PREVIEW_MAX_ROWS = 24        # Höhe in Zeilen (= doppelt so viele Pixel)
+
+
+def image_preview_text(path, max_cols: int = PREVIEW_MAX_COLS,
+                       max_rows: int = PREVIEW_MAX_ROWS) -> Text | None:
+    """Bild als rich.Text aus ▀-Zellen. None, wenn PIL fehlt oder das Bild
+    nicht lesbar ist (dann gibt es einfach keine Vorschau, keinen Fehler)."""
+    try:
+        from PIL import Image
+        img = Image.open(str(path)).convert("RGB")
+    except Exception:
+        return None
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return None
+    # Zellen sind etwa doppelt so hoch wie breit -> 1 Zelle = 1 Pixel breit, 2 Pixel hoch.
+    cols = max(1, min(max_cols, w))
+    rows = max(1, round(h / w * cols / 2))
+    if rows > max_rows:
+        rows = max_rows
+        cols = max(1, round(w / h * rows * 2))
+    try:
+        small = img.resize((cols, rows * 2), Image.LANCZOS)
+    except Exception:
+        return None
+    px = small.load()
+    out = Text(no_wrap=True, overflow="crop")
+    for r in range(rows):
+        for c in range(cols):
+            top = px[c, 2 * r]
+            bot = px[c, 2 * r + 1]
+            out.append("▀", style=Style(color=f"#{top[0]:02x}{top[1]:02x}{top[2]:02x}",
+                                        bgcolor=f"#{bot[0]:02x}{bot[1]:02x}{bot[2]:02x}"))
+        if r < rows - 1:
+            out.append("\n")
+    return out
+
+
+def image_preview(path, title: str | None = None):
+    """Panel mit der Bild-Vorschau (oder None, wenn keine möglich ist)."""
+    from pathlib import Path as _P
+    body = image_preview_text(path)
+    if body is None:
+        return None
+    name = _P(str(path)).name
+    return Panel(body, title=f"[muted]🖼 {escape(title or name)}[/muted]", title_align="left",
+                 box=ROUNDED, border_style="brand.rand", padding=(0, 1), expand=False)
+
+
+def show_image_preview(path, title: str | None = None) -> bool:
+    """Vorschau in den Verlauf drucken. True, wenn etwas gezeigt wurde."""
+    panel = image_preview(path, title)
+    if panel is None:
+        return False
+    console.print(panel)
+    return True
+
+
+def anzeige_kurz(text: str, zeilen: int = 14) -> str:
+    """Lange Werkzeug-Ausgaben (Webseiten) für die Anzeige kürzen – das Modell bekommt den vollen Text."""
+    teile = str(text).splitlines()
+    if len(teile) <= zeilen + 2:
+        return str(text)
+    rest = len(teile) - zeilen
+    return "\n".join(teile[:zeilen]) + f"\n… {rest} weitere Zeilen – die KI hat alles gelesen."
+
+
+def action_result(result: str, ok: bool | None = None, sekunden: float | None = None):
+    """Panel: Ergebnis einer Aktion. Im Vollbild als Chip „✓ erste Zeile · 6 s ▸“, der per Klick aufgeht;
+    Fehler stehen offen da. Im Stil kompakt: „⎿ Ergebnis“ eingerückt unter der Werkzeug-Zeile."""
+    if anzeige() == "kompakt":
+        voll = _ergebnis_kompakt(result, ok, sekunden, kurz=False)
+        if TUI is None:
+            return voll
+        return Klapp(_ergebnis_kompakt(result, ok, sekunden, kurz=True), voll, offen=ok is False)
+    if ok is None:
+        title = Text("◇ Ergebnis · Status ungeprüft", style="muted")
+    else:
+        title = Text("✓ Ergebnis" if ok else "✗ Ergebnis", style="ok" if ok else "err")
+    if sekunden is not None:
+        title.append(f"  ·  {fmt_elapsed(sekunden)}", style="brand.dim")
+    panel = Panel(
+        Text(str(result), style="assistant"),
+        title=title, title_align="left",
+        box=ROUNDED, border_style="accent.rand", padding=(0, 2),
+    )
+    if TUI is None:
+        return panel
+    erste, rest = _erste_zeile(result)
+    symbol, stil = ("◇", "muted") if ok is None else ("✓", "ok") if ok else ("✗", "err")
+    return Klapp(_chip(symbol, stil, erste, rest, fmt_elapsed(sekunden) if sekunden is not None else ""),
+                 panel, offen=ok is False)
+
+
+# ---------------------------------------------------------------------------
+# Web: laufende Suche, Treffer-Karten, gelesene Seite, Recherche-Leiste.
+# Die Daten kommen aus tools/webanzeige.py und sind schon bereinigt; gezeigt wird nur reiner Text (kein Markup).
+# ---------------------------------------------------------------------------
+_AMPEL_STIL = {"gruen": "ok", "gelb": "warn", "grau": "muted", "warn": "err"}
+
+
+def _sek(s: float | None) -> str:
+    if s is None:
+        return ""
+    return f"{s:.1f} s".replace(".", ",") if s < 10 else fmt_elapsed(s)
+
+
+def web_laeuft(info: dict, sekunden: float) -> Text:
+    """„🌐 sucht im Netz  ◜  „…“  ·  2,1 s“ – der Radar dreht sich mit der Zeit."""
+    import webanzeige as WA
+    t = Text("  ", no_wrap=True, overflow="ellipsis")
+    t.append(f"{info.get('symbol') or '🌐'} ", style="brand")
+    t.append(str(info.get("verb") or ""), style="brand")
+    t.append(f"  {WA.radar(sekunden)}  ", style="user")
+    t.append(str(info.get("ziel") or ""), style="assistant")
+    if info.get("zusatz"):
+        t.append(f"  ·  {info['zusatz']}", style="muted")
+    t.append(f"  ·  {_sek(sekunden)}", style="brand.dim")
+    return t
+
+
+def _treffer_zeilen(daten: dict) -> Table:
+    import webanzeige as WA
+    tab = Table.grid(padding=(0, 1))
+    tab.add_column(width=2, justify="right", no_wrap=True)
+    tab.add_column(width=2, no_wrap=True)
+    tab.add_column(ratio=1)
+    for z in daten.get("treffer", []):
+        zeichen = WA.AMPEL.get(z["ampel"], WA.AMPEL["grau"])[0]
+        titel = Text(z["titel"], style="assistant.fett", no_wrap=True, overflow="ellipsis")
+        unten = Text(no_wrap=True, overflow="ellipsis")
+        unten.append(z["host"], style="accent")
+        if z["ampel"] == "warn":
+            unten.append("  ·  wollte schon einmal steuern", style="err")
+        elif z["ampel"] == "gelb":
+            unten.append("  ·  unbekannte Seite", style="warn")
+        if z["auszug"]:
+            unten.append(f"  ·  „{z['auszug']}“", style="muted")
+        tab.add_row(Text(str(z["nr"]), style="brand.dim"), Text(zeichen, style=_AMPEL_STIL.get(z["ampel"], "muted")),
+                    Group(titel, unten))
+    return tab
+
+
+def web_karte(daten: dict, sekunden: float | None = None):
+    """Treffer einer Suche als Karte: Ampel, Titel, Domain, kurzer Auszug."""
+    import webanzeige as WA
+    titel = Text("🔎 ", style="brand")
+    titel.append(WA.kopf(daten), style="brand")
+    unter = Text(f"„{daten.get('suche', '')}“", style="muted")
+    if sekunden is not None:
+        unter.append(f"  ·  {_sek(sekunden)}", style="brand.dim")
+    if not daten.get("treffer"):
+        leer = Text("  🔎 ", style="brand")
+        leer.append(f"keine Treffer zu „{daten.get('suche', '')}“", style="muted")
+        return leer
+    teile = [_treffer_zeilen(daten)]
+    if (leg := WA.legende(daten)):
+        teile.append(Text(leg, style="brand.dim", no_wrap=True, overflow="ellipsis"))
+    panel = Panel(Group(*teile), title=titel, title_align="left", subtitle=unter, subtitle_align="right",
+                  box=ROUNDED, border_style="accent.rand", padding=(0, 1))
+    if TUI is None:
+        return panel
+    kurz = Text("  🔎 ", style="brand", no_wrap=True, overflow="ellipsis")
+    kurz.append(WA.kopf(daten), style="assistant")
+    kurz.append(f"  ·  „{daten.get('suche', '')}“  ▸", style="accent.dim")
+    return Klapp(kurz, panel, offen=True)
+
+
+def lese_karte(daten: dict, sekunden: float | None = None) -> Group:
+    """Eine gelesene Seite: „📖 gelesen 🟢 domain · Teil 1 von 3 · ≈ 4.200 Wörter · 0,8 s“ und ihr Anfang."""
+    import webanzeige as WA
+    kopf = Text("  📖 ", style="brand", no_wrap=True, overflow="ellipsis")
+    kopf.append("gelesen  ", style="brand")
+    kopf.append(WA.AMPEL.get(daten.get("ampel"), WA.AMPEL["grau"])[0] + " ",
+                style=_AMPEL_STIL.get(daten.get("ampel"), "muted"))
+    kopf.append(WA.lese_zeile(daten), style="accent")
+    if daten.get("ampel") in ("gelb", "warn"):
+        kopf.append(f"  ·  {WA.AMPEL[daten['ampel']][1]}", style=_AMPEL_STIL[daten["ampel"]])
+    if sekunden is not None:
+        kopf.append(f"  ·  {_sek(sekunden)}", style="brand.dim")
+    if not daten.get("titel"):
+        return Group(kopf)
+    return Group(kopf, Text(f"     „{daten['titel']}“", style="muted", no_wrap=True, overflow="ellipsis"))
+
+
+def web_ergebnis(daten: dict, sekunden: float | None = None):
+    return lese_karte(daten, sekunden) if daten.get("art") == "lesen" else web_karte(daten, sekunden)
+
+
+_SCHRITT_ZEICHEN = {"fertig": ("●", "ok"), "laeuft": ("◐", "user"), "offen": ("○", "brand.dim")}
+
+
+def recherche_leiste(stand: dict, sekunden: float = 0.0) -> Text:
+    """„🧭 Recherche  ●━━━●━━━◐━━━○   Plan · Suchen 3/5 · Lesen 2/4 · Bericht  ·  1m 02s“."""
+    import webanzeige as WA
+    schritte = WA.schritt_zustand(stand)
+    t = Text("  🧭 ", style="brand", no_wrap=True, overflow="ellipsis")
+    t.append("Recherche  ", style="brand")
+    for i, (_name, zustand, _z) in enumerate(schritte):
+        zeichen, stil = _SCHRITT_ZEICHEN[zustand]
+        if zustand == "laeuft":
+            zeichen = WA.radar(sekunden)
+        if i:
+            t.append("━━━", style="ok" if zustand == "fertig" else "brand.rand")
+        t.append(zeichen, style=stil)
+    t.append("   ")
+    for i, (name, zustand, zaehler) in enumerate(schritte):
+        if i:
+            t.append(" · ", style="brand.dim")
+        t.append(name + (f" {zaehler}" if zaehler else ""),
+                 style={"fertig": "ok", "laeuft": "assistant.fett", "offen": "muted"}[zustand])
+    if stand.get("phase") == "fertig":
+        t.append(f"  ·  {stand.get('quellen', 0)} Quellen", style="muted")
+    t.append(f"  ·  {fmt_elapsed(sekunden)}", style="brand.dim")
+    return t
+
+
+@contextmanager
+def recherche_live():
+    """Schritt-Leiste, die während der Recherche mitläuft; danach bleibt der letzte Stand im Verlauf stehen."""
+    letzter: dict = {}
+    with live_view(Text("  🧭 Recherche …", style="brand")) as live:
+        def zeigen(stand: dict, sekunden: float) -> None:
+            letzter["stand"], letzter["s"] = stand, sekunden
+            live.update(recherche_leiste(stand, sekunden))
+        yield zeigen
+    if letzter:
+        console.print(recherche_leiste(letzter["stand"], letzter["s"]))
+
+
+# Mini-Player für fertige Songs: Klicks im Vollbild laufen über App-Aktionen (screen_tx._NemiApp.action_musik)
+MUSIK_KARTEN: dict[str, str] = {}
+_WAV_PFAD = re.compile(r"[A-Za-z]:\\[^\n„“\"]*?\.wav", re.IGNORECASE)
+
+
+def _songtitel(pfad) -> str:
+    from pathlib import Path
+    stamm = Path(str(pfad)).stem
+    return re.sub(r"_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}(-\d{2})?(_\d+)?$", "", stamm).strip(" _") or stamm
+
+
+class _Welle:
+    """Wellenform eines Songs über die ganze verfügbare Breite (bei jeder Breite neu gerechnet, gemerkt)."""
+
+    def __init__(self, pfad, farbe: str):
+        self.pfad, self.farbe, self._je_breite = pfad, farbe, {}
+
+    def __rich_console__(self, console, options):
+        import cockpit
+        breite = max(8, options.max_width)
+        if breite not in self._je_breite:
+            self._je_breite[breite] = cockpit.wellenform(self.pfad, breite) or "♪"
+        yield Text(self._je_breite[breite], style=self.farbe, no_wrap=True, overflow="crop")
+
+
+def musik_karte(pfad, titel: str | None = None, info: str = ""):
+    """Karte eines Songs: Titel, Länge, Wellenform, ▶ Abspielen · 🎙 Als Cover · 📂 Ordner."""
+    import hashlib
+    import wave
+    from pathlib import Path
+    pfad = Path(str(pfad))
+    titel = titel or _songtitel(pfad)
+    try:
+        with wave.open(str(pfad), "rb") as w:
+            sek = w.getnframes() / max(1, w.getframerate())
+    except Exception:
+        sek = 0.0
+    kennung = hashlib.sha1(str(pfad).encode("utf-8"), usedforsecurity=False).hexdigest()[:10]
+    MUSIK_KARTEN[kennung] = str(pfad)
+    farbe = persona_farbe()
+    knoepfe = Text(no_wrap=True, overflow="crop")
+    for i, (zeichen, was) in enumerate((("▶ Abspielen", "spielen"), ("🎙 Als Cover", "cover"), ("📂 Ordner", "ordner"))):
+        if i:
+            knoepfe.append("   ")
+        knoepfe.append(f" {zeichen} ", style=Style(color="#e4e7f2", bgcolor="#1c1f30", bold=True,
+                                                   meta={"@click": f"app.musik('{kennung}', '{was}')"}))
+    teile = [_Welle(pfad, farbe)]
+    if info:
+        teile.append(Text(info, style="muted"))
+    teile.append(knoepfe)
+    body = Group(*teile)
+    kopf = Text("🎵 ", style="accent")
+    kopf.append(f"„{titel}“", style=f"bold {farbe}")
+    if sek:
+        kopf.append(f"  ·  {int(sek) // 60}:{int(sek) % 60:02d}", style="brand.dim")
+    return Panel(body, title=kopf, title_align="left", box=ROUNDED, border_style=farbe, padding=(0, 2))
+
+
+def musik_karte_aus(text: str) -> bool:
+    """Steht in einem Werkzeug-Ergebnis ein vorhandener Song, seine Karte drucken. True, wenn gedruckt."""
+    from pathlib import Path
+    for m in _WAV_PFAD.finditer(str(text or "")):
+        if Path(m.group(0)).is_file():
+            console.print(musik_karte(m.group(0)))
+            return True
+    return False
+
+
+def execution_receipt(records):
+    """Systembilanz der Werkzeugaufrufe; bewertet keine Modellbehauptungen."""
+    if not records:
+        return Text("  Keine Werkzeugaktion ausgeführt.", style="muted")
+    labels = {
+        "success": ("✓", "Ausführung erfolgreich", "ok"),
+        "failed": ("✗", "Ausführung fehlgeschlagen", "err"),
+        "unverified": ("◇", "Status ungeprüft", "muted"),
+        "rejected": ("–", "Abgelehnt · nicht ausgeführt", "muted"),
+        "not_run": ("–", "Nicht ausgeführt", "muted"),
+    }
+    body = Text()
+    for index, record in enumerate(records):
+        status = record.get("status", "unverified")
+        if status not in labels or (record.get("tool") == "subagenten" and status == "success"):
+            status = "unverified"
+        icon, label, color = labels[status]
+        if index:
+            body.append("\n")
+        body.append(f"{icon} {record.get('tool', 'Werkzeug')}", style=color)
+        body.append(f"  ·  {label}", style="muted")
+        if record.get("text"):
+            detail = " ".join(str(record["text"]).split())
+            body.append("\n  " + (detail[:157] + "…" if len(detail) > 160 else detail),
+                        style="muted")
+    return Panel(body, title=Text("Systembilanz · Werkzeugaktionen", style="brand"),
+                 title_align="left", box=ROUNDED, border_style="brand.rand", padding=(0, 2))
+
+
+def tool_result(name: str, result: str):
+    preview = result if len(result) <= 800 else result[:800] + "\n… (gekürzt)"
+    return Panel(
+        Text(preview, style="assistant"),
+        title=f"[ok]✓ {name}[/ok]", title_align="left",
+        box=ROUNDED, border_style="accent.rand", padding=(0, 2),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Kleine Helfer
+# ---------------------------------------------------------------------------
+
+def _esc(msg) -> str:
+    """Meldungen enthalten oft fremden Text (Dateinamen, Fehlertexte, Modell-Antworten): eckige Klammern darin
+    sind kein Markup – „[/b]“ ließ sonst die Ausgabe abstürzen, „[link=…]“ baute einen Link."""
+    from rich.markup import escape
+    return escape(str(msg))
+
+
+def info(msg: str) -> None:
+    console.print(f"[muted]ℹ {_esc(msg)}[/muted]")
+
+
+def helfer_zeile(name: str, text: str) -> Text:
+    """Zeile des Einrichtungs-Helfers – Text ohne Markup, er stammt vom Modell."""
+    zeile = Text()
+    zeile.append(f"✨ {name}  ", style="accent")
+    zeile.append(text)
+    return zeile
+
+
+def helfer_sagt(name: str, text: str) -> None:
+    console.print(helfer_zeile(name, text))
+
+
+def nutzer_sagt(text: str) -> None:
+    """Antwort des Nutzers im Verlauf, wie eine gesendete Nachricht (ohne Markup)."""
+    console.print(Text(f"  ❯ {text}", style="user"))
+
+
+def success(msg: str) -> None:
+    console.print(f"[ok]✓ {_esc(msg)}[/ok]")
+
+
+def warn(msg: str) -> None:
+    console.print(f"[warn]⚠ {_esc(msg)}[/warn]")
+
+
+FEHLER_ZAHL = 0               # Fehlermeldungen bisher (/ablauf zählt Schritte mit Fehler)
+
+
+def error(msg: str) -> None:
+    global FEHLER_ZAHL
+    FEHLER_ZAHL += 1
+    console.print(f"[err]✗ {_esc(msg)}[/err]")
+
+
+# ---------------------------------------------------------------------------
+# TUI-Brücke  (Vollbild-Modus, ui/screen.py)
+# ---------------------------------------------------------------------------
+# Wenn NemiCLI im Vollbild-TUI läuft, setzt screen.py ui.TUI auf die Screen-
+# Instanz und lenkt ui.console in einen Scroll-Puffer um. Damit die bestehenden
+# Funktionen (Live-Anzeige, Spinner) nicht direkt auf stdout malen, gehen sie
+# über diese kleine Abstraktion. Im klassischen Modus (TUI is None) bleibt alles
+# wie bisher.
+
+TUI = None   # wird von screen.py auf die Screen-Instanz gesetzt
+
+
+@contextmanager
+def live_view(initial):
+    """Live-Anzeige für eine streamende Antwort – klassisch via rich.Live,
+    im TUI über den Scroll-Puffer (kein direktes Malen auf stdout)."""
+    if TUI is None:
+        with Live(initial, console=console, refresh_per_second=12,
+                  transient=True, vertical_overflow="crop") as live:
+            yield live
+    else:
+        TUI.live_update(initial)
+
+        class _TuiLive:
+            def update(self, renderable):
+                TUI.live_update(renderable)
+
+        try:
+            yield _TuiLive()
+        finally:
+            TUI.live_clear()
+
+
+@contextmanager
+def thinking(label: str = "denkt nach"):
+    if TUI is not None:
+        # Im Vollbild kein rich-Spinner (würde Steuerzeichen in den Puffer malen) –
+        # stattdessen eine dezente Zeile im Verlauf.
+        console.print(f"[muted]✦ {APP_NAME} {escape(label)} …[/muted]")
+        yield
+        return
+    with console.status(f"[brand]✦ {APP_NAME}[/brand] [muted]{escape(label)} …[/muted]",
+                        spinner="dots", spinner_style="accent"):
+        yield
+
+
+def setup_panel(gpu: dict, hint: dict, links: list[tuple[str, str]] | None = None) -> None:
+    """Zeigt erkannte GPU + reine Fakten (welche Größe passt) + Links zum SELBER
+    Aussuchen. NemiCLI gibt bewusst kein bestimmtes Modell vor."""
+    body = Text()
+    body.append("🎮 Erkannt: ", style="brand")
+    body.append(f"{gpu.get('name', '?')}", style="accent")
+    vram = gpu.get("vram_mb", 0)
+    if vram:
+        body.append(f"   ·   {vram / 1024:.0f} GB VRAM", style="muted")
+    if gpu.get("vendor") == "nvidia" and gpu.get("cuda_max"):
+        body.append(f"   ·   CUDA {gpu['cuda_max']}", style="muted")
+    body.append("\n\n")
+    body.append("📐 Was passt? ", style="brand")
+    body.append(f"{hint['fits']}\n", style="muted")
+    body.append("   (nur ein Anhaltspunkt – das Modell suchst du dir selbst aus)",
+                style="muted")
+    if links:
+        body.append("\n\n🔎 Modelle stöbern:\n", style="brand")
+        for label, url in links:
+            body.append(f"   {label}  ", style="muted")
+            body.append(f"{url}\n", style="accent")
+    console.print(Panel(body, title="[brand]🚀 Lokale Einrichtung[/brand]",
+                        title_align="left", box=ROUNDED, border_style="accent",
+                        padding=(1, 2)))
+
+
+_SCHRITT_RE = re.compile(r"(\d+)\s*/\s*(\d+)")
+
+
+def _fortschritt_balken(i: int, n: int, cells: int = 30) -> Text:
+    """Ein Füllbalken  ▓▓▓▓░░░░  42%  – Stil wie der Kontext-Balken unten."""
+    frac = 0.0 if n <= 0 else max(0.0, min(1.0, i / n))
+    filled = round(frac * cells)
+    bar = Text("  ")
+    bar.append("▓" * filled, style="accent")
+    bar.append("░" * (cells - filled), style="brand.dim")
+    bar.append(f"  {int(frac * 100)}%", style="muted")
+    return bar
+
+
+def progress_panel(title: str, msg: str, live: bool = True):
+    """Fortschritts-Panel. Steckt in der Meldung ein 'i/n' (z.B. 'Schritt 12/30'),
+    zeigen wir zusätzlich einen echten Ladebalken – sonst nur den Spinner
+    (z.B. beim Laden des Modells oder VAE-Dekodieren, wo es keine Schritte gibt).
+    live=False: fest gedruckter Stand ohne Spinner, der sonst nach Bewegung aussieht."""
+    spinner = (Spinner("dots", text=Text(f"  {msg}", style="muted"), style="accent") if live
+               else Text(f"  {msg}", style="muted"))
+    m = _SCHRITT_RE.search(msg)
+    if m:
+        i, n = int(m.group(1)), int(m.group(2))
+        inhalt = Group(spinner, _fortschritt_balken(i, n))
+    else:
+        inhalt = spinner
+    return Panel(inhalt, title=f"[brand]{title}[/brand]", title_align="left",
+                 box=ROUNDED, border_style="brand.rand", padding=(0, 2))
+
+
+def _profil_text(profil, body: Text) -> None:
+    """Steckbrief des Rechners (engines/systemprofil.py) als Zeilen mit Zeichen."""
+    body.append("🧠 ", style="brand")
+    body.append(profil.cpu, style="accent")
+    body.append(f"  ·  {profil.kerne} Kerne / {profil.threads} Threads"
+                + ("  ·  AVX-512" if profil.avx512 else "  ·  AVX2" if profil.avx2 else ""), style="muted")
+    body.append(f"\n🧮 {profil.ram_mb / 1024:.0f} GB Arbeitsspeicher  ·  frei {profil.ram_frei_mb / 1024:.0f} GB\n",
+                style="muted")
+    for g in profil.gpus:
+        body.append("🎮 ", style="brand")
+        body.append(g.name, style="accent")
+        teile = ([f"{g.vram_mb / 1024:.0f} GB"] if g.vram_mb else []) + (["integriert"] if g.integriert else [])
+        if g.cuda_cap:
+            teile.append(f"sm_{g.cuda_cap.replace('.', '')}" + (f" · {g.generation}" if g.generation else ""))
+        body.append(("  ·  " + "  ·  ".join(teile) if teile else "") + "\n", style="muted")
+    if not profil.gpus:
+        body.append("🎮 keine Grafikkarte erkannt\n", style="muted")
+    body.append("⚡ ", style="brand")
+    if profil.nvidia:
+        body.append(f"Lokale Modelle rechnen mit CUDA auf der {profil.nvidia.name}", style="muted")
+        if profil.cuda_max:
+            body.append(f" (Treiber kann CUDA {profil.cuda_max:g})", style="muted")
+    else:
+        body.append("Lokale Modelle rechnen auf der CPU – CUDA gibt es nur mit einer NVIDIA-Karte", style="muted")
+    body.append(f"\n🪟 {profil.windows} (Build {profil.build})", style="muted")
+
+
+def steckbrief_panel(profil) -> None:
+    """/systemcheck: was in diesem PC steckt."""
+    body = Text()
+    _profil_text(profil, body)
+    console.print(Panel(body, title="[brand]🖥 Dein PC[/brand]", title_align="left", box=ROUNDED,
+                        border_style="accent", padding=(1, 2)))
+
+
+def hf_willkommen(profil, frei_platte: str, motor_bereit: bool) -> None:
+    """Kopf des Hugging-Face-Downloaders: Rechner, Regeln, was danach passiert."""
+    body = Text()
+    _profil_text(profil, body)
+    body.append(f"\n💽 Frei auf der Platte: {frei_platte}\n\n", style="muted")
+    for zeichen, satz in (("🔎", "Nur Modelle, die NemiCLI selbst laden kann – ab 4B, von bekannten Anbietern"),
+                          ("⭐", "Q4_K_M wird vorgeschlagen: klein, schnell, kaum schlechter als das Original"),
+                          ("🔐", "Nach dem Laden wird jede Datei mit SHA-256 gegen Hugging Face geprüft"),
+                          ("⏸", "Esc hält an – beim nächsten Mal geht es an derselben Stelle weiter")):
+        body.append(f"{zeichen}  ", style="brand")
+        body.append(f"{satz}\n", style="muted")
+    if not motor_bereit:
+        body.append("\n⚠  Für lokale Modelle fehlt noch torch – laden geht, verwenden erst nach /einrichten.",
+                    style="warn")
+    body.rstrip()
+    console.print(Panel(body, title="[brand]🤗 Modell von Hugging Face holen[/brand]", title_align="left",
+                        box=ROUNDED, border_style="accent", padding=(1, 2)))
+
+
+def hf_modell(modell, datei, mmproj, passt: tuple[str, str], frei_platte: str, ziel: str) -> None:
+    """Steckbrief vor dem Download."""
+    t = Table.grid(padding=(0, 2))
+    t.add_column(style="muted", no_wrap=True)
+    t.add_column()
+    t.add_row("Modell", Text(modell.name, style="accent"))
+    t.add_row("Anbieter", f"{modell.anbieter}  ·  ⬇ {modell.downloads:,}".replace(",", "."))
+    t.add_row("Größe", f"{modell.groesse_text}  ·  Bauart {modell.bauart}")
+    if modell.kontext:
+        t.add_row("Kontext", f"{modell.kontext:,} Token".replace(",", "."))
+    t.add_row("Datei", f"{datei.name}  ·  {_gb(datei.groesse)}")
+    t.add_row("Sehen", f"👁 {mmproj.name}  ·  {_gb(mmproj.groesse)}" if mmproj else "–")
+    t.add_row("Grafikkarte", f"{passt[0]} {passt[1]}")
+    t.add_row("Platte", f"frei {frei_platte}")
+    t.add_row("Ziel", Text(ziel, style="muted"))
+    console.print(Panel(t, title="[brand]📦 Steckbrief[/brand]", title_align="left", box=ROUNDED,
+                        border_style="brand.rand", padding=(1, 2)))
+
+
+def _gb(n: int) -> str:
+    return f"{n / 2**30:.1f} GB".replace(".", ",")
+
+
+def _dauer(sek: float) -> str:
+    sek = int(max(0, sek))
+    return f"{sek // 3600}:{sek % 3600 // 60:02d}:{sek % 60:02d}" if sek >= 3600 else f"{sek // 60}:{sek % 60:02d}"
+
+
+def hf_fortschritt(datei: str, phase: str, erledigt: int, gesamt: int, tempo: float, nr: int, von: int):
+    """Live-Panel beim Laden: Balken, GB, Tempo, Restzeit."""
+    kopf = Text()
+    kopf.append(f"  {datei}", style="accent")
+    if von > 1:
+        kopf.append(f"   ({nr}/{von})", style="muted")
+    zeile = Text("  ")
+    if phase == "pruefe":
+        zeile.append(f"🔐 prüfe angefangene Datei  {_gb(erledigt)} / {_gb(gesamt)}", style="muted")
+    else:
+        zeile.append(f"{_gb(erledigt)} / {_gb(gesamt)}", style="muted")
+        if tempo > 0:
+            zeile.append(f"  ·  {tempo / 2**20:.0f} MB/s  ·  noch {_dauer((gesamt - erledigt) / tempo)}",
+                         style="muted")
+    zeile.append("   ·   Esc hält an", style="brand.dim")
+    return Panel(Group(kopf, _fortschritt_balken(erledigt, gesamt, cells=40), zeile),
+                 title="[brand]⬇ Herunterladen[/brand]", title_align="left", box=ROUNDED,
+                 border_style="accent", padding=(0, 1))
+
+
+def update_tabelle(eintraege) -> None:
+    """/update: was im venv zu tun ist."""
+    import luecken
+    marke = {"fehlt": ("🔴", "fehlt"), "passt nicht": ("🟠", "Version passt nicht"),
+             "torch-bau": ("🟠", "falscher Bau für die Grafikkarte"), "update": ("🟢", "neuere Version"),
+             "torch-update": ("🔥", "neuere PyTorch-Fassung für deine Karte"),
+             "luecke": ("🛡", "Sicherheitslücke"), "luecke-offen": ("⚠", "Sicherheitslücke, offen"),
+             "schadcode": ("🚫", "als Schadpaket gemeldet"), "ueberfluessig": ("🧹", "nicht mehr gebraucht")}
+    t = Table(box=None, padding=(0, 2), show_edge=False, header_style="muted")
+    t.add_column("")
+    t.add_column("Paket", style="accent")
+    t.add_column("jetzt", style="muted")
+    t.add_column("danach")
+    t.add_column("warum", style="muted", overflow="fold")
+    for e in eintraege:
+        z, warum = marke.get(e.grund, ("•", e.grund))
+        if e.luecken:
+            kenn = ", ".join(l.kennung for l in e.luecken[:2]) + (f" +{len(e.luecken) - 2}" if len(e.luecken) > 2 else "")
+            warum = (warum if e.grund in ("luecke", "luecke-offen", "schadcode", "ueberfluessig")
+                     else warum + " · Lücke") + \
+                f" · {luecken.schwerste(e.luecken)}: {kenn}"
+        if e.hinweis and e.hinweis != "wird nicht mehr gebraucht":
+            warum += f"\n{e.hinweis}"
+        danach = (e.neu or ("CUDA-Bau" if e.grund == "torch-bau" else "entfernen" if e.entfernen
+                            else "–" if e.grund == "luecke-offen" else e.spez[len(e.name):] or "aktuell"))
+        t.add_row(z, e.name, e.installiert or "–", danach, warum)
+    console.print(Panel(t, title="[brand]📦 venv prüfen[/brand]", title_align="left", box=ROUNDED,
+                        border_style="brand.rand", padding=(1, 2)))
+
+
+def befehl_panel(befehl: str, sekunden: float, zeilen: list[str]):
+    """Live-Anzeige eines laufenden Befehls: was läuft, wie lange, letzte Ausgabe."""
+    erste = (befehl.strip().splitlines() or [""])[0]
+    kopf = Text("  ")
+    kopf.append(erste if len(erste) <= 160 else erste[:159] + "…", style="accent")
+    teile = [Spinner("dots", text=kopf, style="accent")]
+    for z in zeilen:
+        teile.append(Text("    " + z, style="muted", no_wrap=True, overflow="ellipsis"))
+    titel = Text("⚙ läuft", style="brand")
+    titel.append(f"  ·  {fmt_elapsed(sekunden)}  ·  Esc bricht ab", style="brand.dim")
+    return Panel(Group(*teile), title=titel, title_align="left",
+                 box=ROUNDED, border_style="brand.rand", padding=(0, 2))
+
+
+def practice_header(thema: str):
+    """Kopf einer Übungsrunde (Übungsmodus)."""
+    return Panel(Text(thema, style="assistant"),
+                 title="[brand]🎓 Übungsmodus[/brand]", title_align="left",
+                 box=ROUNDED, border_style="accent", padding=(0, 2))
+
+
+def practice_code(name: str, code: str):
+    """Zeigt den geschriebenen Übungs-Code (gekürzt)."""
+    preview = code if len(code) <= 1400 else code[:1400] + "\n… (gekürzt)"
+    return Panel(Text(preview, style="muted"),
+                 title=f"[muted]📝 {escape(name)}[/muted]", title_align="left",
+                 box=ROUNDED, border_style="brand.rand", padding=(0, 2))
+
+
+def goodbye() -> None:
+    console.print()
+    console.print(
+        Panel(Align.center(Text("👋  Bis bald!", style="brand")),
+              box=ROUNDED, border_style="brand.rand", padding=(0, 4))
+    )
+
+
+# ---------------------------------------------------------------------------
+# Prompt (prompt_toolkit)
+# ---------------------------------------------------------------------------
+
+def _make_prompt_style() -> PTStyle:
+    p = THEMES[_active]
+    return PTStyle.from_dict({
+        "prompt": f"{p['accent']} bold",
+        "": "#c8c4ff",
+        "bottom-toolbar": "noreverse bg:#15151f",
+        "bottom-toolbar.text": "noreverse bg:#15151f",
+    })
+
+
+PROMPT_STYLE = _make_prompt_style()
+PROMPT_FRAGMENTS = [("class:prompt", "  ❯ ")]
+
+
+def input_divider() -> Rule:
+    """Dünne Trennlinie über der Eingabezeile (rahmt die Eingabe oben ein)."""
+    return Rule(style="brand.rand")
+
+
+def ml_panel(stats: dict) -> None:
+    """Zeigt den ML-Bericht (Ordner-Sinn) als hübsches Panel – für /ml."""
+    cur = stats["current"]
+    body = Text()
+
+    # Kopf: aktueller Ordner + Einschätzung mit Balken
+    body.append("📂 ", style="brand")
+    body.append(f"{stats['path']}\n", style="muted")
+    if cur["empty"]:
+        body.append("   leer / nicht lesbar (keine Merkmale)\n", style="muted")
+    else:
+        conf = cur["confidence"]
+        cells = 16
+        filled = max(1, round(conf * cells))
+        body.append("   ")
+        body.append("▓" * filled, style="accent")
+        body.append("░" * (cells - filled), style="brand.dim")
+        body.append(f"  {round(conf * 100)} %  ", style="accent")
+        body.append(f"{cur['name']}\n", style="brand")
+
+    # Top-Einschätzungen
+    if stats["top"]:
+        body.append("\n  Wie sicher bin ich? (Top 4)\n", style="muted")
+        for name, p in stats["top"]:
+            cells = 16
+            filled = max(0, round(p * cells))
+            body.append(f"   {name:<30} ", style="default")
+            body.append("▓" * filled, style="accent")
+            body.append("░" * (cells - filled), style="brand.dim")
+            body.append(f"  {round(p * 100):>3} %\n", style="muted")
+
+    # Lern-Zustand
+    body.append("\n  Mein Wissen\n", style="muted")
+    body.append(f"   • {stats['classes']} Ordner-Typen, "
+                f"{stats['vocab']} Merkmale im Vokabular\n", style="default")
+    body.append(f"   • trainiert aus {stats['seed']} eingebauten + "
+                f"{stats['learned']} selbst gelernten Beispielen\n", style="default")
+    if stats["learned_by"]:
+        teile = ", ".join(f"{k} ×{v}" for k, v in stats["learned_by"].items())
+        body.append(f"   • selbst dazugelernt: {teile}\n", style="default")
+
+    console.print(Panel(body, title="🧠 Ordner-Sinn (ML)", title_align="left",
+                        box=ROUNDED, border_style="accent", padding=(1, 2)))
+
+
+def fmt_duration(s: float) -> str:
+    """Kompakte Sitzungs-Dauer: 42s · 5m · 1h 03m."""
+    s = int(s)
+    if s < 60:
+        return f"{s}s"
+    if s < 3600:
+        return f"{s // 60}m"
+    return f"{s // 3600}h {(s % 3600) // 60:02d}m"
+
+
+def fmt_cost(c: float) -> str:
+    """Grobe Kosten als $-Betrag, lesbar gerundet."""
+    if c <= 0:
+        return "$0"
+    if c < 0.01:
+        return "<$0.01"
+    if c < 1:
+        return f"${c:.2f}"
+    return f"${c:.2f}"
+
+
+# Ampel-Farben für den Kontext-Balken: viel Platz → grün, fast voll → rot.
+def _ctx_color(frac: float) -> str:
+    if frac < 0.50:
+        return "#4ade80"     # grün
+    if frac < 0.80:
+        return "#fbbf24"     # gelb
+    if frac < 0.95:
+        return "#fb923c"     # orange
+    return "#f87171"         # rot
+
+
+def _ctx_fragments(used: int, total: int, bg: str):
+    """Farbiger Füllbalken fürs Modell-Gedächtnis: [████░░░░] 12.4k/200k."""
+    total = max(1, total)
+    frac = min(1.0, used / total)
+    cells = 8
+    filled = max(0, min(cells, round(frac * cells)))
+    col = _ctx_color(frac)
+    mut = f"fg:{leise()} bg:{bg}"
+    return [
+        (mut, "["),
+        (f"fg:{col} bg:{bg}", "█" * filled),
+        (f"fg:#3a3a4a bg:{bg}", "░" * (cells - filled)),
+        (mut, "] "),
+        (f"fg:{col} bg:{bg}", f"{fmt_tokens(used)}/{fmt_tokens(total)}"),
+    ]
+
+
+def fit_fragments(fragments, width: int, ellipsis: str = "…"):
+    """Kürzt eine formatierte Zeile nach Terminalspalten, auch mit breiten Zeichen."""
+    fragments = list(to_formatted_text(fragments))
+    width = max(0, width)
+    if not width:
+        return []
+    if fragment_list_width(fragments) <= width:
+        return fragments
+    if get_cwidth(ellipsis) > width:
+        ellipsis = ""
+    room = width - get_cwidth(ellipsis)
+    result = []
+    for fragment in fragments:
+        kept = ""
+        for char in fragment[1]:
+            cells = get_cwidth(char)
+            if cells > room:
+                if kept:
+                    result.append((fragment[0], kept, *fragment[2:]))
+                if ellipsis:
+                    result.append((fragment[0], ellipsis))
+                return result
+            kept += char
+            room -= cells
+        if kept:
+            result.append((fragment[0], kept, *fragment[2:]))
+    return result
+
+
+def _footer_line(fragments, width: int):
+    """Färbt auch die freie Fläche bis zum rechten Fensterrand."""
+    fragments = fit_fragments(fragments, width)
+    remaining = max(0, width - fragment_list_width(fragments))
+    return fragments + [("bg:#11131d", " " * remaining)]
+
+
+def input_hints(width: int, busy=False, practicing=False, modal=False,
+                has_thinking=False, reading_thinking=False, reviewing_action=False):
+    """Eigene, bei kleinen Fenstern kürzere Tastaturhilfe unter der Eingabe."""
+    p = THEMES[_active]
+    key = f"fg:{p['accent']} bg:#11131d"
+    muted = f"fg:{leise()} bg:#11131d"
+    if reviewing_action:
+        choices = [[("F8", "ausführen"), ("Esc", "ablehnen"), ("↑/↓ · Bild↑/↓", "lesen")],
+                   [("F8", "ausführen"), ("Esc", "ablehnen")],
+                   [("F8", "Ja"), ("Esc", "Nein")]]
+    elif reading_thinking:
+        choices = [[("↑/↓", "scrollen"), ("Bild↑/↓", "blättern"), ("F2 / Esc", "schließen")],
+                   [("↑/↓", "scrollen"), ("F2 / Esc", "schließen")], [("Esc", "zurück")]]
+    elif modal:
+        choices = [[("Enter", "wählen"), ("Esc", "zurück")],
+                   [("Enter", "OK"), ("Esc", "zurück")], [("Enter", "OK")]]
+    else:
+        actions = [("Enter", "senden"), ("Strg+J", "neue Zeile"), ("/", "Befehle"), ("Strg+K", "Suche"),
+                   ("Shift+Tab", "Modus"), ("F3", "Cockpit"), ("F12", "Chat sichern")]
+        if has_thinking:
+            actions.append(("F2", "Denktext"))
+        stop = [("Esc", "Übung stoppen" if practicing else "abbrechen")]
+        choices = [stop + actions[1:] if busy or practicing else actions,
+                   stop + [("Strg+J", "Zeile")] if busy or practicing else
+                   [("Enter", "senden"), ("Strg+J", "Zeile")],
+                   stop if busy or practicing else [("Enter", "senden")]]
+    for actions in choices:
+        fragments = [(muted, "  ")]
+        for i, (label, explanation) in enumerate(actions):
+            if i:
+                fragments.append((muted, "   ·   "))
+            fragments += [(key, label), (muted, f" {explanation}")]
+        if fragment_list_width(fragments) + 2 <= width:
+            break
+    return _footer_line(fragments, width)
+
+
+_MODE_COLORS = {"chat": "#7dc4ff", "lesen": "#8fd18f", "normal": None, "auto": "#ffb454",
+                "autoan": "#ff7a59"}
+
+
+def _mode_fragments(bg: str) -> list:
+    """Der Arbeitsmodus – auffällig, denn er entscheidet, was ohne Rückfrage passiert.
+    Auto blinkt in den letzten 30 s des Zünders."""
+    import modes
+    key, text = modes.status_fragment()
+    p = THEMES[_active]
+    color = _MODE_COLORS.get(key) or p["brand"]
+    style = f"fg:{color} bg:{bg} bold"
+    if key == "auto":
+        rest = modes.auto_remaining() or 0
+        invertiert = f"fg:{bg} bg:{color} bold"
+        if rest <= 30 and int(time.monotonic() * 2) % 2 == 0:
+            return [(style, f" {text} ")]             # Wechsel = Blinken kurz vor dem Zünder
+        return [(invertiert, f" {text} ")]
+    if key == "autoan":
+        return [(f"fg:{bg} bg:{color} bold", f" {text} ")]
+    return [(style, text)]
+
+
+def _coding_fragments(bg: str, sep: list) -> list:
+    """Abzeichen in der Statusleiste, solange der Coding-Assistent an ist."""
+    try:
+        import coding
+        text = coding.status_text()
+    except Exception:
+        text = ""
+    if not text:
+        return []
+    return sep + [(f"fg:#ffffff bg:{CODING_BLAU} bold", f" 🟦 {text} ")]
+
+
+def _responsive_toolbar(state: dict, width: int):
+    p = THEMES[_active]
+    bg = "#11131d"
+    acc = f"fg:{p['accent']} bg:{bg}"
+    brand = f"fg:{p['brand']} bg:{bg}"
+    muted = f"fg:{leise()} bg:{bg}"
+    sep = [(muted, "  ·  " if width >= 80 else " · ")]
+    model = " ".join(str(state.get("model") or "—").split())
+    if width < 118 and ":" in model:
+        model = model.split(":", 1)[1]
+    used, total = state.get("ctx", 0), state.get("ctx_max", 0) or 1
+    if width >= 80:
+        context = [(muted, "Kontext ")] + _ctx_fragments(used, total, bg)
+    elif width >= 34:
+        context = [(muted, "Ctx "),
+                   (f"fg:{_ctx_color(used / total)} bg:{bg}",
+                    f"{fmt_tokens(used)}/{fmt_tokens(total)}")]
+    else:
+        context = [(muted, "Ctx "),
+                   (f"fg:{_ctx_color(used / total)} bg:{bg}",
+                    f"{min(100, max(0, round(used / total * 100)))}%")]
+    details = sep + _mode_fragments(bg) + _coding_fragments(bg, sep) + sep + context
+    model_room = max(1, width - 4 - fragment_list_width(details))
+    model_room = min(model_room, max(12, width * 2 // 5))
+    fragments = [(muted, "  ")] + fit_fragments([(acc, model)], model_room) + details
+    extras = []
+    if state.get("strength"):
+        extras.append([(muted, "Stärke "), (brand, str(state["strength"]))])
+    if state.get("cost", 0) > 0:
+        extras.append([(brand, fmt_cost(state["cost"]))])
+    if state.get("start"):
+        extras.append([(muted, "Sitzung "),
+                       (brand, fmt_duration(time.monotonic() - state["start"]))])
+    for extra in extras:
+        if fragment_list_width(fragments + sep + extra) + 2 <= width:
+            fragments += sep + extra
+    return _footer_line(fragments, width)
+
+
+def bottom_toolbar(state: dict, width: int | None = None):
+    """Statusleiste unter der Eingabe: Modell · Stärke · Chat · Kontext-Balken ·
+    Kosten · Sitzungs-Dauer · Hinweise. Gibt prompt_toolkit-Fragmente zurück."""
+    if width is not None:
+        return _responsive_toolbar(state, max(0, width))
+    p = THEMES[_active]
+    bg = "#15151f"
+    acc = f"fg:{p['accent']} bg:{bg}"
+    brand = f"fg:{p['brand']} bg:{bg}"
+    mut = f"fg:{leise()} bg:{bg}"
+    sep = (mut, "   ·   ")
+
+    frags = [(mut, "  ⌬ "), (acc, state.get("model", "—"))]
+    frags += [sep] + _mode_fragments(bg) + _coding_fragments(bg, [sep])
+    if state.get("strength"):
+        frags += [sep, (mut, "⚡ "), (brand, state["strength"])]
+    # Kontext-Balken (Ampel): wie voll ist das Modell-Gedächtnis?
+    frags += [sep] + _ctx_fragments(state.get("ctx", 0),
+                                    state.get("ctx_max", 0) or 1, bg)
+    # Kosten nur zeigen, wenn welche anfielen (Cloud); lokal bleibt es aus.
+    if state.get("cost", 0) > 0:
+        frags += [sep, (mut, "💲"), (brand, fmt_cost(state["cost"]).lstrip("$"))]
+    # Sitzungs-Dauer
+    if state.get("start"):
+        frags += [sep, (mut, "⏱ "), (brand, fmt_duration(time.monotonic() - state["start"]))]
+    frags += [(mut, "    "), (f"fg:{p['accent_dim']} bg:{bg}", "/help"),
+              (mut, "  ·  ^J neue Zeile  ·  esc bricht ab  ")]
+    return frags
+
+
+# ---------------------------------------------------------------------------
+# Systemcheck  (/systemcheck)
+# ---------------------------------------------------------------------------
+
+def system_panel(rep: dict, todos: list[str]) -> None:
+    """Zeigt: welche Grafikkarte, was ist installiert, was fehlt noch,
+    und den pip-Befehl, der zu genau diesem PC passt."""
+    gpu, plan, st = rep["gpu"], rep["plan"], rep["stock"]
+    body = Text()
+
+    # --- Hardware ---------------------------------------------------------
+    body.append("🎮 Grafikkarte\n", style="brand")
+    body.append(f"   {gpu.get('name', '?')}", style="accent")
+    if gpu.get("vram_mb"):
+        body.append(f"   ·   {gpu['vram_mb'] / 1024:.0f} GB VRAM", style="muted")
+    if rep.get("sm"):
+        body.append(f"   ·   {rep['sm']}", style="muted")
+    if gpu.get("cuda_max"):
+        body.append(f"   ·   Treiber bis CUDA {gpu['cuda_max']}", style="muted")
+    body.append(f"\n   {rep['hint']['fits']}\n", style="muted")
+
+    # --- torch ------------------------------------------------------------
+    t = rep.get("torch", {})
+    body.append("\n🔥 Rechen-Motor (torch, fürs Bilder-Malen)\n", style="brand")
+    if not t.get("da"):
+        body.append("   nicht installiert\n", style="warn")
+    else:
+        body.append(f"   torch {t.get('version', '?')}", style="accent")
+        if t.get("cuda"):
+            body.append(f"  ·  CUDA {t['cuda']}", style="muted")
+        body.append("\n   ")
+        if t.get("gpu_nutzbar") and rep.get("torch_passt") is not False:
+            body.append("✅ nutzt deine Grafikkarte\n", style="ok")
+        elif t.get("gpu_nutzbar"):
+            body.append(f"⚠ kennt {rep.get('sm')} nicht – rechnet falsch/langsam\n",
+                        style="warn")
+        else:
+            body.append("⚠ sieht die Grafikkarte NICHT – rechnet auf der CPU\n",
+                        style="warn")
+
+    body.append("\n   Passender Befehl für diesen PC ", style="muted")
+    body.append(f"({plan['grund']}):\n", style="muted")
+    body.append(f"   {plan['cmd']}\n", style="accent")
+    body.append(f"   {plan['extra']}\n", style="accent")
+    if plan.get("warnung"):
+        body.append(f"   ⚠ {plan['warnung']}\n", style="warn")
+    if rep.get("frozen") and rep.get("extlibs"):
+        body.append(f"   ℹ {rep['extlibs']}\n", style="muted")
+
+    # --- Pakete -----------------------------------------------------------
+    body.append("\n📦 Pakete\n", style="brand")
+    for p in rep["pakete"]:
+        zeichen, stil = ("✅", "ok") if p["da"] else (
+            ("❌", "warn") if p["pflicht"] else ("–", "muted"))
+        body.append(f"   {zeichen} {p['name']:<18}", style=stil)
+        body.append(f"{p['version']:<15}", style="muted")
+        body.append(f"{p['zweck']}\n", style="muted")
+    if rep.get("transformers_ok") is False:
+        body.append("   ⚠ transformers ist älter als 5.10 (bekannte Sicherheitslücken) – "
+                    "/update räumt es auf.\n", style="warn")
+
+    # --- Modelle ----------------------------------------------------------
+    body.append("\n🧠 Modelle auf diesem PC\n", style="brand")
+    body.append(f"   Bild-Modelle (Krea 2):   {st['bildmodelle']}\n", style="accent")
+    body.append(f"      {st['bild_ordner']}\n", style="muted")
+    body.append(f"   Ollama: {'✅ läuft' if st['ollama'] else '– nicht erreichbar'}"
+                f"   ·   {st['frei_gb']} GB frei\n", style="muted")
+    body.append("   Modelle bringt NemiCLI nicht mit – die suchst du dir selbst aus\n",
+                style="muted")
+    body.append("   (Ordner KI-Modelle, je Bereich eine Anleitung.txt).\n", style="muted")
+
+    # --- Was fehlt --------------------------------------------------------
+    if todos:
+        body.append("\n📋 Das fehlt noch\n", style="brand")
+        for i, td in enumerate(todos, 1):
+            body.append(f"   {i}. {td}\n", style="default")
+    else:
+        body.append("\n✅ Alles da – nichts zu tun.\n", style="ok")
+
+    console.print(Panel(body, title="[brand]🩺 Systemcheck[/brand]",
+                        title_align="left", box=ROUNDED, border_style="accent",
+                        padding=(1, 2)))
+
+
+# ---------------------------------------------------------------------------
+# Einrichtungs-Assistent  (/einrichten)
+# ---------------------------------------------------------------------------
+
+def wizard_panel(schritte: list[dict], titel: str = "🧰 Einrichtung") -> None:
+    """Checkliste: was ist da, was fehlt."""
+    body = Text()
+    for s in schritte:
+        if s["ok"]:
+            body.append("  ✅ ", style="ok")
+        elif s.get("pflicht"):
+            body.append("  ❌ ", style="warn")
+        else:
+            body.append("  ⬜ ", style="muted")
+        body.append(f"{s['titel']}\n", style="brand" if not s["ok"] else "default")
+        body.append(f"      {s['info']}\n", style="muted")
+    console.print(Panel(body, title=f"[brand]{titel}[/brand]", title_align="left",
+                        box=ROUNDED, border_style="accent", padding=(1, 2)))
+
+
+def wizard_models_panel(hinweise: list[tuple[str, str]], ordner: dict) -> None:
+    """Wo bekommt man Modelle her – und wohin damit."""
+    body = Text()
+    body.append("Modelle bringt NemiCLI nicht mit – die suchst du dir selbst aus.\n\n",
+                style="muted")
+    for label, wo in hinweise:
+        body.append(f"  • {label}\n", style="brand")
+        body.append(f"    {wo}\n", style="accent")
+    body.append("\n  Dateien gehören hierhin:\n", style="brand")
+    body.append(f"    Krea 2 (Bilder)  →  {ordner['bilder']}\n", style="muted")
+    console.print(Panel(body, title="[brand]📦 Modelle besorgen[/brand]",
+                        title_align="left", box=ROUNDED, border_style="accent",
+                        padding=(1, 2)))

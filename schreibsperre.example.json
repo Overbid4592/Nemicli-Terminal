@@ -1,0 +1,8 @@
+{
+  "_hinweis": "Beispiel fuer private Zusatzsperren. Kopiere diese Datei lokal zu schreibsperre.json und trage dort deine eigenen Pfade ein. schreibsperre.json wird von Git ignoriert und gehoert nicht ins Repository.",
+  "_pfade": "nur-lesen: die KI darf ansehen, aber nicht aendern",
+  "_pfade_absolut": "komplett tabu: weder ansehen noch aendern",
+  "_beispiel": "\"pfade_absolut\": [\"C:\\Users\\DeinName\\Desktop\\GeheimesProjekt\"]",
+  "pfade": [],
+  "pfade_absolut": []
+}

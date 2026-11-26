@@ -1,0 +1,3047 @@
+"""
+screen_tx.py - Das Vollbild-TUI von NemiCLI auf Textual (Nachfolger von screen.py).
+
+Gleiche Schnittstelle wie der alte Screen (install/run/select/text_input/
+review_action/live_update/print_reflow/set_helfer/…), damit main.py, confirm.py
+und ui.py nichts davon merken. Umschalten auf den alten Screen: NEMICLI_TUI=alt.
+
+Was anders ist – und warum:
+- Der Verlauf besteht aus echten Widgets (ein Static pro gedrucktem Block) statt
+  aus vorgerenderten ANSI-Zeilen. Textual rendert jeden Block in der AKTUELLEN
+  Breite neu, sobald sich das Fenster ändert – Panels, Banner, Markdown, alles.
+  Kein Reflow-Sonderweg, keine Geister-Zeichen, kein Zellen-Diff von Hand.
+- ui.console bleibt der Weg, wie alle Module ausgeben. Er ist hier eine
+  Console, deren print() die Renderables abfängt und in den Verlauf hängt,
+  statt sie zu Text zu rendern.
+- Menüs, Texteingabe, Aktionsprüfung (F8) und Denktext (F2) sind ModalScreens.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import io
+import os
+import re
+import threading
+import time
+from typing import Callable
+
+from rich.align import Align
+from rich.cells import cell_len
+from rich.console import Console, Group
+from rich.markdown import Markdown
+from rich.padding import Padding
+from rich.panel import Panel
+from rich.style import Style
+from rich.segment import Segment
+from rich.styled import Styled
+from rich.table import Table
+from rich.text import Text
+
+from textual import events
+from textual.app import App, ComposeResult
+from textual.strip import Strip
+from textual.visual import RichVisual
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.screen import ModalScreen, Screen as _TxScreen
+from textual.selection import SELECT_ALL, SelectEnd, Selection
+from textual.geometry import Offset
+from textual.widgets import Button, Input, Static, TextArea
+
+from prompt_toolkit.document import Document
+from prompt_toolkit.completion import CompleteEvent
+
+import ui
+import mascot
+import cockpit
+import palette
+import eingabe_win
+from commands import SlashCompleter
+import models as M
+import konsolenzeichen
+
+konsolenzeichen.treiber_glaetten()      # Flaggen & Co. breitengleich glätten – sonst verrutscht die Ansicht
+
+eingabe_win.einschalten()           # Emojis über Alt+Ziffernblock nicht verlieren
+
+
+SCROLL_ZEILEN = 4             # Zeilen je Mausrad-Raste (Textual-Vorgabe: 2)
+SPEICHER_BLITZ_S = 1.5        # so lange leuchtet der 100k-Balken nach einer Änderung auf
+_ALIVE_SPERRE = threading.Lock()   # Lebenszeichen schreiben und beim Ende löschen nicht gleichzeitig
+
+
+def esc_notstopp(text: str = "⏹ ESC – Abbruch! Die KI hört sofort auf. Gelöscht wird nichts.") -> bool:
+    """ESC (oder STOP) während einer Runde der KI: den Not-Stopp sofort auslösen und sichtbar melden – nicht
+    erst, wenn die Runde das nächste Mal nachsieht. Gilt in jedem Bereich, auch in Rückfragen und Menüs."""
+    try:
+        import notstopp
+    except Exception:
+        return False
+    if not notstopp.runde_laeuft() or notstopp.ausgeloest():
+        return False
+    notstopp.ausloesen()
+    try:
+        ui.warn(text)
+    except Exception:
+        pass
+    return True
+
+
+def _scroll_zeilen() -> int:
+    """Zeilen je Mausrad-Raste: Config-Schlüssel "scroll_zeilen" (1–20), sonst SCROLL_ZEILEN."""
+    try:
+        import config
+        return max(1, min(20, int(config.load().get("scroll_zeilen", SCROLL_ZEILEN))))
+    except Exception:
+        return SCROLL_ZEILEN
+
+
+def _uebung_gewuenscht() -> bool:
+    """Übungsmodus laut Config (Schlüssel "uebung"). Fehlt er: an – wie früher.
+    /uebung aus schreibt False, damit man es nicht bei jedem Start neu sagen muss."""
+    try:
+        import config
+        return bool(config.load().get("uebung", True))
+    except Exception:
+        return True
+from screen import terminal_safe as _terminal_safe, maus_tracking_aus, _checkpoint_menu, _persona_menu
+
+
+def emoji_ganz() -> bool:
+    """Im eigenen NemiCLI-Fenster zählen Fenster (terminal_fenster) und Oberfläche (rich/Textual) Emoji als
+    Graphem-Gruppen: ❤️, 👍🏻, 👩‍💻 und 1️⃣ bleiben dort vollständig und bunt. Andere Terminals bekommen die
+    vereinfachte Form, deren Breite überall gleich ist."""
+    return os.environ.get("NEMICLI_FENSTER") == "1"
+
+
+def terminal_safe(text: str) -> str:
+    return _terminal_safe(text, emoji_ganz())
+
+_SCHIRM_BG = "#0c0d14"       # Grundfarbe; das eigene Fenster lässt Zellen in dieser Farbe frei
+_COMPOSER_BG = "#11131d"
+_TOOLBAR_BG = "#15151f"
+_ROLL_SCHRITTE = (0.45, 0.8, 1.0)    # weiches Blättern: Anteile des Wegs, je Schritt ein Bild
+_ROLL_PAUSE_S = 0.03
+_MIN_INPUT_ROWS = 3
+_MAX_INPUT_ROWS = 8
+_MAX_BLOCKS = 600            # Verlauf im Speicher kappen (Widgets)
+_SUCH_STUECK = 30            # so viele Blöcke durchsucht die Suche am Stück
+_MAX_COMPLETIONS = 10         # sichtbare Zeilen im /-Menü, der Rest wird geblättert
+
+
+# ---------------------------------------------------------------------------
+# prompt_toolkit-Fragmente -> rich.Text  (Toolbar, Hinweise, Maskottchen bleiben
+# unverändert; sie liefern (style, text)-Tupel, die wir hier übersetzen)
+# ---------------------------------------------------------------------------
+_STYLE_CACHE: dict[str, Style] = {}
+
+
+def _nutzer_markieren() -> None:
+    """Die Zeile ist getippt: sie zählt für den Befehlsverlauf (/ablauf)."""
+    try:
+        import ablauf
+        ablauf.markieren()
+    except Exception:
+        pass
+
+
+def _taetig(art: str | None) -> None:
+    """Status neben dem Bild der Persönlichkeit (startseite.taetig); Fehler stören den Zug nicht."""
+    try:
+        import startseite
+        startseite.taetig(art)
+    except Exception:
+        pass
+
+
+def _figur(tun) -> None:
+    """Figur der Persönlichkeit im eigenen Fenster (ui/figur.py); Fehler stören den Zug nicht."""
+    try:
+        import figur
+        tun(figur)
+    except Exception:
+        pass
+
+
+def pt_style(spec: str) -> Style:
+    """'fg:#41e0d0 bg:#11131d bold' -> rich.Style. Unbekannte Tokens werden ignoriert."""
+    if spec in _STYLE_CACHE:
+        return _STYLE_CACHE[spec]
+    kw: dict = {}
+    for tok in (spec or "").split():
+        low = tok.lower()
+        if low.startswith("fg:"):
+            kw["color"] = tok[3:]
+        elif low.startswith("bg:"):
+            kw["bgcolor"] = tok[3:]
+        elif low in ("bold", "italic", "underline", "reverse", "blink", "strike", "dim"):
+            kw[low] = True
+        elif low in ("nobold", "noitalic", "nounderline", "noreverse", "noblink"):
+            kw[low[2:]] = False
+        elif low.startswith("#") or low in ("ansiwhite", "white", "black"):
+            kw["color"] = tok
+        # class:… und ähnliches: kein Gegenstück in rich, wird übersprungen
+    try:
+        st = Style(**kw)
+    except Exception:
+        st = Style()
+    _STYLE_CACHE[spec] = st
+    return st
+
+
+# Symbole mit Text-Darstellung als Vorgabe (🛡 ℹ 🗂 🎚 …): rich und Terminal zählen eine Zelle,
+# das Terminal malt sie aber aus der Emoji-Schrift zwei Zellen breit – die zweite Hälfte
+# überdeckt das folgende Zeichen („ℹ🛡Wache“ statt „ℹ 🛡 Wache“). Ein Leerzeichen dahinter
+# gibt ihnen den Platz, den sie tatsächlich belegen. Nur hier, vor dem Rendern – im
+# klassischen Modus wird fertiger Text gefiltert, dort würde es Rahmen verschieben.
+# Aus dem BMP nur Emoji mit Text-Vorgabe (Unicode emoji-data: Emoji_Presentation=No), keine
+# Pfeile und Formen \u2013 die haben Terminal-Schriften selbst und malen sie schmal.
+_UEBERHANG_BMP = (0x2139, 0x2328, 0x23CF, 0x23ED, 0x23EE, 0x23EF, 0x23F1, 0x23F2, 0x23F8, 0x23F9, 0x23FA,
+                  0x2600, 0x2601, 0x2602, 0x2603, 0x2604, 0x260E, 0x2611, 0x2618, 0x261D, 0x2620, 0x2622,
+                  0x2623, 0x2626, 0x262A, 0x262E, 0x262F, 0x2638, 0x2639, 0x263A, 0x2640, 0x2642, 0x265F,
+                  0x2668, 0x267B, 0x267E, 0x2692, 0x2694, 0x2695, 0x2696, 0x2697, 0x2699, 0x269B, 0x269C,
+                  0x26A0, 0x26A7, 0x26B0, 0x26B1, 0x26C8, 0x26CF, 0x26D1, 0x26D3, 0x26E9, 0x26F0, 0x26F1,
+                  0x26F4, 0x26F7, 0x26F8, 0x26F9, 0x2702, 0x2708, 0x2709, 0x270C, 0x270D, 0x270F, 0x2712,
+                  0x271D, 0x2721, 0x2733, 0x2734, 0x2744, 0x2747, 0x2763, 0x2764)
+
+
+def _ueberhang_muster() -> re.Pattern:
+    from rich.cells import cell_len
+    import unicodedata
+    kandidaten = list(_UEBERHANG_BMP) + [c for c in range(0x1F300, 0x1F700)
+                                         if unicodedata.category(chr(c)) == "So"]
+    return re.compile("[" + "".join(chr(c) for c in kandidaten if cell_len(chr(c)) == 1) + "]")
+
+
+_UEBERHANG = _ueberhang_muster()
+_UEBERHANG_LUECKE = re.compile("(" + _UEBERHANG.pattern + ") ")     # beim Kopieren wieder heraus
+
+
+def _emoji_muster() -> tuple[re.Pattern, re.Pattern]:
+    """Für emoji_ganz: Zeichen aus _UEBERHANG, die mit U+FE0F ein Emoji von zwei Zellen werden (bekommen den
+    Zusatz, wenn keine Variante folgt), und die übrigen (behalten die Lücke)."""
+    from rich.cells import cell_len
+    zeichen = _UEBERHANG.pattern[1:-1]
+    emoji = "".join(c for c in zeichen if cell_len(c + "\ufe0f") == 2)
+    rest = "".join(c for c in zeichen if c not in emoji)
+    return re.compile(f"[{emoji}](?![\ufe0e\ufe0f])"), re.compile(f"[{rest}]" if rest else r"(?!x)x")
+
+
+_EMOJI_BUNT, _UEBERHANG_REST = _emoji_muster()
+
+
+_PLATZHALTER = re.compile(r"[\ue000-\ue1ff]")              # Bildstellen der Startseite (terminal_fenster)
+
+
+def _zusaetze(plain: str) -> list[tuple[int, str]]:
+    """(Stelle, Zusatz) für ueberhang: Lücke hinter Symbolen, die breiter gemalt als gezählt werden; mit
+    emoji_ganz stattdessen U+FE0F, damit das Symbol bunt und mit seiner wahren Breite erscheint."""
+    if not emoji_ganz():
+        return [(m.end(), " ") for m in _UEBERHANG.finditer(plain)]
+    return sorted([(m.end(), "\ufe0f") for m in _EMOJI_BUNT.finditer(plain)]
+                  + [(m.end(), " ") for m in _UEBERHANG_REST.finditer(plain)])
+
+
+def ueberhang(text: str) -> str:
+    if not text or text.isascii():
+        return text
+    teile, vorher = [], 0
+    for stelle, zusatz in _zusaetze(text):
+        teile += [text[vorher:stelle], zusatz]
+        vorher = stelle
+    return "".join(teile) + text[vorher:] if teile else text
+
+
+def _ueberhang_text(t: Text) -> Text:
+    """Wie ueberhang, aber für rich.Text mit Stilen: der Zusatz gehört zum Abschnitt seines Zeichens. U+FE0F
+    muss im selben Abschnitt liegen – getrennt zählte ❤ eine Zelle und U+FE0F keine, zusammen sind es zwei."""
+    zusaetze = _zusaetze(t.plain) if t.plain and not t.plain.isascii() else []
+    if not zusaetze:
+        return t
+    from bisect import bisect_right
+    from rich.text import Span
+    stellen = [s for s, _ in zusaetze]
+    teile, vorher = [], 0
+    for stelle, zusatz in zusaetze:
+        teile += [t.plain[vorher:stelle], zusatz]
+        vorher = stelle
+    plain = "".join(teile) + t.plain[vorher:]
+    breite = [0]
+    for _s, zusatz in zusaetze:
+        breite.append(breite[-1] + len(zusatz))
+
+    def neu(i: int) -> int:
+        """Zusätze an Stelle <= i hängen an Zeichen vor i: am Anfang eines Abschnitts davor, an seinem Ende darin."""
+        return i + breite[bisect_right(stellen, i)]
+
+    spans = [Span(neu(s.start), neu(s.end), s.style) for s in t.spans]
+    return Text(plain, style=t.style, justify=t.justify, overflow=t.overflow, no_wrap=t.no_wrap,
+                end=t.end, tab_size=t.tab_size, spans=spans)
+
+
+def _sicher(text: str) -> str:
+    """terminal_safe plus ohne Bild-Platzhalter: die gehören nur zu startseite.Bildstelle."""
+    text = terminal_safe(text)
+    return text if not text or text.isascii() else _PLATZHALTER.sub("", text)
+
+
+def fragments_to_text(fragments) -> Text:
+    """Liste von (style, text[, handler]) -> rich.Text (Emoji-sicher)."""
+    out = Text(no_wrap=True, overflow="crop")
+    for frag in fragments or []:
+        style, text = frag[0], frag[1]
+        if text:
+            out.append(ueberhang(_sicher(text)), style=pt_style(style))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Renderables Emoji-sicher machen (siehe terminal_safe in screen.py)
+# ---------------------------------------------------------------------------
+def sanitize(renderable):
+    """Bringt die Texte in einem Renderable auf die Emoji-Form, deren Breite
+    Terminal und rich gleich sehen. Deckt die Typen ab, die NemiCLI druckt."""
+    try:
+        if isinstance(renderable, str):
+            return ueberhang(_sicher(renderable))
+        if isinstance(renderable, Text):
+            if getattr(renderable, "BILDSTELLE", False):      # echte Bildstelle der Startseite
+                return renderable
+            plain = _sicher(renderable.plain)
+            if plain != renderable.plain:
+                renderable.plain = plain
+            return _ueberhang_text(renderable)
+        if isinstance(renderable, Markdown):
+            src = ueberhang(_sicher(renderable.markup))
+            if src != renderable.markup:
+                # type(...) statt Markdown: sonst verliert ein NemiMarkdown beim
+                # Entschaerfen der Emoji seine schoenen Code-Bloecke.
+                return type(renderable)(src, code_theme=renderable.code_theme,
+                                justify=renderable.justify,
+                                style=renderable.style, hyperlinks=renderable.hyperlinks,
+                                inline_code_lexer=renderable.inline_code_lexer,
+                                inline_code_theme=renderable.inline_code_theme)
+            return renderable
+        if isinstance(renderable, Panel):
+            renderable.renderable = sanitize(renderable.renderable)
+            if isinstance(renderable.title, str):
+                renderable.title = ueberhang(_sicher(renderable.title))
+            elif isinstance(renderable.title, Text):
+                renderable.title = sanitize(renderable.title)
+            return renderable
+        if isinstance(renderable, Group):
+            return Group(*[sanitize(r) for r in renderable.renderables], fit=renderable.fit)
+        if isinstance(renderable, Table):                   # Raster der Startseite, Tabellen
+            for spalte in renderable.columns:
+                spalte._cells[:] = [sanitize(z) for z in spalte._cells]
+            return renderable
+        if isinstance(renderable, (Align, Padding, Styled)):
+            renderable.renderable = sanitize(renderable.renderable)
+            return renderable
+        if isinstance(renderable, ui.Klapp):
+            renderable.kurz, renderable.lang = sanitize(renderable.kurz), sanitize(renderable.lang)
+            return renderable
+    except Exception:
+        pass
+    return renderable
+
+
+class _ReflowRenderable:
+    """Hülle für print_reflow: ruft die Fabrik bei JEDEM Rendern mit der dann
+    gültigen Breite auf (Banner-Padding richtet sich nach der Breite)."""
+
+    def __init__(self, make: Callable):
+        self.make = make
+
+    def __rich_console__(self, console, options):
+        try:
+            r = self.make(width=options.max_width)
+        except TypeError:
+            r = self.make()
+        yield sanitize(r)
+
+
+# ---------------------------------------------------------------------------
+# Verlaufs-Block mit Text-Markierung: Textual kann Text nur in reinen
+# Text-Widgets markieren/kopieren. Unsere Blöcke sind rich-Renderables
+# (Panels, Markdown) – darum hier: Auswahl selbst einfärben und den Text
+# aus einem Klartext-Render der gleichen Breite herausziehen.
+# ---------------------------------------------------------------------------
+class _SelectableRich(RichVisual):
+    """RichVisual, das die Maus-Markierung (Screen-Auswahl) mit einfärbt."""
+
+    def render_strips(self, width, height, style, options):
+        strips = super().render_strips(width, height, style, options)
+        # Jedes Segment bekommt seine Zeichenposition als Meta-Info ("offset").
+        # Daran erkennt Textual beim Klicken/Ziehen, WO im Text die Maus ist –
+        # ohne das wird immer der ganze Block markiert.
+        annotated = []
+        for y, strip in enumerate(strips):
+            x = 0
+            segs = []
+            for seg in strip:
+                for stueck in _graphem_stuecke(seg.text):
+                    meta = Style.from_meta({"offset": (x, y)})
+                    segs.append(Segment(stueck, (seg.style + meta) if seg.style else meta,
+                                        seg.control))
+                    x += len(stueck)
+            annotated.append(Strip(segs, strip.cell_length))
+        strips = annotated
+        sel, sel_style = options.selection, options.selection_style
+        if sel is None or sel_style is None:
+            return strips
+        markieren = _markier_stil(sel_style, style)
+        out = []
+        for y, strip in enumerate(strips):
+            span = sel.get_span(y)
+            if span is None:
+                out.append(strip)
+                continue
+            x0, x1 = span
+            x0 = _zellen(strip, x0)
+            x1 = strip.cell_length if x1 == -1 else _zellen(strip, x1)
+            x0 = max(0, min(x0, strip.cell_length))
+            x1 = max(x0, min(x1, strip.cell_length))
+            mitte = Strip([Segment(s.text, markieren(s.style), s.control) for s in strip.crop(x0, x1)])
+            out.append(Strip.join([strip.crop(0, x0), mitte, strip.crop(x1)]))
+        return out
+
+
+def _graphem_stuecke(text: str) -> list[str]:
+    """Text in Stücke für die Offset-Markierung: Graphem-Gruppen aus mehreren Zeichen (❤️, 👩‍💻, 👍🏻) einzeln.
+    Textual rechnet die Maus-Spalte Zeichen für Zeichen in einen Offset um und zählt dabei U+FE0F, Verbinder
+    und Hautton mit ihrer eigenen Breite – innerhalb eines Stücks aus einer Gruppe stimmt dagegen die Spalte."""
+    if not text or text.isascii():
+        return [text]
+    try:
+        from rich.cells import split_graphemes
+        spannen, _ = split_graphemes(text)
+    except Exception:
+        return [text]
+    if all(e - a == 1 for a, e, _w in spannen):
+        return [text]
+    stuecke, lauf = [], ""
+    for a, e, _w in spannen:
+        if e - a == 1:
+            lauf += text[a]
+            continue
+        if lauf:
+            stuecke.append(lauf)
+            lauf = ""
+        stuecke.append(text[a:e])
+    if lauf:
+        stuecke.append(lauf)
+    return stuecke
+
+
+def _ganze_gruppen(selection, text: str):
+    """Auswahl auf Graphem-Grenzen erweitern: Anfang und Ende mitten in ❤️ oder 👩‍💻 nehmen die ganze Gruppe."""
+    try:
+        from rich.cells import split_graphemes
+    except Exception:
+        return selection
+    zeilen = text.splitlines()
+
+    def grenze(stelle, nach_vorn: bool):
+        if stelle is None or not 0 <= stelle.y < len(zeilen):
+            return stelle
+        zeile, x = zeilen[stelle.y], stelle.x
+        if zeile.isascii() or not 0 < x < len(zeile):
+            return stelle
+        for a, e, _w in split_graphemes(zeile)[0]:
+            if a < x < e:
+                return Offset(a if nach_vorn else e, stelle.y)
+        return stelle
+
+    return Selection(grenze(selection.start, True), grenze(selection.end, False))
+
+
+# Doppelklick: Ein Wort reicht bis zu Leerraum, Klammern, Anführungszeichen und Rändern – Pfade, Links und
+# Dateinamen bleiben so ganz; Satzzeichen am Ende gehören nicht dazu.
+_WORT_GRENZE = frozenset(" \t\"'`()[]{}<>«»„“”‚‘’│▎,;")
+_WORT_ENDE = ".:!?…"
+_RAND = " │▎╭╮╰╯─━┃┌┐└┘═║"
+
+
+def spalte_zu_zeichen(zeile: str, spalte: int) -> int:
+    """Zeichen unter einer Bildschirm-Spalte (ein Emoji ist ein Zeichen, aber zwei Spalten breit)."""
+    pos = 0
+    for i, ch in enumerate(zeile):
+        pos += cell_len(ch)
+        if spalte < pos:
+            return i
+    return max(0, len(zeile) - 1)
+
+
+def wort_spanne(zeile: str, i: int) -> tuple[int, int] | None:
+    """(Anfang, Ende) des Wortes am Zeichen i – None auf Leerraum oder einem Trennzeichen."""
+    if not 0 <= i < len(zeile) or zeile[i] in _WORT_GRENZE:
+        return None
+    a, e = i, i + 1
+    while a > 0 and zeile[a - 1] not in _WORT_GRENZE:
+        a -= 1
+    while e < len(zeile) and zeile[e] not in _WORT_GRENZE:
+        e += 1
+    while e - 1 > i and zeile[e - 1] in _WORT_ENDE:
+        e -= 1
+    return a, e
+
+
+def absatz_spanne(zeilen: list[str], y: int) -> tuple[int, int]:
+    """Erste und letzte Zeile des Absatzes um Zeile y – bis zur nächsten Leer- oder Randzeile, so bleibt ein
+    umbrochener Satz ganz."""
+    def leer(n: int) -> bool:
+        return not zeilen[n].strip(_RAND)
+    a = e = y
+    while a > 0 and not leer(a - 1):
+        a -= 1
+    while e + 1 < len(zeilen) and not leer(e + 1):
+        e += 1
+    return a, e
+
+
+def _zellen(strip, zeichen: int) -> int:
+    """Spalte vor dem Zeichen Nr. `zeichen` der Zeile. Die Auswahl zählt Zeichen (wie die Offsets),
+    gemalt wird in Spalten – ein Emoji ist ein Zeichen, aber zwei Spalten breit."""
+    spalte = 0
+    for seg in strip:
+        if zeichen <= 0:
+            break
+        n = len(seg.text)
+        if zeichen >= n:
+            spalte += seg.cell_length
+            zeichen -= n
+        else:
+            spalte += cell_len(seg.text[:zeichen])
+            zeichen = 0
+    return spalte
+
+
+def _markier_stil(sel_style, grund):
+    """Stil eines markierten Zeichens: die halbtransparente Markierfarbe mit dem Hintergrund des Zeichens
+    mischen und oben auflegen. Strip.apply_style legt sie darunter – dann ist sie unsichtbar."""
+    from textual.color import Color as _Farbe
+    sel_bg, sel_fg = sel_style.background, sel_style.foreground
+    unten_bg = grund.background
+
+    def markieren(stil: Style | None) -> Style:
+        stil = stil or Style()
+        bg = _Farbe.from_rich_color(stil.bgcolor) if stil.bgcolor is not None else unten_bg
+        neu = {}
+        if sel_bg is not None and sel_bg.a > 0:
+            neu["bgcolor"] = ((bg or _Farbe(0, 0, 0)) + sel_bg).rich_color
+        if sel_fg is not None and sel_fg.a > 0:
+            fg = _Farbe.from_rich_color(stil.color) if stil.color is not None else grund.foreground
+            neu["color"] = ((fg or _Farbe(255, 255, 255)) + sel_fg).rich_color
+        return stil + Style(**neu) if neu else stil
+    return markieren
+
+
+class _Block(Static):
+    """Ein gedruckter Block im Verlauf – markier- und kopierbar."""
+
+    def __init__(self, renderable, **kw):
+        super().__init__(renderable, **kw)
+        self.nemi_renderable = renderable
+        self._sel_visual = None
+        self._klartext = None                    # (Breite, Renderable, Text) für die Suche
+
+    def render(self):
+        if self._sel_visual is None:
+            self._sel_visual = _SelectableRich(self, self.nemi_renderable)
+        return self._sel_visual
+
+    def _plain_lines(self) -> str:
+        """Klartext-Render in der aktuellen Breite (so, wie es auf dem Schirm liegt)."""
+        w = max(1, self.content_size.width)
+        sio = io.StringIO()
+        con = Console(file=sio, width=w, color_system=None, force_terminal=False,
+                      legacy_windows=False, theme=ui._build_theme(ui.current_theme()),
+                      soft_wrap=False, highlight=False)
+        con.print(self.nemi_renderable)
+        return sio.getvalue()
+
+    def klartext(self) -> str:
+        """Wie _plain_lines, gemerkt je Breite – die Suche liest jeden Block bei jedem Tastendruck."""
+        stand = (max(1, self.content_size.width), self.nemi_renderable)
+        if self._klartext is None or self._klartext[0] != stand[0] or self._klartext[1] is not stand[1]:
+            self._klartext = (*stand, self._plain_lines())
+        return self._klartext[2]
+
+    def ganz_kopieren(self) -> str:
+        """Der ganze Block als Text, so bereinigt wie beim Markieren."""
+        gewaehlt = self.get_selection(Selection(None, None))
+        return gewaehlt[0] if gewaehlt else ""
+
+    async def on_click(self, event: events.Click) -> None:
+        if event.button == 3:                    # Rechtsklick: ganzen Block kopieren
+            event.stop()
+            self.app.block_kopieren(self)
+            return
+        # Doppelklick = Wort, Dreifachklick = Absatz (Textual nähme den ganzen Block bzw. den ganzen Verlauf).
+        if event.button == 1 and event.chain in (2, 3) and event.widget is self and self._klick_markieren(event):
+            event.prevent_default()
+            await self.broker_event("click", event)
+
+    def _klick_markieren(self, event: events.Click) -> bool:
+        stelle = event.get_content_offset(self)
+        zeilen = self.klartext().split("\n")
+        if stelle is None or not 0 <= stelle.y < len(zeilen):
+            return False
+        zeile = zeilen[stelle.y]
+        if event.chain == 2:
+            spanne = wort_spanne(zeile, spalte_zu_zeichen(zeile, stelle.x))
+            if spanne is None:
+                return False
+            auswahl = Selection(Offset(spanne[0], stelle.y), Offset(spanne[1], stelle.y))
+        else:
+            a, e = absatz_spanne(zeilen, stelle.y)
+            if not zeilen[a].strip(_RAND):
+                return False
+            auswahl = Selection(Offset(0, a), Offset(len(zeilen[e]), e))
+        self.screen.selections = {self: auswahl}
+        kopieren = getattr(self.app, "_auswahl_kopieren", None)
+        if kopieren is not None:
+            kopieren(False)
+        return True
+
+    def get_selection(self, selection):
+        try:
+            plain = self._plain_lines()
+            raw = _ganze_gruppen(selection, plain).extract(plain)
+        except Exception:
+            return None
+        # Kopiert wird nur der geschriebene Text: Panel-Ränder und Nachlauf-
+        # Leerzeichen weg, Bild-Vorschauen (Zeilen aus ▀) ganz weg.
+        lines = []
+        for line in raw.split("\n"):
+            line = line.rstrip()
+            if line.endswith("│"):
+                line = line[:-1].rstrip()
+            if line.startswith("│"):
+                line = line[1:]
+                line = line[2:] if line.startswith("  ") else line.lstrip(" ")
+            elif line.startswith("▎"):                 # Leiste links der Antworten (ui.LEISTE)
+                line = line[2:] if line.startswith("▎ ") else line[1:]
+            line = _UEBERHANG_LUECKE.sub(r"\1", line)
+            line = _PLATZHALTER.sub("", line)
+            if line and sum(ch == "▀" for ch in line) >= 0.8 * len(line):
+                continue
+            lines.append(line)
+        return "\n".join(lines).strip("\n"), "\n"
+
+
+class _KlappBlock(_Block):
+    """Ein ui.Klapp im Verlauf: eingeklappt eine Zeile, ein Klick klappt auf und wieder zu."""
+
+    def __init__(self, klapp, **kw):
+        self.klapp = klapp
+        super().__init__(klapp.lang if klapp.offen else klapp.kurz, **kw)
+
+    def umschalten(self) -> None:
+        self.klapp.offen = not self.klapp.offen
+        self.nemi_renderable = sanitize(self.klapp.lang if self.klapp.offen else self.klapp.kurz)
+        self._sel_visual = None
+        self.refresh(layout=True)
+
+    def on_click(self, event: events.Click) -> None:
+        if event.button != 1:                    # Rechtsklick behandelt _Block (Textual ruft beide)
+            return
+        try:                                     # beim Markieren nicht aufklappen
+            if self.screen.get_selected_text():
+                return
+        except Exception:
+            pass
+        self.umschalten()
+
+
+class _AntwortBlock(_Block):
+    """Eine Antwort im Verlauf: Ein Klick auf ihre Titelzeile klappt sie auf eine Zeile ein und wieder auf."""
+
+    def __init__(self, renderable, **kw):
+        super().__init__(renderable, **kw)
+        self.voll = renderable
+        self.eingeklappt = False
+
+    def _titelzeile(self) -> int:
+        """Zeile des Blocks, in der der Titel der Antwort steht (davor können Notiz und Denktext stehen)."""
+        panel = _antwort_panel(self.voll)
+        titel = panel.title if panel is not None else None
+        titel = titel.plain if isinstance(titel, Text) else Text.from_markup(str(titel or "")).plain
+        titel = titel.strip()
+        if titel:
+            for y, zeile in enumerate(self.klartext().split("\n")):
+                if titel in zeile:
+                    return y
+        return 0
+
+    def _kurz(self):
+        panel = _antwort_panel(self.voll)
+        quelle = getattr(panel.renderable, "markup", None) or ""
+        erste = next((z.strip() for z in str(quelle).splitlines() if z.strip()), "")
+        zeile = Text(no_wrap=True, overflow="ellipsis")
+        zeile.append(f"▸ {max(1, self.size.height)} Zeilen  ", style="muted")
+        zeile.append(erste, style="assistant")
+        return Panel(zeile, title=panel.title, title_align="left", box=panel.box,
+                     border_style=panel.border_style, padding=panel.padding)
+
+    def umschalten(self) -> None:
+        self.eingeklappt = not self.eingeklappt
+        self.nemi_renderable = self._kurz() if self.eingeklappt else self.voll
+        self._sel_visual = None
+        self.refresh(layout=True)
+
+    def on_click(self, event: events.Click) -> None:
+        if event.button != 1:                    # Rechtsklick behandelt _Block (Textual ruft beide)
+            return
+        try:                                     # beim Markieren nicht einklappen
+            if self.screen.get_selected_text():
+                return
+        except Exception:
+            pass
+        if self.eingeklappt or event.y == self._titelzeile():
+            self.umschalten()
+
+
+class _SuchFeld(Input):
+    """Eingabezeile der Suche im Verlauf: Enter und ↑ zum älteren Treffer, ↓ zum neueren, Esc schließt."""
+
+    async def _on_key(self, event: events.Key) -> None:
+        nemi = self.app.nemi
+        if event.key in ("escape", "ctrl+f"):
+            event.stop()
+            event.prevent_default()
+            if event.key == "escape":
+                esc_notstopp()                  # auch aus der Suche heraus hält ESC die KI an
+            nemi.suche_schliessen()
+            return
+        if event.key in ("up", "down", "enter"):
+            event.stop()
+            event.prevent_default()
+            nemi.such_sprung(1 if event.key == "down" else -1)
+            return
+        await super()._on_key(event)
+
+
+def _windows_clipboard(text: str) -> None:
+    """Text in die Windows-Zwischenablage (user32). Läuft im Hintergrund-Thread,
+    damit die Oberfläche nicht ruckelt; Fehler sind egal – dann bleibt der
+    OSC-52-Weg des Terminals."""
+    import sys
+
+    if not sys.platform.startswith("win"):
+        return
+
+    def _run():
+        try:
+            import zwischenablage
+            zwischenablage.setzen(text)
+        except Exception:
+            pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+
+# ---------------------------------------------------------------------------
+# Die abfangende Console: ui.console zeigt hierher
+# ---------------------------------------------------------------------------
+class _CaptureConsole(Console):
+    """Alles, was per ui.console.print(...) kommt, landet als Block im Verlauf."""
+
+    def __init__(self, screen: "Screen", width: int):
+        super().__init__(file=io.StringIO(), force_terminal=True, color_system="truecolor",
+                         width=width, theme=ui._build_theme(ui.current_theme()), soft_wrap=False)
+        self._screen = screen
+
+    def print(self, *objects, sep=" ", end="\n", style=None, justify=None, overflow=None,
+              no_wrap=None, emoji=None, markup=None, highlight=None, width=None, height=None,
+              crop=True, soft_wrap=None, new_line_start=False):
+        if not objects:
+            self._screen.append_block(Text(""))
+            return
+        renderables = self._collect_renderables(objects, sep, "", justify=justify, emoji=emoji,
+                                                markup=markup, highlight=highlight)
+        block = renderables[0] if len(renderables) == 1 else Group(*renderables)
+        if style:
+            block = Styled(block, style)
+        self._screen.append_block(block)
+
+    def push_theme(self, theme, inherit: bool = True) -> None:
+        super().push_theme(theme, inherit=inherit)
+        self._screen.apply_theme()
+
+    def pop_theme(self) -> None:
+        super().pop_theme()
+        self._screen.apply_theme()
+
+    def clear(self, home: bool = True) -> None:
+        self._screen.clear()
+
+
+# ---------------------------------------------------------------------------
+# Modale Bildschirme
+# ---------------------------------------------------------------------------
+_COCKPIT_SPALTEN = cockpit.BREITE + 3          # Inhalt + Rand links + Abstand
+
+
+def _cockpit_gewuenscht() -> bool:
+    """Cockpit beim Start offen? (Config „cockpit“, Vorgabe zu)."""
+    try:
+        import config
+        return bool(config.load().get("cockpit", False))
+    except Exception:
+        return False
+
+
+def _weich_gewuenscht() -> bool:
+    """Weiches Blättern im Verlauf? (Config „terminal_weich“, Vorgabe an)."""
+    try:
+        import config
+        return bool(config.load().get("terminal_weich", True))
+    except Exception:
+        return True
+
+
+def _fenster_melden(befehl: str) -> None:
+    """Steuerbefehl ans eigene Terminal-Fenster (Grundfarbe, Puls). In anderen Terminals passiert nichts."""
+    try:
+        import startseite
+        if startseite.echtes_fenster():
+            startseite.STEUERN(befehl)
+    except Exception:
+        pass
+
+
+def _antwort_panel(renderable):
+    """Das Antwort-Panel in einem gedruckten Block (ui.assistant_panel) – oder None."""
+    if isinstance(renderable, Panel):
+        return renderable if renderable.box is ui.LEISTE else None
+    if isinstance(renderable, Group):
+        for teil in reversed(renderable.renderables):
+            if isinstance(teil, Panel) and teil.box is ui.LEISTE:
+                return teil
+    return None
+
+
+def _treffer_in(text: str, begriff: str) -> list[tuple[int, int, int]]:
+    """Fundstellen ohne Groß/Klein als (Zeile, erstes Zeichen, Zeichen dahinter)."""
+    begriff = begriff.strip()
+    if not begriff:
+        return []
+    muster = re.compile(re.escape(begriff), re.IGNORECASE)
+    return [(y, m.start(), m.end()) for y, zeile in enumerate(text.split("\n")) for m in muster.finditer(zeile)]
+
+
+def _mischen(a: str, b: str, t: float) -> str:
+    """Farbe zwischen a (t=0) und b (t=1), beide als #rrggbb."""
+    try:
+        x = [int(a[i:i + 2], 16) for i in (1, 3, 5)]
+        y = [int(b[i:i + 2], 16) for i in (1, 3, 5)]
+    except (ValueError, IndexError):
+        return a
+    t = max(0.0, min(1.0, t))
+    return "#" + "".join(f"{round(u + (v - u) * t):02x}" for u, v in zip(x, y))
+
+
+def _hints_text(**kw) -> Text:
+    return fragments_to_text(ui.input_hints(200, **kw))
+
+
+def _modus_text() -> Text:
+    """Kleine Modus-Anzeige im Dialog (Shift+Tab wechselt auch dort)."""
+    import modes
+    p = ui.THEMES[ui.current_theme()]
+    t = Text(no_wrap=True, overflow="crop")
+    t.append("  Shift+Tab", style=f"{p['accent']}")
+    t.append(f" Modus: {modes.anzeige()}", style=ui.leise())
+    return t
+
+
+class _NemiModal(ModalScreen):
+    """Gemeinsames für alle Dialoge: durchscheinender Hintergrund (der Verlauf
+    dahinter bleibt lesbar – man muss ja sehen, WAS man freigibt) und
+    Shift+Tab für den Arbeitsmodus, wie im Hauptbildschirm."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.add_class("nemi-modal")
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key == "shift+tab":
+            event.stop()
+            self.app.action_mode()
+            try:
+                self.query_one("#modus", Static).update(_modus_text())
+            except Exception:
+                pass
+
+
+class _SelectScreen(_NemiModal):
+    """Auswahl-Menü: klickbare Knöpfe – oder ↑/↓/Tab · Enter · Esc = letzte Option · 1-9."""
+
+    DEFAULT_CSS = """
+    _SelectScreen > Vertical { width: 90%; max-width: 110; height: auto;
+        background: #11131d; border: round #5b54a8; padding: 1 2; margin-bottom: 7; }
+    _SelectScreen #q { margin-bottom: 1; }
+    _SelectScreen Button { width: 100%; height: 1; min-height: 1; min-width: 10;
+        margin: 0; padding: 0 1; content-align: left middle; text-align: left;
+        background: #11131d; color: #9298ac; }
+    _SelectScreen Button:hover { background: #1c1f30; color: #e4e7f2; }
+    _SelectScreen Button.-sel { background: #1c1f30; color: #e4e7f2; text-style: bold; }
+    _SelectScreen Button:focus { text-style: bold; }
+    """
+    BINDINGS = [Binding("up", "move(-1)", show=False), Binding("down", "move(1)", show=False),
+                Binding("tab", "move(1)", show=False), Binding("enter", "choose", show=False),
+                Binding("escape", "cancel", show=False), Binding("ctrl+c", "cancel", show=False)]
+
+    def __init__(self, question: str, options: list):
+        super().__init__()
+        self.question, self.options, self.sel = question, list(options), 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(Text(terminal_safe(self.question), style="bold"), id="q")
+            for i, (_val, label) in enumerate(self.options):
+                yield Button(Text(f"  {i + 1}. {terminal_safe(str(label))}"), id=f"opt{i}",
+                             compact=True)          # Text statt str: kein Markup; eine Zeile, ohne 3D-Rand
+            yield Static(id="hint")
+            yield Static(id="modus")
+
+    def on_mount(self) -> None:
+        self.query_one("#hint", Static).update(_hints_text(modal=True))
+        self.query_one("#modus", Static).update(_modus_text())
+        self._draw()
+
+    def _draw(self) -> None:
+        p = ui.THEMES[ui.current_theme()]
+        for i, (_val, label) in enumerate(self.options):
+            b = self.query_one(f"#opt{i}", Button)
+            mark = "❯" if i == self.sel else " "
+            b.label = Text(f"{mark} {i + 1}. {terminal_safe(str(label))}",
+                           style=f"bold {p['accent']}" if i == self.sel else "")
+            b.set_class(i == self.sel, "-sel")
+        try:
+            self.query_one(f"#opt{self.sel}", Button).focus()
+        except Exception:
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        idx = int(event.button.id[3:])
+        self.dismiss(self.options[idx][0])
+
+    def action_move(self, d: int) -> None:
+        self.sel = (self.sel + d) % len(self.options)
+        self._draw()
+
+    def action_choose(self) -> None:
+        self.dismiss(self.options[self.sel][0])
+
+    def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
+        self.dismiss(self.options[-1][0])
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key.isdigit() and event.key != "0":
+            n = int(event.key) - 1
+            if n < len(self.options):
+                event.stop()
+                self.dismiss(self.options[n][0])
+            return
+        super().on_key(event)
+
+
+class _PaletteScreen(_NemiModal):
+    """Befehls-Palette (Strg+K): tippen, die passenden Befehle, Einstellungen und Modelle erscheinen –
+    ↑/↓ wählen, Enter ausführen (oder Klick), Esc zurück. Tippfehler sind erlaubt."""
+
+    DEFAULT_CSS = """
+    _PaletteScreen > Vertical { width: 86%; max-width: 104; height: auto; margin-top: 2;
+        background: #11131d; border: round #5b54a8; padding: 1 2; }
+    _PaletteScreen Input { margin-bottom: 1; background: #0c0d14; border: tall #2a2a36; }
+    _PaletteScreen Input:focus { border: tall #5b54a8; }
+    """
+    BINDINGS = [Binding("up", "move(-1)", show=False), Binding("down", "move(1)", show=False),
+                Binding("enter", "choose", show=False, priority=True),
+                Binding("escape", "cancel", show=False), Binding("ctrl+c", "cancel", show=False)]
+
+    def __init__(self, eintraege: list):
+        super().__init__()
+        self.alle, self.sel = eintraege, 0
+        self.treffer = palette.suchen(eintraege, "")
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            yield Static(Text("🔎 Was möchtest du tun?", style="bold"), id="q")
+            yield Input(placeholder="Befehl, Einstellung, Modell … – Tippfehler sind okay", id="suche")
+            yield Static(id="treffer")
+            yield Static(id="hint")
+
+    def on_mount(self) -> None:
+        self.query_one("#hint", Static).update(_hints_text(modal=True))
+        self.query_one("#suche", Input).focus()
+        self._draw()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self.treffer = palette.suchen(self.alle, event.value)
+        self.sel = 0
+        self._draw()
+
+    def _draw(self) -> None:
+        p = ui.THEMES[ui.current_theme()]
+        zeilen = []
+        if not self.treffer:
+            zeilen.append(Text("  nichts gefunden – anders schreiben oder Esc", style=ui.leise()))
+        for i, e in enumerate(self.treffer):
+            aktiv = i == self.sel
+            klick = Style(meta={"@click": f"screen.waehlen({i})"})
+            t = Text(no_wrap=True, overflow="ellipsis")
+            t.append("❯ " if aktiv else "  ", style=Style(color=p["accent"], bold=True) + klick)
+            t.append(f"{e.zeile:<26}", style=(Style(color=p["accent"], bold=True) if aktiv
+                                              else Style(color="#e4e7f2")) + klick)
+            t.append("  " + terminal_safe(e.beschreibung),
+                     style=Style(color="#c3c8d4" if aktiv else ui.leise()) + klick)
+            zeilen.append(t)
+        self.query_one("#treffer", Static).update(Group(*zeilen))
+
+    def action_move(self, d: int) -> None:
+        if self.treffer:
+            self.sel = (self.sel + d) % len(self.treffer)
+            self._draw()
+
+    def action_waehlen(self, i: int) -> None:
+        if 0 <= i < len(self.treffer):
+            self.dismiss(self.treffer[i])
+
+    def action_choose(self) -> None:
+        self.dismiss(self.treffer[self.sel] if self.treffer else None)
+
+    def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
+        self.dismiss(None)
+
+
+class _TextScreen(_NemiModal):
+    """Eine Zeile Text (z.B. API-Key). Enter = OK, Esc = leer."""
+
+    DEFAULT_CSS = """
+    _TextScreen > Vertical { width: 90%; max-width: 110; height: auto;
+        background: #11131d; border: round #5b54a8; padding: 1 2; margin-bottom: 7; }
+    _TextScreen Input { margin-top: 1; }
+    """
+    BINDINGS = [Binding("escape", "cancel", show=False), Binding("ctrl+c", "cancel", show=False)]
+
+    def __init__(self, question: str, password: bool):
+        super().__init__()
+        self.question, self.password = question, password
+
+    def compose(self) -> ComposeResult:
+        p = ui.THEMES[ui.current_theme()]
+        with Vertical():
+            yield Static(Text(terminal_safe(self.question), style=f"bold {p['accent']}"))
+            yield Input(password=self.password, id="inp")
+            yield Static(_hints_text(modal=True))
+
+    def on_mount(self) -> None:
+        self.query_one("#inp", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value)
+
+    def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
+        self.dismiss("")
+
+
+# Prüffenster: graue, eingelassene Lesefläche (dunkle Kante oben/links, helle
+# unten/rechts) und Farben für den Vergleich aus actions.vergleich().
+_GRAU = {"rahmen": "#26272c", "flaeche": "#2d2f34", "schatten": "#0f1012", "licht": "#5a5e68",
+         "text": "#d5d8de", "leise": "#a4a8b1", "nummer": "#6f737c",
+         "plus": "#bff0cb", "plus_grund": "#234a31", "minus": "#ffc9c9", "minus_grund": "#5a2a2e",
+         "warnung": "#ffbe76"}
+_VERGLEICH_ZEILE = re.compile(r"^([+\- ]) (\s*\d+) │ ?(.*)$")
+
+
+def _vorschau_text(text: str, review: bool, breite: int = 0) -> Text:
+    """Prüftext eingefärbt: Kopf, Warnungen, Vergleich (+ grün, − rot) und Inhalt.
+    `breite` > 0 füllt geänderte Zeilen bis zum Rand mit ihrer Farbe."""
+    if not review:
+        return Text(text, style="#b6bed3")
+    akzent = ui.THEMES[ui.current_theme()]["accent"]
+    g = _GRAU
+    t = Text()
+    abschnitt = "kopf"
+    for i, zeile in enumerate(text.split("\n")):
+        if i:
+            t.append("\n")
+        if i == 0:
+            t.append(zeile, style=f"bold {akzent}")
+            continue
+        if zeile.startswith("Änderungen"):
+            abschnitt = "vergleich"
+            t.append(zeile, style=f"bold {g['text']}")
+            continue
+        if zeile.startswith(("Vollständiger", "Vollständige")):
+            abschnitt = "inhalt"
+            t.append(zeile, style=f"bold {g['text']}")
+            continue
+        if abschnitt == "vergleich" and (m := _VERGLEICH_ZEILE.match(zeile)):
+            art, nr, rest = m.groups()
+            if art in "+-":
+                grund = g["plus_grund"] if art == "+" else g["minus_grund"]
+                farbe = f"{g['plus'] if art == '+' else g['minus']} on {grund}"
+                kopf = f"{'+' if art == '+' else '−'} "
+                t.append(kopf, style=f"bold {farbe}")
+                t.append(f"{nr} │ ", style=f"{g['nummer']} on {grund}")
+                luecke = breite - len(kopf) - len(nr) - 3 - len(rest)
+                t.append(rest + " " * max(luecke, 0 if rest else 1), style=farbe)
+            else:
+                t.append(f"  {nr} │ ", style=g["nummer"])
+                t.append(rest, style=g["leise"])
+            continue
+        if abschnitt == "kopf":
+            if "ÜBERSCHRIEBEN" in zeile:
+                t.append(zeile, style=f"bold {g['warnung']}")
+            elif zeile.startswith("Ziel:"):
+                t.append("Ziel: ", style=g["leise"])
+                t.append(zeile[6:], style=f"bold {akzent}")
+            else:
+                t.append(zeile, style=g["text"])
+            continue
+        t.append(zeile, style=g["text"])
+    return t
+
+
+class _ReaderScreen(_NemiModal):
+    """Langer Text zum Lesen: Aktionsprüfung (F8 gibt frei) oder Denktext (F2/Esc)."""
+
+    DEFAULT_CSS = f"""
+    _ReaderScreen > Vertical {{ width: 96%; height: 90%; background: {_GRAU['rahmen']};
+        border: round #5b54a8; padding: 0 1; }}
+    _ReaderScreen VerticalScroll {{ height: 1fr; scrollbar-size-vertical: 1;
+        background: {_GRAU['flaeche']}; padding: 0 1;
+        border-top: tall {_GRAU['schatten']}; border-left: tall {_GRAU['schatten']};
+        border-bottom: tall {_GRAU['licht']}; border-right: tall {_GRAU['licht']}; }}
+    _ReaderScreen #hint {{ height: 1; }}
+    """
+    BINDINGS = [
+        Binding("escape", "close(False)", show=False),
+        Binding("enter", "line(1)", show=False), Binding("ctrl+j", "line(1)", show=False),
+        Binding("up", "line(-1)", show=False), Binding("down", "line(1)", show=False),
+        Binding("pageup", "page(-1)", show=False), Binding("pagedown", "page(1)", show=False),
+        Binding("home", "edge(0)", show=False), Binding("end", "edge(1)", show=False),
+        Binding("ctrl+home", "edge(0)", show=False), Binding("ctrl+end", "edge(1)", show=False),
+    ]
+
+    def __init__(self, text: str, *, review: bool):
+        super().__init__()
+        self.text, self.review = text, review
+
+    def compose(self) -> ComposeResult:
+        with Vertical():
+            with VerticalScroll(id="body"):
+                yield Static(_vorschau_text(terminal_safe(self.text), self.review), id="text")
+            yield Static(id="hint")
+
+    def on_resize(self, event: events.Resize) -> None:
+        body = self.query_one("#body", VerticalScroll)
+        breite = body.scrollable_content_region.width
+        if breite > 0 and self.review:
+            self.query_one("#text", Static).update(
+                _vorschau_text(terminal_safe(self.text), self.review, breite))
+
+    def on_mount(self) -> None:
+        self.query_one("#hint", Static).update(
+            _hints_text(modal=True, reviewing_action=self.review, reading_thinking=not self.review))
+        self.query_one("#body", VerticalScroll).focus()
+
+    def on_key(self, event: events.Key) -> None:
+        if self.review and event.key == "f8":
+            event.stop()
+            self.dismiss(True)
+        elif not self.review and event.key == "f2":
+            event.stop()
+            self.dismiss(False)
+        else:
+            super().on_key(event)
+
+    def action_close(self, ok: bool) -> None:
+        if not ok:
+            esc_notstopp()
+        self.dismiss(bool(ok))
+
+    def action_line(self, d: int) -> None:
+        self.query_one("#body", VerticalScroll).scroll_relative(y=d, animate=False)
+
+    def action_page(self, d: int) -> None:
+        body = self.query_one("#body", VerticalScroll)
+        (body.scroll_page_down if d > 0 else body.scroll_page_up)(animate=False)
+
+    def action_edge(self, end: int) -> None:
+        body = self.query_one("#body", VerticalScroll)
+        (body.scroll_end if end else body.scroll_home)(animate=False)
+
+
+# ---------------------------------------------------------------------------
+# Auswahl & Texteingabe IM Eingaberahmen (kein Fenster darüber): Die Box
+# „NemiCLI möchte ausführen“ steht direkt darüber im Verlauf und bleibt
+# lesbar – man muss ja sehen, was man freigibt.
+# ---------------------------------------------------------------------------
+class _InlineSelect(Vertical, can_focus=True):
+    """Frage + klickbare Knöpfe; Tastatur: ↑/↓/Tab · Enter · Esc = letzte · 1-9."""
+
+    DEFAULT_CSS = """
+    _InlineSelect { height: auto; background: #11131d; padding: 0 1; }
+    _InlineSelect #q { margin-bottom: 0; }
+    _InlineSelect Button { width: 100%; height: 1; min-height: 1; min-width: 10;
+        margin: 0; padding: 0 1; content-align: left middle; text-align: left;
+        background: #11131d; color: #9298ac; }
+    _InlineSelect Button:hover { background: #1c1f30; color: #e4e7f2; }
+    _InlineSelect Button.-sel { background: #1c1f30; color: #e4e7f2; text-style: bold; }
+    _InlineSelect Button:focus { text-style: bold; }
+    """
+    BINDINGS = [Binding("up", "move(-1)", show=False), Binding("down", "move(1)", show=False),
+                Binding("tab", "move(1)", show=False), Binding("enter", "choose", show=False),
+                Binding("escape", "cancel", show=False)]
+
+    def __init__(self, question: str, options: list, done):
+        super().__init__()
+        self.question, self.options, self.sel, self._done = question, list(options), 0, done
+
+    def compose(self) -> ComposeResult:
+        yield Static(Text(terminal_safe(self.question), style="bold"), id="q")
+        for i, (_val, label) in enumerate(self.options):
+            yield Button(Text(f"  {i + 1}. {terminal_safe(str(label))}"), id=f"opt{i}", compact=True)
+
+    def on_mount(self) -> None:
+        self._draw()
+        self.focus()
+
+    def _draw(self) -> None:
+        p = ui.THEMES[ui.current_theme()]
+        for i, (_val, label) in enumerate(self.options):
+            b = self.query_one(f"#opt{i}", Button)
+            mark = "❯" if i == self.sel else " "
+            b.label = Text(f"{mark} {i + 1}. {terminal_safe(str(label))}",
+                           style=f"bold {p['accent']}" if i == self.sel else "")
+            b.set_class(i == self.sel, "-sel")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        event.stop()
+        self._done(self.options[int(event.button.id[3:])][0])
+
+    def on_descendant_focus(self, event) -> None:
+        # Klick auf einen Knopf gibt ihm den Fokus – die Tasten sollen trotzdem hier landen
+        self.focus()
+
+    def action_move(self, d: int) -> None:
+        self.sel = (self.sel + d) % len(self.options)
+        self._draw()
+
+    def action_choose(self) -> None:
+        self._done(self.options[self.sel][0])
+
+    def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
+        self._done(self.options[-1][0])
+
+    def on_key(self, event: events.Key) -> None:
+        if event.key.isdigit() and event.key != "0":
+            n = int(event.key) - 1
+            if n < len(self.options):
+                event.stop()
+                self._done(self.options[n][0])
+        elif event.key == "shift+tab":
+            event.stop()
+            self.app.action_mode()
+
+
+class _InlineText(Vertical):
+    """Frage + eine Eingabezeile (z.B. API-Key). Enter = OK, Esc = leer."""
+
+    DEFAULT_CSS = """
+    _InlineText { height: auto; background: #11131d; padding: 0 1; }
+    _InlineText Input { border: none; height: 1; padding: 0 1; background: #1c1f30; }
+    _InlineText Input:focus { border: none; }
+    """
+    BINDINGS = [Binding("escape", "cancel", show=False)]
+
+    def __init__(self, question: str, password: bool, done):
+        super().__init__()
+        self.question, self.password, self._done = question, password, done
+
+    def compose(self) -> ComposeResult:
+        p = ui.THEMES[ui.current_theme()]
+        yield Static(Text(terminal_safe(self.question), style=f"bold {p['accent']}"))
+        yield Input(password=self.password, id="inp")
+
+    def on_mount(self) -> None:
+        self.query_one("#inp", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self._done(event.value)
+
+    def action_cancel(self) -> None:
+        esc_notstopp()                 # ESC in einer Rückfrage stoppt auch die Runde
+        self._done("")
+
+
+# ---------------------------------------------------------------------------
+# Eingabefeld: Enter sendet, Strg+J = neue Zeile, Tab = Vervollständigung
+# ---------------------------------------------------------------------------
+class _Composer(TextArea):
+    _SCROLL = {"pageup": ("page", -1), "pagedown": ("page", 1), "ctrl+up": ("line", -1),
+               "ctrl+down": ("line", 1), "ctrl+end": ("bottom", None),
+               "alt+up": ("antwort", -1), "alt+down": ("antwort", 1)}
+
+    async def _on_key(self, event: events.Key) -> None:
+        nemi = self.app.nemi
+        if event.key == "enter":
+            event.stop()
+            event.prevent_default()
+            nemi._submit()
+            return
+        if event.key == "ctrl+j":
+            event.stop()
+            event.prevent_default()
+            self.insert("\n")
+            return
+        if event.key == "tab":
+            event.stop()
+            event.prevent_default()
+            nemi._complete_next()
+            return
+        if event.key in ("up", "down") and nemi._complete is not None and nemi._complete.display:
+            event.stop()
+            event.prevent_default()
+            nemi._complete_next(1 if event.key == "down" else -1)
+            return
+        if event.key == "shift+tab":
+            event.stop()
+            event.prevent_default()
+            self.app.action_mode()
+            return
+        if event.key in self._SCROLL:
+            # Verlauf scrollen – die Eingabe ist ohnehin nur wenige Zeilen hoch
+            event.stop()
+            event.prevent_default()
+            what, arg = self._SCROLL[event.key]
+            nemi._scroll(what, arg)
+            return
+        await super()._on_key(event)
+
+
+# ---------------------------------------------------------------------------
+# Die App (Layout + Tasten)
+# ---------------------------------------------------------------------------
+class _Log(VerticalScroll):
+    """Der Verlauf. Meldet seine Breite nach jedem Layout an den Screen und
+    bleibt beim Fensterziehen unten, solange der Nutzer nicht hochgescrollt hat."""
+
+    def on_resize(self, event: events.Resize) -> None:
+        nemi = self.app.nemi
+        nemi._sync_width()
+        nemi._refresh_chrome()
+        if nemi._follow:
+            self.call_after_refresh(nemi._scroll_bottom)
+
+    def on_mouse_scroll_up(self, event) -> None:
+        self.app.nemi._follow = False
+
+    def on_mouse_scroll_down(self, event) -> None:
+        self.call_after_refresh(self.app.nemi._check_follow)
+
+
+def _startpunkt_auf_dem_schirm(self) -> Offset:
+    """Startpunkt einer Markierung in Bildschirm-Koordinaten. Textual 8 addiert die Rollstrecke
+    seit dem Start – rollt der Verlauf aber nach unten, wandert der Startpunkt nach OBEN. Mit dem
+    falschen Vorzeichen fällt beim Mitrollen der Anfang der Markierung heraus."""
+    return (self.container.region.offset + self.container_pointer_delta
+            - (self.container.scroll_offset - self.container_initial_scroll_offset))
+
+
+try:
+    from textual import selection as _tx_selection
+    if isinstance(getattr(_tx_selection.SelectStart, "pointer_start_offset", None), property):
+        _tx_selection.SelectStart.pointer_start_offset = property(_startpunkt_auf_dem_schirm)
+except Exception:
+    pass
+
+
+class _NemiScreen(_TxScreen):
+    """Hauptschirm: Markieren über den Verlauf hinaus. Zieht die Maus beim Markieren unter den
+    Verlauf (Kopfzeile, Eingabe, Leisten), gilt sie als in seiner letzten Zeile – so rollt er
+    weiter bis zum Textende, und das Ende der Markierung bleibt im Text. Beim Mitrollen wandert das
+    Ende der Markierung mit, auch wenn die Maus stillsteht (Textual setzt es nur bei Bewegung)."""
+
+    _nemi_maus: tuple[int, int] | None = None
+
+    def _forward_event(self, event: events.Event) -> None:
+        if (isinstance(event, events.MouseMove) and not event.is_forwarded
+                and self._selecting and self._select_state is not None):
+            try:
+                r = self.query_one("#log").content_region
+            except Exception:
+                r = None
+            if r is not None and r.height > 0 and event.screen_y >= r.bottom:
+                event._y = event._screen_y = r.bottom - 1
+                event._x = event._screen_x = r.right - 1          # unter dem Text = bis Zeilenende
+            self._nemi_maus = (event.screen_x, event.screen_y)
+        elif isinstance(event, events.MouseDown):
+            self._nemi_maus = None
+            if (event.shift and event.button == 1 and not event.is_forwarded
+                    and self._umschalt_erweitern(event.screen_x, event.screen_y)):
+                return                                            # keine neue Markierung beginnen
+        super()._forward_event(event)
+
+    def _umschalt_erweitern(self, x: int, y: int) -> bool:
+        """Umschalt+Klick: die Markierung vom festen Ende bis zur Klickstelle ziehen (auch über mehrere Blöcke)
+        und kopieren. Liegt der Klick vor der Markierung, bleibt ihr Ende fest, sonst ihr Anfang."""
+        ziel, zelle = self._block_unter(x, y)
+        if ziel is None or zelle is None:
+            return False
+        bloecke = sorted((w for w in self.selections if isinstance(w, _Block) and w.parent is ziel.parent),
+                         key=lambda w: w.virtual_region.y)
+        if not bloecke:
+            return False
+        zeilen = ziel.klartext().split("\n")
+        if not 0 <= zelle.y < len(zeilen):
+            return False
+        stelle = Offset(spalte_zu_zeichen(zeilen[zelle.y], zelle.x), zelle.y)
+        erster, letzter = bloecke[0], bloecke[-1]
+        anfang = self.selections[erster].start or Offset(0, 0)
+        if (ziel.virtual_region.y, stelle.y, stelle.x) < (erster.virtual_region.y, anfang.y, anfang.x):
+            oben, unten = (ziel, stelle), (letzter, self.selections[letzter].end)     # nach oben erweitern
+        else:
+            oben, unten = (erster, anfang), (ziel, stelle + (1, 0))
+        if oben[0] is unten[0]:
+            neu = {oben[0]: Selection(oben[1], unten[1])}
+        else:                                                     # in Lesereihenfolge: so kommt auch der Text
+            neu = {oben[0]: Selection(oben[1], None)}
+            for w in ziel.parent.displayed_children:
+                if (w.allow_select and w not in (oben[0], unten[0])
+                        and oben[0].virtual_region.y < w.virtual_region.y < unten[0].virtual_region.y):
+                    neu[w] = SELECT_ALL
+            neu[unten[0]] = Selection(None, unten[1])
+        self.selections = neu
+        kopieren = getattr(self.app, "_auswahl_kopieren", None)
+        if kopieren is not None:
+            kopieren(False)
+        return True
+
+    def _watch__select_state(self, select_state) -> None:
+        """Wie Textual, aber die Blöcke zwischen den beiden Endpunkten kommen aus ihrer Lage im
+        Verlauf: Textual ordnet sie nach der Bildschirmkarte, die beim Mitrollen einen Schritt
+        hinterher ist – ein gerade hereingerollter Block landete vorn und fehlte in der Markierung.
+        Und ohne Überhang: Liegt ein Ende außerhalb des Sichtbaren, nahm Textual alles bis zum
+        Anfang bzw. Ende des Verlaufs dazu."""
+        super()._watch__select_state(select_state)
+        st = self._select_state
+        if st is None or st.end is None:
+            return
+        a, b = st.start.content_widget, st.end.content_widget
+        if a is None or b is None or a is b or a.parent is None or a.parent is not b.parent:
+            return
+        erster, letzter = (a, b) if a.virtual_region.y <= b.virtual_region.y else (b, a)
+        ab = {a: st.start.content_offset, b: st.end.content_offset}
+        alt = self.selections
+        neu = {w: s for w, s in alt.items() if w.parent is not a.parent}
+        for w in a.parent.displayed_children:
+            if not (w.allow_select and erster.virtual_region.y <= w.virtual_region.y <= letzter.virtual_region.y):
+                continue
+            if w in alt:
+                neu[w] = alt[w]
+            elif w is erster and ab[w] is not None:
+                neu[w] = Selection(ab[w], None)
+            elif w is letzter and ab[w] is not None:
+                neu[w] = Selection(None, ab[w] + (1, 0))
+            else:
+                neu[w] = SELECT_ALL
+        if neu != alt:
+            self.selections = neu
+
+    def _block_unter(self, x: int, y: int):
+        """(Block, Offset im Block) unter einem Punkt im Verlauf – aus der Rollposition gerechnet;
+        die Bildschirmkarte ist während des Mitrollens einen Schritt hinterher."""
+        try:
+            log = self.query_one("#log")
+        except Exception:
+            return None, None
+        r = log.content_region
+        if not r.contains(x, y):
+            return None, None
+        vy = int(log.scroll_y) + (y - r.y)
+        try:
+            verlauf = log.query_one("#verlauf")
+        except Exception:
+            return None, None
+        vy -= verlauf.virtual_region.y
+        for kind in verlauf.displayed_children:
+            vr = kind.virtual_region
+            if vr.y <= vy < vr.bottom:
+                if not kind.allow_select:
+                    return None, None
+                return kind, Offset(max(0, x - r.x - vr.x), vy - vr.y)
+        return None, None
+
+    def _update_select(self) -> None:
+        stand, maus = self._select_state, self._nemi_maus
+        if stand is not None and maus is not None and self._selecting:
+            widget, offset = self._block_unter(*maus)
+            if widget is None:
+                widget, offset = self.get_widget_and_offset_at(*maus)
+            if widget is not None:
+                if offset is not None:
+                    behaelter = widget if isinstance(widget, _TxScreen) else widget.parent
+                    ende = SelectEnd(behaelter, widget, offset)
+                else:
+                    ende = SelectEnd(widget, None, None)
+                self._select_state = stand.update_end(Offset(*maus), ende)
+                return
+        super()._update_select()
+
+
+class _NemiApp(App):
+    # Randzone, in der das Ziehen den Verlauf von selbst weiterrollt (Textual-Vorgabe: 3).
+    # Etwas breiter, weil man beim Markieren nach oben selten zeilengenau am Rand landet.
+    SELECT_AUTO_SCROLL_LINES = 5
+    SELECT_AUTO_SCROLL_SPEED = 90.0             # Zeilen je Sekunde ganz am Rand (Textual: 60)
+
+    CSS = f"""
+    Screen {{ background: {_SCHIRM_BG}; }}
+    Screen.nemi-modal {{ background: rgba(0, 0, 0, 0.35); align: center bottom; }}
+    _ReaderScreen.nemi-modal {{ align: center middle; }}
+    _PaletteScreen.nemi-modal {{ align: center top; }}
+    #cockpit {{ dock: right; width: {_COCKPIT_SPALTEN}; display: none; background: #0f1019;
+               border-left: vkey #2a2a36; padding: 1 1; }}
+    #log {{ height: 1fr; align-vertical: bottom; scrollbar-size-vertical: 1; scrollbar-color: #2a2a36;
+           scrollbar-color-hover: #3a3a4a; scrollbar-background: {_SCHIRM_BG}; }}
+    #log.start {{ align-vertical: top; }}
+    #leiste {{ height: auto; display: none; }}
+    #log > Static {{ width: 1fr; }}
+    #verlauf {{ width: 1fr; height: auto; }}
+    #verlauf > _Block {{ width: 1fr; }}
+    #verlauf > _Block.kopiert {{ background: #1c2540; }}
+    Screen > .screen--selection {{ background: #8b5cf6 62%; }}
+    #suchzeile {{ height: 1; display: none; background: {_COMPOSER_BG}; }}
+    #verlaufsuche {{ width: 1fr; height: 1; border: none; padding: 0 1; background: #1c1f30; }}
+    #verlaufsuche:focus {{ border: none; }}
+    #suchzahl {{ width: auto; min-width: 14; height: 1; padding: 0 1; color: {ui.LEISE}; background: {_COMPOSER_BG}; }}
+    #live {{ width: 1fr; }}
+    #header {{ height: 1; background: {_COMPOSER_BG}; }}
+    #frame {{ height: auto; background: {_COMPOSER_BG}; border-left: round #5b54a8;
+              border-right: round #5b54a8; border-bottom: round #5b54a8; }}
+    #complete {{ height: auto; background: {_COMPOSER_BG}; display: none; padding-left: 3; }}
+    #inline {{ height: auto; background: {_COMPOSER_BG}; }}
+    #input {{ height: {_MIN_INPUT_ROWS}; background: {_COMPOSER_BG}; border: none; padding: 0 0 0 2;
+              color: #e4e7f2; scrollbar-size-vertical: 1; }}
+    #input:focus {{ border: none; }}
+    #input .text-area--cursor-line {{ background: {_COMPOSER_BG}; }}
+    #toolbar {{ height: 1; background: {_TOOLBAR_BG}; }}
+    #hints {{ height: 1; background: {_COMPOSER_BG}; }}
+    """
+    # Esc/F2/Shift+Tab ohne priority: ein offenes Modal behandelt seine Tasten
+    # selbst (Screen-Bindings kommen vor App-Bindings). Strg+C muss priority
+    # haben (sonst kopiert das Textfeld) und reicht im Modal an dessen Abbruch weiter.
+    BINDINGS = [
+        Binding("escape", "esc", show=False),
+        Binding("ctrl+c", "ctrl_c", show=False, priority=True),
+        Binding("ctrl+d", "quit_app", show=False, priority=True),
+        Binding("ctrl+q", "quit_app", show=False, priority=True),
+        Binding("f2", "thinking", show=False),
+        Binding("f3", "cockpit", show=False),
+        Binding("ctrl+k", "palette", show=False, priority=True),
+        Binding("f12", "mitschnitt", show=False),
+        Binding("shift+tab", "mode", show=False),
+        Binding("pageup", "page(-1)", show=False),
+        Binding("pagedown", "page(1)", show=False),
+        Binding("ctrl+up", "line(-1)", show=False),
+        Binding("ctrl+down", "line(1)", show=False),
+        Binding("ctrl+end", "bottom", show=False),
+        Binding("ctrl+f", "suche", show=False, priority=True),
+        Binding("alt+up", "antwort(-1)", show=False),
+        Binding("alt+down", "antwort(1)", show=False),
+    ]
+
+    def __init__(self, screen: "Screen"):
+        super().__init__()
+        self.nemi = screen
+        self.scroll_sensitivity_y = float(_scroll_zeilen())
+
+    def get_default_screen(self) -> _TxScreen:
+        return _NemiScreen(id="_default")
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="cockpit")
+        yield Static("", id="leiste")
+        with _Log(id="log"):
+            # Fertige Blöcke in einem eigenen Behälter: Ändert sich nur die laufende Antwort, bleibt
+            # seine Anordnung zwischengespeichert – sonst ordnet Textual je Bild alle Blöcke neu an.
+            yield Vertical(id="verlauf")
+            yield Static("", id="live")
+        with Horizontal(id="suchzeile"):
+            yield _SuchFeld(placeholder="Im Verlauf suchen …  Enter/↑ älter · ↓ neuer · Esc schließt", id="verlaufsuche")
+            yield Static("", id="suchzahl")
+        yield Static("", id="header")
+        with Vertical(id="frame"):
+            yield Static("", id="complete")
+            yield Vertical(id="inline")
+            yield _Composer("", id="input", soft_wrap=True, show_line_numbers=False,
+                            tab_behavior="focus")
+        yield Static("", id="toolbar")
+        yield Static("", id="hints")
+
+    def on_mount(self) -> None:
+        self.nemi._bind(self)
+        self.query_one("#live", Static).display = False
+        self.query_one("#input", _Composer).focus()
+        self.set_interval(0.2, self.nemi._tick)
+        self.nemi._refresh_chrome()
+        if self.nemi.start_text:
+            self.set_timer(0.3, self.nemi._submit_start_text)
+
+    def on_unmount(self) -> None:
+        self.nemi._lebenszeichen_ende()          # Lebenszeichen weg, sobald das Fenster zu ist
+
+    # --- Größe: Console-Breite mitziehen (Banner-Padding & Co) ---
+    def on_resize(self, event: events.Resize) -> None:
+        self.call_after_refresh(self.nemi._sync_width)
+        self.nemi._refresh_chrome()
+
+    # --- Eingabe ---
+    def on_text_area_changed(self, _event) -> None:
+        self.nemi._on_text_changed()
+
+    # --- Aktionen (Tasten) ---
+    def action_esc(self) -> None:
+        self.nemi._on_escape()
+
+    def _auswahl_kopieren(self, leeren: bool) -> int:
+        """Markierten Text in die Zwischenablage. Gibt die Zeichenzahl zurück (0 = nichts da)."""
+        try:
+            text = self.screen.get_selected_text()
+        except Exception:
+            text = None
+        if not text or not text.strip():
+            return 0
+        self.copy_to_clipboard(text)              # Terminal-Weg (OSC 52), falls unterstützt
+        _windows_clipboard(text)                  # sicherer Weg unter Windows
+        if leeren:
+            self.screen.clear_selection()
+        self.nemi._kopie_melden(len(text))
+        return len(text)
+
+    def on_text_selected(self, _event) -> None:
+        """Maustaste losgelassen = kopiert, ohne Strg+C.
+
+        Markieren mit der linken Taste allein: gedrückt halten und ziehen, der
+        Verlauf rollt am Rand von selbst mit, Loslassen kopiert. Die Markierung
+        bleibt danach stehen (der nächste Klick räumt sie weg), damit sichtbar
+        ist, was erfasst wurde.
+        """
+        self._auswahl_kopieren(leeren=False)
+
+    def action_ctrl_c(self) -> None:
+        # Markierter Text im Verlauf? Dann kopieren – das erwartet jeder von Strg+C.
+        # (Beim Ziehen mit der Maus ist es schon kopiert; das hier ist der Tastenweg
+        # und für die Markierung per Tastatur.)
+        if self._auswahl_kopieren(leeren=True):
+            return
+        if self.nemi._modal is not None:
+            scr = self.screen
+            try:
+                if hasattr(scr, "action_cancel"):
+                    scr.action_cancel()
+                elif hasattr(scr, "action_close"):
+                    scr.action_close(False)
+            except Exception:
+                pass
+            return
+        self.nemi._on_ctrl_c()
+
+    def action_quit_app(self) -> None:
+        self.exit()
+
+    def action_thinking(self) -> None:
+        self.nemi._toggle_thinking()
+
+    def action_cockpit(self) -> None:
+        self.nemi.cockpit_umschalten()
+
+    def action_palette(self) -> None:
+        self.nemi.palette_oeffnen()
+
+    def action_kachel(self, befehl: str) -> None:
+        """Kachel der Startseite (startseite.KACHELN): den Befehl abschicken wie getippt – nur diese festen."""
+        import startseite
+        if befehl in startseite.KACHEL_BEFEHLE and not self.nemi.busy and self.nemi._modal is None:
+            self.nemi._input.load_text(befehl)
+            self.nemi._submit()
+
+    def action_musik(self, kennung: str, was: str) -> None:
+        """Knöpfe der Musik-Karte (ui.musik_karte): abspielen, als Cover vorbereiten, Ordner öffnen."""
+        import os
+        from pathlib import Path
+        pfad = ui.MUSIK_KARTEN.get(kennung)
+        if not pfad or not Path(pfad).is_file():
+            ui.warn("Den Song finde ich nicht mehr.")
+            return
+        try:
+            if was == "spielen":
+                os.startfile(pfad)
+            elif was == "ordner":
+                os.startfile(str(Path(pfad).parent))
+            elif was == "cover" and self.nemi._input is not None:
+                self.nemi._input.load_text(f"Mach ein Cover von „{ui._songtitel(pfad)}“ im Stil ")
+                self.nemi._input.move_cursor(self.nemi._input.document.end)
+                self.nemi._input.focus()
+        except OSError as e:
+            ui.warn(f"Ging nicht: {e}")
+
+    def action_mitschnitt(self) -> None:
+        """F12: das ganze laufende Gespraech als Markdown sichern.
+
+        Im Terminal laesst sich ein langer Verlauf kaum markieren, und der
+        Denktext steht dort ohnehin nur zusammengeklappt. Die Datei hat alles."""
+        import mitschrift
+        try:
+            ziel = mitschrift.speichern()
+        except ValueError as e:
+            ui.warn(f"F12: {e}")
+            return
+        except OSError as e:
+            ui.error(f"F12: konnte nicht schreiben - {e}")
+            return
+        ui.success(f"F12 - Gespraech gesichert: {ziel.name} "
+                   f"({mitschrift.anzahl()} Eintraege, mit Denktext)")
+        ui.info(f"Liegt in: {ziel.parent}")
+
+    def action_mode(self) -> None:
+        import modes
+        key = modes.cycle()
+        ui.info(f"Modus: {modes.anzeige()}" + (
+            f"  ·  Zünder: nach {modes.AUTO_FUSE_S // 60} min zurück in Chatten"
+            if key == "auto" else ""))
+        self.nemi._refresh_chrome()
+
+    def action_page(self, d: int) -> None:
+        self.nemi._scroll("page", d)
+
+    def action_line(self, d: int) -> None:
+        self.nemi._scroll("line", d)
+
+    def action_bottom(self) -> None:
+        self.nemi._scroll("bottom", None)
+
+    def action_antwort(self, d: int) -> None:
+        self.nemi._scroll("antwort", d)
+
+    def action_suche(self) -> None:
+        self.nemi.suche_oeffnen()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "verlaufsuche":
+            self.nemi.suche_aendern(event.value)
+
+    def block_kopieren(self, block: _Block) -> None:
+        """Rechtsklick auf einen Block: sein ganzer Text in die Zwischenablage, der Block blitzt kurz auf."""
+        text = block.ganz_kopieren()
+        if not text.strip():
+            return
+        self.copy_to_clipboard(text)
+        _windows_clipboard(text)
+        block.add_class("kopiert")
+        self.set_timer(0.4, lambda: block.remove_class("kopiert"))
+        self.nemi._kopie_melden(len(text))
+
+
+# ---------------------------------------------------------------------------
+# Der Screen: Zustand + Schnittstelle für main/confirm/ui
+# ---------------------------------------------------------------------------
+class Screen:
+    def __init__(self):
+        self.ctx = None
+        self.handler = None
+        self.session_state: dict = {}
+        self._model_completions_fn = lambda: {}
+        self.app: _NemiApp | None = None
+        self.busy = False
+        self._abort = False
+        self.thinking_expanded = False
+        self._last_thinking = None
+        self._thinking_live = False
+        self._modal: str | None = None        # "select" | "text" | "review" | "thinking" | None
+        self._chrome_stand: dict = {}         # zuletzt gesetzte Kopf-/Leisten-Texte und Rahmenfarbe
+        # --- Übungsmodus (Leerlauf) ---
+        self._practice_fn = None
+        self.practice_on = _uebung_gewuenscht()   # aus der Config – /uebung aus bleibt aus
+        self._practicing = False
+        self._practice_task = None
+        self._practice_stopping = False
+        self._practice_consent = None
+        self._idle_after = 600.0
+        self._last_input = time.monotonic()
+        # --- Helfer-Agenten ---
+        self.helfer_aktiv = 0
+        self.bibliothekar_text = ""
+        self.speicher_token: int | None = None       # Füllstand des Einlese-Speichers (None = kein Balken)
+        self.vollscan_text = ""
+        self._pulse_on = True
+        # --- intern ---
+        self._old_console = None
+        self._loop_thread = None
+        self._blocks = 0
+        self._log = self._live = self._verlauf = self._header = self._toolbar = self._hints = None
+        self._leiste = None
+        self._cockpit = None
+        self._cockpit_takt = 0
+        self._input = self._complete = self._frame = self._inline = None
+        self._pending: list = []              # Blöcke, die vor dem Start gedruckt wurden
+        self._tx_theme_pushed = False
+        self._follow = True                   # Verlauf hängt am unteren Ende?
+        self._weich = _weich_gewuenscht()     # Blättern in kleinen Schritten statt in einem Sprung
+        self._roll_kennung = 0                # ein neues Blättern löst das laufende ab
+        self._suchzeile = self._suchfeld = self._suchzahl = None
+        self._such_treffer: list = []         # (Block, Zeile, erstes Zeichen, Zeichen dahinter), alt nach neu
+        self._such_nr = -1
+        self._such_kennung = 0                # eine neue Suche löst die laufende ab
+        self._puls_gemeldet = None            # dem eigenen Fenster zuletzt gemeldet: arbeitet / ruht
+        self._sitz_gemeldet = 0               # dem eigenen Fenster zuletzt gemeldet: Zeile der Figur
+        self._wecker: list = []               # fällige Erinnerungen der KI an sich selbst, noch nicht abgearbeitet
+        self._kopie_zeichen = 0               # kurze Meldung „📋 n kopiert“ im Rahmen …
+        self._kopie_bis = 0.0                 # … bis zu diesem Zeitpunkt
+        self.start_text: str | None = None    # --sag: erste Nachricht gleich abschicken
+        self._comp_base = None                # (Basistext, Index) für Tab-Vervollständigung
+        self._comp_items: list = []
+        self._completer = SlashCompleter(
+            get_themes=lambda: ui.THEMES,
+            get_models=lambda: self._model_completions_fn(),
+            get_strengths=lambda: M.strength_menu(self.session_state.get("model")),
+            get_checkpoints=_checkpoint_menu,
+            get_personas=_persona_menu,
+        )
+        try:
+            import os
+            self.width = max(40, os.get_terminal_size().columns)
+        except OSError:
+            self.width = 100
+
+    # -- Installation: ui umlenken ----------------------------------------
+    def install(self) -> None:
+        self._old_console = ui.console
+        ui.console = _CaptureConsole(self, self._text_width())
+        ui._theme_pushed = False
+        ui.TUI = self
+        try:
+            import subagents
+            subagents.on_aktiv(self.set_helfer)
+        except Exception:
+            pass
+
+    def uninstall(self) -> None:
+        if self._old_console is not None:
+            ui.console = self._old_console
+        ui.TUI = None
+        ui.BANNER_KOMPAKT = False
+        ui._theme_pushed = False
+
+    def _bind(self, app: _NemiApp) -> None:
+        """Vom App-Mount: Widgets merken, gepufferte Blöcke einhängen."""
+        self._loop_thread = threading.current_thread()
+        self._log = app.query_one("#log", _Log)
+        self._leiste = app.query_one("#leiste", Static)
+        self._cockpit = app.query_one("#cockpit", Static)
+        self._cockpit.display = _cockpit_gewuenscht()       # angedockt: nimmt dem Rest den Platz selbst weg
+        self._live = app.query_one("#live", Static)
+        self._verlauf = app.query_one("#verlauf", Vertical)
+        self._header = app.query_one("#header", Static)
+        self._toolbar = app.query_one("#toolbar", Static)
+        self._hints = app.query_one("#hints", Static)
+        self._input = app.query_one("#input", _Composer)
+        self._complete = app.query_one("#complete", Static)
+        self._frame = app.query_one("#frame", Vertical)
+        self._inline = app.query_one("#inline", Vertical)
+        self._suchzeile = app.query_one("#suchzeile", Horizontal)
+        self._suchfeld = app.query_one("#verlaufsuche", _SuchFeld)
+        self._suchzahl = app.query_one("#suchzahl", Static)
+        _fenster_melden("grund=" + _SCHIRM_BG.lstrip("#"))
+        self._log.set_class(not ui.BANNER_KOMPAKT, "start")   # Startseite oben, der Chat danach unten
+        self.apply_theme()
+        pending, self._pending = self._pending, []
+        for r in pending:
+            self._mount_block(r)
+        self._sync_width()
+
+    def apply_theme(self) -> None:
+        """Theme der rich-Console auch der Textual-Console geben (Stilnamen wie
+        'brand'/'muted' müssen dort auflösbar sein) und Rahmenfarben setzen."""
+        if self.app is None:
+            return
+        try:
+            if self._tx_theme_pushed:
+                self.app.console.pop_theme()
+            self.app.console.push_theme(ui._build_theme(ui.current_theme()))
+            self._tx_theme_pushed = True
+        except Exception:
+            pass
+        self._chrome_stand = {}   # Stilnamen lösen jetzt anders auf: alles neu setzen
+        self._refresh_chrome()
+        try:
+            self.app.refresh()
+        except Exception:
+            pass
+
+    # -- Breite ------------------------------------------------------------
+    def _text_width(self) -> int:
+        try:
+            return max(40, self._log.content_size.width)
+        except Exception:
+            return max(40, self.width - 1)
+
+    def _sync_width(self) -> None:
+        w = self._text_width()
+        try:
+            if self._log.content_size.width <= 0:          # noch kein Layout
+                w = max(40, self.app.size.width - 2)
+        except Exception:
+            pass
+        self.width = w
+        try:
+            ui.console.width = w
+        except Exception:
+            pass
+
+    def _terminal_width(self) -> int:
+        """Breite für Leisten und Kopfzeile – ohne das Cockpit, wenn es offen ist."""
+        try:
+            breite = self.app.size.width
+            if self._cockpit is not None and self._cockpit.display:
+                breite -= _COCKPIT_SPALTEN
+            return max(1, breite)
+        except Exception:
+            return self.width
+
+    # -- Verlauf -------------------------------------------------------------
+    def append_block(self, renderable) -> None:
+        """Ein gedruckter Block kommt in den Verlauf (Thread-sicher)."""
+        renderable = sanitize(renderable)
+        if self._log is None or self.app is None:
+            self._pending.append(renderable)
+            return
+        if threading.current_thread() is not self._loop_thread:
+            try:
+                self.app.call_from_thread(self._mount_block, renderable)
+            except Exception:
+                self._pending.append(renderable)
+            return
+        self._mount_block(renderable)
+
+    def _kopie_melden(self, zeichen: int, sekunden: float = 4.0) -> None:
+        """Kurz im Eingaberahmen zeigen, dass kopiert wurde – ohne einen Block zu drucken.
+
+        Ein gedruckter Hinweis würde den Verlauf verschieben, genau während man
+        noch auf seiner frischen Markierung sitzt.
+        """
+        self._kopie_zeichen = zeichen
+        self._kopie_bis = time.monotonic() + sekunden
+        self._refresh_chrome()
+        if self.app is not None:
+            try:
+                self.app.set_timer(sekunden, self._refresh_chrome)
+            except Exception:
+                pass
+
+    def _auswahl_offen(self) -> bool:
+        """Hält der Nutzer gerade eine Markierung? Dann nichts unter ihm wegscrollen."""
+        try:
+            return bool(self.app.screen.selections)
+        except Exception:
+            return False
+
+    def _check_follow(self) -> None:
+        """Ist der Verlauf (wieder) ganz unten? Dann hängen wir uns wieder ans Ende."""
+        try:
+            if self._log.is_vertical_scroll_end or self._log.max_scroll_y == 0:
+                self._follow = True
+        except Exception:
+            pass
+
+    def _mount_block(self, renderable) -> None:
+        # Während einer Markierung bleibt der Verlauf stehen: sonst rutscht einem
+        # die frisch gezogene Auswahl weg, sobald sie unten weiterschreibt.
+        follow = self._follow and not self._auswahl_offen()
+        if isinstance(renderable, ui.Klapp):
+            w = _KlappBlock(renderable, classes="block")
+        elif _antwort_panel(renderable) is not None:
+            w = _AntwortBlock(renderable, classes="block")
+        else:
+            w = _Block(renderable, classes="block reflow" if isinstance(renderable, _ReflowRenderable) else "block")
+        self._verlauf.mount(w)
+        self._blocks += 1
+        if self._blocks > _MAX_BLOCKS:
+            alt = self._log.query(".block")
+            for old in list(alt)[: self._blocks - _MAX_BLOCKS]:
+                old.remove()
+            self._blocks = _MAX_BLOCKS
+        if follow:
+            self.app.call_after_refresh(self._scroll_bottom)
+
+    def _scroll_bottom(self) -> None:
+        try:
+            self._log.scroll_end(animate=False)
+        except Exception:
+            pass
+
+    def _scroll(self, what: str, arg) -> None:
+        if self._log is None:
+            return
+        if what == "page":
+            self._rollen_nach(self._log.scroll_y + arg * max(1, self._log.scrollable_content_region.height))
+        elif what == "antwort":
+            ziel = self._antwort_ziel(arg)
+            if ziel is None:
+                return
+            self._rollen_nach(ziel)
+        elif what == "line":
+            self._log.scroll_relative(y=arg, animate=False)
+        else:
+            self._log.scroll_end(animate=False)
+            self._follow = True
+            return
+        if arg < 0:
+            self._follow = False
+        else:
+            self.app.call_after_refresh(self._check_follow)
+
+    def _rollen_nach(self, ziel: float) -> None:
+        """Verlauf auf eine Zeile rollen – weich in wenigen Schritten (Config terminal_weich) oder sofort."""
+        log = self._log
+        ziel = max(0.0, min(float(ziel), float(log.max_scroll_y)))
+        self._roll_kennung += 1
+        kennung, start = self._roll_kennung, float(log.scroll_y)
+        am_ende = ziel >= log.max_scroll_y       # dort hängt sich der Verlauf wieder ans Ende
+        if not self._weich or abs(ziel - start) < 2:
+            log.scroll_to(y=ziel, animate=False)
+            self._follow = self._follow or am_ende
+            return
+
+        def schritt(i: int) -> None:
+            if kennung != self._roll_kennung:
+                return
+            log.scroll_to(y=round(start + (ziel - start) * _ROLL_SCHRITTE[i]), animate=False)
+            if i + 1 < len(_ROLL_SCHRITTE):
+                self.app.set_timer(_ROLL_PAUSE_S, lambda: schritt(i + 1))
+            else:
+                self._follow = self._follow or am_ende
+        schritt(0)
+
+    def _antwort_ziel(self, richtung: int) -> float | None:
+        """Rollstand, bei dem die vorige (−1) oder nächste (+1) Antwort oben steht; None: keine weitere."""
+        try:
+            basis = self._verlauf.virtual_region.y
+            lagen = [basis + b.virtual_region.y + (0 if b.eingeklappt else b._titelzeile())
+                     for b in self._verlauf.children if isinstance(b, _AntwortBlock)]
+            y = self._log.scroll_y
+        except Exception:
+            return None
+        if richtung < 0:
+            davor = [lage for lage in lagen if lage < y - 0.5]
+            return max(davor) if davor else None
+        danach = [lage for lage in lagen if lage > y + 0.5]
+        return min(danach) if danach else float(self._log.max_scroll_y)
+
+    # -- Suche im Verlauf (Strg+F) -----------------------------------------------
+    def suche_oeffnen(self) -> None:
+        if self.app is None or self._suchzeile is None or self._modal is not None:
+            return
+        self._suchzeile.display = True
+        self._suchfeld.focus()
+        self.suche_aendern(self._suchfeld.value)
+
+    def suche_schliessen(self) -> None:
+        if self._suchzeile is None:
+            return
+        self._such_kennung += 1
+        self._such_treffer, self._such_nr = [], -1
+        self._suchzeile.display = False
+        try:
+            self.app.screen.clear_selection()
+        except Exception:
+            pass
+        if self._input is not None:
+            self._input.focus()
+
+    def suche_aendern(self, begriff: str) -> None:
+        """Neu suchen: von der neuesten Nachricht rückwärts, in Stücken – die Oberfläche bleibt bedienbar."""
+        self._such_kennung += 1
+        self._such_treffer, self._such_nr = [], -1
+        bloecke = [b for b in self._verlauf.children if isinstance(b, _Block)] if begriff.strip() else []
+        self._such_stueck(self._such_kennung, begriff, bloecke, len(bloecke))
+
+    def _such_stueck(self, kennung: int, begriff: str, bloecke: list, ende: int) -> None:
+        if kennung != self._such_kennung:
+            return
+        start = max(0, ende - _SUCH_STUECK)
+        neu = [(block, y, a, b) for block in bloecke[start:ende]
+               for y, a, b in _treffer_in(block.klartext(), begriff)]
+        erster_fund = self._such_nr < 0 and bool(neu)
+        self._such_treffer = neu + self._such_treffer
+        if erster_fund:
+            self._such_nr = len(self._such_treffer) - 1          # beim neuesten Treffer beginnen
+        elif self._such_nr >= 0:
+            self._such_nr += len(neu)                            # ältere kommen davor, der Platz bleibt
+        self._treffer_zeigen(springen=erster_fund or start == 0)
+        if start > 0:
+            self.app.set_timer(0.01, lambda: self._such_stueck(kennung, begriff, bloecke, start))
+
+    def such_sprung(self, schritt: int) -> None:
+        if self._such_treffer:
+            self._such_nr = (self._such_nr + schritt) % len(self._such_treffer)
+        self._treffer_zeigen(springen=True)
+
+    def _treffer_zeigen(self, springen: bool) -> None:
+        """Zahl neben dem Suchfeld; der aktuelle Treffer wird markiert und in die Mitte gerollt."""
+        anzahl = len(self._such_treffer)
+        if anzahl:
+            self._suchzahl.update(f"{self._such_nr + 1} / {anzahl}")
+        else:
+            self._suchzahl.update("kein Treffer" if self._suchfeld.value.strip() else "")
+        if not springen:
+            return
+        try:
+            if not anzahl:
+                self.app.screen.clear_selection()
+                return
+            block, y, a, b = self._such_treffer[self._such_nr]
+            if block.parent is None:                  # inzwischen aus dem Verlauf gekappt
+                return
+            self.app.screen.selections = {block: Selection(Offset(a, y), Offset(b, y))}
+            self._follow = False
+            lage = self._verlauf.virtual_region.y + block.virtual_region.y + y
+            self._roll_kennung += 1
+            self._log.scroll_to(y=max(0, lage - self._log.size.height // 2), animate=False)
+        except Exception:
+            pass
+
+    def print_reflow(self, make) -> None:
+        """Renderable, das bei jeder Breite frisch gebaut wird (Banner)."""
+        self.append_block(_ReflowRenderable(make))
+
+    def clear(self) -> None:
+        self._last_thinking = None
+        self._thinking_live = False
+        self.live_clear()
+        if self._log is None:
+            self._pending.clear()
+            return
+        for w in list(self._log.query(".block")):
+            w.remove()
+        self._blocks = 0
+        ui.BANNER_KOMPAKT = False                 # neu begonnen: wieder der große Banner
+        self._log.set_class(True, "start")
+        self._leiste.display = False
+
+    # -- Live-Region (streamende Antwort) -----------------------------------
+    def live_update(self, renderable) -> None:
+        if self._live is None:
+            return
+        self._live.update(sanitize(renderable))
+        self._live.display = True
+        if self._follow:
+            self.app.call_after_refresh(self._scroll_bottom)
+
+    def live_clear(self) -> None:
+        if self._live is None:
+            return
+        self._live.update("")
+        self._live.display = False
+
+    # -- vom Chat-Loop genutzt ----------------------------------------------
+    def consume_abort(self) -> bool:
+        if self._abort:
+            self._abort = False
+            return True
+        return False
+
+    def set_thinking(self, text: str, seconds: float | None, live: bool) -> None:
+        if text:
+            self._last_thinking = {"text": text, "seconds": seconds}
+        self._thinking_live = live and bool(text)
+
+    def invalidate(self) -> None:
+        self._refresh_chrome()
+
+    def force_repaint(self) -> None:
+        if self.app is not None:
+            try:
+                self.app.refresh(repaint=True, layout=True)
+            except Exception:
+                pass
+        self._refresh_chrome()
+
+    # -- Bibliothekar (Gedächtnis-Vektorisierung im Hintergrund) ----------------
+    def set_bibliothekar(self, text: str) -> None:
+        """„Chat #152 · Brocken 12/40“ → Badge mit Mini-Balken in der Statuszeile; "" = weg."""
+        self.bibliothekar_text = text or ""
+        self._refresh_chrome()
+
+    def set_speicher(self, token: int | None) -> None:
+        """Füllstand des Einlese-Speichers → Balken „4k │ 100k“ in der Statuszeile; ändert er sich, leuchtet der
+        Balken kurz auf."""
+        alt = getattr(self, "speicher_token", None)
+        self.speicher_token = token
+        if alt is not None and token is not None and token != alt:
+            self._speicher_blitz_bis = time.monotonic() + SPEICHER_BLITZ_S
+            try:
+                self.app.set_timer(SPEICHER_BLITZ_S + 0.1, self._refresh_chrome)
+            except Exception:
+                pass
+        self._refresh_chrome()
+
+    def set_vollscan(self, text: str) -> None:
+        """„Vollscan · C:\\ 310/743 GB“ → Badge mit Mini-Balken; "" = weg."""
+        self.vollscan_text = text or ""
+        self._refresh_chrome()
+
+    # -- Helfer-Agenten -------------------------------------------------------
+    def set_helfer(self, n: int) -> None:
+        self.helfer_aktiv = max(0, n)
+        if self.helfer_aktiv == 0:
+            self._pulse_on = True
+        self._refresh_chrome()
+
+    # -- Kopfzeile, Toolbar, Hinweise -----------------------------------------
+    def _tick(self) -> None:
+        """Alle 0,2 s: Animationen, Zünder, Puls, Lebenszeichen, Briefkasten."""
+        import modes
+        if modes.check_fuse():
+            ui.warn(modes.fuse_message())
+        self._lebenszeichen()
+        if self.helfer_aktiv > 0:
+            self._pulse_on = int(time.time() * 2) % 2 == 0      # halbe Sekunde hell/dunkel
+        self._refresh_chrome()
+        self._cockpit_takt += 1
+        if self._cockpit_takt % 5 == 0:                        # Cockpit einmal je Sekunde
+            self._cockpit_zeichnen()
+
+    # -- Cockpit (F3) und Palette (Strg+K) ---------------------------------------
+    def cockpit_umschalten(self) -> None:
+        if self._cockpit is None:
+            return
+        self._cockpit.display = not self._cockpit.display
+        self._chrome_stand = {}                                 # Leisten in der neuen Breite
+        try:
+            import config
+            config.update(cockpit=bool(self._cockpit.display))
+        except Exception:
+            pass
+        self._cockpit_zeichnen()
+        self.app.call_after_refresh(self._sync_width)
+
+    def _cockpit_zeichnen(self) -> None:
+        if self._cockpit is None or not self._cockpit.display:
+            return
+        stand = dict(self.session_state or {})
+        try:
+            import hintergrund
+            stand["aufgaben"] = hintergrund.laufend()
+            if stand["aufgaben"]:
+                import actions
+                stand["fortschritt"] = actions.bild_status() or ""
+        except Exception:
+            pass
+        try:
+            import plan
+            d = plan.daten()
+            if d:
+                for punkt in d["punkte"]:
+                    punkt["zeichen"] = plan.zeichen(punkt, d)
+                stand["plan"] = d
+        except Exception:
+            pass
+        try:
+            import startseite
+            stand["wache"] = startseite.STAND.get("wache")
+        except Exception:
+            pass
+        try:
+            self._cockpit.update(cockpit.render(stand, ui.persona_farbe()))
+        except Exception:
+            pass
+
+    def palette_oeffnen(self) -> None:
+        if self.app is None or self._modal is not None:
+            return
+        try:
+            liste = palette.eintraege(modelle=self._model_completions_fn(),
+                                      personas=list(_persona_menu().items()))
+        except Exception:
+            liste = palette.eintraege()
+        self._modal = "palette"
+        self._refresh_chrome()
+
+        def fertig(e) -> None:
+            self._modal = None
+            self._refresh_chrome()
+            if e is None or self._input is None:
+                return
+            self._input.load_text(e.befehl)
+            self._input.move_cursor(self._input.document.end)
+            self._input.focus()
+            if not e.braucht_eingabe:
+                self._submit()
+        self.app.push_screen(_PaletteScreen(liste), callback=fertig)
+
+    def _figur_sitz(self) -> int:
+        """Zeilen vom unteren Rand bis zur Kopfzeile der Eingabe (0 = unbekannt oder noch nicht angeordnet)."""
+        try:
+            region = self._header.region
+            if region.height <= 0 or region.y <= 0:
+                return 0
+            return max(0, int(self.app.size.height - region.y))
+        except Exception:
+            return 0
+
+    def _refresh_chrome(self) -> None:
+        if self._header is None or self.app is None:
+            return
+        try:
+            if self.ctx is not None:
+                self.ctx.sync_session()
+            # Nur Geändertes setzen: jedes update() und jede Rahmenfarbe ordnet den Schirm neu an – im Takt
+            # (5× je Sekunde) mit dem ganzen Verlauf, bei langen Chats spürbar beim Scrollen.
+            p = ui.THEMES[ui.current_theme()]
+            neu = {
+                "kopf": self._composer_header(),
+                "leiste": fragments_to_text(ui.bottom_toolbar(self.session_state, width=self._terminal_width())),
+                "hinweise": fragments_to_text(ui.input_hints(
+                    self._terminal_width(), busy=self.busy, practicing=self._practicing,
+                    modal=self._modal is not None, has_thinking=bool(self._last_thinking),
+                    reading_thinking=self._modal == "thinking",
+                    reviewing_action=self._modal == "review")),
+                "rahmen": p["accent_dim"] if self.busy else p["brand_dim"],
+            }
+            alt = self._chrome_stand
+            for name, widget in (("kopf", self._header), ("leiste", self._toolbar), ("hinweise", self._hints)):
+                if alt.get(name) != neu[name]:
+                    widget.update(neu[name])
+            if alt.get("rahmen") != neu["rahmen"]:
+                for edge in ("border_left", "border_right", "border_bottom"):
+                    setattr(self._frame.styles, edge, ("round", neu["rahmen"]))
+            self._chrome_stand = neu
+            if self.busy != self._puls_gemeldet:        # eigenes Fenster: Hintergrund atmet beim Arbeiten
+                self._puls_gemeldet = self.busy
+                _fenster_melden("puls=1" if self.busy else "puls=0")
+            sitz = self._figur_sitz()
+            if sitz and sitz != self._sitz_gemeldet:     # Figur sitzt auf der Kopfzeile der Eingabe
+                self._sitz_gemeldet = sitz
+                _figur(lambda F: F.sitz(sitz))
+        except Exception as e:                   # sonst stünden Kopf und Leiste still, ohne jede Spur
+            art = type(e).__name__
+            gemeldet = getattr(self, "_chrome_fehler", set())
+            if art not in gemeldet:
+                gemeldet.add(art)
+                self._chrome_fehler = gemeldet
+                try:
+                    import debugbericht
+                    debugbericht.fehler("Kopfzeile/Leiste zeichnen", e)
+                except Exception:
+                    pass
+
+    def _composer_header(self) -> Text:
+        width = self._terminal_width()
+        p = ui.THEMES[ui.current_theme()]
+        color = p["accent_dim"] if self.busy else p["brand_dim"]
+        border = Style(color=color, bgcolor=_COMPOSER_BG)
+        muted = Style(color=ui.leise(), bgcolor=_COMPOSER_BG)
+        accent = Style(color=p["accent"], bgcolor=_COMPOSER_BG)
+        status = "● bereit"
+        if self._modal is not None:
+            status = {"select": "◇ Auswahl", "text": "◇ Eingabe", "palette": "◇ Suche",
+                      "thinking": "◇ Denktext", "review": "◇ Aktion prüfen"}.get(self._modal, "◇")
+        elif self._practicing:
+            status = "◇ beendet Übung …" if self._practice_stopping else "◇ übt"
+        elif self.busy:
+            status = "◌ arbeitet"
+        left = Text(no_wrap=True, overflow="crop")
+        left.append("╭─", border)
+        left.append(f" {ui.persona_name()} ", accent + Style(bold=True))
+        left.append("· ", muted)
+        left.append(status, accent)
+        left.append(" ", border)
+        if self._kopie_zeichen and time.monotonic() < self._kopie_bis:
+            left.append("· ", muted)
+            left.append(f"📋 {self._kopie_zeichen} Zeichen kopiert ", accent)
+        if self.helfer_aktiv > 0:
+            punkt = (Style(color=p["accent"], bgcolor=_COMPOSER_BG, bold=True) if self._pulse_on
+                     else Style(color=p["accent_dim"], bgcolor=_COMPOSER_BG))
+            left.append("· ", muted)
+            left.append("●", punkt)
+            left.append(f" Subagenten aktiv: {self.helfer_aktiv} ", accent)
+        import re as _re
+
+        def hintergrund_badge(ziel: Text, symbol: str, text: str, kompakt: bool) -> None:
+            """Arbeit nebenher sichtbar machen; „i/n“ im Text wird zum Mini-Balken.
+            kompakt: nur Symbol, Balken und Prozent (ohne Balken: Text gekürzt)."""
+            m = _re.search(r"(\d+)\s*/\s*(\d+)", text)
+            ziel.append("· ", muted)
+            ziel.append(ueberhang(symbol) + " ", accent)
+            if not (kompakt and m):
+                ziel.append(text.strip()[:16 if kompakt else 60], Style(color=p["accent"], bgcolor=_COMPOSER_BG))
+            if m and int(m.group(2)) > 0:
+                frac = max(0.0, min(1.0, int(m.group(1)) / int(m.group(2))))
+                zellen = 5 if kompakt else 8
+                voll = round(frac * zellen)
+                if not kompakt:
+                    ziel.append(" ", muted)
+                ziel.append("▓" * voll, accent)
+                ziel.append("░" * (zellen - voll), Style(color=p["accent_dim"], bgcolor=_COMPOSER_BG))
+                ziel.append(f" {int(frac * 100)}% ", muted)
+            else:
+                ziel.append(" ", muted)
+
+        if self.speicher_token is not None and width >= 60:
+            import einlesen
+            t = self.speicher_token
+            halbe = einlesen.halbe(t)
+            farbe, halb = einlesen.farbe(t), einlesen.halb(t)
+            blitz = getattr(self, "_speicher_blitz_bis", 0.0)
+            if isinstance(blitz, float) and time.monotonic() < blitz:
+                farbe, halb = einlesen.hell(farbe), einlesen.hell(halb)
+            for i, zeichen in enumerate(einlesen.zeichen(t)):
+                grund = farbe if 2 * i + 2 <= halbe else halb if 2 * i + 1 <= halbe else einlesen.LEER
+                left.append(zeichen, Style(color="#ffffff", bold=True, bgcolor=grund))
+            left.append(" ", muted)
+        plaketten: list[tuple[str, str]] = []
+        try:                                     # Hintergrund-Aufgabe zuerst: sie darf nie wegfallen
+            import hintergrund
+            if (plakette := hintergrund.plakette()):
+                plaketten.append(plakette)
+        except Exception:
+            pass
+        if self.bibliothekar_text:
+            kurz = (self.bibliothekar_text if width >= 120
+                    else _re.sub(r"\s*·.*?(?=Brocken|$)", " ", self.bibliothekar_text))
+            plaketten.append(("📚", kurz))
+        if self.vollscan_text:
+            plaketten.append(("🛡", self.vollscan_text))
+        basis = left.copy()
+        for sym, txt in plaketten:
+            hintergrund_badge(left, sym, txt, kompakt=False)
+        if len(plaketten) > 1 and left.cell_len + 12 > width:     # eng: alle Plaketten kurz
+            left = basis
+            for sym, txt in plaketten:
+                hintergrund_badge(left, sym, txt, kompakt=True)
+        right = fragments_to_text(mascot.rprompt(mit_hintergrund=False))
+        right.append("─╮", border)
+        if width >= 70 and self._modal is None:
+            badge = fragments_to_text(mascot.folder_badge(compact=width < 105))
+            candidate = Text(" ", muted) + badge + Text("  ", muted) + right
+            if left.cell_len + candidate.cell_len + 3 <= width:
+                right = candidate
+        if left.cell_len + right.cell_len > width:
+            right = Text("╮", border)
+            left.truncate(max(0, width - 1), overflow="ellipsis")
+        gap = max(0, width - left.cell_len - right.cell_len)
+        out = Text(no_wrap=True, overflow="crop")
+        out.append_text(left)
+        if self.busy and self._modal is None and gap >= 12:
+            # Arbeitet die KI, läuft ein Lichtschweif in ihrer Farbe über die Linie
+            farbe = ui.persona_farbe()
+            spitze = int(time.monotonic() * 16) % (gap + 10) - 5
+            for i in range(gap):
+                abstand = abs(i - spitze)
+                if abstand <= 4:
+                    out.append("━" if abstand <= 1 else "─",
+                               Style(color=_mischen(farbe, color, abstand / 5), bgcolor=_COMPOSER_BG,
+                                     bold=abstand == 0))
+                else:
+                    out.append("─", border)
+        else:
+            out.append("─" * gap, border)
+        out.append_text(right)
+        # Hintergrund der ganzen Zeile
+        out.stylize(Style(bgcolor=_COMPOSER_BG))
+        return out
+
+    # -- Eingabe ------------------------------------------------------------
+    def _input_height(self) -> int:
+        try:
+            width = max(1, self._input.content_size.width)
+        except Exception:
+            width = 80
+        rows = 0
+        for line in (self._input.text or "").split("\n"):
+            cells = Text(line.expandtabs(4)).cell_len + 1
+            rows += max(1, -(-cells // width))
+        return max(_MIN_INPUT_ROWS, min(_MAX_INPUT_ROWS, rows))
+
+    def _on_text_changed(self) -> None:
+        self._last_input = time.monotonic()
+        self._stop_practice()
+        try:
+            self._input.styles.height = self._input_height()
+        except Exception:
+            pass
+        self._update_completions()
+        try:                                        # 🧭 Kompass: Befehle neben dem Terminal
+            import kompass
+            kompass.getippt(self._input.text, self.eingabe_setzen)
+        except Exception:
+            pass
+
+    def eingabe_setzen(self, text: str) -> None:
+        """Text in die Eingabe (Kompass-Klick) – abgeschickt wird erst mit Enter."""
+        if self._input is None or self._modal is not None:
+            return
+        self._input.load_text(text)
+        self._input.move_cursor(self._input.document.end)
+        self._input.focus()
+
+    def _candidates(self, text: str) -> list:
+        if not text.startswith("/") or "\n" in text:
+            return []
+        try:
+            doc = Document(text, len(text))
+            return list(self._completer.get_completions(doc, CompleteEvent()))
+        except Exception:
+            return []
+
+    def _update_completions(self) -> None:
+        if self._complete is None:
+            return
+        text = self._input.text
+        if self._comp_base is not None and text != self._comp_base[2]:
+            self._comp_base = None                  # Nutzer hat weitergetippt
+        items = self._candidates(text)
+        self._comp_items = items
+        if not items:
+            self._complete.display = False
+            return
+        if self._comp_base is not None:             # Liste der Basis, durch die geblättert wird
+            items = self._candidates(self._comp_base[0]) or items
+        p = ui.THEMES[ui.current_theme()]
+        sel = self._comp_base[1] if self._comp_base is not None else -1
+        # Fenster von _MAX_COMPLETIONS Zeilen, das der Auswahl folgt
+        start = min(max(0, sel - _MAX_COMPLETIONS + 1), max(0, len(items) - _MAX_COMPLETIONS))
+        ende = min(len(items), start + _MAX_COMPLETIONS)
+        t = Text(no_wrap=True, overflow="ellipsis")
+        if start:
+            t.append(f"  ▲ {start} weitere\n", style=ui.leise())
+        for i in range(start, ende):
+            c = items[i]
+            st = f"bold {p['accent']}" if i == sel else "#c8c4ff"
+            t.append(f"{c.text:<22}", style=st)
+            meta = getattr(c, "display_meta_text", "") or ""
+            t.append(f" {meta}", style=ui.leise())
+            if i < ende - 1:
+                t.append("\n")
+        if ende < len(items):
+            t.append(f"\n  ▼ {len(items) - ende} weitere · ↑↓ blättern", style=ui.leise())
+        self._complete.update(t)
+        self._complete.display = True
+
+    def _complete_next(self, schritt: int = 1) -> None:
+        """Tab/↓: nächste Vervollständigung einsetzen, ↑: vorige."""
+        text = self._input.text
+        if self._comp_base is None:
+            items = self._candidates(text)
+            if not items:
+                return
+            self._comp_base = [text, 0 if schritt > 0 else len(items) - 1, None]
+        else:
+            base, idx, _ = self._comp_base
+            items = self._candidates(base)
+            if not items:
+                self._comp_base = None
+                return
+            self._comp_base[1] = (idx + schritt) % len(items)
+        base, idx, _ = self._comp_base
+        c = items[idx]
+        neu = base[: len(base) + c.start_position] + c.text
+        self._comp_base[2] = neu
+        self._input.load_text(neu)
+        self._input.move_cursor(self._input.document.end)
+        self._comp_items = items
+        self._update_completions()
+
+    def _banner_verkleinern(self) -> None:
+        """Erste Nachricht: Die Startseite wird zur festen Leiste über dem Chat (Bild, Name, Gruß, Lage) –
+        sie rollt nicht mit; der Chat steht darunter wie gewohnt unten."""
+        if ui.BANNER_KOMPAKT:
+            return
+        ui.BANNER_KOMPAKT = True
+        try:
+            self._log.set_class(False, "start")
+            for w in self._log.query(".reflow"):
+                w.display = False
+            if hasattr(ui, "leiste_renderable"):
+                self._leiste.update(_ReflowRenderable(ui.leiste_renderable))
+                self._leiste.display = True
+            import startseite
+            startseite.bild_abmelden(0)                     # das große Bild der Startseite ist weg
+        except Exception:
+            pass
+
+    def reflow_auffrischen(self) -> None:
+        """Reflow-Blöcke (Startseite) neu zeichnen, weil ihr Inhalt nachkam – Thread-sicher."""
+        if self._log is None or self.app is None:
+            return
+        if threading.current_thread() is not self._loop_thread:
+            try:
+                self.app.call_from_thread(self.reflow_auffrischen)
+            except Exception:
+                pass
+            return
+        try:
+            for w in self._log.query(".reflow"):
+                w._sel_visual = None
+                w.refresh(layout=True)
+            if self._leiste.display:
+                self._leiste.refresh(layout=True)
+        except Exception:
+            pass
+
+    def _echo_user(self, text: str) -> None:
+        ui.console.print(Text(f"  ❯ {text}", style="user"))
+
+    def _submit(self) -> None:
+        self._last_input = time.monotonic()
+        text = self._input.text
+        if self._modal is None and self._neustart_pruefen(text):
+            return
+        if self.busy:
+            # „STOP“ während der Arbeit wirkt wie ESC (Not-Stopp); anderes wartet in der Eingabe
+            try:
+                import notstopp
+                stop = self._modal is None and notstopp.ist_stop(text)
+            except Exception:
+                stop = False
+            if stop:
+                self._input.load_text("")
+                self._echo_user(text)
+                self._abort = True
+                if not esc_notstopp("⏹ STOP angekommen – die KI hört sofort auf. Gelöscht wird nichts."):
+                    ui.warn("⏹ STOP angekommen – die KI hört auf.")
+            return
+        self._input.load_text("")
+        self._comp_base = None
+        self._update_completions()
+        if not text.strip():
+            return
+        self._follow = True                   # beim Absenden ans untere Ende springen
+        self._banner_verkleinern()
+        self._echo_user(text)
+        self._zug_starten(text, nutzer=True)
+
+    def _zug_starten(self, text: str, nutzer: bool = False) -> None:
+        """Eine Nachricht an die KI geben und ihren Zug laufen lassen (getippt oder vom Wecker).
+        `nutzer`: getippt – zählt für den Befehlsverlauf (/ablauf)."""
+        self.busy = True
+        self._refresh_chrome()
+        self.app.call_after_refresh(self._scroll_bottom)
+        _figur(lambda F: F.nutzer(text))
+        _taetig("denkt")
+
+        async def _runner():
+            result = None
+            if nutzer:
+                _nutzer_markieren()
+            try:
+                result = await self.handler(self.ctx, text)
+            except Exception as e:
+                ui.error(f"Fehler: {e}")
+            finally:
+                _taetig(None)
+                _figur(lambda F: F.fertig())
+                self.busy = self._practicing
+                self._last_input = time.monotonic()
+                self.force_repaint()
+            if result == "exit" and self.app is not None:
+                self.app.exit()
+
+        asyncio.get_running_loop().create_task(_runner())
+
+    def _neustart_pruefen(self, text: str) -> bool:
+        """/restart greift sofort, auch mitten in der Arbeit oder wenn die KI hängt (wie der Not-Stopp).
+        Er kommt nur über diese Eingabe – Inbox und Kontextmenü lassen keine /befehle durch."""
+        try:
+            import neustart
+        except Exception:
+            return False
+        if not neustart.ist_befehl(text) or getattr(self, "_neustart_laeuft", False):
+            return False
+        self._neustart_laeuft = True
+        self._input.load_text("")
+        self._echo_user(text)
+        self._abort = True                    # laufende KI anhalten
+        asyncio.get_running_loop().create_task(neustart.ausfuehren())
+        return True
+
+    # -- Wecker: fällige Erinnerungen im Chat zeigen, die der KI an sich selbst abarbeiten ------
+    _wecker_stamp = 0.0
+
+    def _erinnerungen_pruefen(self) -> None:
+        """Fällige Erinnerungen abholen (alle 5 s). An den Nutzer: eine Zeile im Chat. Von der KI an sich
+        selbst: Sie bekommt den Text als Nachricht – sofort, oder sobald sie frei ist."""
+        try:
+            from wache import erinnerungen as ER
+            import persoenlichkeiten as PS
+            faellig = ER.abholen(terminal=True, wer=PS.active().name)
+        except Exception:
+            return
+        for d in faellig:
+            if d.get("fuer") == ER.FUER_KI:
+                self._wecker.append(d)
+            else:
+                ui.info(ER.meldung(d))
+        self._wecker_abarbeiten()
+
+    def _wecker_abarbeiten(self) -> None:
+        if not self._wecker or self.busy or self._modal is not None or self.handler is None:
+            return
+        from wache import erinnerungen as ER
+        d = self._wecker.pop(0)
+        self._follow = True
+        self._banner_verkleinern()
+        ui.info(f"⏰ {d.get('wer') or ui.persona_name()} wird erinnert: {d['text']}")
+        self._zug_starten(ER.auftrag(d))
+
+    # -- Lebenszeichen & Briefkasten (Rechtsklick-Menü -> offenes Fenster) ------
+    _alive_stamp = 0.0
+    _inbox_stamp = 0.0
+    _alive_laeuft = False
+    _alive_ende = False
+
+    def _lebenszeichen(self) -> None:
+        """Alle 2 s .nemicli.alive anfassen; jede Sekunde .nemicli.inbox prüfen."""
+        now = time.monotonic()
+        try:
+            import kontextmenue as K
+        except Exception:
+            return
+        if now - self._alive_stamp >= 2.0 and not self._alive_laeuft:
+            # Eigener Faden: eine langsame Platte hält so die Oberfläche nicht an.
+            self._alive_stamp = now
+            self._alive_laeuft = True
+            threading.Thread(target=self._lebenszeichen_schreiben, args=(K,), daemon=True,
+                             name="lebenszeichen").start()
+        if now - self._wecker_stamp >= 5.0:
+            self._wecker_stamp = now
+            self._erinnerungen_pruefen()
+        if now - self._inbox_stamp >= 1.0:
+            self._inbox_stamp = now
+            try:                                    # Klick aufs Wache-Symbol: fester Befehl, kein Text von außen
+                if self.handler is not None and K.wache_fenster_abholen():
+                    asyncio.get_running_loop().create_task(self.handler(self.ctx, "/wache fenster"))
+            except Exception:
+                pass
+            try:                                    # Werkzeug atelier_oeffnen der KI: fester Befehl
+                import atelier as _AT
+                if self.handler is not None and _AT.abholen():
+                    asyncio.get_running_loop().create_task(self.handler(self.ctx, "/atelier"))
+            except Exception:
+                pass
+            if self.busy or self._modal is not None:
+                return                              # erst, wenn die KI frei ist
+            try:
+                if not K.INBOX_DATEI.exists():
+                    return
+                alt = time.time() - K.INBOX_DATEI.stat().st_mtime
+                text = K.INBOX_DATEI.read_text(encoding="utf-8").strip()
+                K.INBOX_DATEI.unlink()
+            except OSError:
+                return
+            # Die Inbox ist für Aufträge aus dem Kontextmenü: frisch, kurz, nie ein /befehl – sonst
+            # könnte jedes Programm Einstellungen (Modus, Schlüssel …) wie der Nutzer ändern.
+            if not text or alt > 120 or len(text) > 4000 or text.lstrip().startswith("/"):
+                if text:
+                    ui.warn("📥 Nachricht aus der Inbox verworfen (zu alt, zu lang oder ein /befehl).")
+                return
+            # Nur Aufträge in der Form des Kontextmenüs gehen unverändert durch, alles andere gerahmt.
+            text, geprueft = K.inbox_auftrag(text)
+            ui.info("📥 Auftrag aus dem Kontextmenü" + ("" if geprueft else " (Herkunft ungeprüft)"))
+            self._input.load_text(text)
+            self._submit()
+
+    def _lebenszeichen_schreiben(self, K) -> None:
+        try:
+            with _ALIVE_SPERRE:
+                if not self._alive_ende:            # nach dem Ende nicht wieder anlegen
+                    K.lebenszeichen_schreiben()
+        except OSError:
+            pass
+        finally:
+            self._alive_laeuft = False
+
+    def _lebenszeichen_ende(self) -> None:
+        gesperrt = _ALIVE_SPERRE.acquire(timeout=3.0)
+        self._alive_ende = True
+        try:
+            import kontextmenue as K
+            K.ALIVE_DATEI.unlink()
+        except Exception:
+            pass
+        finally:
+            if gesperrt:
+                _ALIVE_SPERRE.release()
+
+    def _submit_start_text(self) -> None:
+        """--sag: Text ins Eingabefeld und abschicken, sobald die Oberfläche steht."""
+        text, self.start_text = self.start_text, None
+        if text and not self.busy:
+            self._input.load_text(text)
+            self._submit()
+
+    def _on_escape(self) -> None:
+        self._last_input = time.monotonic()
+        if self._modal is not None:
+            return                          # das Modal hat eigene Esc-Behandlung
+        import sys
+        st = sys.modules.get("stimme")      # Esc beendet auch das Vorlesen
+        if st is not None and st.spricht():
+            st.stopp()
+        if self._practicing:
+            self._stop_practice()
+        elif self.busy:
+            self._abort = True
+            esc_notstopp()                  # sofort und sichtbar, nicht erst beim nächsten Nachsehen
+
+    def _on_ctrl_c(self) -> None:
+        if self._modal is not None:
+            return
+        if self._practicing:
+            self._stop_practice()
+        elif self.busy:
+            self._abort = True
+            esc_notstopp()
+        else:
+            self.app.exit()
+
+    # -- Denktext (F2) ---------------------------------------------------------
+    def _toggle_thinking(self) -> None:
+        self._last_input = time.monotonic()
+        if self._modal is not None:
+            return
+        if self._thinking_live and self.busy:
+            self.thinking_expanded = not self.thinking_expanded
+        elif self._last_thinking:
+            asyncio.get_running_loop().create_task(self._show_thinking())
+        self._refresh_chrome()
+
+    async def _show_thinking(self) -> None:
+        try:
+            await self._modal_run("thinking",
+                                  _ReaderScreen(self._last_thinking["text"], review=False))
+        except RuntimeError:
+            pass
+
+    # -- Übungsmodus (Leerlauf) – unverändert übernommen ----------------------
+    def _stop_practice(self) -> bool:
+        if not self._practicing:
+            return False
+        if self._practice_stopping:
+            return True
+        self._practice_stopping = True
+        if self._practice_task is not None and not self._practice_task.done():
+            self._practice_task.cancel()
+        self._refresh_chrome()
+        return True
+
+    async def _idle_loop(self) -> None:
+        while True:
+            await asyncio.sleep(1.0)
+            if (not self.practice_on or self.busy or self._practicing
+                    or self._modal is not None or self._practice_fn is None):
+                continue
+            if self.ctx is None or self.ctx.backend is None:
+                continue
+            if time.monotonic() - self._last_input < self._idle_after:
+                continue
+            await self._start_practice()
+
+    async def _start_practice(self) -> None:
+        prov = M.split_ref(self.ctx.model or "")[0]
+        is_cloud = prov not in ("local", "ollama", "gguf", "")
+        if is_cloud and self._practice_consent is None:
+            choice = await self.select(
+                "⚠ Übungsmodus mit CLOUD-Modell starten? Das verbraucht laufend "
+                "Tokens und kann ins Geld gehen.",
+                [("ja",   "Ja, mit Cloud-Modell üben (kostet)"),
+                 ("nein", "Nein – Übungsmodus aus")])
+            self._practice_consent = (choice == "ja")
+            self._last_input = time.monotonic()
+            if not self._practice_consent:
+                self.practice_on = False
+                try:
+                    import config
+                    config.update(uebung=False)      # dauerhaft, bis /uebung an
+                except Exception:
+                    pass
+                return
+        if is_cloud and self._practice_consent is False:
+            return
+        self._launch_practice(self.ctx, self._practice_fn, repeat=True)
+
+    def _launch_practice(self, ctx, practice_fn, *, repeat):
+        previous_busy = self.busy
+        owner = asyncio.current_task()
+        self._practicing = True
+        self._practice_stopping = False
+        self.busy = True
+        self._abort = False
+        self._refresh_chrome()
+
+        def should_stop() -> bool:
+            return (self._practice_stopping or self._abort
+                    or (repeat and not self.practice_on))
+
+        def release():
+            self._practicing = False
+            self._practice_stopping = False
+            self.busy = previous_busy and owner is not None and not owner.done()
+            self._practice_task = None
+            self._last_input = time.monotonic()
+            self.force_repaint()
+
+        async def _runner():
+            result = "abgebrochen"
+            try:
+                while not should_stop():
+                    result = await practice_fn(ctx, should_stop)
+                    if not repeat or result in ("abgelehnt", "abgebrochen"):
+                        break
+                    for _ in range(15):
+                        if should_stop():
+                            break
+                        await asyncio.sleep(0.2)
+                return result
+            except asyncio.CancelledError:
+                return "abgebrochen"
+            except Exception as e:
+                ui.error(f"Übungsmodus-Fehler: {e}")
+                return "fehler"
+            finally:
+                release()
+
+        self._practice_task = asyncio.create_task(_runner())
+        self._practice_task.add_done_callback(
+            lambda task: release() if self._practice_task is task else None)
+        return self._practice_task
+
+    async def run_practice_once(self, ctx, practice_fn):
+        if self._practicing:
+            return "abgebrochen"
+        task = self._launch_practice(ctx, practice_fn, repeat=False)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled():
+                return "abgebrochen"
+            self._stop_practice()
+            await asyncio.shield(task)
+            raise
+
+    # -- Modale Menüs / Eingaben ------------------------------------------------
+    async def _modal_run(self, kind: str, screen: ModalScreen):
+        if self._modal is not None:
+            raise RuntimeError("Eine andere Rückfrage ist bereits geöffnet.")
+        self._modal = kind
+        self._refresh_chrome()
+        fut = asyncio.get_running_loop().create_future()
+
+        def _done(result):
+            if not fut.done():
+                fut.set_result(result)
+
+        try:
+            self.app.push_screen(screen, callback=_done)
+            return await fut
+        finally:
+            self._modal = None
+            self._last_input = time.monotonic()
+            try:
+                self._input.focus()
+            except Exception:
+                pass
+            self._refresh_chrome()
+
+    async def _inline_run(self, kind: str, make_widget):
+        """Auswahl/Texteingabe im Eingaberahmen: das Eingabefeld weicht solange,
+        der Verlauf darüber bleibt komplett sichtbar."""
+        if self._modal is not None:
+            raise RuntimeError("Eine andere Rückfrage ist bereits geöffnet.")
+        fut = asyncio.get_running_loop().create_future()
+
+        def _done(result):
+            if not fut.done():
+                fut.set_result(result)
+
+        widget = make_widget(_done)
+        self._modal = kind
+        self._input.display = False
+        self._complete.display = False
+        self._refresh_chrome()
+        self._follow = True
+        self.app.call_after_refresh(self._scroll_bottom)
+        try:
+            await self._inline.mount(widget)
+            return await fut
+        finally:
+            try:
+                await widget.remove()
+            except Exception:
+                pass
+            self._modal = None
+            self._input.display = True
+            self._last_input = time.monotonic()
+            try:
+                self._input.focus()
+            except Exception:
+                pass
+            self._refresh_chrome()
+
+    async def review_action(self, title: str, preview: str) -> bool:
+        """Vollständige Aktionsvorschau; nur F8 gibt diese einzelne Aktion frei."""
+        return (await self._modal_run("review", _ReaderScreen(
+            f"{title}\n\n{preview}", review=True))) is True
+
+    async def select(self, question, options):
+        """Auswahl-Menü im Eingaberahmen (ersetzt confirm.ask im TUI)."""
+        return await self._inline_run(
+            "select", lambda done: _InlineSelect(question, options, done))
+
+    async def text_input(self, question, password=False):
+        """Texteingabe (z.B. API-Key) im Eingaberahmen."""
+        return await self._inline_run(
+            "text", lambda done: _InlineText(question, password, done))
+
+    # -- Start -------------------------------------------------------------
+    async def run(self, ctx, handler, session_state=None, model_completions=None,
+                  practice=None) -> None:
+        self.ctx = ctx
+        self.handler = handler
+        if session_state is not None:
+            self.session_state = session_state
+        if model_completions is not None:
+            self._model_completions_fn = model_completions
+        self._practice_fn = practice
+        self.app = _NemiApp(self)
+        idle = asyncio.create_task(self._idle_loop())
+        try:
+            import neustart
+            neustart.BEENDEN = self.app.exit
+        except Exception:
+            pass
+        try:
+            await self.app.run_async()
+        finally:
+            idle.cancel()
+            self._lebenszeichen_ende()
+            practice_task = self._practice_task
+            if practice_task is not None:
+                self._stop_practice()
+                await asyncio.shield(practice_task)
+            maus_tracking_aus()

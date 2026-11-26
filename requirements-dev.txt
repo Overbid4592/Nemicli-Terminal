@@ -1,0 +1,6 @@
+# Nur zum Entwickeln: die Motor-Tests vergleichen den GGUF-Motor mit transformers und die Bild-Motoren mit diffusers,
+# build_exe.py baut die exe mit PyInstaller. Nutzer brauchen das nicht (requirements.txt).
+-r requirements.txt
+transformers>=5.19
+pyinstaller>=6.22.3
+diffusers>=0.42
