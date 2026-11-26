@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Farbmischer</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <main>
+    <h1>🎨 Farbmischer</h1>
+    <div class="reihe">
+      <input id="a" type="color" value="#8b7cff">
+      <span>+</span>
+      <input id="b" type="color" value="#ffd400">
+    </div>
+    <input id="anteil" type="range" min="0" max="1" step="0.05" value="0.5">
+    <div id="ergebnis" class="ergebnis"></div>
+    <div id="code" class="code"></div>
+  </main>
+  <script src="app.js"></script>
+</body>
+</html>

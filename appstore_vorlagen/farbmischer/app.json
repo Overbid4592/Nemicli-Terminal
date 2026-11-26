@@ -1,0 +1,13 @@
+{
+  "titel": "Farbmischer",
+  "beschreibung": "Mischt zwei Farben und zeigt das Ergebnis – praktisch für Themes und Bilder.",
+  "icon": "icon.svg",
+  "version": "1.0",
+  "funktionen": [
+    {
+      "name": "mischen",
+      "beschreibung": "Mischt zwei Farben (#RRGGBB) im Verhältnis anteil (0 = nur a, 1 = nur b) und gibt die Mischfarbe zurück.",
+      "felder": {"a": "Farbe #RRGGBB", "b": "Farbe #RRGGBB", "anteil": "0–1, Vorgabe 0.5"}
+    }
+  ]
+}

@@ -1,0 +1,5 @@
+Dieses LoRA verändert Gemma 4 (Google), lizenziert unter der Apache License 2.0:
+https://ai.google.dev/gemma/docs/gemma_4_license
+
+Veränderung: ein LoRA-Zusatz für die Einrichtung von NemiCLI (Gespräch mit Aktions-Klammer), trainiert mit
+dem LoRA-Motor von NemiCLI auf synthetischem Lernstoff. Das Grundmodell selbst wird nicht mitgeliefert.

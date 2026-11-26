@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="de">
+<head>
+<meta charset="utf-8">
+<title>NemiCLI – Einstellungen</title>
+<style>
+  body { font: 15px/1.5 "Segoe UI", sans-serif; background: #0c0d14; color: #e4e7f2; margin: 0; padding: 28px; }
+  h1 { font-size: 20px; color: #41e0d0; margin: 0 0 6px; }
+  p { color: #9298ac; margin: 0 0 18px; }
+  label { display: block; margin: 14px 0 6px; }
+  input { width: 100%; max-width: 420px; padding: 8px 10px; border-radius: 8px; border: 1px solid #5b54a8;
+          background: #11131d; color: #e4e7f2; font: 15px "Consolas", monospace; }
+  button { margin-top: 18px; padding: 8px 16px; border-radius: 8px; border: 1px solid #41e0d0;
+           background: #11131d; color: #41e0d0; cursor: pointer; font-size: 15px; }
+  #status { margin-top: 12px; color: #7cffb2; }
+  code { color: #41e0d0; }
+</style>
+</head>
+<body>
+  <h1>🐈 NemiCLI – Nemi antwortet</h1>
+  <p>Die Erweiterung redet nur mit deinem laufenden NemiCLI auf <code>127.0.0.1</code>.
+     Den Schlüssel zeigt dir NemiCLI mit <code>/chrome</code>.</p>
+  <label for="port">Port</label>
+  <input id="port" type="number" min="1" max="65535" value="9000">
+  <label for="key">Geheimschlüssel</label>
+  <input id="key" type="text" placeholder="aus /chrome kopieren" autocomplete="off">
+  <button id="save">Speichern</button>
+  <button id="test">Verbindung testen</button>
+  <div id="status"></div>
+  <script src="options.js"></script>
+</body>
+</html>

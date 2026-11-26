@@ -1,0 +1,13 @@
+{
+  "titel": "Würfel",
+  "beschreibung": "Würfelt eine oder mehrere Zahlen – für Spiele, Entscheidungen und Zufall.",
+  "icon": "icon.svg",
+  "version": "1.0",
+  "funktionen": [
+    {
+      "name": "wuerfeln",
+      "beschreibung": "Würfelt anzahl Würfel mit je seiten Seiten und gibt die Augen und die Summe zurück.",
+      "felder": {"seiten": "Zahl 2–100, Vorgabe 6", "anzahl": "Zahl 1–10, Vorgabe 1"}
+    }
+  ]
+}
