@@ -1,0 +1,109 @@
+# Sensible Daten & Umgebung
+.env
+.env.*
+.*.tmp
+chatgpt_konto.json
+chatgpt_konto.tmp
+# .env.example bleibt im Repo – die README verweist darauf.
+!.env.example
+
+# Lokale Werkzeug-Einstellungen
+/.claude/
+
+# Python
+venv/
+.runtime/
+__pycache__/
+*.pyc
+
+# Builds (NemiCLI.spec bleibt im Repo – das ist der Bauplan der exe)
+build/
+dist/
+*.exe
+
+# Große Modelle & GPU-Binaries (49 GB – liegen nur lokal)
+/KI-Modelle/
+/Models/
+/ModelGGUF/
+/Vision/
+# Modell- und Datenbankdateien überall; gewollte Dateien sind bereits eingecheckt
+# und werden weiter verfolgt, neue nur mit `git add -f`.
+*.gguf
+*.safetensors
+*.pt
+*.bin
+*.onnx
+*.db
+*.db-wal
+*.db-shm
+
+# Persönliche Daten: Chat-Verlauf, Gedächtnis, gemalte Bilder, Übungen
+chats/
+learned/
+Bilder/
+NemiSandbox/
+Befehle/
+Persoenlichkeiten/
+memory.md
+# weitere Daten-Bereiche (paths.DATEN_INHALT), falls der Daten-Ordner der Programm-Ordner ist
+/Wissen/
+/Skills/
+/Profile/
+/Agenten/
+/Wache/
+/Apps/
+/Papierkorb/
+/Papierkorb_Aufraeumen/
+/Cache/
+/cache/
+/Doku/
+/Sinne/
+/Charaktergalerie/
+/Debugbericht/
+/VideoGen/
+
+# Logs & Verlauf
+logs/
+*.log
+.cli_history
+
+# Claude-Code-Sitzungseinstellungen (rechnerspezifisch)
+.claude/settings.local.json
+
+# Lokale Konfig (aktives Modell etc.)
+nemicli.config.json
+nemicli.config.json.*
+# Lebenszeichen/Briefkasten des laufenden Fensters (Rechtsklick-Menue)
+.nemicli.alive
+.nemicli.inbox
+
+# Gesicherte Gespraeche (F12) - privat, gehoeren nicht ins Repo
+Gespraeche/
+!Gespraeche/LIES-MICH.txt
+
+# Ablage des Coding-Assistenten - gehoert zum jeweiligen Projekt
+.nemicli/
+# Ablage des frueheren /workspace in alten Projekten
+.workspace/
+
+# Eigene Internet-Freigaben (einstellung_aendern)
+allowlist_eigen.json
+
+# Zeitplan-Aufträge, Hintergrund-Berichte, Vorschläge der Persönlichkeit, eigene Sperrliste
+Zeitplan/
+Berichte/
+Vorschläge/
+schreibsperre.json
+
+# Sicherungskopien von Editoren
+*.bak
+
+# Sicherungen (/backup)
+Backup/
+/kernel-cache/
+
+# Zwischenstände des LoRA-Trainings
+*_stand.safetensors
+
+# Netz-Zwang für Python-Kindprozesse (wird zur Laufzeit angelegt)
+/_netzzwang/
