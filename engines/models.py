@@ -1,0 +1,88 @@
+"""
+models.py - Modell-Referenzen und Denk-Stärke.
+
+Modell-Referenzen ("refs") sind einheitlich `<anbieter>:<modell>`:
+    anthropic:claude-opus-4-8       -> Cloud (siehe providers.py)
+    openai:gpt-4o                   -> Cloud (siehe providers.py)
+    ollama:gemma3                   -> Ollama auf diesem PC
+    gguf:Gemma4                     -> eigener GGUF-Motor (engines/gguflokal.py,
+                                       Modelle in KI-Modelle/KI-Chat/Chatmodell/<Name>/)
+
+Modellordner: core/modellorte.py (KI-Modelle/); `Models/` ist ein früherer Ort.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+
+import reasoning
+
+# --- Wo die Modelle liegen -------------------------------------------------
+try:                                     # exe-Modus: Daten liegen neben der exe
+    from paths import ROOT as _ROOT
+except Exception:                        # Selbsttest ohne Bootstrap
+    _ROOT = Path(__file__).resolve().parent.parent      # Projekt-Wurzel
+MODELS_DIR = _ROOT / "Models"            # früherer Modell-Ort (Altcode-kompatibel)
+
+LLM_DIR = MODELS_DIR                     # Alias (Altcode-kompatibel)
+
+
+STRENGTHS: dict[str, tuple[str, str]] = {
+    "schnell": ("low",    "schnell & günstig, wenig Nachdenken"),
+    "normal":  ("medium", "ausgewogen (Standard)"),
+    "stark":   ("high",   "denkt gründlicher nach"),
+    "max":     ("max",    "maximale Denkleistung, langsamer"),
+}
+DEFAULT_STRENGTH = "normal"
+
+
+def effort_for(strength: str) -> str:
+    return STRENGTHS.get(strength, STRENGTHS[DEFAULT_STRENGTH])[0]
+
+
+def strength_supported(ref: str | None) -> bool:
+    """Ob für dieses Backend eine Denkstärke oder ein Denkbudget bekannt ist."""
+    return bool(ref and (ref.startswith(("anthropic:", "gguf:")) or reasoning.profile(ref)))
+
+
+def _gguf_staerken() -> dict[str, str]:
+    """Eigener Motor: die Stärke ist das Denk-Budget; ob nachgedacht wird, regelt /denken."""
+    import gguflokal
+    return {k: ("Denken ohne Grenze" if not n else f"Denk-Budget {n:,} Token".replace(",", "."))
+            + f" · {desc}" for k, (_eff, desc) in STRENGTHS.items()
+            for n in (gguflokal.STAERKE_BUDGET[k],)}
+
+
+def strength_menu(ref: str | None = None) -> dict[str, str]:
+    """Modellgerechte Beschreibungen; ohne Ref bleibt das klassische Menü."""
+    if ref is None or ref.startswith("anthropic:"):
+        return {k: desc for k, (_eff, desc) in STRENGTHS.items()}
+    if ref.startswith("gguf:"):
+        return _gguf_staerken()
+    return reasoning.strength_menu(ref)
+
+
+def strength_note(ref: str | None, strength: str) -> str:
+    """Erläutert die wirksame Einstellung ohne unbelegte Denkstufen."""
+    if ref and ref.startswith("anthropic:"):
+        return STRENGTHS.get(strength, STRENGTHS[DEFAULT_STRENGTH])[1]
+    if ref and ref.startswith("gguf:"):
+        import denkweise
+        return (_gguf_staerken().get(strength, "") + f". Ob nachgedacht wird: /denken "
+                f"({denkweise.TEXT[denkweise.stufe()]}).")
+    return reasoning.strength_note(ref, strength)
+
+
+# --- Referenz-Helfer -------------------------------------------------------
+
+def make_ref(provider: str, model_id: str) -> str:
+    return f"{provider}:{model_id}"
+
+
+def split_ref(ref: str) -> tuple[str, str]:
+    """'openai:gpt-4o' -> ('openai', 'gpt-4o'). Ohne ':' -> ('', ref)."""
+    provider, sep, model_id = ref.partition(":")
+    if not sep:
+        return "", ref
+    return provider, model_id
+

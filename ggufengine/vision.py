@@ -1,0 +1,874 @@
+"""
+Vision-Encoder für mmproj-Dateien.  `load_projector()` liest den Projektor-Typ aus
+der Datei und wählt den passenden Encoder:
+
+* "gemma4v"         -> Gemma4Vision  (Gemma 4)
+* "gemma4uv"        -> Gemma4UnifiedVision (Gemma 4 12B, ohne Encoder-Schichten)
+* "qwen3vl_merger"  -> Qwen3VLVision (Qwen3-VL mit DeepStack / Qwen3.5)
+* "pixtral"         -> PixtralVision (Mistral Small 3.x, Ministral 3)
+* "lfm3vl"          -> Lfm3Vision (LFM3-VL, LFM3-Omni, d1)
+
+Jeder Encoder bietet `marks` (Anfangs-, Platzhalter- und End-Token eines Bildes im
+Prompt), `n_out` (Breite der Embeddings), `default_tokens`, `load()`, `unload()`
+und `encode()`.  Encoder mit DeepStack (`n_deepstack` > 0) liefern `n_out * (1 +
+n_deepstack)` Spalten: die Eingabe-Embeddings, dann je einen Block pro früher LM-Schicht.
+
+Gemma-4-Vision-Encoder ("gemma4v"-mmproj), nach tools/mtmd/models/gemma4v.cpp aus
+llama.cpp und der transformers-Referenz:
+
+* Patches zu 16x16 Pixeln, Pixelwerte auf [-1, 1] skaliert, kein Patch-Bias
+* gelernte 2-D-Positionstabellen (eine für x, eine für y), zu den Patch-Embeddings addiert
+* ViT-Blöcke: RMSNorm -> Attention (q/k-RMSNorm mit Gewicht, v-RMSNorm ohne,
+  2-D-NeoX-RoPE mit Basis 100: x auf der ersten Hälfte jedes Heads, y auf der zweiten,
+  Skalierung 1.0, bidirektional) -> RMSNorm -> Residual -> RMSNorm -> gegatetes GELU-MLP
+  -> RMSNorm -> Residual
+* „clippable“ Linears: Ein- und Ausgaben auf Grenzen je Matrix aus der Datei begrenzt
+* 3x3-Average-Pooling über das Patch-Raster, mal sqrt(n_embd), gewichtslose RMSNorm,
+  Projektion auf die Breite des Sprachmodells
+
+Die Gewichte bleiben im Datei-Mapping (RAM) und liegen nur auf der GPU, während ein
+Bild kodiert wird (`load()` / `unload()`).
+"""
+from __future__ import annotations
+
+import math
+import re
+from typing import List, Optional, Tuple
+
+import torch
+import torch.nn.functional as F
+
+from .gguf import GGUFError, GGUFFile
+from .models.common import WeightLoader, rms_norm, schliesst_bei_fehler
+
+IMAGE_TOKENS = 280          # Soft-Tokens je Bild (transformers-Standard)
+MIN_IMAGE_TOKENS = 70       # llama.cpp-Grenzen für gemma4v
+MAX_IMAGE_TOKENS = 1120
+MAX_PIXELS = 64 << 20                   # Obergrenze für image_max_pixels aus der Datei
+
+
+class _Clipped:
+    """y = clamp(clamp(x, in_min, in_max) @ W^T, out_min, out_max)."""
+
+    def __init__(self, ld: WeightLoader, name: str):
+        self.w = ld.get(name + ".weight")
+        lim = lambda s: float(ld.get(f"{name}.{s}", torch.float32).item()) if ld.has(f"{name}.{s}") else None
+        self.in_min, self.in_max = lim("input_min"), lim("input_max")
+        self.out_min, self.out_max = lim("output_min"), lim("output_max")
+
+    def __call__(self, x: torch.Tensor) -> torch.Tensor:
+        if self.in_min is not None or self.in_max is not None:
+            x = x.clamp(self.in_min, self.in_max)
+        y = F.linear(x.to(self.w.dtype), self.w)
+        if self.out_min is not None or self.out_max is not None:
+            y = y.clamp(self.out_min, self.out_max)
+        return y
+
+
+class _Block:
+    def __init__(self, ld: WeightLoader, i: int, eps: float):
+        p = f"v.blk.{i}."
+        self.eps = eps
+        self.ln1 = ld.norm(p + "ln1.weight")
+        self.q, self.k, self.v = (_Clipped(ld, p + n) for n in ("attn_q", "attn_k", "attn_v"))
+        self.o = _Clipped(ld, p + "attn_out")
+        self.q_norm = ld.norm(p + "attn_q_norm.weight")
+        self.k_norm = ld.norm(p + "attn_k_norm.weight")
+        self.attn_post = ld.norm(p + "attn_post_norm.weight")
+        self.ln2 = ld.norm(p + "ln2.weight")
+        self.gate, self.up, self.down = (_Clipped(ld, p + n) for n in ("ffn_gate", "ffn_up", "ffn_down"))
+        self.ffn_post = ld.norm(p + "ffn_post_norm.weight")
+
+
+class Gemma4Vision:
+    marks = ("<|image>", "<|image|>", "<image|>")
+    default_tokens = IMAGE_TOKENS
+    uses_grid = False
+
+    @schliesst_bei_fehler()
+    def __init__(self, path: str, device, dtype=torch.bfloat16):
+        self.gg = GGUFFile(path)
+        g = self.gg
+        if projector_type(g) != "gemma4v" or not g.get("clip.has_vision_encoder"):
+            raise GGUFError("not a Gemma 4 vision projector (clip.vision.projector_type != gemma4v)")
+        self.n_embd = int(g.require("clip.vision.embedding_length"))
+        self.n_head = int(g.require("clip.vision.attention.head_count"))
+        self.n_layer = int(g.require("clip.vision.block_count"))
+        self.patch = int(g.require("clip.vision.patch_size"))
+        self.n_out = int(g.require("clip.vision.projection_dim"))
+        self.eps = float(g.get("clip.vision.attention.layer_norm_epsilon", 1e-6))
+        self.merge = int(g.get("clip.vision.projector.scale_factor", 3))
+        self.rope_base = 100.0
+        if not (0 < self.n_layer <= 128 and 0 < self.patch <= 64 and self.n_embd % self.n_head == 0
+                and 0 < self.merge <= 8):
+            raise GGUFError("implausible vision hyper-parameters")
+        self.head_dim = self.n_embd // self.n_head
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.loaded = False
+
+    # -- Gewichte nur auf der GPU, solange sie gebraucht werden ----------------
+    def load(self):
+        if self.loaded:
+            return
+        ld = WeightLoader(self.gg, self.device, self.dtype, quant=False)
+        pe = ld.get("v.patch_embd.weight", torch.float32)          # (E, 3, P, P)
+        if tuple(pe.shape) != (self.n_embd, 3, self.patch, self.patch):
+            raise GGUFError("v.patch_embd.weight has an unexpected shape")
+        self.patch_embd = pe
+        pos = ld.get("v.position_embd.weight", torch.float32)       # (2, n_pos, E)
+        if pos.dim() != 3 or pos.shape[0] != 2 or pos.shape[2] != self.n_embd:
+            raise GGUFError("v.position_embd.weight has an unexpected shape")
+        self.pos_x, self.pos_y = pos[0], pos[1]
+        self.blocks = [_Block(ld, i, self.eps) for i in range(self.n_layer)]
+        self.proj = ld.get("mm.input_projection.weight")             # (n_out, E)
+        if tuple(self.proj.shape) != (self.n_out, self.n_embd):
+            raise GGUFError("mm.input_projection.weight has an unexpected shape")
+        half = self.head_dim // 2
+        self.inv_freq = 1.0 / (self.rope_base ** (torch.arange(0, half, 2, device=self.device,
+                                                               dtype=torch.float32) / half))
+        self.loaded = True
+
+    def unload(self):
+        for name in ("patch_embd", "pos_x", "pos_y", "blocks", "proj", "inv_freq"):
+            self.__dict__.pop(name, None)
+        self.loaded = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # -- preprocessing -----------------------------------------------------------
+    max_tokens = MAX_IMAGE_TOKENS
+
+    def grid_for(self, width: int, height: int, tokens: int = IMAGE_TOKENS) -> Tuple[int, int]:
+        """(Tokens quer, Tokens hoch) bei erhaltenem Seitenverhältnis, insgesamt höchstens `tokens`."""
+        tokens = max(MIN_IMAGE_TOKENS, min(int(tokens), getattr(self, "max_tokens", MAX_IMAGE_TOKENS)))
+        if width <= 0 or height <= 0:
+            raise ValueError("empty image")
+        s = math.sqrt(tokens / (width * height))
+        nx, ny = max(1, int(width * s)), max(1, int(height * s))
+        while nx * ny > tokens:
+            if nx >= ny:
+                nx -= 1
+            else:
+                ny -= 1
+        return nx, ny
+
+    def pixels(self, image, tokens: int = IMAGE_TOKENS) -> torch.Tensor:
+        """PIL-Bild -> (3, H, W) float in [0, 1], H und W Vielfache von patch * merge."""
+        from PIL import Image
+        img = image.convert("RGB")
+        nx, ny = self.grid_for(img.width, img.height, tokens)
+        unit = self.patch * self.merge
+        img = img.resize((nx * unit, ny * unit), Image.BICUBIC)
+        raw = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
+        return raw.view(img.height, img.width, 3).permute(2, 0, 1).float() / 255.0
+
+    # -- encoder -----------------------------------------------------------------
+    def _rope(self, x: torch.Tensor, px: torch.Tensor, py: torch.Tensor) -> torch.Tensor:
+        """x: (N, H, D).  NeoX-Rotation der Dims [0, D/2) um x und [D/2, D) um y."""
+        half = x.shape[-1] // 2
+
+        def rot(part, pos):
+            f = torch.outer(pos.float(), self.inv_freq)                 # (N, half/2)
+            cos, sin = f.cos().unsqueeze(1), f.sin().unsqueeze(1)
+            a, b = part[..., :half // 2], part[..., half // 2:]
+            return torch.cat([a * cos - b * sin, a * sin + b * cos], dim=-1)
+
+        return torch.cat([rot(x[..., :half], px), rot(x[..., half:], py)], dim=-1)
+
+    @torch.inference_mode()
+    def encode(self, image, tokens: int = IMAGE_TOKENS) -> torch.Tensor:
+        """PIL-Bild -> (n_tokens, projection_dim) float32-Embeddings auf dem Gerät."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        pix = self.pixels(image, tokens).to(self.device)
+        pix = pix * 2.0 - 1.0
+        x = F.conv2d(pix.unsqueeze(0), self.patch_embd, stride=self.patch)[0]      # (E, gy, gx)
+        E, gy, gx = x.shape
+        if gx > self.pos_x.shape[0] or gy > self.pos_y.shape[0]:
+            raise GGUFError("image larger than the position tables")
+        x = x.flatten(1).t()                                                          # (N, E), row-major
+        py = torch.arange(gy, device=self.device).repeat_interleave(gx)
+        px = torch.arange(gx, device=self.device).repeat(gy)
+        h = x + self.pos_x.index_select(0, px) + self.pos_y.index_select(0, py)
+        N, H, D = h.shape[0], self.n_head, self.head_dim
+        for b in self.blocks:
+            r = h
+            y = rms_norm(h, b.ln1, self.eps)
+            q = rms_norm(b.q(y).float().view(N, H, D), b.q_norm, self.eps)
+            k = rms_norm(b.k(y).float().view(N, H, D), b.k_norm, self.eps)
+            v = rms_norm(b.v(y).float().view(N, H, D), 1.0, self.eps)
+            q, k = self._rope(q, px, py), self._rope(k, px, py)
+            a = F.scaled_dot_product_attention(q.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               k.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               v.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               scale=1.0)[0].transpose(0, 1).reshape(N, E)
+            h = r + rms_norm(b.o(a).float(), b.attn_post, self.eps)
+            y = rms_norm(h, b.ln2, self.eps)
+            y = b.down(F.gelu(b.gate(y).float(), approximate="tanh") * b.up(y).float()).float()
+            h = h + rms_norm(y, b.ffn_post, self.eps)
+        m = self.merge
+        pooled = F.avg_pool2d(h.t().reshape(1, E, gy, gx), m, m)[0]                  # (E, gy/m, gx/m)
+        pooled = pooled.flatten(1).t() * math.sqrt(E)
+        pooled = rms_norm(pooled, 1.0, self.eps)
+        return F.linear(pooled.to(self.proj.dtype), self.proj).float()
+
+
+class Gemma4UnifiedVision(Gemma4Vision):
+    """Gemma 4 12B „Unified“ ("gemma4uv"-mmproj, llama.cpp tools/mtmd/models/gemma4uv.cpp):
+    keine Encoder-Schichten.  Blöcke aus patch_size * 3 Pixeln (das 3x3-Merge steckt im
+    Patch-Embedding) mit Werten in [0, 1] -> LayerNorm -> Linear (+Bias) ->
+    LayerNorm -> + x/y-Positionstabellen -> LayerNorm -> gewichtslose RMSNorm -> Projektion.
+    Die Merkmalsreihenfolge eines Blocks ist (Kanal, Zeile, Spalte) wie in ggmls im2col.
+
+    Das Sprachmodell liest die Tokens eines Bildes bidirektional, daher muss ein Bild in
+    einen Forward-Aufruf des Sliding-Window-Modells passen (höchstens PREFILL_CHUNK)."""
+
+    LN_EPS = 1e-5                # Vorgabe von PyTorch-LayerNorm (Gemma4UnifiedVisionEmbedder)
+
+    @schliesst_bei_fehler()
+    def __init__(self, path: str, device, dtype=torch.bfloat16):
+        from .models.common import PREFILL_CHUNK
+        self.gg = GGUFFile(path)
+        g = self.gg
+        if projector_type(g) != "gemma4uv" or not g.get("clip.has_vision_encoder"):
+            raise GGUFError("not a Gemma 4 unified vision projector (clip.vision.projector_type != gemma4uv)")
+        self.n_embd = int(g.require("clip.vision.embedding_length"))
+        self.merge_in_patch = int(g.get("clip.vision.projector.scale_factor", 3))
+        self.patch = int(g.require("clip.vision.patch_size")) * self.merge_in_patch
+        self.merge = 1
+        self.n_out = int(g.require("clip.vision.projection_dim"))
+        self.eps = float(g.get("clip.vision.attention.layer_norm_epsilon", 1e-6))
+        if not (0 < self.n_embd <= 16384 and 0 < self.patch <= 256 and 0 < self.n_out <= 16384):
+            raise GGUFError("implausible vision hyper-parameters")
+        self.max_tokens = min(MAX_IMAGE_TOKENS, PREFILL_CHUNK)
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.loaded = False
+
+    def load(self):
+        if self.loaded:
+            return
+        ld = WeightLoader(self.gg, self.device, self.dtype, quant=False)
+        f32 = lambda n: ld.get(n, torch.float32)
+        roh = 3 * self.patch * self.patch
+        self.patch_embd = f32("v.patch_embd.weight")                  # (E, 3 * P * P)
+        self.patch_bias = f32("v.patch_embd.bias")
+        if tuple(self.patch_embd.shape) != (self.n_embd, roh) or self.patch_bias.numel() != self.n_embd:
+            raise GGUFError("v.patch_embd has an unexpected shape")
+        self.norms = [(f32(f"v.patch_norm.{i}.weight"), f32(f"v.patch_norm.{i}.bias")) for i in (1, 2, 3)]
+        if self.norms[0][0].numel() != roh or any(w.numel() != self.n_embd for w, _ in self.norms[1:]):
+            raise GGUFError("v.patch_norm has an unexpected shape")
+        pos = f32("v.position_embd.weight")                            # (2, n_pos, E)
+        if pos.dim() != 3 or pos.shape[0] != 2 or pos.shape[2] != self.n_embd:
+            raise GGUFError("v.position_embd.weight has an unexpected shape")
+        self.pos_x, self.pos_y = pos[0], pos[1]
+        self.proj = f32("mm.input_projection.weight")                  # (n_out, E)
+        if tuple(self.proj.shape) != (self.n_out, self.n_embd):
+            raise GGUFError("mm.input_projection.weight has an unexpected shape")
+        self.loaded = True
+
+    def unload(self):
+        for name in ("patch_embd", "patch_bias", "norms", "pos_x", "pos_y", "proj"):
+            self.__dict__.pop(name, None)
+        self.loaded = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    @torch.inference_mode()
+    def encode(self, image, tokens: int = IMAGE_TOKENS) -> torch.Tensor:
+        """PIL-Bild -> (n_tokens, projection_dim) float32-Embeddings auf dem Gerät."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        pix = self.pixels(image, tokens).to(self.device)                              # [0, 1]
+        P = self.patch
+        gy, gx = pix.shape[1] // P, pix.shape[2] // P
+        if gx > self.pos_x.shape[0] or gy > self.pos_y.shape[0]:
+            raise GGUFError("image larger than the position tables")
+        x = F.unfold(pix.unsqueeze(0), kernel_size=P, stride=P)[0].t()               # (N, 3*P*P), row-major
+        (w1, b1), (w2, b2), (w3, b3) = self.norms
+        x = F.layer_norm(x, (x.shape[-1],), w1, b1, self.LN_EPS)
+        x = F.linear(x, self.patch_embd, self.patch_bias)
+        x = F.layer_norm(x, (self.n_embd,), w2, b2, self.LN_EPS)
+        py = torch.arange(gy, device=self.device).repeat_interleave(gx)
+        px = torch.arange(gx, device=self.device).repeat(gy)
+        x = x + self.pos_x.index_select(0, px) + self.pos_y.index_select(0, py)
+        x = F.layer_norm(x, (self.n_embd,), w3, b3, self.LN_EPS)
+        x = rms_norm(x, 1.0, self.eps)
+        return F.linear(x, self.proj).float()
+
+
+class Qwen3VLVision:
+    """Qwen3-VL-Vision-Tower ("qwen3vl_merger"-mmproj, auch von Qwen3.5 genutzt):
+
+    * 16x16-Patches; das Video-Patch-Embedding hat zwei zeitliche Taps, ein Bild ist
+      beide Frames zugleich (Conv mit Tap 0 + Conv mit Tap 1 + Bias); Pixel auf [-1, 1]
+    * gelernte 48x48-Positionstabelle, bilinear auf das Patch-Raster interpoliert
+    * Patches in 2x2-Merge-Fenstern geordnet (Fensterzeile, Fensterspalte, Zeile, Spalte)
+    * ViT-Blöcke: LayerNorm -> fusioniertes qkv -> 2-D-Rotary (Zeile auf der ersten Hälfte der
+      Rotary-Frequenzen, Spalte auf der zweiten, NeoX-Paare über den ganzen Head) ->
+      bidirektionale Attention -> LayerNorm -> GELU(tanh)-MLP, alle Linears mit Bias
+    * Merger: LayerNorm -> 4 benachbarte Patches verkettet -> Linear -> GELU -> Linear
+    * DeepStack (Qwen3-VL, Tensoren v.deepstack.<block>.*): nach den markierten Blöcken erzeugt
+      ein zweiter Merger – 4 Patches verkettet -> LayerNorm -> Linear -> GELU -> Linear –
+      Merkmale für die ersten LM-Schichten; als zusätzliche Spalten in Blockreihenfolge angehängt
+    Die Embeddings kommen zeilenweise über das zusammengeführte Raster; `encode` liefert auch
+    dessen Form für die M-RoPE-Positionen des Sprachmodells."""
+
+    marks = ("<|vision_start|>", "<|image_pad|>", "<|vision_end|>")
+    default_tokens = 1024       # zusammengeführte Tokens; genug für Text auf Screenshots
+    beschreiber_tokens = 2048   # als Bildbeschreiber (4B, Kontext 4096): liest auf 4K-Screenshots Zahlen und Adressen
+    min_tokens, max_tokens = 64, 4096
+    uses_grid = True
+
+    @schliesst_bei_fehler()
+    def __init__(self, path: str, device, dtype=torch.bfloat16):
+        self.gg = GGUFFile(path)
+        g = self.gg
+        if projector_type(g) != "qwen3vl_merger" or not g.get("clip.has_vision_encoder"):
+            raise GGUFError("not a Qwen3-VL vision projector")
+        self.n_embd = int(g.require("clip.vision.embedding_length"))
+        self.n_head = int(g.require("clip.vision.attention.head_count"))
+        self.n_layer = int(g.require("clip.vision.block_count"))
+        self.patch = int(g.require("clip.vision.patch_size"))
+        self.n_out = int(g.require("clip.vision.projection_dim"))
+        self.eps = float(g.get("clip.vision.attention.layer_norm_epsilon", 1e-6))
+        self.merge = int(g.get("clip.vision.spatial_merge_size", 2))
+        self.mean = [float(x) for x in (g.get("clip.vision.image_mean") or [0.5] * 3)]
+        self.std = [float(x) for x in (g.get("clip.vision.image_std") or [0.5] * 3)]
+        if not (0 < self.n_layer <= 128 and 0 < self.patch <= 64 and self.n_embd % self.n_head == 0
+                and 0 < self.merge <= 8 and len(self.mean) == 3 and len(self.std) == 3
+                and all(s > 0 for s in self.std)):
+            raise GGUFError("implausible vision hyper-parameters")
+        self.head_dim = self.n_embd // self.n_head
+        if self.head_dim % 4:
+            raise GGUFError("vision head size must be a multiple of 4")
+        self.deepstack = _deepstack_blocks(g, self.n_layer)
+        self.n_deepstack = len(self.deepstack)
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.loaded = False
+
+    def load(self):
+        if self.loaded:
+            return
+        ld = WeightLoader(self.gg, self.device, self.dtype, quant=False)
+        E, P = self.n_embd, self.patch
+        f32 = torch.float32
+        self.patch_w = [ld.get(n, f32) for n in ("v.patch_embd.weight", "v.patch_embd.weight.1")
+                        if ld.has(n)]
+        if not self.patch_w or any(tuple(w.shape) != (E, 3, P, P) for w in self.patch_w):
+            raise GGUFError("v.patch_embd.weight has an unexpected shape")
+        self.patch_b = ld.get("v.patch_embd.bias", f32) if ld.has("v.patch_embd.bias") else None
+        pos = ld.get("v.position_embd.weight", f32)                      # (side*side, E)
+        side = int(round(math.sqrt(pos.shape[0])))
+        if pos.dim() != 2 or pos.shape[1] != E or side * side != pos.shape[0]:
+            raise GGUFError("v.position_embd.weight has an unexpected shape")
+        self.pos_table = pos.view(side, side, E).permute(2, 0, 1).unsqueeze(0)   # (1, E, side, side)
+        opt = lambda n: ld.get(n) if ld.has(n) else None
+        self.blocks = []
+        for i in range(self.n_layer):
+            p = f"v.blk.{i}."
+            self.blocks.append({
+                "ln1": (ld.get(p + "ln1.weight", f32), ld.get(p + "ln1.bias", f32)),
+                "ln2": (ld.get(p + "ln2.weight", f32), ld.get(p + "ln2.bias", f32)),
+                "qkv": (ld.get(p + "attn_qkv.weight"), opt(p + "attn_qkv.bias")),
+                "out": (ld.get(p + "attn_out.weight"), opt(p + "attn_out.bias")),
+                "up": (ld.get(p + "ffn_up.weight"), opt(p + "ffn_up.bias")),
+                "down": (ld.get(p + "ffn_down.weight"), opt(p + "ffn_down.bias")),
+            })
+        if tuple(self.blocks[0]["qkv"][0].shape) != (3 * E, E):
+            raise GGUFError("attn_qkv has an unexpected shape")
+        self.post_ln = (ld.get("v.post_ln.weight", f32), ld.get("v.post_ln.bias", f32))
+        self.mm0 = (ld.get("mm.0.weight"), opt("mm.0.bias"))
+        self.mm2 = (ld.get("mm.2.weight"), opt("mm.2.bias"))
+        if self.mm0[0].shape[1] != E * self.merge ** 2 or self.mm2[0].shape[0] != self.n_out:
+            raise GGUFError("merger has an unexpected shape")
+        self.ds = {}
+        for i in self.deepstack:
+            p = f"v.deepstack.{i}."
+            ds = {"norm": (ld.get(p + "norm.weight", f32), ld.get(p + "norm.bias", f32)),
+                  "fc1": (ld.get(p + "fc1.weight"), opt(p + "fc1.bias")),
+                  "fc2": (ld.get(p + "fc2.weight"), opt(p + "fc2.bias"))}
+            if (ds["norm"][0].shape[0] != E * self.merge ** 2 or ds["fc1"][0].shape[1] != E * self.merge ** 2
+                    or ds["fc2"][0].shape[0] != self.n_out):
+                raise GGUFError(f"deepstack merger {i} has an unexpected shape")
+            self.ds[i] = ds
+        rot = self.head_dim // 2                                          # Rotary-Dims eines Achsenpaars
+        self.inv_freq = 1.0 / (10000.0 ** (torch.arange(0, rot, 2, device=self.device,
+                                                         dtype=torch.float32) / rot))
+        self.loaded = True
+
+    def unload(self):
+        for name in ("patch_w", "patch_b", "pos_table", "blocks", "post_ln", "mm0", "mm2", "ds", "inv_freq"):
+            self.__dict__.pop(name, None)
+        self.loaded = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # -- preprocessing -----------------------------------------------------------
+    def pixels(self, image, tokens: int) -> torch.Tensor:
+        """PIL-Bild -> (3, H, W) normalisiert, H und W Vielfache von patch * merge."""
+        from PIL import Image
+        img = image.convert("RGB")
+        tokens = max(self.min_tokens, min(int(tokens), self.max_tokens))
+        nx, ny = _fit_grid(img.width, img.height, tokens)
+        unit = self.patch * self.merge
+        img = img.resize((nx * unit, ny * unit), Image.BICUBIC)
+        raw = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
+        x = raw.view(img.height, img.width, 3).permute(2, 0, 1).float() / 255.0
+        return (x - torch.tensor(self.mean).view(3, 1, 1)) / torch.tensor(self.std).view(3, 1, 1)
+
+    # -- encoder -----------------------------------------------------------------
+    def _window_order(self, x: torch.Tensor) -> torch.Tensor:
+        """(C, gy, gx) -> (N, C) in Merge-Fenster-Reihenfolge."""
+        C, gy, gx = x.shape
+        m = self.merge
+        return x.reshape(C, gy // m, m, gx // m, m).permute(1, 3, 2, 4, 0).reshape(-1, C)
+
+    @staticmethod
+    def _rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        half = x.shape[-1] // 2
+        return x * cos + torch.cat([-x[..., half:], x[..., :half]], dim=-1) * sin
+
+    @torch.inference_mode()
+    def encode(self, image, tokens: Optional[int] = None):
+        """PIL-Bild -> ((n_tokens, projection_dim) float32-Embeddings, (Zeilen, Spalten))."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        pix = self.pixels(image, tokens or self.default_tokens).to(self.device).unsqueeze(0)
+        x = sum(F.conv2d(pix, w, stride=self.patch) for w in self.patch_w)[0]    # (E, gy, gx)
+        if self.patch_b is not None:
+            x = x + self.patch_b.view(-1, 1, 1)
+        E, gy, gx = x.shape
+        pos = F.interpolate(self.pos_table, size=(gy, gx), mode="bilinear", align_corners=True)[0]
+        h = self._window_order(x + pos)                                              # (N, E)
+        coords = torch.stack(torch.meshgrid(torch.arange(gy, device=self.device),
+                                            torch.arange(gx, device=self.device), indexing="ij"))
+        rc = self._window_order(coords).float()                                      # (N, 2)
+        ang = torch.cat([torch.outer(rc[:, 0], self.inv_freq), torch.outer(rc[:, 1], self.inv_freq)], dim=-1)
+        ang = torch.cat([ang, ang], dim=-1)                                          # (N, D)
+        cos, sin = ang.cos().unsqueeze(1), ang.sin().unsqueeze(1)
+        N, H, D = h.shape[0], self.n_head, self.head_dim
+        lin = lambda t, wb: F.linear(t.to(wb[0].dtype), wb[0], wb[1]).float()
+        m = self.merge
+        tief = []
+        for nr, b in enumerate(self.blocks):
+            y = F.layer_norm(h, (E,), *b["ln1"], self.eps)
+            q, k, v = lin(y, b["qkv"]).view(N, 3, H, D).unbind(1)
+            q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
+            a = F.scaled_dot_product_attention(q.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               k.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               v.transpose(0, 1).unsqueeze(0).to(self.dtype)
+                                               )[0].transpose(0, 1).reshape(N, E)
+            h = h + lin(a, b["out"])
+            y = F.layer_norm(h, (E,), *b["ln2"], self.eps)
+            h = h + lin(F.gelu(lin(y, b["up"]), approximate="tanh"), b["down"])
+            if nr in self.ds:
+                ds = self.ds[nr]
+                y = F.layer_norm(h.reshape(-1, E * m * m), (E * m * m,), *ds["norm"], self.eps)
+                tief.append(lin(F.gelu(lin(y, ds["fc1"])), ds["fc2"]))
+        y = F.layer_norm(h, (E,), *self.post_ln, self.eps).reshape(-1, E * m * m)
+        out = lin(F.gelu(lin(y, self.mm0)), self.mm2)
+        return (torch.cat([out] + tief, dim=1) if tief else out), (gy // m, gx // m)
+
+
+class PixtralVision:
+    """Pixtral-Vision-Encoder mit dem Mistral-3-Projektor ("pixtral"-mmproj: Mistral Small 3.x,
+    Ministral 3), nach transformers PixtralVisionModel + Mistral3MultiModalProjector:
+
+    * 14x14-Patches (Conv ohne Bias), mean/std aus der Datei, RMSNorm (ln_pre)
+    * Blöcke: RMSNorm -> Attention (ohne Bias, 2-D-RoPE, bidirektional) -> Residual ->
+      RMSNorm -> SiLU-gegatetes MLP -> Residual
+    * 2-D-RoPE im Layout, das llama.cpp speichert (der Konverter verschränkt die q/k-Zeilen): die
+      erste Hälfte jedes Heads dreht benachbarte Paare um die Patch-Zeile mit den geraden
+      Frequenzen, die zweite Hälfte um die Spalte mit den ungeraden Frequenzen
+    * Projektor: RMSNorm -> 2x2 benachbarte Patches verkettet (Kanal, Zeile, Spalte)
+      -> Linear -> Linear -> GELU -> Linear
+    Die Embeddings kommen zeilenweise über das zusammengeführte Raster; im Prompt endet jede Zeile
+    mit [IMG_BREAK], die letzte mit [IMG_END] (chat.ZEILEN_MARKEN)."""
+
+    default_tokens = 1024       # zusammengeführte Tokens, höchstens (image_size / 28)^2
+    min_tokens = 4
+    uses_grid = False
+
+    @schliesst_bei_fehler()
+    def __init__(self, path: str, device, dtype=torch.bfloat16):
+        from .chat import ZEILEN_MARKEN
+        self.marks = ZEILEN_MARKEN
+        self.gg = GGUFFile(path)
+        g = self.gg
+        if projector_type(g) != "pixtral" or not g.get("clip.has_vision_encoder"):
+            raise GGUFError("not a Pixtral vision projector")
+        self.n_embd = int(g.require("clip.vision.embedding_length"))
+        self.n_head = int(g.require("clip.vision.attention.head_count"))
+        self.n_layer = int(g.require("clip.vision.block_count"))
+        self.patch = int(g.require("clip.vision.patch_size"))
+        self.image_size = int(g.get("clip.vision.image_size", 1540))
+        self.merge = int(g.get("clip.vision.spatial_merge_size", 2))
+        self.eps = float(g.get("clip.vision.attention.layer_norm_epsilon", 1e-5))
+        self.rope_base = float(g.get("clip.rope.freq_base", 10000.0))
+        self.silu = bool(g.get("clip.use_silu", True))
+        self.mean = [float(x) for x in (g.get("clip.vision.image_mean") or [0.5] * 3)]
+        self.std = [float(x) for x in (g.get("clip.vision.image_std") or [0.5] * 3)]
+        mm2 = g.tensors.get("mm.2.weight")
+        if mm2 is None:
+            raise GGUFError("mm.2.weight missing")
+        self.n_out = int(mm2.shape[0])
+        if not (0 < self.n_layer <= 128 and 0 < self.patch <= 64 and self.n_embd % self.n_head == 0
+                and 0 < self.merge <= 8 and 0 < self.image_size <= 8192 and 0 < self.n_out <= 65536
+                and 0 < self.rope_base < 1e9 and len(self.mean) == 3 and len(self.std) == 3
+                and all(s > 0 for s in self.std)):
+            raise GGUFError("implausible vision hyper-parameters")
+        self.head_dim = self.n_embd // self.n_head
+        if self.head_dim % 4:
+            raise GGUFError("vision head size must be a multiple of 4")
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.loaded = False
+
+    def load(self):
+        if self.loaded:
+            return
+        ld = WeightLoader(self.gg, self.device, self.dtype, quant=False)
+        E, P, f32 = self.n_embd, self.patch, torch.float32
+        opt = lambda n: ld.get(n) if ld.has(n) else None
+        self.patch_embd = ld.get("v.patch_embd.weight", f32)
+        if tuple(self.patch_embd.shape) != (E, 3, P, P):
+            raise GGUFError("v.patch_embd.weight has an unexpected shape")
+        self.ln_pre = ld.get("v.pre_ln.weight", f32)
+        self.blocks = []
+        for i in range(self.n_layer):
+            p = f"v.blk.{i}."
+            self.blocks.append({n: ld.get(p + n + ".weight") for n in
+                                ("attn_q", "attn_k", "attn_v", "attn_out", "ffn_gate", "ffn_up", "ffn_down")})
+            self.blocks[-1]["ln1"] = ld.get(p + "ln1.weight", f32)
+            self.blocks[-1]["ln2"] = ld.get(p + "ln2.weight", f32)
+        if tuple(self.blocks[0]["attn_q"].shape) != (E, E):
+            raise GGUFError("attn_q has an unexpected shape")
+        self.mm_norm = ld.get("mm.input_norm.weight", f32)
+        self.merger = ld.get("mm.patch_merger.weight")                    # (E, E * merge^2)
+        self.mm1 = (ld.get("mm.1.weight"), opt("mm.1.bias"))
+        self.mm2 = (ld.get("mm.2.weight"), opt("mm.2.bias"))
+        if (tuple(self.merger.shape) != (E, E * self.merge ** 2) or self.mm1[0].shape[1] != E
+                or tuple(self.mm2[0].shape) != (self.n_out, self.mm1[0].shape[0])):
+            raise GGUFError("projector has an unexpected shape")
+        freqs = 1.0 / (self.rope_base ** (torch.arange(0, self.head_dim, 2, device=self.device,
+                                                       dtype=torch.float32) / self.head_dim))
+        self.f_row, self.f_col = freqs[0::2], freqs[1::2]
+        self.loaded = True
+
+    def unload(self):
+        for name in ("patch_embd", "ln_pre", "blocks", "mm_norm", "merger", "mm1", "mm2", "f_row", "f_col"):
+            self.__dict__.pop(name, None)
+        self.loaded = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # -- preprocessing -----------------------------------------------------------
+    def grid_for(self, width: int, height: int, tokens: int) -> Tuple[int, int]:
+        """(zusammengeführte Tokens quer, hoch): Seitenverhältnis erhalten, höchstens `tokens`, nicht breiter
+        als die Bildgröße des Modells und nicht größer als das Bild selbst."""
+        unit = self.patch * self.merge
+        tokens = max(self.min_tokens, int(tokens))
+        nx, ny = _fit_grid(width, height, tokens)
+        seite = max(1, self.image_size // unit)
+        s = min(1.0, seite / max(nx, ny))
+        nx, ny = max(1, int(nx * s)), max(1, int(ny * s))
+        return min(nx, max(1, math.ceil(width / unit))), min(ny, max(1, math.ceil(height / unit)))
+
+    def pixels(self, image, tokens: int) -> torch.Tensor:
+        """PIL-Bild -> (3, H, W) normalisiert, H und W Vielfache von patch * merge."""
+        from PIL import Image
+        img = image.convert("RGB")
+        nx, ny = self.grid_for(img.width, img.height, tokens)
+        unit = self.patch * self.merge
+        img = img.resize((nx * unit, ny * unit), Image.BICUBIC)
+        raw = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
+        x = raw.view(img.height, img.width, 3).permute(2, 0, 1).float() / 255.0
+        return (x - torch.tensor(self.mean).view(3, 1, 1)) / torch.tensor(self.std).view(3, 1, 1)
+
+    # -- encoder -----------------------------------------------------------------
+    @staticmethod
+    def _paare(t: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        a, b = t[..., 0::2], t[..., 1::2]
+        return torch.stack([a * cos - b * sin, a * sin + b * cos], dim=-1).flatten(-2)
+
+    @torch.inference_mode()
+    def encode(self, image, tokens: Optional[int] = None):
+        """PIL-Bild -> ((n_tokens, n_out) float32-Embeddings, (Zeilen, Spalten))."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        return self.encode_pixels(self.pixels(image, tokens or self.default_tokens))
+
+    @torch.inference_mode()
+    def encode_pixels(self, pix: torch.Tensor):
+        """(3, H, W) normalisierte Pixel, H und W Vielfache von patch * merge."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        P, m = self.patch, self.merge
+        if pix.shape[1] % (P * m) or pix.shape[2] % (P * m):
+            raise ValueError("image size must be a multiple of patch_size * spatial_merge_size")
+        x = F.conv2d(pix.to(self.device, torch.float32).unsqueeze(0), self.patch_embd, stride=P)[0]
+        E, gy, gx = x.shape
+        h = rms_norm(x.flatten(1).t(), self.ln_pre, self.eps)                     # (N, E), row-major
+        row = torch.arange(gy, device=self.device, dtype=torch.float32).repeat_interleave(gx)
+        col = torch.arange(gx, device=self.device, dtype=torch.float32).repeat(gy)
+        ar, ac = torch.outer(row, self.f_row), torch.outer(col, self.f_col)
+        cr, sr, cc, sc = ar.cos().unsqueeze(1), ar.sin().unsqueeze(1), ac.cos().unsqueeze(1), ac.sin().unsqueeze(1)
+        N, H, D = h.shape[0], self.n_head, self.head_dim
+        half = D // 2
+        lin = lambda t, w: F.linear(t.to(w.dtype), w).float()
+
+        def rope(t):
+            return torch.cat([self._paare(t[..., :half], cr, sr), self._paare(t[..., half:], cc, sc)], dim=-1)
+        act = F.silu if self.silu else (lambda t: F.gelu(t, approximate="tanh"))
+        for b in self.blocks:
+            y = rms_norm(h, b["ln1"], self.eps)
+            q = rope(lin(y, b["attn_q"]).view(N, H, D))
+            k = rope(lin(y, b["attn_k"]).view(N, H, D))
+            v = lin(y, b["attn_v"]).view(N, H, D)
+            a = F.scaled_dot_product_attention(q.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               k.transpose(0, 1).unsqueeze(0).to(self.dtype),
+                                               v.transpose(0, 1).unsqueeze(0).to(self.dtype)
+                                               )[0].transpose(0, 1).reshape(N, E)
+            h = h + lin(a, b["attn_out"])
+            y = rms_norm(h, b["ln2"], self.eps)
+            h = h + lin(act(lin(y, b["ffn_gate"])) * lin(y, b["ffn_up"]), b["ffn_down"])
+        y = rms_norm(h, self.mm_norm, self.eps)
+        y = F.unfold(y.t().reshape(1, E, gy, gx), kernel_size=m, stride=m)[0].t()   # (N/m², E·m²)
+        y = lin(y, self.merger)
+        w1, b1 = self.mm1
+        w2, b2 = self.mm2
+        y = F.gelu(F.linear(y.to(w1.dtype), w1, b1).float())
+        return F.linear(y.to(w2.dtype), w2, b2).float(), (gy // m, gx // m)
+
+
+class Lfm3Vision:
+    """LFM3-VL-Vision-Tower ("lfm3vl"-mmproj; auch die Augen von LFM3-Omni und d1):
+
+    * 16x16-Patches, Pixel auf [-1, 1]; der Patchifier hat zwei zeitliche Taps (ein Bild ist beide
+      Frames zugleich), kein Bias; danach RMSNorm (v.embedding_norm)
+    * Patches in 2x2-Merge-Block-Reihenfolge (Blockzeile, Blockspalte, Zeile, Spalte)
+    * Schichten: RMSNorm -> (gegatete depthwise 3x3-Conv über das Patch-Raster | bidirektionale GQA
+      mit q/k-RMSNorm je Head und axialer 2-D-RoPE, Basis 1e6: Zeilenwinkel auf dem ersten Viertel
+      des Heads, Spaltenwinkel auf dem zweiten, NeoX-Paare über den ganzen Head) -> Residual ->
+      RMSNorm -> SwiGLU -> Residual
+    * Projektor: LayerNorm -> 4 Patches eines Blocks verkettet -> Linear -> GELU -> Linear
+    Bildgröße wie beim Referenz-Prozessor: Seiten Vielfache von 32, Pixelzahl zwischen den
+    Grenzen der Datei und höchstens `tokens` zusammengeführte Tokens."""
+
+    marks = ("<|vision_start|>", "<|image|>", "<|vision_end|>")
+    default_tokens = 1024
+    beschreiber_tokens = 1024   # als Bildbeschreiber: mit 280 Token liest er Schrift nicht mehr
+    min_tokens, max_tokens = 64, 2048
+    uses_grid = False
+    ROPE_BASIS = 1e6            # rope_theta der Referenz (nicht in der mmproj gespeichert)
+
+    @schliesst_bei_fehler()
+    def __init__(self, path: str, device, dtype=torch.bfloat16):
+        self.gg = GGUFFile(path)
+        g = self.gg
+        if projector_type(g) != "lfm3vl" or not g.get("clip.has_vision_encoder"):
+            raise GGUFError("not an LFM3 vision projector")
+        self.n_embd = int(g.require("clip.vision.embedding_length"))
+        self.n_head = int(g.require("clip.vision.attention.head_count"))
+        self.n_kv = int(g.get("clip.vision.attention.head_count_kv", self.n_head))
+        self.n_layer = int(g.require("clip.vision.block_count"))
+        self.patch = int(g.require("clip.vision.patch_size"))
+        self.n_out = int(g.require("clip.vision.projection_dim"))
+        self.eps = float(g.get("clip.vision.attention.layer_norm_epsilon", 1e-5))
+        self.merge = int(g.get("clip.vision.spatial_merge_size", 2))
+        self.min_pixels = int(g.get("clip.vision.image_min_pixels", 65536))
+        self.max_pixels = min(int(g.get("clip.vision.image_max_pixels", 16777216)), MAX_PIXELS)
+        self.mean = [float(x) for x in (g.get("clip.vision.image_mean") or [0.5] * 3)]
+        self.std = [float(x) for x in (g.get("clip.vision.image_std") or [0.5] * 3)]
+        if not (0 < self.n_layer <= 128 and 0 < self.patch <= 64 and self.n_embd % self.n_head == 0
+                and 0 < self.n_kv <= self.n_head and self.n_head % self.n_kv == 0 and 0 < self.merge <= 8
+                and len(self.mean) == 3 and len(self.std) == 3 and all(s > 0 for s in self.std)
+                and 0 < self.min_pixels <= self.max_pixels):
+            raise GGUFError("implausible vision hyper-parameters")
+        self.head_dim = self.n_embd // self.n_head
+        if self.head_dim % 4:
+            raise GGUFError("vision head size must be a multiple of 4")
+        self.device = torch.device(device)
+        self.dtype = dtype
+        self.loaded = False
+
+    def load(self):
+        if self.loaded:
+            return
+        ld = WeightLoader(self.gg, self.device, self.dtype, quant=False)
+        E, P, D = self.n_embd, self.patch, self.head_dim
+        f32 = torch.float32
+        self.patch_w = [ld.get(n, f32) for n in ("v.patch_embd.weight", "v.patch_embd.weight.1") if ld.has(n)]
+        if not self.patch_w or any(tuple(w.shape) != (E, 3, P, P) for w in self.patch_w):
+            raise GGUFError("v.patch_embd.weight has an unexpected shape")
+        self.emb_norm = ld.get("v.embedding_norm.weight", f32)
+        self.blocks = []
+        for i in range(self.n_layer):
+            p = f"v.blk.{i}."
+            b = {"ln1": ld.get(p + "ln1.weight", f32), "ln2": ld.get(p + "ln2.weight", f32),
+                 "gate": ld.get(p + "ffn_gate.weight"), "up": ld.get(p + "ffn_up.weight"),
+                 "down": ld.get(p + "ffn_down.weight")}
+            if ld.has(p + "attn_q.weight"):
+                b.update(q=ld.get(p + "attn_q.weight"), k=ld.get(p + "attn_k.weight"), v=ld.get(p + "attn_v.weight"),
+                         out=ld.get(p + "attn_out.weight"), q_norm=ld.get(p + "attn_q_norm.weight", f32),
+                         k_norm=ld.get(p + "attn_k_norm.weight", f32))
+                if tuple(b["k"].shape) != (self.n_kv * D, E) or tuple(b["q"].shape) != (E, E):
+                    raise GGUFError(f"vision block {i}: unexpected attention shapes")
+            else:
+                b.update(c_in=ld.get(p + "conv2d_in_proj.weight"), c_out=ld.get(p + "conv2d_out_proj.weight"),
+                         c_w=ld.get(p + "conv2d_spatial.weight", f32))
+                if tuple(b["c_in"].shape) != (3 * E, E) or b["c_w"].shape[0] != E or b["c_w"].dim() != 4:
+                    raise GGUFError(f"vision block {i}: unexpected conv shapes")
+            self.blocks.append(b)
+        self.mm_norm = (ld.get("mm.input_norm.weight", f32), ld.get("mm.input_norm.bias", f32))
+        self.mm0 = (ld.get("mm.0.weight"), ld.get("mm.0.bias") if ld.has("mm.0.bias") else None)
+        self.mm2 = (ld.get("mm.2.weight"), ld.get("mm.2.bias") if ld.has("mm.2.bias") else None)
+        if self.mm0[0].shape[1] != E * self.merge ** 2 or self.mm2[0].shape[0] != self.n_out:
+            raise GGUFError("projector has an unexpected shape")
+        achse = D // 2                                                    # Winkel je Achse über D/2 Dimensionen
+        self.inv_freq = 1.0 / (self.ROPE_BASIS ** (torch.arange(0, achse, 2, device=self.device,
+                                                                dtype=torch.float32) / achse))
+        self.loaded = True
+
+    def unload(self):
+        for name in ("patch_w", "emb_norm", "blocks", "mm_norm", "mm0", "mm2", "inv_freq"):
+            self.__dict__.pop(name, None)
+        self.loaded = False
+        if self.device.type == "cuda":
+            torch.cuda.empty_cache()
+
+    # -- preprocessing -----------------------------------------------------------
+    def groesse(self, width: int, height: int, tokens: int) -> Tuple[int, int]:
+        """(Breite, Höhe) wie das Referenz-smart_resize: Vielfache von patch * merge, Pixelzahl
+        innerhalb [min_pixels, max_pixels] – die Obergrenze auf `tokens` zusammengeführte Tokens gesenkt."""
+        if width <= 0 or height <= 0:
+            raise ValueError("empty image")
+        if max(width, height) / min(width, height) > 200:            # wie smart_resize der Referenz
+            raise ValueError("image aspect ratio must be smaller than 200")
+        f = self.patch * self.merge
+        tokens = max(self.min_tokens, min(int(tokens), self.max_tokens))
+        hi = min(self.max_pixels, MAX_PIXELS, tokens * f * f)
+        lo = min(self.min_pixels, hi)
+        h, w = max(f, round(height / f) * f), max(f, round(width / f) * f)
+        if h * w > hi:
+            beta = math.sqrt(height * width / hi)
+            h, w = max(f, math.floor(height / beta / f) * f), max(f, math.floor(width / beta / f) * f)
+        elif h * w < lo:
+            beta = math.sqrt(lo / (height * width))
+            h, w = math.ceil(height * beta / f) * f, math.ceil(width * beta / f) * f
+        return w, h
+
+    def pixels(self, image, tokens: int) -> torch.Tensor:
+        """PIL-Bild -> (3, H, W), normalisiert."""
+        from PIL import Image
+        img = image.convert("RGB")
+        img = img.resize(self.groesse(img.width, img.height, tokens), Image.BICUBIC)
+        raw = torch.frombuffer(bytearray(img.tobytes()), dtype=torch.uint8)
+        x = raw.view(img.height, img.width, 3).permute(2, 0, 1).float() / 255.0
+        return (x - torch.tensor(self.mean).view(3, 1, 1)) / torch.tensor(self.std).view(3, 1, 1)
+
+    # -- encoder -----------------------------------------------------------------
+    def _block_order(self, x: torch.Tensor) -> torch.Tensor:
+        """(C, gy, gx) -> (N, C) in Merge-Block-Reihenfolge."""
+        C, gy, gx = x.shape
+        m = self.merge
+        return x.reshape(C, gy // m, m, gx // m, m).permute(1, 3, 2, 4, 0).reshape(-1, C)
+
+    def _raster(self, h: torch.Tensor, gy: int, gx: int) -> torch.Tensor:
+        """(N, C) in Merge-Block-Reihenfolge -> (1, C, gy, gx)."""
+        m = self.merge
+        return h.view(gy // m, gx // m, m, m, -1).permute(4, 0, 2, 1, 3).reshape(1, -1, gy, gx)
+
+    @torch.inference_mode()
+    def encode(self, image, tokens: Optional[int] = None) -> torch.Tensor:
+        """PIL-Bild -> (n_tokens, projection_dim) float32-Embeddings, zeilenweise über das zusammengeführte Raster."""
+        if not self.loaded:
+            raise RuntimeError("vision weights are not loaded")
+        pix = self.pixels(image, tokens or self.default_tokens).to(self.device).unsqueeze(0)
+        return self.encode_pixels(pix)
+
+    def encode_pixels(self, pix: torch.Tensor) -> torch.Tensor:
+        x = sum(F.conv2d(pix, w, stride=self.patch) for w in self.patch_w)[0]      # (E, gy, gx)
+        E, gy, gx = x.shape
+        h = rms_norm(self._block_order(x), self.emb_norm, self.eps)               # (N, E)
+        coords = torch.stack(torch.meshgrid(torch.arange(gy, device=self.device),
+                                            torch.arange(gx, device=self.device), indexing="ij"))
+        rc = self._block_order(coords).float()                                    # (N, 2)
+        ang = torch.cat([torch.outer(rc[:, 0], self.inv_freq), torch.outer(rc[:, 1], self.inv_freq)], dim=-1)
+        ang = torch.cat([ang, ang], dim=-1)                                       # (N, D)
+        cos, sin = ang.cos().unsqueeze(1), ang.sin().unsqueeze(1)
+        N, H, Hkv, D = h.shape[0], self.n_head, self.n_kv, self.head_dim
+        lin = lambda t, w, b=None: F.linear(t.to(w.dtype), w, b).float()
+        dreh = lambda t: t * cos + torch.cat([-t[..., D // 2:], t[..., :D // 2]], dim=-1) * sin
+        for b in self.blocks:
+            y = rms_norm(h, b["ln1"], self.eps)
+            if "q" in b:
+                q = dreh(rms_norm(lin(y, b["q"]).view(N, H, D), b["q_norm"], self.eps))
+                k = dreh(rms_norm(lin(y, b["k"]).view(N, Hkv, D), b["k_norm"], self.eps))
+                v = lin(y, b["v"]).view(N, Hkv, D)
+                t = lambda z: z.transpose(0, 1).unsqueeze(0).to(self.dtype)
+                a = F.scaled_dot_product_attention(t(q), t(k), t(v), enable_gqa=Hkv != H)[0]
+                out = lin(a.transpose(0, 1).reshape(N, E), b["out"])
+            else:
+                bb, c, xx = lin(y, b["c_in"]).chunk(3, dim=-1)
+                k = b["c_w"].shape[-1]
+                conv = F.conv2d(self._raster(bb * xx, gy, gx), b["c_w"], padding=k // 2, groups=E)
+                out = lin(c * self._block_order(conv[0]), b["c_out"])
+            h = h + out
+            y = rms_norm(h, b["ln2"], self.eps)
+            h = h + lin(F.silu(lin(y, b["gate"])) * lin(y, b["up"]), b["down"])
+        y = F.layer_norm(h, (E,), *self.mm_norm, 1e-6).reshape(-1, E * self.merge ** 2)
+        return lin(F.gelu(lin(y, *self.mm0)), *self.mm2)
+
+
+def _fit_grid(width: int, height: int, tokens: int) -> Tuple[int, int]:
+    """(quer, hoch) bei erhaltenem Seitenverhältnis, höchstens `tokens` Zellen."""
+    if width <= 0 or height <= 0:
+        raise ValueError("empty image")
+    s = math.sqrt(tokens / (width * height))
+    nx, ny = max(1, int(width * s)), max(1, int(height * s))
+    while nx * ny > tokens:
+        if nx >= ny:
+            nx -= 1
+        else:
+            ny -= 1
+    return nx, ny
+
+
+def _deepstack_blocks(gg: GGUFFile, n_layer: int) -> List[int]:
+    """ViT-Blöcke mit DeepStack-Merger, aus den Tensornamen (der Konverter schreibt auch
+    clip.vision.is_deepstack_layers; beides muss übereinstimmen, wenn vorhanden)."""
+    bloecke = sorted({int(m.group(1)) for t in gg.tensor_list
+                      if (m := re.fullmatch(r"v\.deepstack\.(\d+)\.fc1\.weight", t.name))})
+    flags = gg.get("clip.vision.is_deepstack_layers")
+    if isinstance(flags, list) and any(flags) and [i for i, f in enumerate(flags) if f] != bloecke:
+        raise GGUFError("clip.vision.is_deepstack_layers does not match the deepstack tensors")
+    if any(not 0 <= i < n_layer for i in bloecke):
+        raise GGUFError("deepstack block index out of range")
+    return bloecke
+
+
+# -- automatische Auswahl ------------------------------------------------------
+ENCODERS = {"gemma4v": Gemma4Vision, "gemma4uv": Gemma4UnifiedVision, "qwen3vl_merger": Qwen3VLVision,
+            "pixtral": PixtralVision, "lfm3vl": Lfm3Vision}
+
+
+def projector_type(gg: GGUFFile) -> Optional[str]:
+    """Projektor-Typ eines mmproj (manche Dateien nutzen clip.projector_type)."""
+    return gg.get("clip.vision.projector_type") or gg.get("clip.projector_type")
+
+
+def load_projector(path: str, device, dtype=torch.bfloat16):
+    """Der Encoder passend zum mmproj unter `path` (Gewichte noch nicht geladen)."""
+    gg = GGUFFile(path)
+    try:
+        typ = projector_type(gg)
+    finally:
+        gg.close()
+    cls = ENCODERS.get(typ)
+    if cls is None:
+        raise GGUFError(f"unsupported vision projector {typ!r}")
+    return cls(path, device, dtype)

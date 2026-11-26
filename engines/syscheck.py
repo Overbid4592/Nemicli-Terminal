@@ -1,0 +1,394 @@
+"""
+syscheck.py - "Was hat dieser PC, und was fehlt noch?"
+
+Für /systemcheck. Beantwortet drei Fragen:
+
+  1. Welche Grafikkarte steckt drin – und welche Rechen-Stufe (compute
+     capability, z.B. sm_120 bei den RTX-50er/Blackwell)? Das entscheidet,
+     WELCHES torch man installieren muss: eine zu alte torch-Version kennt
+     sm_120 nicht und rechnet dann gar nicht oder nur auf der CPU.
+  2. Was ist schon installiert (torch, transformers …)?
+  3. Was liegt an Modellen da (GGUF / Checkpoints) und was fehlt?
+
+Es wird NICHTS automatisch installiert und kein bestimmtes Modell vorgegeben –
+der Bericht nennt nur Fakten plus den passenden pip-Befehl zum Kopieren.
+"""
+
+from __future__ import annotations
+
+import importlib.util
+import re
+import shutil
+import sys
+import time
+from pathlib import Path
+
+import setup as S
+import systemprofil
+
+try:
+    from paths import ROOT
+except Exception:
+    ROOT = Path(__file__).resolve().parent.parent
+
+
+# ===========================================================================
+#  Rechen-Stufe der NVIDIA-Karte (sm_XX)
+# ===========================================================================
+
+def compute_cap() -> str:
+    """Compute Capability der ersten NVIDIA-Karte, z.B. '12.0' (= sm_120).
+    Leerer String, wenn keine NVIDIA-Karte da ist oder nvidia-smi es nicht sagt."""
+    out = S._run([S.nvidia_smi(), "--query-gpu=compute_cap",
+                  "--format=csv,noheader"])
+    m = re.search(r"(\d+)\.(\d+)", out)
+    return f"{int(m.group(1))}.{int(m.group(2))}" if m else ""
+
+
+def sm_tag(cap: str) -> str:
+    """'12.0' -> 'sm_120'."""
+    if not cap:
+        return ""
+    major, _, minor = cap.partition(".")
+    return f"sm_{major}{minor}"
+
+
+# Was für ein torch braucht diese Rechen-Stufe MINDESTENS? (hardware.json, „torch_baus“)
+# Blackwell (sm_120, RTX 50xx) läuft erst ab CUDA 12.8 – ältere torch-Räder haben den Code
+# für sm_120 gar nicht drin. Empfohlen wird nie fest ein Bau: passt der installierte, bleibt er,
+# sonst der neueste im PyTorch-Index bis zur Grenze des Treibers (bester_kanal).
+_UNBEKANNT = {"kanal": "cu126", "cuda": 12.6, "grund": "Standard-CUDA-Bau"}
+
+
+def _wheel_for(cap: str) -> tuple[str, str]:
+    """Gibt (kanal, grund) zurück. kanal = pip-Index-Kürzel wie 'cu128' (der Mindest-Bau)."""
+    nv = systemprofil.nvidia()
+    unbekannt = nv.get("unbekannt") or _UNBEKANNT
+    baus = nv.get("torch_baus") or []
+    try:
+        major = int(float(cap))
+    except Exception:
+        return unbekannt["kanal"], unbekannt["grund"]
+    if not baus:
+        return unbekannt["kanal"], unbekannt["grund"]
+    for bau in baus:
+        if major >= bau["ab_stufe"]:
+            return bau["kanal"], bau["grund"]
+    zu_alt = nv.get("zu_alt") or {"kanal": "cpu", "grund": "diese Karte ist für CUDA zu alt – nur CPU"}
+    return zu_alt["kanal"], zu_alt["grund"]
+
+
+def _cuda_fuer(kanal: str) -> float:
+    """Treiber-CUDA-Version, die ein torch-Kanal mindestens braucht."""
+    nv = systemprofil.nvidia()
+    for bau in nv.get("torch_baus") or []:
+        if bau["kanal"] == kanal:
+            return bau["cuda"]
+    return (nv.get("unbekannt") or _UNBEKANNT)["cuda"]
+
+
+_TORCH_URL = "https://download.pytorch.org/whl/"
+KANAL_MERKEN_S = 3600                    # gefundener bester Kanal gilt so lange (kein Index-Abruf je Aufruf)
+_KANAL_MERK: dict = {}
+
+
+def _kanal_text(cuda: float) -> str:
+    return f"cu{int(round(cuda * 10))}"
+
+
+def installierter_bau() -> float:
+    """CUDA-Bau des torch im venv (z. B. 13.4) – 0, wenn keins oder ein CPU-Bau da ist. Ohne torch zu laden."""
+    try:
+        import wizard
+        bau = wizard._torch_bau()
+        return float(bau) if bau and bau != "cpu" else 0.0
+    except (ImportError, ValueError):
+        return 0.0
+
+
+def bester_kanal(minimum: str, cuda_max: float, holen=None) -> tuple[str, bool]:
+    """Neuester CUDA-Kanal im PyTorch-Index zwischen Mindest-Bau und Treiber-Grenze, in dem es torch für dieses
+    Python gibt. (kanal, im Index gefunden) – ohne Netz oder Treffer der Mindest-Bau."""
+    schluessel = (minimum, round(float(cuda_max or 0), 1))
+    gemerkt = _KANAL_MERK.get(schluessel)
+    if holen is None and gemerkt and time.monotonic() - gemerkt[1] < KANAL_MERKEN_S:
+        return gemerkt[0], True
+    try:
+        import venvpflege as V
+        for kanal in V.torch_kanaele(minimum, float(cuda_max or 0)):
+            if V.torch_versionen(kanal, get=holen):
+                if holen is None:
+                    _KANAL_MERK[schluessel] = (kanal, time.monotonic())
+                return kanal, True
+    except Exception:
+        pass
+    return minimum, False
+
+
+def torch_plan(gpu: dict | None = None, cap: str = "", installiert: float | None = None, holen=None) -> dict:
+    """Der passende Installations-Plan für Bild-Erzeugung auf DIESEM PC.
+
+    NVIDIA: Passt der installierte CUDA-Bau (`installiert`, sonst aus dem venv gelesen), bleibt er; sonst der
+    neueste Kanal im PyTorch-Index bis zur Treiber-Grenze (`holen` ersetzt den Abruf in Tests).
+
+    Rückgabe: {ok, kanal, grund, cmd, extra, warnung}
+      cmd     = pip-Befehl für torch (zum Kopieren ins venv-Fenster, /venv)
+      extra   = pip-Befehl für den Rest (Krea 2)
+      warnung = Hinweis, wenn etwas nicht zusammenpasst
+    """
+    gpu = gpu or S.gpu_info()
+    vendor = gpu.get("vendor", "cpu")
+    py = "python -m pip install"
+
+    extra = f'{py} safetensors tokenizers pillow numpy'
+
+    if vendor == "nvidia":
+        minimum, grund = _wheel_for(cap or compute_cap())
+        kanal = minimum
+        if kanal == "cpu":
+            return {"ok": True, "kanal": "cpu", "grund": grund,
+                    "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}cpu",
+                    "extra": extra,
+                    "warnung": "Bilder malen dauert auf der CPU sehr lange (Minuten pro Bild)."}
+        warn = ""
+        if not systemprofil.nvidia().get("torch_baus"):
+            warn = ("Hardware-Datenbank (hardware.json) nicht lesbar – der CUDA-Bau ist nur geraten. "
+                    "NemiCLI neu installieren.")
+        cuda_max = gpu.get("cuda_max") or 0
+        need = _cuda_fuer(minimum)
+        bau = (installiert if installiert is not None else installierter_bau())
+        if bau and bau >= need and (not cuda_max or bau <= cuda_max):
+            kanal = _kanal_text(bau)
+            grund = (f"installiert: CUDA-{bau:g}-Bau – passt (die Karte braucht mindestens {need:g}); "
+                     "neuere Fassungen holt /update torch")
+        elif cuda_max >= need:
+            kanal, gefunden = bester_kanal(minimum, cuda_max, holen)
+            grund = (f"neuester Bau für deinen Treiber (CUDA bis {cuda_max:g})" if gefunden else
+                     f"{grund} – Mindest-Bau; den neuesten passenden holt /update torch")
+        if cuda_max and cuda_max < need:
+            warn = (f"Dein Grafik-Treiber kann nur CUDA {cuda_max}, gebraucht wird "
+                    f"mindestens {need}. Erst den NVIDIA-Treiber aktualisieren.")
+        return {"ok": True, "kanal": kanal, "grund": grund,
+                "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}{kanal}",
+                "extra": extra, "warnung": warn}
+
+    if vendor == "amd":
+        return {"ok": True, "kanal": "directml", "grund":
+                "AMD unter Windows: ROCm gibt es nur für Linux",
+                "cmd": "pip3 install torch-directml",
+                "extra": extra,
+                "warnung": "AMD auf Windows läuft über DirectML – langsamer und nicht überall stabil."}
+
+    if vendor == "intel":
+        return {"ok": True, "kanal": "cpu",
+                "grund": "Intel-Grafik: läuft praktisch auf der CPU",
+                "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}cpu",
+                "extra": extra,
+                "warnung": "Bilder malen dauert damit sehr lange."}
+
+    return {"ok": True, "kanal": "cpu", "grund": "keine nutzbare Grafikkarte gefunden",
+            "cmd": f"pip3 install torch torchvision --index-url {_TORCH_URL}cpu", "extra": extra,
+            "warnung": "Ohne Grafikkarte dauert ein Bild mehrere Minuten."}
+
+
+# ===========================================================================
+#  Was ist installiert?
+# ===========================================================================
+
+def _version(mod: str) -> str | None:
+    """Version eines Pakets, ohne es zu importieren (importlib.metadata)."""
+    try:
+        from importlib.metadata import version
+        return version(mod)
+    except Exception:
+        return None
+
+
+def _installed(mod: str) -> bool:
+    try:
+        return importlib.util.find_spec(mod) is not None
+    except Exception:
+        return False
+
+
+def torch_status() -> dict:
+    """Ist torch da, sieht es die GPU, kennt es die Rechen-Stufe der Karte?
+    Torch wird hier WIRKLICH importiert (dauert ein paar Sekunden) – aber nur,
+    wenn es installiert ist."""
+    ver = _version("torch")
+    if not ver:
+        return {"da": False}
+    info = {"da": True, "version": ver, "cuda": None, "gpu_nutzbar": False,
+            "arch": [], "passt": None}
+    try:
+        import torch                       # kann ein paar Sekunden dauern
+        info["cuda"] = getattr(torch.version, "cuda", None)
+        info["gpu_nutzbar"] = bool(torch.cuda.is_available())
+        try:
+            info["arch"] = list(torch.cuda.get_arch_list())
+        except Exception:
+            info["arch"] = []
+    except Exception as e:
+        info["fehler"] = str(e)[:200]
+    return info
+
+
+def packages() -> list[dict]:
+    """Liste aller Pakete, die NemiCLI kennt: Name, Version, wofür, Pflicht?"""
+    rows = [
+        ("rich", "Terminal-Optik", True),
+        ("textual", "Vollbild-Oberfläche", True),
+        ("prompt_toolkit", "Eingabe (klassisch) & Menüs", True),
+        ("httpx", "Internet-Verbindungen", True),
+        ("openai", "Cloud-Anbieter (OpenAI-Protokoll)", True),
+        ("anthropic", "Cloud-Anbieter Anthropic", True),
+        ("dotenv", "Schlüssel aus .env lesen", True),
+        ("torch", "Rechen-Motor für Krea 2, lokale Modelle und Gedächtnis", False),
+        ("transformers", "nur für safetensors-Gedächtnismodelle (GGUF braucht es nicht)", False),
+        ("safetensors", "Modell-Dateien laden", False),
+        ("tokenizers", "Wortliste für Krea 2 und den Gedächtnis-Encoder", False),
+        ("numpy", "Rechnen für Wache, Kugel und Bilder", False),
+        ("PIL", "Bilder speichern und lesen (Pillow)", False),
+        ("tensorrt_rtx", "Zusatz TensorRT-RTX: Prompts schneller lesen, schneller malen (SDK unter "
+                         "Models/TensorRT-RTX ablegen, das Paket kommt von selbst)", False),
+    ]
+    dist = {"dotenv": "python-dotenv", "PIL": "pillow", "tensorrt_rtx": "tensorrt-rtx"}
+    out = []
+    for mod, zweck, pflicht in rows:
+        v = _version(dist.get(mod, mod))
+        out.append({"name": dist.get(mod, mod), "modul": mod, "zweck": zweck,
+                    "pflicht": pflicht, "da": bool(v) or _installed(mod),
+                    "version": v or ""})
+    return out
+
+
+def transformers_ok() -> bool | None:
+    """transformers ab 5.10 (ältere haben bekannte Sicherheitslücken). None = nicht installiert."""
+    v = _version("transformers")
+    if not v:
+        return None
+    try:
+        from packaging.version import Version
+        return Version(v) >= Version("5.10")
+    except Exception:
+        return True
+
+
+# ===========================================================================
+#  Was liegt an Modellen da?
+# ===========================================================================
+
+def model_stock() -> dict:
+    """Zählt vorhandene Bild-Modelle (Krea 2 und die weiteren Bild-Motoren) und sagt, wo sie hingehören."""
+    try:
+        import krea
+        bilder, ordner = len(krea.discover()), str(krea.krea_dir())
+    except Exception:
+        bilder, ordner = 0, str(ROOT / "Models" / "Krea2")
+    try:
+        import bildmotoren
+        bilder += len(bildmotoren.modelle())
+    except Exception:
+        pass
+
+    try:
+        import gguflokal
+        gguf = len(gguflokal.modelle())
+    except Exception:
+        gguf = 0
+
+    frei = 0
+    try:
+        frei = shutil.disk_usage(str(ROOT)).free // (1024 ** 3)
+    except Exception:
+        pass
+
+    return {
+        "bildmodelle": bilder,
+        "bild_ordner": ordner,
+        "gguf": gguf,
+        "ollama": S.ollama_running(),
+        "frei_gb": frei,
+    }
+
+
+# ===========================================================================
+#  Gesamt-Bericht
+# ===========================================================================
+
+def report(deep: bool = True) -> dict:
+    """Alles zusammen für ui.system_panel(). deep=False lässt den (langsamen)
+    torch-Import weg."""
+    try:            # exe-Betrieb: extern installiertes torch erst sichtbar machen,
+        import extlibs               # sonst meldet der Bericht es fälschlich als fehlend
+        extlibs.enable()
+    except Exception:
+        pass
+    gpu = S.gpu_info()
+    cap = compute_cap() if gpu.get("vendor") == "nvidia" else ""
+    rep = {
+        "gpu": gpu,
+        "cap": cap,
+        "sm": sm_tag(cap),
+        "hint": S.hardware_hint(gpu),
+        "plan": torch_plan(gpu, cap),
+        "pakete": packages(),
+        "transformers_ok": transformers_ok(),
+        "stock": model_stock(),
+        "python": f"{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}",
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "root": str(ROOT),
+    }
+    try:
+        import extlibs
+        rep["extlibs"] = extlibs.status_text()
+    except Exception:
+        rep["extlibs"] = ""
+    rep["torch"] = torch_status() if deep else {"da": bool(_version("torch"))}
+
+    # Passt das installierte torch zur Karte? (kennt es sm_120?)
+    t = rep["torch"]
+    if t.get("da") and t.get("arch") and rep["sm"]:
+        rep["torch_passt"] = any(rep["sm"] in a for a in t["arch"])
+    else:
+        rep["torch_passt"] = None
+    return rep
+
+
+def todo(rep: dict) -> list[str]:
+    """Kurze Liste: was fehlt noch? (Klartext, in der Reihenfolge sinnvoll)"""
+    out: list[str] = []
+    st = rep["stock"]
+    if not st["ollama"] and not st.get("gguf"):
+        out.append("Kein lokales Modell: eine GGUF-Datei in einen Ordner unter KI-Modelle/KI-Chat/Chatmodell/ legen "
+                   "(eigener Motor) oder Ollama einrichten (/model).")
+    if st["bildmodelle"] == 0:
+        out.append(f"Zum Bilder-Malen fehlt ein Krea-2-Modell in {st['bild_ordner']} "
+                   "(siehe LIES-MICH dort).")
+    t = rep["torch"]
+    if not t.get("da"):
+        out.append("torch ist nicht installiert – ohne das kann NemiCLI keine "
+                   "Bilder malen. Befehl steht oben.")
+    else:
+        # Nur, wenn torch wirklich geprüft wurde: die schnelle Prüfung (deep=False) kennt „gpu_nutzbar“ nicht.
+        if "gpu_nutzbar" in t and not t["gpu_nutzbar"] and rep["gpu"].get("vendor") == "nvidia":
+            out.append("torch sieht deine Grafikkarte nicht – es rechnet auf der "
+                       "CPU. Mit dem Befehl oben neu installieren.")
+        if rep.get("torch_passt") is False:
+            out.append(f"Dein torch kennt {rep['sm']} nicht (deine Karte ist zu neu "
+                       "für diese torch-Version). Befehl oben nutzen.")
+    if rep["transformers_ok"] is False:
+        out.append("transformers ist älter als 5.10 (bekannte Sicherheitslücken) – "
+                   "/update räumt es auf.")
+    if st["frei_gb"] and st["frei_gb"] < 20:
+        out.append(f"Nur noch {st['frei_gb']} GB frei – Modelle brauchen viel Platz.")
+    return out
+
+
+if __name__ == "__main__":            # Selbsttest:  python engines/syscheck.py
+    import json
+    r = report(deep="--fast" not in sys.argv)
+    print(json.dumps(r, indent=2, ensure_ascii=False))
+    print("\nTODO:")
+    for t in todo(r):
+        print(" -", t)

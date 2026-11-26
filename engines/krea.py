@@ -1,0 +1,2017 @@
+"""
+krea.py - NemiCLIs eigene Pipeline für Krea 2.
+
+Erwarteter Ordner `KI-Modelle/KI-Bild/BildgenKI/Krea2/` (früher `Models/Krea2/`):
+
+    *.safetensors / *.gguf        Diffusionsmodelle (mehrere möglich, /bildmodel wählt): bf16, fp16,
+                                  FP8, MXFP8, NVFP4, INT8 (auch ConvRot), GGUF; mit oder ohne
+                                  ComfyUI-Vorsatz, auch geteilt (…-00001-of-0000N)
+    text_encoders/*.safetensors   Qwen3-VL-4B (FP8 skaliert oder bf16)
+    vae/*.safetensors             Qwen-Image-VAE
+    tokenizer/                    Qwen-Tokenizer (vocab.json + merges.txt oder tokenizer.json)
+
+Ablauf:
+
+    Prompt -> Qwen3-VL (12 abgegriffene Schichten) -> Single-Stream-DiT
+    (Flow-Matching, eigener Sampler) -> VAE-Decoder -> PNG
+
+Krea 2 Turbo läuft in der Vorgabe mit CFG 1: ein Modelldurchlauf pro Schritt, ohne Gegen-Prompt.
+Über die Schaltzentrale (einstellungen()) rechnet es ab CFG > 1 zusätzlich gegen einen festen Gegen-Prompt. Krea 2 Raw (Name enthält „raw“) rechnet wie das offizielle sampling.py
+mit 52 Euler-Schritten, CFG 3,5 gegen den leeren Prompt und größenabhängiger Verschiebung. Speicher wie ComfyUI mit --disable-smart-memory: jedes Teil ist
+nur während seines Rechenschritts im VRAM und wartet sonst im Arbeitsspeicher.
+Nach 5 Minuten Ruhe (Config: `bild_krea_entladen`; keine Runde, keine
+Hintergrund-Aufgabe) wird auch der Arbeitsspeicher geräumt.
+
+Alle Netze sind hier von Hand nachgebaut. Es wird nichts aus dem Netz geladen.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import re
+import struct
+import sys
+import threading
+
+try:
+    import debugbericht as _DBG
+except Exception:                                    # Selbsttest ohne core/ im Pfad
+    class _DBG:                                      # type: ignore[no-redef]
+        @staticmethod
+        def ereignis(*a, **k): pass
+
+        @staticmethod
+        def fehler(*a, **k): pass
+
+        @staticmethod
+        def motor_log(): pass
+
+        class messen:
+            def __init__(self, *a): pass
+
+            def __enter__(self): return self
+
+            def __exit__(self, *a): return False
+import time
+from pathlib import Path
+
+try:
+    from paths import ROOT as _ROOT, INSTALL as _INSTALL
+except Exception:
+    _ROOT = _INSTALL = Path(__file__).resolve().parent.parent
+
+# KI-Modelle/KI-Bild/BildgenKI/Krea2 zuerst, danach die früheren Orte (Daten-, dann Programmordner)
+try:
+    import modellorte as _MO
+    KREA_DIRS = list(dict.fromkeys([_MO.ordner("bild") / _MO.KREA, *_MO.alte("krea")]))
+except Exception:                                    # Selbsttest ohne Bootstrap
+    KREA_DIRS = [_ROOT / "Models" / "Krea2", _INSTALL / "Models" / "Krea2"]
+OUT_DIR = _ROOT / "Bilder"
+MAX_EDGE = 2048
+
+DEFAULTS = {
+    "steps": 14,
+    "size": (832, 1216),
+    "sampler": "euler_ancestral",       # oder "euler"
+    "shift": 1.15,
+    "entladen_nach": 300,               # Sekunden Ruhe, dann auch RAM frei (nächstes Bild lädt neu)
+    "gesicht": True,                    # Gesichter nach dem Malen vergrößert nachmalen
+    "gesicht_staerke": 0.35,            # Rauschstärke beim Nachmalen: Augen und Mund bleiben, wo sie sind
+    "gesicht_schritte": 10,
+    "gesicht_kante": 1024,              # Arbeitsgröße des Ausschnitts (längere Kante)
+}
+
+# Prompt beim Nachmalen eines Gesichts-Ausschnitts. Nur das Gesicht beschreiben: der ganze Bild-Prompt („steht am Strand, rote Schuhe …“) ließe Krea
+# die Szene in den kleinen Ausschnitt malen. Aussehen, Stil und Licht kommen aus dem Ausschnitt selbst.
+# Krea-Prosa statt Stichworten; ohne Bildart („photograph“), damit gezeichnete Bilder ihren Stil behalten.
+GESICHT_SATZ = ("A close-up of the same face, with the same expression, hairstyle, makeup, lighting and art "
+                "style as before. Both eyes are clear and evenly shaped, the irises show natural patterns, "
+                "and a small catchlight shines in each eye. Every eyelash is "
+                "cleanly defined, and the skin keeps its natural texture.")
+
+# Qwen3-VL-Eingabe: dieselbe Systemvorlage wie Qwen-Image. Vor dem Weiterreichen
+# wird alles bis einschließlich "<|im_start|>user\n" abgeschnitten.
+_TEMPLATE = ("<|im_start|>system\nDescribe the image by detailing the color, shape, size, "
+             "texture, quantity, text, spatial relationships of the objects and "
+             "background:<|im_end|>\n<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n")
+_TAPS = [2, 5, 8, 11, 14, 17, 20, 23, 26, 29, 32, 35]     # hidden_states[k] = Eingang von Schicht k
+_IM_START, _TOK_USER, _TOK_NL = 151644, 872, 198
+
+# Latent-Normierung des Qwen-Image-VAE (identisch mit Wan 2.1)
+_LAT_MEAN = [-0.7571, -0.7089, -0.9113, 0.1075, -0.1745, 0.9653, -0.1517, 1.5508,
+             0.4134, -0.0715, 0.5517, -0.3632, -0.1922, -0.9497, 0.2503, -0.2921]
+_LAT_STD = [2.8184, 1.4541, 2.3275, 2.6558, 1.2196, 1.7708, 2.6052, 2.0743,
+            3.2687, 2.1526, 2.8652, 1.5579, 1.6382, 1.1253, 2.8251, 1.9160]
+
+_E2M1 = [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0,
+         -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0]
+
+
+# ===========================================================================
+#  Dateien finden
+# ===========================================================================
+
+def _kopf(path: Path) -> dict:
+    """JSON-Kopf einer .safetensors-Datei, ohne die Gewichte zu laden."""
+    try:
+        with open(path, "rb") as f:
+            n = struct.unpack("<Q", f.read(8))[0]
+            if n <= 0 or n > (200 << 20):
+                return {}
+            return json.loads(f.read(n).decode("utf-8", "replace"))
+    except Exception:
+        return {}
+
+
+_ERKANNT: dict = {}                   # Pfad -> ((mtime, Größe), ist Krea 2)
+
+
+def ist_krea2(path: Path) -> bool:
+    """Krea-2-Diffusionsmodell? safetensors (auch geteilt, mit oder ohne ComfyUI-Vorsatz) oder GGUF.
+    Liest nur die Köpfe; das Ergebnis gilt, bis sich die Datei ändert."""
+    path = Path(path)
+    try:
+        st = path.stat()
+        stand = (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return False
+    alt = _ERKANNT.get(str(path))
+    if alt is not None and alt[0] == stand:
+        return alt[1]
+    try:
+        from bildmotoren import gewichte as G
+        if G.ist_folgeteil(path):
+            ja = False
+        else:
+            namen, _ = G.ohne_praefix(G.namen(path))
+            ja = any(k.startswith("txtfusion.") for k in namen)
+    except Exception:
+        ja = any(k.startswith("model.diffusion_model.txtfusion.") for k in _kopf(path))
+    _ERKANNT[str(path)] = (stand, ja)
+    return ja
+
+
+def _kandidaten(d: Path) -> list[Path]:
+    if not d.is_dir():
+        return []
+    return sorted(p for p in d.iterdir() if p.is_file() and p.suffix.lower() in (".safetensors", ".gguf"))
+
+
+def _erste(d: Path) -> Path | None:
+    dateien = sorted(d.glob("*.safetensors")) if d.is_dir() else []
+    return dateien[0] if dateien else None
+
+
+def krea_dir() -> Path:
+    """Der erste Krea2-Ordner, der ein Modell enthält (sonst der neue Ort)."""
+    for d in KREA_DIRS:
+        if any(ist_krea2(f) for f in _kandidaten(d)):
+            return d
+    return KREA_DIRS[0]
+
+
+def discover() -> dict[str, Path]:
+    """ref -> Pfad aller Krea-2-Diffusionsmodelle (ref = Dateiname ohne Endung; bei gleichem Namen
+    in zwei Formaten bekommt die zweite Datei ihren vollen Namen)."""
+    aus: dict[str, Path] = {}
+    for f in _kandidaten(krea_dir()):
+        if ist_krea2(f):
+            ref = re.sub(r"-00001-of-\d{5}$", "", f.stem)
+            aus[f.name if ref in aus else ref] = f
+    return aus
+
+
+def ist_raw(ref: str | None) -> bool:
+    """Krea 2 Raw (Grundmodell ohne Destillation) am Namen erkennen: braucht viele Schritte und CFG."""
+    return bool(ref) and re.search(r"(?i)(?:^|[^a-z])raw(?:[^a-z]|$)", str(ref)) is not None
+
+
+TEIL_ORDNER = {"text": "text_encoders", "vae": "vae"}
+TEIL_SCHLUESSEL = {"text": "bild_krea_text", "vae": "bild_krea_vae"}      # gewählte Datei (Name im Ordner)
+
+
+def teil_dateien(art: str) -> list[str]:
+    """Die safetensors im Ordner des Teils (text oder vae), nach Namen."""
+    d = krea_dir() / TEIL_ORDNER[art]
+    return [p.name for p in sorted(d.glob("*.safetensors"))] if d.is_dir() else []
+
+
+def _teil(d: Path, art: str) -> Path | None:
+    """Die gewählte Datei des Teils, wenn es sie gibt – sonst die erste im Ordner."""
+    name = str(_cfg(TEIL_SCHLUESSEL[art], "") or "")
+    if name and Path(name).name == name:
+        p = d / name
+        if p.is_file() and p.suffix.lower() == ".safetensors":
+            return p
+    return _erste(d)
+
+
+def teile() -> dict[str, Path | None]:
+    d = krea_dir()
+    return {"text": _teil(d / "text_encoders", "text"),
+            "vae": _teil(d / "vae", "vae"),
+            "tokenizer": d / "tokenizer"}
+
+
+# --- Eigener Bild-Motor: gewähltes Modell ------------------------------------
+
+def chosen_model() -> str | None:
+    """Das per /bildmodel gewählte Krea-Modell; sonst das erste gefundene."""
+    try:
+        import config
+        gemerkt = config.load().get("bild_krea_model") or None
+    except Exception:
+        gemerkt = None
+    modelle = discover()
+    if gemerkt and gemerkt in modelle:
+        return gemerkt
+    return next(iter(modelle), None)
+
+
+SCHRITTE_MIN, SCHRITTE_MAX = 8, 16
+
+
+def schritte() -> int:
+    """Gespeicherte Schrittzahl (Config `bild_krea_schritte`, 8–16); sonst der Standard."""
+    try:
+        import config
+        n = int(config.load().get("bild_krea_schritte") or DEFAULTS["steps"])
+    except Exception:
+        n = DEFAULTS["steps"]
+    return min(max(n, SCHRITTE_MIN), SCHRITTE_MAX)
+
+
+# Schaltzentrale (Controllcenter 🎛 Krea 2): CFG wie in ComfyUI gezählt (1 = ein Durchlauf, ohne Gegen-Prompt),
+# fester Gegen-Prompt, Sampler und Zeitverschiebung. Ab CFG > 1 rechnet jeder Schritt zweimal.
+CFG_BEREICH = (1.0, 5.0)
+SHIFT_BEREICH = (0.5, 3.0)
+SAMPLER = ("euler_ancestral", "euler")
+ZEITPLAENE = ("simple", "beta")      # beta wie in ComfyUI (alpha = beta = 0,6): mehr Schritte an Anfang und Ende
+NEGATIV_MAX = 1500
+
+
+def einstellungen() -> dict:
+    """Werte der Schaltzentrale, begrenzt: cfg (1 = aus), negativ, sampler, shift."""
+    def zahl(key, standard, lo, hi):
+        try:
+            return min(max(float(_cfg(key, standard)), lo), hi)
+        except (TypeError, ValueError):
+            return standard
+    sampler = str(_cfg("bild_krea_sampler", DEFAULTS["sampler"]) or "").lower()
+    zeitplan = str(_cfg("bild_krea_zeitplan", ZEITPLAENE[0]) or "").lower()
+    return {"cfg": zahl("bild_krea_cfg", 1.0, *CFG_BEREICH),
+            "negativ": " ".join(str(_cfg("bild_krea_negativ", "") or "").split())[:NEGATIV_MAX],
+            "sampler": sampler if sampler in SAMPLER else DEFAULTS["sampler"],
+            "shift": zahl("bild_krea_shift", DEFAULTS["shift"], *SHIFT_BEREICH),
+            "zeitplan": zeitplan if zeitplan in ZEITPLAENE else ZEITPLAENE[0]}
+
+
+# Krea 2 Raw wie im offiziellen sampling.py: Euler, CFG v = c + g·(c − u) mit leerem Gegen-Prompt,
+# Zeitverschiebung mu linear in der Bildgröße (256 px -> 0,5 · 1280 px -> 1,15, gemessen in 16er-Feldern).
+RAW_SCHRITTE, RAW_SCHRITTE_MIN, RAW_SCHRITTE_MAX = 52, 20, 80
+RAW_CFG = 3.5
+_RAW_MU = ((256 // 16) ** 2, 0.5, (1280 // 16) ** 2, 1.15)
+
+
+# Detail-Satz der Schaltzentrale: bei Bildern mit Person angehängt, nicht bei gezeichneten Stilen. Krea liest Prosa;
+# zwei, drei gezielte Angaben zu Schärfe und Haut wirken, Stichwortlisten („8k, masterpiece“) nicht. Positiv
+# formuliert: Krea hat keinen Negativ-Prompt, ein „no smoothing“ kann das Gegenteil bewirken.
+DETAIL_SATZ = ("Sharp focus on the face and eyes, crisp irises and eyelashes, natural unretouched skin texture with "
+               "visible pores and fine vellus hair.")
+DETAIL_MAX = 400
+_PERSON = re.compile(r"(?i)\b(woman|women|man|men|girl|boy|lady|person|people|she|he|her|his|face|portrait)\b")
+_GEZEICHNET = re.compile(r"(?i)\b(anime|manga|cartoon|illustration|illustrated|drawing|drawn|painting|painted|sketch|"
+                         r"comic|chibi|pixel art|watercolou?r|3d render|cel[- ]shaded|vector art|line art)\b")
+# Von hinten gesehen: Gesichts- und Augenangaben würden das Bild zur Kamera drehen – diese Teile fallen weg.
+_HINTEN = re.compile(r"(?i)\b(from behind|from the back|seen from the back|back view|rear view|back to the camera|"
+                     r"facing away|turned away)\b")
+_GESICHT_TEIL = re.compile(r"(?i)\b(face|faces|eyes?|iris|irises|eyelash(?:es)?|lashes|pupils?|lips|gaze)\b")
+
+
+def detail_satz() -> str:
+    """Der Detail-Satz der Schaltzentrale (Config `bild_krea_detail_satz`); leer, wenn er aus ist."""
+    if not _cfg("bild_krea_detail", True):
+        return ""
+    return " ".join(_cfg("bild_krea_detail_satz", DETAIL_SATZ).split())[:DETAIL_MAX]     # leer gespeichert: ohne Satz
+
+
+def mit_detail(prompt: str, satz: str | None = None) -> str:
+    """Prompt mit angehängtem Detail-Satz – nur mit Person und ohne gezeichneten Stil. Teile des Satzes (zwischen
+    Kommas), deren Wörter schon alle im Prompt stehen, fallen weg, von hinten gesehen auch die Teile zu Gesicht und
+    Augen. Passt er nicht mehr in MAX_TEXT, bleibt der Prompt, wie er ist: die Szene geht vor."""
+    satz = detail_satz() if satz is None else satz
+    if not satz or not _PERSON.search(prompt or "") or _GEZEICHNET.search(prompt or ""):
+        return prompt
+    da = set(re.findall(r"[a-z]{4,}", prompt.lower()))
+    teile = [t for t in re.split(r"\s*,\s*", satz.strip().rstrip(".")) if t]
+    neu = [t for t in teile if not set(re.findall(r"[a-z]{4,}", t.lower())) <= da]
+    if _HINTEN.search(prompt):
+        neu = [t for t in neu if not _GESICHT_TEIL.search(t)]
+    if not neu:
+        return prompt
+    rest = ", ".join(neu)
+    mit = f"{prompt.rstrip()} {rest[:1].upper()}{rest[1:]}."
+    return prompt if ueberlang(mit) else mit
+
+
+def raw_schritte() -> int:
+    """Schritte für Raw (Config `bild_krea_raw_schritte`, 20–80; Vorgabe 52)."""
+    try:
+        n = int(_cfg("bild_krea_raw_schritte", RAW_SCHRITTE))
+    except (TypeError, ValueError):
+        n = RAW_SCHRITTE
+    return min(max(n, RAW_SCHRITTE_MIN), RAW_SCHRITTE_MAX)
+
+
+def raw_cfg() -> float:
+    """CFG-Stärke für Raw (Config `bild_krea_raw_cfg`, 0–10; Vorgabe 3,5)."""
+    try:
+        g = float(_cfg("bild_krea_raw_cfg", RAW_CFG))
+    except (TypeError, ValueError):
+        g = RAW_CFG
+    return min(max(g, 0.0), 10.0)
+
+
+def raw_mu(W: int, H: int) -> float:
+    x1, y1, x2, y2 = _RAW_MU
+    return y1 + (y2 - y1) / (x2 - x1) * ((W // 16) * (H // 16) - x1)
+
+
+def set_schritte(n: int) -> int:
+    """Schrittzahl dauerhaft speichern (auf 8–16 begrenzt). Gibt den gespeicherten Wert zurück."""
+    import config
+    n = min(max(int(n), SCHRITTE_MIN), SCHRITTE_MAX)
+    config.update(bild_krea_schritte=n)
+    return n
+
+
+def set_chosen_model(ref: str) -> None:
+    """Krea-Modell merken und Krea als Bild-Motor wählen."""
+    import config
+    config.update(bild_krea_model=ref, bild_backend="krea")
+
+
+def _extlibs() -> None:
+    """Als exe: torch & Co. aus einem installierten Python einbinden (extlibs.py).
+    Die exe bringt sie nicht mit – ohne diesen Schritt fehlen sie immer."""
+    try:
+        import extlibs
+        extlibs.enable()
+    except Exception:
+        pass
+
+
+def missing_reason() -> str | None:
+    """None, wenn Krea 2 malen kann. Sonst ein kurzer Hinweis."""
+    _extlibs()
+    fehlt = []
+    for mod, nice in (("torch", "PyTorch"), ("safetensors", "safetensors"),
+                      ("tokenizers", "tokenizers"), ("PIL", "Pillow"), ("numpy", "numpy")):
+        try:
+            __import__(mod)
+        except Exception:
+            fehlt.append(nice)
+    if fehlt:
+        return "Es fehlt: " + ", ".join(fehlt) + "."
+    d = krea_dir()
+    if not discover():
+        return f"Kein Krea-2-Modell in {d}."
+    t = teile()
+    if t["text"] is None:
+        return f"Text-Encoder fehlt: {d / 'text_encoders'}"
+    if t["vae"] is None:
+        return f"VAE fehlt: {d / 'vae'}"
+    if not _tokenizer_da(t["tokenizer"]):
+        return f"Tokenizer fehlt: {t['tokenizer']} (tokenizer.json oder vocab.json + merges.txt + tokenizer_config.json)"
+    return None
+
+
+def _tokenizer_da(d: Path) -> bool:
+    return (d / "tokenizer.json").exists() or all(
+        (d / n).exists() for n in ("vocab.json", "merges.txt", "tokenizer_config.json"))
+
+
+# Vorzerlegung des Qwen-BPE (Qwen 2 bis 3 teilen Wortliste und Regeln)
+_QWEN_SPLIT = (r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}"
+               r"| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+")
+
+
+_TOK_CACHE: dict = {}
+
+
+def _tokenizer():
+    """Qwen-Tokenizer aus dem lokalen Ordner, je Ordner einmal gebaut."""
+    d = teile()["tokenizer"]
+    if (tok := _TOK_CACHE.get(str(d))) is None:
+        tok = _TOK_CACHE[str(d)] = _tokenizer_bauen(d)
+    return tok
+
+
+def _tokenizer_bauen(d: Path):
+    """Qwen-Tokenizer: tokenizer.json oder vocab.json + merges.txt."""
+    from tokenizers import AddedToken, Regex, Tokenizer, decoders, models, normalizers, pre_tokenizers
+    if (d / "tokenizer.json").exists():
+        tok = Tokenizer.from_file(str(d / "tokenizer.json"))
+    else:
+        tok = Tokenizer(models.BPE.from_file(str(d / "vocab.json"), str(d / "merges.txt"),
+                                             continuing_subword_prefix="", end_of_word_suffix="",
+                                             fuse_unk=False, byte_fallback=False))
+        tok.normalizer = normalizers.NFC()
+        tok.pre_tokenizer = pre_tokenizers.Sequence([
+            pre_tokenizers.Split(Regex(_QWEN_SPLIT), behavior="isolated", invert=False),
+            pre_tokenizers.ByteLevel(add_prefix_space=False, use_regex=False)])
+        tok.decoder = decoders.ByteLevel()
+        cfg = d / "tokenizer_config.json"
+        if not cfg.exists():                     # ohne sie würden <|im_start|> & Co. als Text zerlegt
+            raise FileNotFoundError(f"Tokenizer unvollständig: {cfg.name} fehlt in {d}")
+        dec = json.loads(cfg.read_text(encoding="utf-8")).get("added_tokens_decoder", {})
+        tok.add_special_tokens([AddedToken(v["content"], special=True, normalized=False)
+                                for _, v in sorted(dec.items(), key=lambda kv: int(kv[0]))])
+    return lambda text: tok.encode(text, add_special_tokens=False).ids
+
+
+# ===========================================================================
+#  Gewichte: bf16, FP8 (skaliert) und NVFP4
+# ===========================================================================
+
+def _lade(path: Path, device, prefix: str = "", skip: tuple = ()) -> dict:
+    from safetensors import safe_open
+    out = {}
+    with safe_open(str(path), framework="pt", device="cpu") as f:
+        for k in f.keys():
+            if not k.startswith(prefix) or k.startswith(skip):
+                continue
+            out[k[len(prefix):]] = f.get_tensor(k).to(device)
+    return out
+
+
+_ALTE_FORMATE = {"nvfp4", "float8_e4m3fn", "float8_e5m2"}
+_SKALEN = (".comfy_quant", ".weight_scale", ".weight_scale_2", ".scale_weight", ".input_scale", ".scale_input",
+           ".pre_quant_scale")
+
+
+def _bisheriger_weg(path: Path) -> bool:
+    """Eine einzelne ComfyUI-safetensors mit Vorsatz in bf16, FP8 oder NVFP4: der bewährte Lader.
+    Alles andere (GGUF, geteilt, ohne Vorsatz, MXFP8, INT8 …) liest der gemeinsame Bild-Lader."""
+    if path.suffix.lower() != ".safetensors":
+        return False
+    from bildmotoren import gewichte as G
+    if G.teile_von(path) != [path]:
+        return False
+    kopf = _kopf(path)
+    if not any(k.startswith("model.diffusion_model.") for k in kopf):
+        return False
+    if any(isinstance(v, dict) and v.get("dtype") in ("I8", "F8_E8M0") for v in kopf.values()):
+        return False
+    try:
+        schichten = json.loads((kopf.get("__metadata__") or {}).get("_quantization_metadata") or "{}").get("layers", {})
+    except ValueError:
+        schichten = {}
+    if any(str(v.get("format", "")) not in _ALTE_FORMATE for v in schichten.values() if isinstance(v, dict)):
+        return False
+    quant = [k for k in kopf if k.endswith(".comfy_quant")]
+    if quant:
+        from safetensors import safe_open
+        with safe_open(str(path), framework="pt", device="cpu") as f:
+            for k in quant:
+                try:
+                    fmt = json.loads(bytes(f.get_tensor(k).tolist())).get("format")
+                except ValueError:
+                    return False
+                if fmt not in _ALTE_FORMATE:
+                    return False
+    return True
+
+
+def _lade_dit(path: Path, device) -> dict:
+    """Gewichte des Diffusionsmodells, Namen ohne Vorsatz. Matrizen in neuen Formaten kommen als
+    bildmotoren.gewichte.Lin (rechnet gepackt), alles andere als dichter Tensor."""
+    if _bisheriger_weg(path):
+        return _lade(path, device, prefix="model.diffusion_model.")
+    import torch
+    from bildmotoren import gewichte as G
+    namen, vorsatz = G.ohne_praefix(G.namen(path))
+    dicht = {"txtfusion.projector.weight"}             # wird als Matrix direkt gelesen, nicht als Linear
+    sd: dict = {}
+    with G.Quelle(path, vorsatz) as q:
+        gguf_typ = {}
+        if q.gguf:
+            from ggufengine.gguf import GGML_TYPES
+            gguf_typ = {k[len(vorsatz):]: GGML_TYPES[ti.ggml_type][0] for k, ti in q._gg.tensors.items()}
+        for k, form in namen.items():
+            if k.endswith(_SKALEN):
+                continue
+            if k.endswith(".weight") and k not in dicht and len(form) == 2:
+                if q.gguf:
+                    gepackt = gguf_typ.get(k, "F32") not in ("F32", "F16", "BF16")
+                else:                                  # Datentyp aus dem Kopf, ohne die Matrix zu lesen
+                    typ = q._st[q._wo[vorsatz + k]].get_slice(vorsatz + k).get_dtype()
+                    gepackt = q.hat(k[:-7] + ".comfy_quant") or typ not in ("BF16", "F16", "F32")
+                if gepackt:
+                    lin = q.lin(k[:-7])
+                    lin.bias = None                    # die Krea-Linear setzt den Bias selbst
+                    sd[k] = lin.zu(device) if str(device) != "cpu" else lin
+                    continue
+            t = q.tensor(k, torch.bfloat16 if len(form) >= 2 else None)
+            sd[k] = t.to(device)
+    return sd
+
+def _from_blocked(blocked, rows: int, cols: int):
+    """cuBLAS-Kachelanordnung (128x4-Blöcke) der NVFP4-Skalen zurück in (rows, cols)."""
+    nr, nc = -(-rows // 128), -(-cols // 4)
+    x = blocked.reshape(-1, 32, 4, 4).transpose(1, 2)
+    x = x.reshape(nr, nc, 128, 4).permute(0, 2, 1, 3)
+    return x.reshape(nr * 128, nc * 4)[:rows, :cols]
+
+
+_LUT_CACHE: dict = {}
+
+
+def _lut256(device, dtype):
+    """Byte -> (hohes Nibble, niedriges Nibble) als zwei E2M1-Werte."""
+    key = (str(device), dtype)
+    if key not in _LUT_CACHE:
+        import torch
+        e = torch.tensor(_E2M1, dtype=torch.float32)
+        b = torch.arange(256)
+        _LUT_CACHE[key] = torch.stack((e[b >> 4], e[b & 15]), -1).to(device, dtype)
+    return _LUT_CACHE[key]
+
+
+def _to_blocked(m):
+    """(rows, cols) -> cuBLAS-Kachelanordnung, aufgefüllt auf 128x4."""
+    import torch
+    r, c = m.shape
+    nr, nc = -(-r // 128), -(-c // 4)
+    if (r, c) != (nr * 128, nc * 4):
+        p = torch.zeros(nr * 128, nc * 4, device=m.device, dtype=m.dtype)
+        p[:r, :c] = m
+        m = p
+    b = m.view(nr, 128, nc, 4).permute(0, 2, 1, 3)
+    return b.reshape(-1, 4, 32, 4).transpose(1, 2).reshape(nr * 128, nc * 4)
+
+
+_FP4_TAB: dict = {}
+
+
+def _fp4_tabellen(device, dtype):
+    """Grenzen zwischen den 15 E2M1-Werten und Paar-Index -> gepacktes Byte."""
+    key = (str(device), dtype)
+    if key not in _FP4_TAB:
+        import torch
+        e = torch.tensor([-6, -4, -3, -2, -1.5, -1, -0.5, 0, 0.5, 1, 1.5, 2, 3, 4, 6.0])
+        code = torch.tensor([15, 14, 13, 12, 11, 10, 9, 0, 1, 2, 3, 4, 5, 6, 7], dtype=torch.int32)
+        paar = (code[:, None] * 16 + code[None, :]).to(torch.uint8).flatten()
+        _FP4_TAB[key] = (((e[1:] + e[:-1]) / 2).to(device, dtype), paar.to(device))
+    return _FP4_TAB[key]
+
+
+def _fp4_quant(x):
+    """Aktivierung (M, K) -> NVFP4: gepackte Werte, Blockskalen (gekachelt), globale Skala."""
+    import torch
+    M, K = x.shape
+    blk = x.view(M, K // 16, 16)
+    am = torch.linalg.vector_norm(blk, ord=float("inf"), dim=-1).float()
+    gs = (am.amax() / 2688.0).clamp(min=1e-12)             # 448 (FP8) * 6 (E2M1)
+    bs = (am / (6.0 * gs)).clamp(max=448.0).to(torch.float8_e4m3fn)
+    bsf = bs.float()
+    inv = torch.where(bsf == 0, 0.0, 1.0 / (gs * bsf)).to(x.dtype)
+    v = (blk * inv.unsqueeze(-1)).view(M, K)
+    grenzen, paar = _fp4_tabellen(x.device, x.dtype)
+    i = torch.bucketize(v, grenzen, out_int32=True)
+    q = paar[i[:, 0::2] * 15 + i[:, 1::2]]                  # erstes Element im hohen Nibble
+    return q, _to_blocked(bs), gs
+
+
+_FP4_OK: dict = {}
+
+
+def _fp4_bereit(device) -> bool:
+    """Kann die Karte NVFP4 direkt multiplizieren (Blackwell, torch mit scaled_mm)?"""
+    key = str(device)
+    if key not in _FP4_OK:
+        import torch
+        import torch.nn.functional as F
+        ok = (torch.device(device).type == "cuda" and hasattr(F, "scaled_mm")
+              and hasattr(torch, "float4_e2m1fn_x2")
+              and torch.cuda.get_device_capability(device) >= (10, 0))
+        _FP4_OK[key] = ok
+    return _FP4_OK[key]
+
+
+class Eingabe:
+    """Eine Aktivierung, die mehrere Schichten teilen: NVFP4-Fassung nur einmal rechnen."""
+
+    def __init__(self, x):
+        self.x = x
+        self._q = None
+
+    def fp4(self):
+        if self._q is None:
+            self._q = _fp4_quant(self.x.reshape(-1, self.x.shape[-1]))
+        return self._q
+
+
+class _Linear:
+    """Linear-Schicht für bf16-, FP8- und NVFP4-Gewichte; andere Formate über bildmotoren.gewichte.Lin."""
+
+    def __init__(self, sd: dict, name: str, dtype):
+        import torch
+        w = sd.pop(name + ".weight")
+        self.bias = sd.pop(name + ".bias", None)
+        if self.bias is not None:
+            self.bias = self.bias.to(dtype)
+        self.dtype = dtype
+        if not isinstance(w, torch.Tensor):            # bildmotoren.gewichte.Lin: MXFP8, INT8, GGUF …
+            self.lin, self.art = w, "lin"
+            self.out_f, self.in_f = w.n_out, w.n_in
+            return
+        quant = sd.pop(name + ".comfy_quant", None)
+        fmt = json.loads(bytes(quant.cpu().tolist())).get("format") if quant is not None else None
+        if fmt is None and w.dtype == torch.uint8 and (name + ".weight_scale_2") in sd:
+            fmt = "nvfp4"                                   # Datei ohne comfy_quant-Angabe: Bytes + zweite Skala
+        if fmt == "nvfp4":
+            ts = sd.pop(name + ".weight_scale_2").float()
+            bs = sd.pop(name + ".weight_scale")
+            self.out_f, self.in_f = w.shape[0], w.shape[1] * 2
+            self.q = w                                      # uint8, zwei Werte je Byte
+            if _fp4_bereit(w.device):
+                self.art = "nvfp4_mm"
+                self.bs, self.ts = bs.reshape(-1), ts
+                self.scale = None                           # entpackt nur bei Bedarf (LoRA-Rückweg)
+            else:
+                self.art = "nvfp4"
+                bs = _from_blocked(bs, self.out_f, self.in_f // 16)
+                self.scale = (bs.float() * ts).to(dtype)
+        elif w.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+            s = sd.pop(name + ".weight_scale", None)
+            self.out_f, self.in_f = w.shape
+            self.w = w
+            self.scale = s.float().to(dtype) if s is not None else None
+            self.art = "fp8"
+        else:
+            self.out_f, self.in_f = w.shape
+            self.w = w.to(dtype)
+            self.art = "plain"
+
+    def weight(self):
+        import torch.nn.functional as F
+        if self.art == "nvfp4_mm":
+            skala = _from_blocked(self.bs, self.out_f, self.in_f // 16).float() * self.ts
+            w = F.embedding(self.q.int(), _lut256(self.q.device, self.dtype))
+            return (w.view(self.out_f, self.in_f // 16, 16) * skala.to(self.dtype).unsqueeze(-1)).view(
+                self.out_f, self.in_f)
+        if self.art == "nvfp4":
+            w = F.embedding(self.q.int(), _lut256(self.q.device, self.dtype))
+            w = w.view(self.out_f, self.in_f // 16, 16) * self.scale.unsqueeze(-1)
+            return w.view(self.out_f, self.in_f)
+        if self.art == "fp8":
+            w = self.w.to(self.dtype)
+            return w * self.scale if self.scale is not None else w
+        if self.art == "lin":
+            return self.lin.gewicht(self.dtype)
+        return self.w
+
+    def __call__(self, x):
+        import torch
+        import torch.nn.functional as F
+        ein = x if isinstance(x, Eingabe) else None
+        x = ein.x if ein else x
+        if self.art == "lin":
+            y = self.lin(x)
+            return y + self.bias.to(y.dtype) if self.bias is not None else y
+        if self.art != "nvfp4_mm":
+            return F.linear(x, self.weight(), self.bias)
+        q, bs, gs = (ein or Eingabe(x)).fp4()
+        S, W = F.ScalingType, F.SwizzleType
+        y = F.scaled_mm(
+            q.view(torch.float4_e2m1fn_x2), self.q.view(torch.float4_e2m1fn_x2).t(),
+            [bs.view(-1), gs], [S.BlockWise1x16, S.TensorWise],
+            [self.bs, self.ts], [S.BlockWise1x16, S.TensorWise],
+            swizzle_a=[W.SWIZZLE_32_4_4, W.NO_SWIZZLE], swizzle_b=[W.SWIZZLE_32_4_4, W.NO_SWIZZLE],
+            bias=self.bias, output_dtype=self.dtype)
+        return y.view(*x.shape[:-1], self.out_f)
+
+
+_SDPA_REIHENFOLGE = None
+
+
+def _sdpa(q, k, v, **kw):
+    """scaled_dot_product_attention mit cuDNN zuerst (auf Blackwell deutlich schneller)."""
+    global _SDPA_REIHENFOLGE
+    import torch.nn.functional as F
+    from torch.nn.attention import SDPBackend, sdpa_kernel
+    if _SDPA_REIHENFOLGE is None:
+        _SDPA_REIHENFOLGE = [SDPBackend.CUDNN_ATTENTION, SDPBackend.FLASH_ATTENTION,
+                             SDPBackend.EFFICIENT_ATTENTION, SDPBackend.MATH]
+    with sdpa_kernel(_SDPA_REIHENFOLGE, set_priority=True):
+        return F.scaled_dot_product_attention(q, k, v, **kw)
+
+
+def _rms(x, w, eps):
+    """RMSNorm mit fertigem float32-Gewicht."""
+    import torch.nn.functional as F
+    return F.rms_norm(x.float(), (x.shape[-1],), weight=w, eps=eps).to(x.dtype)
+
+
+# ===========================================================================
+#  Text: Qwen3-VL-4B (nur der Sprachteil)
+# ===========================================================================
+
+class _Qwen3Text:
+    HEADS, KV_HEADS, HEAD_DIM, EPS, THETA = 32, 8, 128, 1e-6, 5_000_000.0
+
+    def __init__(self, path: Path, device, dtype):
+        n_layers = max(_TAPS)                      # Schicht 35 und die Schluss-Norm braucht es nicht
+        skip = ("model.visual.", "lm_head.", "model.norm.") + tuple(
+            f"model.layers.{i}." for i in range(n_layers, 64))
+        sd = _lade(path, device, prefix="model.", skip=skip)
+        self.dtype = dtype
+        self.embed = sd.pop("embed_tokens.weight").to(dtype)
+        self.layers = []
+        for i in range(n_layers):
+            p = f"layers.{i}."
+            L = {n: _Linear(sd, p + n, dtype) for n in
+                 ("self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj",
+                  "self_attn.o_proj", "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj")}
+            for n in ("input_layernorm", "post_attention_layernorm",
+                      "self_attn.q_norm", "self_attn.k_norm"):
+                L[n] = sd.pop(p + n + ".weight").float()
+            self.layers.append(L)
+
+    def _rope(self, n, device):
+        import torch
+        inv = 1.0 / (self.THETA ** (torch.arange(0, self.HEAD_DIM, 2, device=device).float()
+                                    / self.HEAD_DIM))
+        f = torch.arange(n, device=device).float()[:, None] * inv[None]
+        emb = torch.cat((f, f), -1)
+        return emb.cos()[None, None], emb.sin()[None, None]
+
+    @staticmethod
+    def _rot(x, cos, sin):
+        import torch
+        h = x.shape[-1] // 2
+        xf = x.float()
+        rot = torch.cat((-xf[..., h:], xf[..., :h]), -1)
+        return (xf * cos + rot * sin).to(x.dtype)
+
+    def taps(self, ids):
+        """(1, seq, 12, 2560): die abgegriffenen Zwischenzustände."""
+        import torch
+        import torch.nn.functional as F
+        x = self.embed[ids][None]
+        n = x.shape[1]
+        cos, sin = self._rope(n, x.device)
+        out = []
+        H, KV, D = self.HEADS, self.KV_HEADS, self.HEAD_DIM
+        for i in range(max(_TAPS) + 1):
+            if i in _TAPS:
+                out.append(x)
+            if i == max(_TAPS):
+                break
+            L = self.layers[i]
+            h = _rms(x, L["input_layernorm"], self.EPS)
+            q = L["self_attn.q_proj"](h).view(1, n, H, D).transpose(1, 2)
+            k = L["self_attn.k_proj"](h).view(1, n, KV, D).transpose(1, 2)
+            v = L["self_attn.v_proj"](h).view(1, n, KV, D).transpose(1, 2)
+            q = self._rot(_rms(q, L["self_attn.q_norm"], self.EPS), cos, sin)
+            k = self._rot(_rms(k, L["self_attn.k_norm"], self.EPS), cos, sin)
+            a = _sdpa(q, k, v, is_causal=True, enable_gqa=True)
+            x = x + L["self_attn.o_proj"](a.transpose(1, 2).reshape(1, n, H * D))
+            h = _rms(x, L["post_attention_layernorm"], self.EPS)
+            x = x + L["mlp.down_proj"](F.silu(L["mlp.gate_proj"](h)) * L["mlp.up_proj"](h))
+        return torch.stack(out, 2)
+
+
+# Krea 2 liest höchstens 512 Text-Token (Prompt + Schluss der Vorlage); wie die Referenz-Pipeline wird der Rest
+# des Prompts abgeschnitten – längere Folgen hat das Modell nie gesehen.
+MAX_TEXT = 512
+_SCHLUSS = 5                                   # <|im_end|> \n <|im_start|> assistant \n
+
+
+def _ids(prompt: str) -> tuple[list[int], int, int]:
+    """Token der Vorlage, Beginn des Prompts darin und Zahl der abgeschnittenen Prompt-Token."""
+    ids = _tokenizer()(_TEMPLATE.format(prompt))
+    ende, gesehen = 0, 0
+    for i, t in enumerate(ids):
+        if t == _IM_START and gesehen < 2:
+            ende, gesehen = i, gesehen + 1
+    if len(ids) > ende + 3 and ids[ende + 1] == _TOK_USER and ids[ende + 2] == _TOK_NL:
+        ende += 3
+    zuviel = max(0, len(ids) - ende - MAX_TEXT)
+    if zuviel:
+        ids = ids[:len(ids) - _SCHLUSS - zuviel] + ids[-_SCHLUSS:]
+    return ids, ende, zuviel
+
+
+def ueberlang(prompt: str) -> int:
+    """Wie viele Token des Prompts Krea 2 abschneidet (0 = passt; auch 0, wenn der Tokenizer fehlt)."""
+    try:
+        return _ids(prompt)[2]
+    except Exception:
+        return 0
+
+
+def _encode(prompt: str, te, device):
+    import torch
+    ids, ende, zuviel = _ids(prompt)
+    if zuviel:
+        _DBG.ereignis(f"Krea 2: Prompt um {zuviel} Token gekürzt (höchstens {MAX_TEXT})")
+    with torch.no_grad():
+        h = te.taps(torch.tensor(ids, device=device))
+    return h[:, ende:].contiguous()
+
+
+# Fertige Text-Einbettungen (im Arbeitsspeicher): derselbe Prompt – etwa der Gesichts-Satz für jedes Gesicht –
+# braucht den Text-Encoder nicht noch einmal auf der Karte.
+_TEXT_CACHE: dict = {}
+_TEXT_CACHE_MAX = 4
+
+
+def _text_schluessel(pfad: Path, prompt: str) -> tuple:
+    try:
+        st = Path(pfad).stat()
+        return str(pfad), st.st_size, st.st_mtime_ns, prompt
+    except OSError:
+        return str(pfad), 0, 0, prompt
+
+
+def _text_einbetten(prompt: str, pfad: Path, device, dtype):
+    """Einbettung des Prompts, aus dem Zwischenspeicher oder frisch mit dem Text-Encoder."""
+    schluessel = _text_schluessel(pfad, prompt)
+    if (ctx := _TEXT_CACHE.pop(schluessel, None)) is not None:
+        _TEXT_CACHE[schluessel] = ctx                # zuletzt benutzt nach hinten
+        _DBG.ereignis("Bildmotor: Text aus dem Zwischenspeicher")
+        return ctx.to(device)
+    te = _auf_gpu("text", pfad, lambda: _Qwen3Text(pfad, device, dtype), device)
+    ctx = _encode(prompt, te, device)
+    del te
+    _TEXT_CACHE[schluessel] = ctx.to("cpu")
+    while len(_TEXT_CACHE) > _TEXT_CACHE_MAX:
+        _TEXT_CACHE.pop(next(iter(_TEXT_CACHE)))
+    _frei()
+    return ctx
+
+
+# ===========================================================================
+#  Diffusionsmodell: Single-Stream-DiT
+# ===========================================================================
+
+class _Attn:
+    def __init__(self, sd, p, heads, kvheads, dtype):
+        self.wq, self.wk, self.wv, self.gate, self.wo = (
+            _Linear(sd, p + n, dtype) for n in ("wq", "wk", "wv", "gate", "wo"))
+        self.qn = sd.pop(p + "qknorm.qnorm.scale").float() + 1.0
+        self.kn = sd.pop(p + "qknorm.knorm.scale").float() + 1.0
+        self.heads, self.kvheads = heads, kvheads
+
+    def __call__(self, x, rope=None):
+        import torch
+        B, L, _ = x.shape
+        e = Eingabe(x)
+        q = self.wq(e).view(B, L, self.heads, -1).transpose(1, 2)
+        k = self.wk(e).view(B, L, self.kvheads, -1).transpose(1, 2)
+        v = self.wv(e).view(B, L, self.kvheads, -1).transpose(1, 2)
+        q, k = _rms(q, self.qn, 1e-5), _rms(k, self.kn, 1e-5)
+        if rope is not None:
+            q, k = _rope_apply(q, rope), _rope_apply(k, rope)
+        a = _sdpa(q, k, v, enable_gqa=self.kvheads != self.heads)
+        a = a.transpose(1, 2).reshape(B, L, -1)
+        return self.wo(a * torch.sigmoid(self.gate(e)))
+
+
+class _SwiGLU:
+    def __init__(self, sd, p, dtype):
+        self.gate, self.up, self.down = (_Linear(sd, p + n, dtype) for n in ("gate", "up", "down"))
+
+    def __call__(self, x):
+        import torch.nn.functional as F
+        e = Eingabe(x)
+        return self.down(F.silu(self.gate(e)) * self.up(e))
+
+
+class _FusionBlock:
+    def __init__(self, sd, p, dtype):
+        self.pre = sd.pop(p + "prenorm.scale").float() + 1.0
+        self.post = sd.pop(p + "postnorm.scale").float() + 1.0
+        self.attn = _Attn(sd, p + "attn.", 20, 20, dtype)
+        self.mlp = _SwiGLU(sd, p + "mlp.", dtype)
+
+    def __call__(self, x):
+        x = x + self.attn(_rms(x, self.pre, 1e-5))
+        return x + self.mlp(_rms(x, self.post, 1e-5))
+
+
+class _Block:
+    def __init__(self, sd, p, dtype):
+        self.mod = sd.pop(p + "mod.lin").to(dtype)
+        self.pre = sd.pop(p + "prenorm.scale").float() + 1.0
+        self.post = sd.pop(p + "postnorm.scale").float() + 1.0
+        self.attn = _Attn(sd, p + "attn.", 48, 12, dtype)
+        self.mlp = _SwiGLU(sd, p + "mlp.", dtype)
+
+    def __call__(self, x, vec, rope):
+        pscale, pshift, pgate, qscale, qshift, qgate = (vec + self.mod).chunk(6, dim=-1)
+        x = x + pgate * self.attn((1 + pscale) * _rms(x, self.pre, 1e-5) + pshift, rope)
+        return x + qgate * self.mlp((1 + qscale) * _rms(x, self.post, 1e-5) + qshift)
+
+
+def _rope_tab(pos, axes=(32, 48, 48), theta=1000.0):
+    """(cos, sin) je Token und Frequenz für die drei Achsen (t, h, w)."""
+    import torch
+    teile_ = []
+    for i, d in enumerate(axes):
+        omega = 1.0 / (theta ** (torch.arange(0, d, 2, dtype=torch.float64, device=pos.device) / d))
+        teile_.append(pos[:, i:i + 1].double() * omega[None])
+    ang = torch.cat(teile_, -1).float()
+    return ang.cos()[None, None], ang.sin()[None, None]
+
+
+def _rope_apply(x, rope):
+    """Paarweise Rotation (x0, x1) benachbarter Kanäle."""
+    import torch
+    cos, sin = rope
+    xf = x.float().unflatten(-1, (-1, 2))
+    x0, x1 = xf[..., 0], xf[..., 1]
+    return torch.stack((cos * x0 - sin * x1, sin * x0 + cos * x1), -1).flatten(-2).to(x.dtype)
+
+
+class _DiT:
+    PATCH, CH = 2, 16
+
+    def __init__(self, path: Path, device, dtype, on_status=None):
+        sd = _lade_dit(path, device)
+        self.dtype = dtype
+        n = 1 + max(int(k.split(".")[1]) for k in sd if k.startswith("blocks."))
+        self.first = _Linear(sd, "first", dtype)
+        self.tmlp = (_Linear(sd, "tmlp.0", dtype), _Linear(sd, "tmlp.2", dtype))
+        self.tproj = _Linear(sd, "tproj.1", dtype)
+        self.txt_layer = [_FusionBlock(sd, f"txtfusion.layerwise_blocks.{i}.", dtype) for i in range(2)]
+        self.txt_proj = sd.pop("txtfusion.projector.weight").to(dtype)
+        self.txt_ref = [_FusionBlock(sd, f"txtfusion.refiner_blocks.{i}.", dtype) for i in range(2)]
+        self.txt_norm = sd.pop("txtmlp.0.scale").float() + 1.0
+        self.txtmlp = (_Linear(sd, "txtmlp.1", dtype), _Linear(sd, "txtmlp.3", dtype))
+        self.blocks = []
+        for i in range(n):
+            self.blocks.append(_Block(sd, f"blocks.{i}.", dtype))
+            if on_status and i % 7 == 6:
+                on_status(f"Krea 2: Modell {i + 1}/{n} Blöcke bereit …")
+        self.last_norm = sd.pop("last.norm.scale").float() + 1.0
+        self.last_mod = sd.pop("last.modulation.lin").to(dtype)
+        self.last = _Linear(sd, "last.linear", dtype)
+
+    @staticmethod
+    def _t_emb(t, dim=256):
+        import torch
+        t = t * 1000.0
+        half = dim // 2
+        f = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
+        a = t[:, None].float() * f[None]
+        return torch.cat((a.cos(), a.sin()), -1)
+
+    def text(self, ctx):
+        """(B, seq, 12, 2560) -> (B, seq, 6144); einmal je Bild."""
+        import torch.nn.functional as F
+        b, l, n, d = ctx.shape
+        x = ctx.to(self.dtype).reshape(b * l, n, d)
+        for blk in self.txt_layer:
+            x = blk(x)
+        x = x.reshape(b, l, n, d).transpose(2, 3)                # b l d n
+        x = F.linear(x, self.txt_proj).squeeze(-1)
+        for blk in self.txt_ref:
+            x = blk(x)
+        x = _rms(x, self.txt_norm, 1e-5)
+        return self.txtmlp[1](F.gelu(self.txtmlp[0](x), approximate="tanh"))
+
+    def __call__(self, x, sigma, txt):
+        import torch
+        import torch.nn.functional as F
+        B, C, H, W = x.shape
+        p = self.PATCH
+        h, w = H // p, W // p
+        img = x.to(self.dtype).reshape(B, C, h, p, w, p).permute(0, 2, 4, 1, 3, 5).reshape(B, h * w, C * p * p)
+        img = self.first(img)
+
+        t = self._t_emb(sigma).unsqueeze(1).to(self.dtype)
+        t = self.tmlp[1](F.gelu(self.tmlp[0](t), approximate="tanh"))
+        vec = self.tproj(F.gelu(t, approximate="tanh"))
+
+        L = txt.shape[1]
+        pos = torch.zeros(L + h * w, 3, device=x.device)
+        pos[L:, 1] = torch.arange(h, device=x.device).repeat_interleave(w).float()
+        pos[L:, 2] = torch.arange(w, device=x.device).repeat(h).float()
+        rope = _rope_tab(pos)
+
+        z = self.bloecke(torch.cat((txt, img), 1), vec, rope)
+        scale, shift = (t + self.last_mod.unsqueeze(0)).chunk(2, dim=1)
+        z = self.last((1 + scale) * _rms(z, self.last_norm, 1e-5) + shift)
+        z = z[:, L:].reshape(B, h, w, C, p, p).permute(0, 3, 1, 4, 2, 5).reshape(B, C, H, W)
+        return z.float()
+
+    def bloecke(self, z, vec, rope):
+        """Die Transformer-Blöcke (dort liegt fast die ganze Rechenzeit; trtmotor ersetzt nur sie)."""
+        for blk in self.blocks:
+            z = blk(z, vec, rope)
+        return z
+
+
+# ===========================================================================
+#  LoRA an den Transformer-Blöcken (Charakter-LoRA einer Persönlichkeit)
+# ===========================================================================
+
+LORA_ZIEL = "krea2"                                    # Profile/<Name>/LoRA/krea2.safetensors
+LORA_SCHICHTEN = ("attn.wq", "attn.wk", "attn.wv", "attn.gate", "attn.wo", "mlp.gate", "mlp.up", "mlp.down")
+
+
+def lora_anbringen(dit: _DiT, rang: int, alpha: float, device, dtype) -> dict:
+    """Jede Ziel-Linear der Blöcke bekommt eine LoRA daneben (B = 0: rechnet zunächst wie vorher).
+    Gibt {"blocks.<i>.<teil>.<name>": LoraLinear} zurück."""
+    import lora as L
+    schichten = {}
+    for i, blk in enumerate(dit.blocks):
+        for ziel in LORA_SCHICHTEN:
+            teil, attr = ziel.split(".")
+            halter = getattr(blk, teil)
+            basis = getattr(halter, attr)
+            basis = basis.basis if isinstance(basis, L.LoraLinear) else basis
+            schicht = L.LoraLinear(basis, rang, alpha, device, dtype)
+            setattr(halter, attr, schicht)
+            schichten[f"blocks.{i}.{ziel}"] = schicht
+    return schichten
+
+
+def lora_einsetzen(dit: _DiT, pfad: Path, staerke: float, device, dtype) -> int:
+    """Gespeicherte LoRA neben die Gewichte setzen (die Grundgewichte bleiben, wie sie sind – auch NVFP4).
+    Gibt die Zahl der Schichten zurück; passt die LoRA nicht zu diesem Modell: RuntimeError."""
+    import torch
+    import lora as L
+    teile_, meta = L.laden(pfad)
+    if not teile_:
+        raise RuntimeError("die LoRA ist leer")
+    rang = next(iter(teile_.values()))[0].shape[0]
+    schichten = lora_anbringen(dit, rang, float(meta.get("alpha") or rang), device, dtype)
+    fremd = set(teile_) - set(schichten)
+    try:
+        if fremd:
+            raise RuntimeError(f"{len(fremd)} Schichten gibt es in diesem Modell nicht (z. B. {sorted(fremd)[0]})")
+        with torch.no_grad():
+            for name, s in schichten.items():
+                a, b, skala = teile_.get(name, (None, None, 0.0))
+                if a is None:
+                    s.B.zero_()
+                    continue
+                if tuple(a.shape) != tuple(s.A.shape) or tuple(b.shape) != tuple(s.B.shape):
+                    raise RuntimeError(f"{name} hat eine andere Form")
+                s.A.copy_(a)
+                s.B.copy_(b)
+                s.skala = skala * float(staerke)
+    except Exception:
+        lora_abnehmen(dit)
+        raise
+    return len(teile_)
+
+
+def lora_abnehmen(dit: _DiT) -> None:
+    import lora as L
+    for blk in dit.blocks:
+        for ziel in LORA_SCHICHTEN:
+            teil, attr = ziel.split(".")
+            halter = getattr(blk, teil)
+            if isinstance(getattr(halter, attr), L.LoraLinear):
+                setattr(halter, attr, getattr(halter, attr).basis)
+
+
+def lora_fuer_figur() -> Path | None:
+    """Die Krea-LoRA der aktiven Persönlichkeit, wenn sie existiert und `bild_lora` an ist (Vorgabe)."""
+    if not _cfg("bild_lora", True):
+        return None
+    try:
+        import profilordner
+        p = profilordner.lora_pfad(LORA_ZIEL)
+        return p if p.is_file() else None
+    except Exception:
+        return None
+
+
+# ===========================================================================
+#  VAE (Qwen-Image / Wan 2.1, als reiner 2D-Encoder/-Decoder für Einzelbilder)
+# ===========================================================================
+#
+# Die kausalen 3D-Faltungen sehen bei einem einzelnen Bild vor sich nur Nullen.
+# Übrig bleibt die letzte Zeitscheibe des Kerns als gewöhnliche 2D-Faltung.
+# Die zeitliche Verkleinerung (time_conv) greift erst ab dem zweiten Bild.
+
+class _VAEBasis:
+    def __init__(self, path: Path, device, dtype, skip: tuple):
+        sd = _lade(path, device, skip=skip)
+        self.sd = {k: v.to(dtype) for k, v in sd.items()}
+        self.dtype = dtype
+
+    def _conv(self, x, p, pad, stride=1):
+        import torch.nn.functional as F
+        w = self.sd[p + ".weight"]
+        if w.ndim == 5:
+            w = w[:, :, -1]
+        return F.conv2d(x, w, self.sd.get(p + ".bias"), stride=stride, padding=pad)
+
+    def _norm(self, x, p):
+        import torch.nn.functional as F
+        g = self.sd[p + ".gamma"].reshape(1, -1, 1, 1)
+        return F.normalize(x.float(), dim=1).to(x.dtype) * (x.shape[1] ** 0.5) * g
+
+    def _res(self, x, p):
+        import torch.nn.functional as F
+        h = self._conv(F.silu(self._norm(x, p + ".residual.0")), p + ".residual.2", 1)
+        h = self._conv(F.silu(self._norm(h, p + ".residual.3")), p + ".residual.6", 1)
+        sc = self._conv(x, p + ".shortcut", 0) if (p + ".shortcut.weight") in self.sd else x
+        return h + sc
+
+    def _attn(self, x, p):
+        b, c, hh, ww = x.shape
+        q, k, v = self._conv(self._norm(x, p + ".norm"), p + ".to_qkv", 0).chunk(3, dim=1)
+        q, k, v = (t.reshape(b, 1, c, hh * ww).transpose(-1, -2) for t in (q, k, v))
+        a = _sdpa(q, k, v)
+        a = a.transpose(-1, -2).reshape(b, c, hh, ww)
+        return x + self._conv(a, p + ".proj", 0)
+
+
+class _VAEEncoder(_VAEBasis):
+    """Bild [-1, 1] (B, 3, H, W) -> Mittelwert des Latents (B, 16, H/8, W/8), unnormiert."""
+
+    def __init__(self, path: Path, device, dtype):
+        super().__init__(path, device, dtype, skip=("decoder.", "conv2."))
+
+    def __call__(self, x):
+        import torch.nn.functional as F
+        x = self._conv(x.to(self.dtype), "encoder.conv1", 1)
+        i = 0
+        while f"encoder.downsamples.{i}.residual.0.gamma" in self.sd or \
+                f"encoder.downsamples.{i}.resample.1.weight" in self.sd:
+            p = f"encoder.downsamples.{i}"
+            if (p + ".resample.1.weight") in self.sd:
+                x = self._conv(F.pad(x, (0, 1, 0, 1)), p + ".resample.1", 0, stride=2)
+            else:
+                x = self._res(x, p)
+            i += 1
+        x = self._res(x, "encoder.middle.0")
+        x = self._attn(x, "encoder.middle.1")
+        x = self._res(x, "encoder.middle.2")
+        x = self._conv(F.silu(self._norm(x, "encoder.head.0")), "encoder.head.2", 1)
+        x = self._conv(x, "conv1", 0)
+        return x[:, :16].float()                     # Mittelwert; die zweite Hälfte ist log var
+
+
+class _VAEDecoder(_VAEBasis):
+    def __init__(self, path: Path, device, dtype):
+        super().__init__(path, device, dtype, skip=("encoder.", "conv1."))
+
+    def __call__(self, z):
+        import torch.nn.functional as F
+        x = self._conv(z.to(self.dtype), "conv2", 0)
+        x = self._conv(x, "decoder.conv1", 1)
+        x = self._res(x, "decoder.middle.0")
+        x = self._attn(x, "decoder.middle.1")
+        x = self._res(x, "decoder.middle.2")
+        i = 0
+        while f"decoder.upsamples.{i}.residual.0.gamma" in self.sd or \
+                f"decoder.upsamples.{i}.resample.1.weight" in self.sd:
+            p = f"decoder.upsamples.{i}"
+            if (p + ".resample.1.weight") in self.sd:
+                x = F.interpolate(x, scale_factor=2.0, mode="nearest-exact")
+                x = self._conv(x, p + ".resample.1", 1)
+            else:
+                x = self._res(x, p)
+            i += 1
+        x = self._conv(F.silu(self._norm(x, "decoder.head.0")), "decoder.head.2", 1)
+        return x.float().clamp(-1, 1)
+
+
+# ===========================================================================
+#  Sampler
+# ===========================================================================
+
+def _sigmas(steps: int, shift: float):
+    """'simple'-Plan über die Flux-Zeitverschiebung (10000 Stützstellen)."""
+    import torch
+    n = 10000
+
+    def sig(t):
+        return math.exp(shift) / (math.exp(shift) + (1.0 / t - 1.0))
+
+    ss = n / steps
+    s = [sig((n - int(i * ss)) / n) for i in range(steps)]
+    return torch.tensor(s + [0.0], dtype=torch.float32)
+
+
+def _beta_cf(x: float, a: float, b: float) -> float:
+    """Kettenbruch der unvollständigen Beta-Funktion (Lentz)."""
+    klein = 1e-300
+    qab, qap, qam = a + b, a + 1.0, a - 1.0
+    c, d = 1.0, 1.0 - qab * x / qap
+    d = 1.0 / (d if abs(d) > klein else klein)
+    h = d
+    for m in range(1, 300):
+        m2 = 2 * m
+        for aa in (m * (b - m) * x / ((qam + m2) * (a + m2)), -(a + m) * (qab + m) * x / ((a + m2) * (qap + m2))):
+            d = 1.0 + aa * d
+            d = 1.0 / (d if abs(d) > klein else klein)
+            c = 1.0 + aa / c
+            c = c if abs(c) > klein else klein
+            h *= d * c
+        if abs(d * c - 1.0) < 1e-12:
+            break
+    return h
+
+
+def beta_cdf(x: float, a: float, b: float) -> float:
+    """Regularisierte unvollständige Beta-Funktion I_x(a, b)."""
+    if x <= 0.0:
+        return 0.0
+    if x >= 1.0:
+        return 1.0
+    vorn = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log(1.0 - x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return vorn * _beta_cf(x, a, b) / a
+    return 1.0 - vorn * _beta_cf(1.0 - x, b, a) / b
+
+
+def beta_ppf(q: float, a: float, b: float) -> float:
+    """Quantil der Beta-Verteilung (Umkehrung von beta_cdf, Intervallhalbierung)."""
+    unten, oben = 0.0, 1.0
+    for _ in range(64):
+        mitte = (unten + oben) / 2
+        if beta_cdf(mitte, a, b) < q:
+            unten = mitte
+        else:
+            oben = mitte
+    return (unten + oben) / 2
+
+
+def _sigmas_beta(steps: int, shift: float, alpha: float = 0.6, beta: float = 0.6):
+    """Zeitplan „beta“ wie in ComfyUI: Stützstellen an den Quantilen der Beta-Verteilung, auf die 10000 Stufen der
+    Zeitverschiebung gerundet; doppelte fallen weg."""
+    import torch
+    n = 10000
+
+    def sig(t):
+        return math.exp(shift) / (math.exp(shift) + (1.0 / t - 1.0))
+
+    werte, letzte = [], None
+    for i in range(steps):
+        t = min(max(round(beta_ppf(1.0 - i / steps, alpha, beta) * n), 1), n) / n
+        if t != letzte:
+            werte.append(sig(t))
+            letzte = t
+    return torch.tensor(werte + [0.0], dtype=torch.float32)
+
+
+def _sigmas_plan(steps: int, shift: float, zeitplan: str = "simple"):
+    return _sigmas_beta(steps, shift) if zeitplan == "beta" else _sigmas(steps, shift)
+
+
+def _sigmas_ab(steps: int, shift: float, start: float):
+    """Wie _sigmas, aber beginnend bei Rauschstärke `start` (Nachmalen eines Bildes).
+    Der Zeitabschnitt bis `start` wird gleichmäßig in `steps` Schritte geteilt."""
+    import torch
+    k = math.exp(shift)
+    start = min(max(float(start), 0.01), 1.0)
+    t0 = 1.0 / (1.0 + k * (1.0 / start - 1.0))          # Umkehrung der Zeitverschiebung
+    s = [k / (k + (1.0 / t - 1.0)) for t in (t0 * (1 - i / steps) for i in range(steps))]
+    return torch.tensor(s + [0.0], dtype=torch.float32)
+
+
+def _sample(model, x, txt, sigmas, sampler, seed, on_status=None, ohne=None, cfg: float = 0.0):
+    """`ohne` + `cfg` > 0: zweiter Durchlauf mit dem leeren Prompt, v = c + cfg·(c − u) (Krea 2 Raw)."""
+    import torch
+    gen = torch.Generator(device=x.device).manual_seed(seed)
+    n = len(sigmas) - 1
+    for i in range(n):
+        s, s_next = float(sigmas[i]), float(sigmas[i + 1])
+        t0 = time.time()
+        with torch.no_grad():
+            t = torch.full((x.shape[0],), s, device=x.device)
+            v = model(x, t, txt)
+            if ohne is not None and cfg > 0:
+                v = v + cfg * (v - model(x, t, ohne))
+        den = x - s * v
+        if s_next == 0.0:
+            x = den
+        elif sampler == "euler":
+            x = x + (s_next - s) * v
+        else:                                   # euler_ancestral (Flow-Variante, eta = 1)
+            s_down = s_next * (s_next / s)
+            a_next, a_down = 1.0 - s_next, 1.0 - s_down
+            renoise = math.sqrt(max(s_next ** 2 - s_down ** 2 * a_next ** 2 / a_down ** 2, 0.0))
+            r = s_down / s
+            x = r * x + (1.0 - r) * den
+            noise = torch.randn(x.shape, generator=gen, device=x.device, dtype=x.dtype)
+            x = (a_next / a_down) * x + noise * renoise
+        if on_status:
+            on_status(f"Krea 2: Schritt {i + 1}/{n} ({time.time() - t0:.1f}s)")
+    return x
+
+
+# ===========================================================================
+#  Ein Bild malen
+# ===========================================================================
+
+def _frei():
+    """Python-Referenzen einsammeln, dann Cache und cuBLAS-Arbeitsspeicher zurückgeben."""
+    import gc
+    import torch
+    gc.collect()
+    if torch.cuda.is_available():
+        with gpu_sperre():                   # sonst würde ein gerade aufgenommener CUDA-Graph (Stimme) ungültig
+            torch.cuda.synchronize()
+            leeren = getattr(torch._C, "_cuda_clearCublasWorkspaces", None)
+            if leeren:
+                leeren()
+            torch.cuda.empty_cache()
+
+
+def gpu_sperre():
+    """Die Sperre, unter der der GGUF-Motor CUDA-Graphen aufnimmt (ohne Motor: keine)."""
+    try:
+        from ggufengine.models.common import GPU_SPERRE
+        return GPU_SPERRE
+    except Exception:
+        import contextlib
+        return contextlib.nullcontext()
+
+
+# Wie ComfyUI mit --disable-smart-memory: Jedes Teil kommt nur für seinen
+# Rechenschritt in den VRAM und wandert danach in den Arbeitsspeicher. Das
+# nächste Bild holt es von dort zurück statt von der Platte. Nach dem Bild
+# belegt Krea im VRAM nur noch den CUDA-Grundbedarf.
+_LOCK = threading.RLock()
+_RAM: dict = {}                      # art -> (pfad, objekt), Gewichte fest im Arbeitsspeicher
+
+
+def _kopie(obj, device, pin: bool = False):
+    """Kopie von obj, deren Tensoren auf device liegen; das Original bleibt unberührt."""
+    import torch
+    if isinstance(obj, torch.Tensor):
+        if device == "cpu":
+            t = obj.to("cpu")
+            return t.pin_memory() if pin and torch.cuda.is_available() else t
+        return obj.to(device, non_blocking=True)
+    if isinstance(obj, list):
+        return [_kopie(x, device, pin) for x in obj]
+    if isinstance(obj, tuple):
+        return tuple(_kopie(x, device, pin) for x in obj)
+    if isinstance(obj, dict):
+        return {k: _kopie(v, device, pin) for k, v in obj.items()}
+    if type(obj).__name__ == "Lin" and hasattr(obj, "zu"):           # bildmotoren.gewichte.Lin
+        if device == "cpu":
+            return obj.zu("cpu", pin=pin and torch.cuda.is_available())
+        return obj.zu(device)
+    if type(obj).__module__ == __name__ and hasattr(obj, "__dict__"):
+        neu = object.__new__(type(obj))
+        neu.__dict__.update({k: _kopie(v, device, pin) for k, v in vars(obj).items()})
+        return neu
+    return obj
+
+
+def _auf_gpu(art: str, pfad: Path, bauen, device):
+    """Arbeitskopie für die Karte: aus dem RAM, beim ersten Mal von der Platte.
+
+    Die Gewichte ändern sich nie. Deshalb bleibt die RAM-Fassung stehen, und
+    nach dem Rechenschritt wird die Kopie auf der Karte nur verworfen.
+    """
+    eintrag = _RAM.get(art)
+    if eintrag is not None and eintrag[0] == pfad:
+        _DBG.ereignis(f"Bildmotor: {art} aus dem RAM auf die GPU")
+        return _kopie(eintrag[1], device)
+    if _RAM.pop(art, None) is not None:              # anderes Modell: alte RAM-Fassung erst ganz freigeben
+        eintrag = None
+        _frei()
+        _host_leeren()
+    _DBG.ereignis(f"Bildmotor: {art} von der Platte")
+    obj = bauen()
+    _RAM[art] = (pfad, _kopie(obj, "cpu", pin=True))
+    return obj
+
+
+def im_ram() -> list[str]:
+    return sorted(_RAM)
+
+
+def entladen() -> None:
+    """Gibt auch die RAM-Kopien frei; das nächste Bild lädt wieder von der Platte."""
+    global _TIMER
+    with _LOCK:
+        if _TIMER is not None:
+            _TIMER.cancel()
+            _TIMER = None
+        zustand = sys.modules.get("gpuzustand")
+        if zustand is not None and zustand.kaputt():   # gepinnten RAM freizugeben kann dann abstürzen
+            _DBG.ereignis("Bildmotor: Entladen übersprungen – CUDA-Sitzung unbrauchbar")
+            return
+        while _RAM:                         # Stück für Stück: Freigeben hält Python kurz fest
+            _RAM.popitem()
+            time.sleep(0.02)
+        _TEXT_CACHE.clear()
+        try:
+            from trtmotor import bild as _tb
+            _tb.entladen()
+        except Exception:
+            pass
+        _frei()
+        _host_leeren()
+    _DBG.ereignis("Bildmotor entladen")
+
+
+def _host_leeren() -> None:
+    """Gepinnten Arbeitsspeicher aus dem Zwischenlager von torch an Windows zurückgeben."""
+    try:
+        import torch
+        leeren = getattr(torch._C, "_host_emptyCache", None)
+        if leeren and torch.cuda.is_available():
+            leeren()
+    except Exception:
+        pass
+
+
+# Nach einer Weile Ruhe wird auch der Arbeitsspeicher geräumt. Gezählt wird nur Ruhe:
+# Solange eine Runde oder Hintergrund-Aufgabe läuft, beginnt die Uhr von vorn.
+RUHE_TAKT_S = 5.0
+
+
+def _beschaeftigt() -> bool:
+    """Läuft eine Runde, ein TensorRT-Bau oder eine Hintergrund-Aufgabe?"""
+    try:
+        import notstopp
+        if notstopp.runde_laeuft():
+            return True
+    except Exception:
+        pass
+    try:                                     # der Bau liest die RAM-Fassung des DiT: nicht darunter entladen
+        baut = getattr(sys.modules.get("trtmotor.bild"), "baut", None)
+        if callable(baut) and baut():
+            return True
+    except Exception:
+        pass
+    try:
+        import hintergrund
+        return bool(hintergrund.laufend())
+    except Exception:
+        return False
+
+
+def _fremd_malt() -> bool:
+    """Malt ein anderer NemiCLI-Prozess oder wartet darauf? Dann ruhende Gewichte nicht doppelt halten."""
+    try:
+        import malsperre
+        return malsperre.fremd_will_malen()
+    except Exception:
+        return False
+
+
+class _Ruheuhr(threading.Thread):
+    """Entlädt nach `sek` Sekunden ohne Arbeit – oder sofort in Ruhe, wenn ein anderer Prozess malt;
+    `cancel()` hält sie an."""
+
+    def __init__(self, sek: float):
+        super().__init__(daemon=True)
+        self.sek = sek
+        self._halt = threading.Event()
+
+    def cancel(self) -> None:
+        self._halt.set()
+
+    def run(self) -> None:
+        ruhig_seit = time.monotonic()
+        while not self._halt.wait(min(RUHE_TAKT_S, self.sek)):
+            if _beschaeftigt():
+                ruhig_seit = time.monotonic()
+            elif (fremd := _fremd_malt()) or time.monotonic() - ruhig_seit >= self.sek:
+                with _LOCK:
+                    if self._halt.is_set():      # inzwischen kam ein neues Bild
+                        return
+                    _DBG.ereignis("Bildmotor: ein anderer Prozess malt – Speicher frei" if fremd
+                                  else f"Bildmotor: {self.sek:g} s Ruhe")
+                    entladen()
+                return
+
+
+_TIMER: _Ruheuhr | None = None
+
+
+def _entladen_nach() -> float:
+    try:
+        import config
+        return float(config.load().get("bild_krea_entladen", DEFAULTS["entladen_nach"]))
+    except Exception:
+        return float(DEFAULTS["entladen_nach"])
+
+
+def _uhr_neu() -> None:
+    """Nach einem Bild: Entlade-Uhr (neu) starten."""
+    global _TIMER
+    if _TIMER is not None:
+        _TIMER.cancel()
+    sek = _entladen_nach()
+    if sek <= 0:
+        _TIMER = None
+        entladen()
+        return
+    _TIMER = _Ruheuhr(sek)
+    _TIMER.start()
+
+
+def _trt():
+    """trtmotor.bild, wenn TensorRT-RTX abgelegt ist und Config bild_trt nicht aus – sonst None."""
+    try:
+        import config
+        if not config.load().get("bild_trt", True):
+            return None
+        import torch
+        from trtmotor import bild, laufzeit
+        return bild if torch.cuda.is_available() and laufzeit.bereit() else None
+    except Exception:
+        return None
+
+
+def _trt_sofort(tb, pfad: Path, dit_ram) -> bool:
+    """Gespeicherte TensorRT-Netze gleich laden (trtmotor.bild.sofort_laden) – nicht, solange ein Bau läuft."""
+    laden, baut = getattr(tb, "sofort_laden", None), getattr(tb, "baut", None)
+    if not callable(laden):
+        return False
+    try:
+        if callable(baut) and baut():
+            return False
+        return bool(laden(pfad, dit_ram))
+    except Exception as exc:
+        _DBG.ereignis(f"TensorRT-Krea: gespeichertes Netz nicht geladen: {exc}")
+        return False
+
+
+def _dit_holen(pfad: Path, device, dtype, on_status, trt: bool = True):
+    """Das DiT für dieses Bild. Mit fertigem TensorRT-Netz kommen nur die kleinen Teile auf die Karte,
+    die Blöcke rechnet TensorRT. Sonst wie bisher – trtmotor misst dabei ein und baut danach.
+    `trt=False` (mit LoRA): immer die eigenen Blöcke, ohne Einmessen."""
+    tb = _trt() if trt else None
+    ram = _RAM.get("dit")
+    if tb is not None and ram is not None and ram[0] == pfad:
+        bloecke = tb.bloecke(pfad)
+        if bloecke is None and _trt_sofort(tb, pfad, ram[1]):      # gespeichertes Netz nach dem Entladen
+            bloecke = tb.bloecke(pfad)
+        if bloecke is not None:
+            leer = object.__new__(_DiT)
+            leer.__dict__.update({k: v for k, v in vars(ram[1]).items() if k != "blocks"})
+            leer.blocks = []
+            dit = _kopie(leer, device)
+            dit.bloecke = bloecke
+            _DBG.ereignis("Bildmotor: Blöcke über TensorRT")
+            return dit
+    dit = _auf_gpu("dit", pfad, lambda: _DiT(pfad, device, dtype, on_status), device)
+    if tb is not None:
+        try:
+            tb.einmessen(pfad, dit)
+        except Exception as exc:
+            _DBG.ereignis(f"TensorRT-Einmessung übersprungen: {exc}")
+    return dit
+
+
+def _trt_nach_bild(pfad: Path, bauen: bool = True) -> None:
+    """Gewichte des TensorRT-Netzes aus dem VRAM; ist die Einmessung fertig, im Hintergrund bauen
+    (`bauen=False`: nur freigeben, etwa nach einem Abbruch)."""
+    tb = _trt()
+    if tb is None:
+        return
+    try:
+        tb.nach_bild(pfad)
+        ram = _RAM.get("dit")
+        if bauen and ram is not None and ram[0] == pfad:
+            tb.vorbereiten(pfad, ram[1])
+    except Exception as exc:
+        _DBG.ereignis(f"TensorRT-Krea: {exc}")
+
+
+def _trt_fehler(exc: BaseException) -> bool:
+    """Ist `exc` ein Laufzeitfehler des TensorRT-Netzes (trtmotor.laufzeit.TrtFehler)?"""
+    klasse = getattr(sys.modules.get("trtmotor.laufzeit"), "TrtFehler", None)
+    return isinstance(klasse, type) and isinstance(exc, klasse)
+
+
+def _male_mit_ersatz(*a, **kw):
+    """_male; scheitert dabei das TensorRT-Netz (TrtFehler), wird das Bild genau einmal ohne TensorRT gemalt."""
+    grund = None
+    try:
+        return _male(*a, **kw)
+    except Exception as e:
+        if kw.get("trt") is False or not _trt_fehler(e):
+            raise
+        grund = f"{type(e).__name__}: {e}"            # nur der Text: der Traceback hielte Tensoren fest
+    _DBG.ereignis(f"TensorRT-Krea gescheitert ({grund}) – das Bild wird ohne TensorRT gemalt")
+    try:
+        _frei()
+    except Exception:
+        pass
+    return _male(*a, **{**kw, "trt": False})
+
+
+def _male(prompt, ref, pfad, t, steps, sampler, shift, W, H, seed, device, dtype, on_status,
+          bild=None, staerke: float = 1.0, lora: Path | None = None, lora_staerke: float = 1.0, cfg: float = 0.0,
+          gegen: str = "", trt: bool = True, zeitplan: str = "simple"):
+    """Die eigentliche Rechnung. Gibt das Bild als uint8-Array zurück. `zeitplan` (simple · beta) gilt beim
+    Neumalen; beim Nachmalen eines Bildes bleibt der gleichmäßige Abschnitt ab `staerke`.
+    Mit `bild` (uint8, H×W×3) wird es ab Rauschstärke `staerke` nachgemalt statt neu.
+    Mit `lora` rechnet sie neben den Blöcken mit (ohne TensorRT – dessen Netz kennt sie nicht).
+    `cfg` > 0: je Schritt ein zweiter Durchlauf mit dem Gegen-Prompt `gegen` (leer = ohne Text, wie Krea 2 Raw).
+    `trt=False`: ohne TensorRT, nur die eigenen Blöcke."""
+    import numpy as np
+    import torch
+
+    if on_status:
+        on_status("Krea 2: Text-Encoder …")
+    ctx = _text_einbetten(prompt, t["text"], device, dtype)
+    ctx_ohne = _text_einbetten(gegen, t["text"], device, dtype) if cfg > 0 else None
+
+    mean = torch.tensor(_LAT_MEAN, device=device).view(1, 16, 1, 1)
+    std = torch.tensor(_LAT_STD, device=device).view(1, 16, 1, 1)
+    start = None
+    if bild is not None:
+        if on_status:
+            on_status("Krea 2: VAE liest das Bild …")
+        enc = _auf_gpu("vae_enc", t["vae"], lambda: _VAEEncoder(t["vae"], device, dtype), device)
+        x = torch.from_numpy(np.ascontiguousarray(bild)).to(device).permute(2, 0, 1)[None]
+        with torch.no_grad():
+            start = (enc(x.float() / 127.5 - 1.0) - mean) / std
+        del enc, x
+        _frei()
+
+    if on_status:
+        on_status("Krea 2: Modell in den VRAM …")
+    trt = trt and lora is None
+    try:
+        dit = _dit_holen(pfad, device, dtype, on_status, trt=trt)
+        if lora is not None:
+            if on_status:
+                on_status("Krea 2: LoRA dazu …")
+            lora_einsetzen(dit, lora, lora_staerke, device, dtype)    # nur in der Arbeitskopie auf der Karte
+        with torch.no_grad():
+            txt = dit.text(ctx)
+            ohne = dit.text(ctx_ohne) if ctx_ohne is not None else None
+        del ctx, ctx_ohne
+        noise = torch.randn((1, 16, H // 8, W // 8),
+                            generator=torch.Generator().manual_seed(seed)).to(device)
+        if start is None:
+            sig = _sigmas_plan(steps, shift, zeitplan).to(device)
+            x0 = noise * sig[0]
+        else:
+            sig = _sigmas_ab(steps, shift, staerke).to(device)
+            x0 = (1.0 - sig[0]) * start + sig[0] * noise   # Flow-Matching: Bild + Rauschen
+        lat = _sample(dit, x0, txt, sig, sampler, seed, on_status, ohne=ohne, cfg=cfg)
+    except BaseException:                              # Fehler oder ESC: TensorRT-Gewichte trotzdem aus dem VRAM
+        if trt:
+            _trt_nach_bild(pfad, bauen=False)
+        raise
+    del dit, txt, ohne, noise, sig, x0, start
+    if trt:
+        _trt_nach_bild(pfad)
+    _frei()
+
+    if on_status:
+        on_status("Krea 2: VAE …")
+    vae = _auf_gpu("vae", t["vae"], lambda: _VAEDecoder(t["vae"], device, dtype), device)
+    with torch.no_grad():
+        img = vae(lat * std + mean)
+    del vae, lat
+    _frei()
+    return ((img[0].permute(1, 2, 0).float().cpu().numpy() + 1.0) * 127.5
+            ).round().clip(0, 255).astype(np.uint8)
+
+
+def _nach_lauf() -> None:
+    """Nach jedem Lauf, auch nach Fehler oder ESC: Arbeitskopien und CUDA-Cache frei, Entlade-Uhr neu."""
+    try:
+        _frei()                             # gc, dann empty_cache unter der GPU-Sperre
+    except Exception:                       # CUDA nach einem Fehler unbrauchbar: die Meldung zählt
+        pass
+    try:
+        _uhr_neu()
+    except Exception as exc:
+        _DBG.ereignis(f"Bildmotor: Entlade-Uhr nicht gestartet: {exc}")
+
+
+def _modell(model: str | None, modelle: dict) -> str | None:
+    """Ein erfundener oder ungenauer Name soll das Bild nicht verhindern."""
+    if model and model not in modelle:
+        name = Path(str(model).replace("\\", "/")).stem.lower()
+        treffer = [k for k in modelle if name and name in k.lower()]
+        model = treffer[0] if treffer else None
+    return model or chosen_model()
+
+
+def _geraet():
+    import torch
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    return device, (torch.bfloat16 if device.type == "cuda" else torch.float32)
+
+
+def generate(prompt: str, *, model: str | None = None, steps: int | None = None,
+             size: tuple[int, int] | None = None, seed: int | None = None,
+             sampler: str | None = None, shift: float | None = None,
+             on_status=None, vorlage: str | None = None, staerke: float = 0.6, lora: str | Path | None = None,
+             lora_staerke: float | None = None, neg: str | None = None, ueber: dict | None = None) -> str:
+    """Malt EIN Bild mit Krea 2 und gibt den Pfad zurück. Blockiert.
+    Mit `vorlage` (Bildpfad) wird dieses Bild ab Rauschstärke `staerke` umgezeichnet statt neu gemalt:
+    Figur, Kleidung und Licht bleiben, der Prompt ändert Pose und Handlung (z. B. Schlüsselbilder fürs Video).
+    `lora`: Charakter-LoRA (z. B. lora_fuer_figur()), Stärke aus `bild_lora_staerke` (Vorgabe 1.0).
+    `neg`: Gegen-Prompt dieses Bildes, kommt vor den der Schaltzentrale; wirkt nur mit CFG > 1 (und bei Raw).
+    `ueber`: Einstellungen nur für dieses Bild statt der gespeicherten (Atelier, A/B-Vergleich) – cfg, negativ,
+    zeitplan, detail (an/aus), detail_satz, text und vae (Dateiname im jeweiligen Ordner)."""
+    import bildsperre
+    import notstopp
+    ein = einstellungen()
+    ueber = dict(ueber or {})
+    if "negativ" in ueber:
+        ein["negativ"] = " ".join(str(ueber["negativ"] or "").split())[:NEGATIV_MAX]
+    if "cfg" in ueber:
+        try:
+            ein["cfg"] = min(max(float(ueber["cfg"]), CFG_BEREICH[0]), CFG_BEREICH[1])
+        except (TypeError, ValueError):
+            pass
+    if str(ueber.get("zeitplan") or "").lower() in ZEITPLAENE:
+        ein["zeitplan"] = str(ueber["zeitplan"]).lower()
+    eigen = " ".join(str(neg or "").split())[:NEGATIV_MAX]
+    gegen_roh = ", ".join(x for x in (eigen, ein["negativ"]) if x) or None
+    prompt, neg = bildsperre.pruefen(prompt, gegen_roh)              # feste Grenzen (auch bei direktem Aufruf)
+    grund = missing_reason()
+    if grund:
+        raise RuntimeError(grund)
+    if "detail" in ueber:
+        satz = " ".join(str(ueber.get("detail_satz") or DETAIL_SATZ).split())[:DETAIL_MAX] if ueber["detail"] else ""
+        prompt = mit_detail(prompt, satz)
+    else:
+        prompt = mit_detail(prompt)
+
+    from PIL import Image, PngImagePlugin
+
+    modelle = discover()
+    ref = _modell(model, modelle)
+    t = teile()
+    for art in TEIL_ORDNER:                  # Text-Encoder oder VAE nur für dieses Bild (Name einer Datei im Ordner)
+        name = str(ueber.get(art) or "")
+        if name and Path(name).name == name and (p := krea_dir() / TEIL_ORDNER[art] / name).is_file():
+            t = {**t, art: p}
+
+    W, H = size or DEFAULTS["size"]
+    W = (min(max(int(W), 256), MAX_EDGE) // 16) * 16
+    H = (min(max(int(H), 256), MAX_EDGE) // 16) * 16
+    raw = ist_raw(ref)
+    if raw:                                  # Grundmodell: wenige Schritte ohne CFG ergäben nur Rauschen
+        steps = min(int(steps), RAW_SCHRITTE_MAX) if steps and int(steps) >= RAW_SCHRITTE_MIN else raw_schritte()
+        sampler = (sampler or "euler").lower()
+        shift = raw_mu(W, H) if shift is None else float(shift)
+    else:
+        steps = min(max(int(steps), SCHRITTE_MIN), SCHRITTE_MAX) if steps else schritte()
+        sampler = (sampler or ein["sampler"]).lower()
+        shift = ein["shift"] if shift is None else float(shift)
+    cfg = raw_cfg() if raw else ein["cfg"] - 1.0
+    # Gegen-Prompt mit dem festen Teil der Bildsperre; Raw ohne eigenen bleibt beim leeren wie im Original.
+    gegen = bildsperre.gegenprompt(neg) if cfg > 0 and (neg or not raw) else ""
+    if seed is None:
+        seed = int(time.time() * 1000) & 0x7FFFFFFF
+
+    device, dtype = _geraet()
+    lora = Path(lora) if lora else None
+    if lora is not None and not lora.is_file():
+        raise RuntimeError(f"LoRA-Datei nicht gefunden: {lora}")
+    lora_staerke = float(_cfg("bild_lora_staerke", 1.0) if lora_staerke is None else lora_staerke)
+
+    fehler, abbruch = None, False
+    with _LOCK:
+        if _TIMER is not None:
+            _TIMER.cancel()                 # neues Bild: nicht mittendrin entladen
+        try:
+            bild = None
+            if vorlage:
+                import numpy as np
+                from PIL import Image, ImageOps
+                with Image.open(vorlage) as im:
+                    bild = np.asarray(ImageOps.fit(im.convert("RGB"), (W, H), Image.LANCZOS))
+            arr = _male_mit_ersatz(prompt, ref, modelle[ref], t, steps, sampler, shift, W, H, seed,
+                                   device, dtype, on_status, bild=bild, staerke=float(staerke), lora=lora,
+                                   lora_staerke=lora_staerke, cfg=cfg, gegen=gegen, zeitplan=ein["zeitplan"])
+        except Exception as e:
+            # Nur den Text behalten: der Traceback hielte sonst alle Tensoren fest.
+            fehler = f"{type(e).__name__}: {e}"
+        except notstopp.Abgebrochen:
+            abbruch = True                  # ESC: erst aufräumen, dann ohne Traceback weiter
+        finally:                            # auch bei Strg+C und Beenden: VRAM frei, Entlade-Uhr an
+            _nach_lauf()
+        if abbruch:
+            raise notstopp.Abgebrochen()
+        if fehler:
+            raise RuntimeError(f"Krea 2: {fehler}")
+
+    import profilordner as _profil                   # Profile/<Persönlichkeit>/Bilder/<Name>_Datum_Uhrzeit.png
+    out = _profil.bild_ziel(OUT_DIR, ".png")
+    meta = PngImagePlugin.PngInfo()
+    meta.add_text("prompt", prompt)
+    meta.add_text("model", ref)
+    # cfg wie ComfyUI gezählt: 1 = ohne Gegen-Prompt; Krea-Raw-Stärke g entspricht 1 + g
+    meta.add_text("params", f"steps={steps}, cfg={1 + cfg:g}, size={W}x{H}, seed={seed}, "
+                            f"sampler={sampler}, shift={shift:g}, backend=krea2"
+                            + (f", zeitplan={ein['zeitplan']}" if ein["zeitplan"] != ZEITPLAENE[0] else "")
+                            + (f", lora={lora.stem}:{lora_staerke:g}" if lora else ""))
+    if gegen:
+        meta.add_text("negative_prompt", gegen)
+    if lora:
+        meta.add_text("lora_datei", str(lora))       # das Gesicht-Nachmalen nimmt dieselbe LoRA
+    Image.fromarray(arr).save(out, pnginfo=meta)
+    return str(out)
+
+
+# ===========================================================================
+#  Gesichter nachmalen
+# ===========================================================================
+
+def _cfg(key: str, standard):
+    """Config-Wert im Typ des Standards; Schalter verstehen auch "false"/"aus"/"nein"/"0" als Text."""
+    try:
+        import config
+        wert = config.load().get(key)
+        if wert is None:
+            return standard
+        if isinstance(standard, bool) and isinstance(wert, str):
+            return wert.strip().lower() not in ("false", "aus", "nein", "no", "off", "0", "")
+        return type(standard)(wert)
+    except Exception:
+        return standard
+
+
+def gesicht_an() -> bool:
+    """Gesichts-Nachbesserung eingeschaltet (Config `bild_krea_gesicht`)?"""
+    return bool(_cfg("bild_krea_gesicht", DEFAULTS["gesicht"]))
+
+
+def set_gesicht(an: bool) -> bool:
+    """Gesichts-Nachbesserung dauerhaft ein- oder ausschalten."""
+    import config
+    config.update(bild_krea_gesicht=bool(an))
+    return bool(an)
+
+
+def _arbeitsgroesse(cw: int, ch: int, kante: int) -> tuple[int, int, float]:
+    """(W, H, Lupe) für den Ausschnitt: längere Kante = `kante`, Vielfache von 16."""
+    lupe = kante / max(cw, ch)
+    W = max(256, (round(cw * lupe) // 16) * 16)
+    H = max(256, (round(ch * lupe) // 16) * 16)
+    return W, H, lupe
+
+
+_GESICHT_HINWEIS = False          # fehlendes Seh-Modell nur einmal je Sitzung melden
+
+
+GESICHTSZUEGE = "Gesichtszuege"      # Unterordner neben dem Original für nachgemalte Gesichter
+
+
+def _lora_orte() -> list[Path]:
+    """Ordner, aus denen eine LoRA laut Bild-Angaben geladen werden darf: Profile/<Name>/LoRA/ und LoRA/Bild/."""
+    orte: list[Path] = []
+    try:
+        import profilordner
+        orte += [p / "LoRA" for p in profilordner.wurzel().iterdir() if p.is_dir()]
+    except Exception:
+        pass
+    try:
+        import lorabild
+        orte.append(lorabild.wurzel())
+    except Exception:
+        pass
+    return orte
+
+
+def _lora_erlaubt(pfad: Path) -> bool:
+    """PNG-Angaben kann jeder schreiben: nur eine .safetensors aus den eigenen LoRA-Ordnern gilt."""
+    try:
+        echt = pfad.resolve(strict=True)
+    except (OSError, RuntimeError):
+        return False
+    if echt.suffix.lower() != ".safetensors" or not echt.is_file():
+        return False
+    for ort in _lora_orte():
+        try:
+            if echt.is_relative_to(ort.resolve()):
+                return True
+        except (OSError, RuntimeError):
+            continue
+    return False
+
+
+def _bild_lora(meta: dict) -> tuple[Path | None, float]:
+    """LoRA und Stärke, mit denen ein Bild gemalt wurde (aus seinen PNG-Angaben); fehlt die Datei oder liegt sie
+    außerhalb der LoRA-Ordner: (None, 1.0)."""
+    import re
+    roh = str(meta.get("lora_datei") or "").strip()
+    if not roh or not Path(roh).is_file():
+        return None, 1.0
+    if not _lora_erlaubt(Path(roh)):
+        _DBG.ereignis("Gesicht nachmalen: LoRA aus den Bild-Angaben liegt nicht in einem LoRA-Ordner – ohne LoRA")
+        return None, 1.0
+    m = re.search(r"lora=[^,]*:([\d.]+)", str(meta.get("params", "")))
+    try:
+        return Path(roh), float(m.group(1)) if m else 1.0
+    except ValueError:
+        return Path(roh), 1.0
+
+
+def gesicht_nachbessern(path, *, staerke: float | None = None, steps: int | None = None,
+                        on_status=None) -> str | None:
+    """Gesichter eines Krea-Bildes vergrößert nachmalen und weich einsetzen.
+
+    Gesichter findet das Seh-Modell (gesichter.finden); nachgemalt wird nur mit GESICHT_SATZ,
+    nicht mit dem Szenen-Prompt. Wurde das Bild mit einer LoRA gemalt (`lora_datei` im Bild), malt sie mit, in
+    derselben Stärke – sonst rutschte das Gesicht von ihrem Aussehen weg. Das Original bleibt; das Ergebnis liegt im Unterordner
+    `Gesichtszuege/<name>.png` (GESICHTSZUEGE). None, wenn kein sicheres Gesicht gefunden wurde oder alle schon groß
+    genug sind. Fehlt das Seh-Modell, einmal je Sitzung RuntimeError mit dem Grund, danach None.
+    Blockiert."""
+    global _GESICHT_HINWEIS
+    import gesichter
+    if missing_reason():
+        return None
+    if (grund := gesichter.grund()):
+        if _GESICHT_HINWEIS:
+            return None
+        _GESICHT_HINWEIS = True
+        raise RuntimeError(grund)
+
+    import re
+    import numpy as np
+    from PIL import Image, PngImagePlugin
+
+    with Image.open(path) as im:
+        meta = dict(getattr(im, "text", {}) or {})
+        arr = np.asarray(im.convert("RGB"))
+    boxen = gesichter.finden(arr)
+    if not boxen:
+        return None
+
+    staerke = _cfg("bild_krea_gesicht_staerke", DEFAULTS["gesicht_staerke"]) if staerke is None else staerke
+    steps = min(max(int(steps or _cfg("bild_krea_gesicht_schritte", DEFAULTS["gesicht_schritte"])), 1),
+                RAW_SCHRITTE_MAX)
+    kante = min(max(int(_cfg("bild_krea_gesicht_kante", DEFAULTS["gesicht_kante"])), 256), MAX_EDGE)
+    params = meta.get("params", "")
+    m = re.search(r"sampler=(\w+)", params)
+    sampler = m.group(1) if m and m.group(1) in ("euler", "euler_ancestral") else DEFAULTS["sampler"]
+    m = re.search(r"seed=(\d+)", params)
+    seed = (int(m.group(1)) if m else int(time.time() * 1000)) + 1
+    prompt = GESICHT_SATZ
+    lora, lora_staerke = _bild_lora(meta)
+
+    modelle = discover()
+    ref = _modell(meta.get("model"), modelle)
+    t = teile()
+    device, dtype = _geraet()
+    raw = ist_raw(ref)
+    if raw:                                 # Raw braucht auch im kurzen Nachmal-Abschnitt mehr Schritte
+        steps = max(steps * 2, RAW_SCHRITTE_MIN)
+
+    import notstopp
+    fertig, fehler, abbruch = 0, None, False
+    with _LOCK:
+        if _TIMER is not None:
+            _TIMER.cancel()
+        try:
+            for i, box in enumerate(boxen):
+                x0, y0, x1, y1 = box
+                W, H, lupe = _arbeitsgroesse(x1 - x0, y1 - y0, kante)
+                if lupe < 1.3:
+                    continue                  # Gesicht hat schon genug Pixel
+                ausschnitt = np.asarray(Image.fromarray(arr[y0:y1, x0:x1]).resize((W, H), Image.LANCZOS))
+                melde = None
+                if on_status:
+                    melde = (lambda s, i=i: on_status(f"Gesicht {i + 1}/{len(boxen)} · {s}"))
+                neu = _male_mit_ersatz(prompt, ref, modelle[ref], t, steps, sampler,
+                                       raw_mu(W, H) if raw else DEFAULTS["shift"],
+                                       W, H, seed + i, device, dtype, melde, bild=ausschnitt, staerke=staerke,
+                                       lora=lora, lora_staerke=lora_staerke, cfg=raw_cfg() if raw else 0.0)
+                arr = gesichter.einsetzen(arr, box, neu)
+                fertig += 1
+        except Exception as e:
+            fehler = f"{type(e).__name__}: {e}"
+        except notstopp.Abgebrochen:
+            abbruch = True
+        finally:
+            _nach_lauf()
+        if abbruch:
+            raise notstopp.Abgebrochen()
+        if fehler:
+            raise RuntimeError(f"Krea 2 (Gesicht): {fehler}")
+    if not fertig:
+        return None
+
+    p = Path(path)
+    ziel = p.parent / GESICHTSZUEGE / f"{p.stem}.png"
+    ziel.parent.mkdir(parents=True, exist_ok=True)
+    info = PngImagePlugin.PngInfo()
+    for k, v in meta.items():
+        info.add_text(k, str(v))
+    info.add_text("nachgebessert", f"gesicht x{fertig}, staerke={staerke}, steps={steps}"
+                                   + (f", lora={lora.stem}:{lora_staerke:g}" if lora else ""))
+    Image.fromarray(arr).save(ziel, pnginfo=info)
+    return str(ziel)

@@ -1,0 +1,615 @@
+"""
+cloud.py - OpenAI-kompatibler Cloud-Motor.
+
+Ein einziger Motor für alle Anbieter, die das OpenAI-Protokoll sprechen
+(OpenAI, Google/Gemini, Mistral, Cohere, Perplexity, DeepSeek, xAI, Groq,
+OpenRouter). Nur base_url + Key unterscheiden sich - die kommen aus providers.py.
+
+Gleiche Schnittstelle wie chat.Chat:
+    stream(text) -> async-Iterator von {"type": "text", "text": ...}
+    ask_once(prompt, system) -> str
+    reset(), .messages
+So funktioniert die Aktions-Schleife in main.py für jeden Anbieter gleich.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+import time
+from typing import AsyncIterator
+
+import denkwerk
+import gespraechsstand as GS
+import persona
+import pricing
+import providers as P
+import reasoning
+from textproc import think_splitter
+from vision import user_content as _user_content
+
+# Hinweis: `openai` wird BEWUSST erst in __init__ importiert (nicht hier oben).
+# Das Paket braucht rund 0,9 Sekunden zum Laden – beim Start von NemiCLI weiß
+# aber noch niemand, ob überhaupt ein Cloud-Modell benutzt wird.
+
+FRIST_S = 300.0              # Lesen/Schreiben je Schritt (lokale Server laden große Modelle erst bei der Anfrage)
+VERBINDEN_S = 15.0           # Verbindungsaufbau
+FILTER_TEXT = "Der Inhaltsfilter des Anbieters hat die Antwort angehalten."
+
+
+def _zeiten_melden(zeiten: list[tuple[str, float]]) -> None:
+    try:
+        import debugbericht
+        debugbericht.ereignis("Anfrage: " + " · ".join(f"{n} {s:.1f} s" for n, s in zeiten), speicher=False)
+    except Exception:
+        pass
+
+
+def _waechter_temperatur(provider: str, modell: str, kwargs: dict) -> float | None:
+    """Temperatur aus den Wertungen des Nutzers (kiwertung, nur mit seinem Schalter). Nicht für Modelle mit
+    fester Temperatur (Denk-Modelle mit reasoning_effort) und nicht, wenn die Optionen schon eine setzen."""
+    if "temperature" in kwargs or "reasoning_effort" in kwargs:
+        return None
+    try:
+        import kiwertung
+        return kiwertung.temperatur_fuer(f"{provider}:{modell}")
+    except Exception:
+        return None
+
+
+def _usage_option_rejected(exc: Exception) -> bool:
+    """Nur eine ausdrücklich unbekannte Usage-Option rechtfertigt den Retry."""
+    if getattr(exc, "status_code", None) not in (400, 422):
+        return False
+    body = getattr(exc, "body", None)
+    texts = [str(exc).lower()]
+    if isinstance(body, dict):
+        error = body.get("error", body)
+        if isinstance(error, dict):
+            if (error.get("param") in ("stream_options", "stream_options.include_usage", "include_usage")
+                    and error.get("code") in ("unsupported_parameter", "unknown_parameter",
+                                              "unrecognized_request_argument", "extra_forbidden")):
+                return True
+            if isinstance(error.get("message"), str):
+                texts.append(error["message"].lower())
+        detail = body.get("detail")
+        if isinstance(detail, list):
+            for item in detail:
+                if (isinstance(item, dict) and item.get("type") == "extra_forbidden"
+                        and any(part in ("stream_options", "include_usage")
+                                for part in item.get("loc", []))):
+                    return True
+    field = r"(?:stream_options(?:\.include_usage)?|include_usage)"
+    unknown = (r"(?:unknown|unrecognized|unrecognised|unsupported|unexpected)\s+"
+               r"(?:(?:request|body)\s+)?(?:field|parameter|argument|option|property|key)"
+               r"(?:\s+supplied)?\s*[:=]?\s*[\"'`]*")
+    return any(re.search(unknown + field + r"\b", text)
+               or re.search(field + r"[\"'`]*\s+(?:is\s+)?(?:not supported|not allowed|unknown)\b", text)
+               for text in texts)
+
+
+class CloudChat:
+    def __init__(self, provider_id: str, model_id: str,
+                 strength: str = reasoning.DEFAULT_STRENGTH):
+        from openai import AsyncOpenAI      # erst jetzt laden (siehe oben)
+
+        prov = P.get(provider_id)
+        if prov is None:
+            raise RuntimeError(f"Unbekannter Anbieter: {provider_id}")
+        if getattr(prov, "kind", "") == "chatgpt":   # die eigentliche Meldung (Anmeldung, Netz) statt „.env“
+            import chatgpt_login
+            key = chatgpt_login.zugang()
+        else:
+            key = prov.key()
+        if not key:
+            if prov.keyless:
+                key = "nemicli"   # lokales Ollama ignoriert den Key, braucht aber einen
+            else:
+                raise RuntimeError(f"Kein API-Key gefunden ({prov.env} in der .env setzen).")
+
+        self.provider_id = provider_id
+        self.model_id = model_id
+        self.model = f"{provider_id}:{model_id}"
+        try:                                         # Kontextlänge schon jetzt im Hintergrund nachfragen
+            P.kontext(provider_id, model_id)
+        except Exception:
+            pass
+        self.strength = (reasoning.normalize_strength(strength)
+                         if reasoning.profile(self.model) else None)
+        self.messages: list[dict] = []
+        self.stand = ""                              # Stand des Gesprächs (gespraechsstand)
+        # Lokales Ollama (nicht „…:cloud“ über Ollama): kompakte Anleitung wie der eigene Motor, Treffer und
+        # nachgereichte Anleitungen an der Nachricht, Stand des Gesprächs und Aufräumen im Hintergrund
+        self._lokal = provider_id == "ollama" and not re.search(r"[-:]cloud\b", model_id.lower())
+        self.kompakter_prompt = self._lokal
+        self._gesendet: dict[int, tuple[dict, str]] = {}   # je Nachricht: wie sie gesendet wird
+        self._puffer: asyncio.Task | None = None     # laufendes Hintergrund-Aufräumen
+        self._puffer_hinweis = ""
+        self._kontext_gemessen = False
+        self.denk_hinweis = ""                       # Denkwerk: nur mit der nächsten gesendeten Nachricht
+        self.rollen_anker = ""                       # Ich-Form/Sprechweise: ebenso, getrennt vom Denk-Hinweis
+        self._hat_gedacht = False                    # das Modell lieferte schon eigenes Nachdenken
+
+        # --- Auto-Stark-Modus (nur lokales Ollama, nur leichtes Gemma) ----------
+        # Bei einer schweren Frage schalten wir für DIESE eine Antwort auf das
+        # große Gemma-Gegenstück um. Beide laufen über denselben Ollama-Client –
+        # es ändert sich nur der Modellname, der Verlauf bleibt derselbe.
+        self.auto_stark = False
+        self.auto_ziel: str | None = None
+        if provider_id == "ollama":
+            try:
+                import config
+                if config.load().get("auto_stark"):
+                    ziel = P.gemma_upgrade_ziel(model_id)
+                    if ziel:
+                        self.auto_stark = True
+                        self.auto_ziel = ziel
+            except Exception:
+                pass
+
+        base_url = prov.chat_base
+        if provider_id == "ollama":         # base_url ist dynamisch (OLLAMA_HOST)
+            base_url = P.ollama_base()
+        headers = {}
+        if provider_id == "openrouter":     # OpenRouter mag eine Kennung (optional)
+            headers = {"HTTP-Referer": "https://localhost/nemicli", "X-Title": "NemiCLI"}
+        extra = {}
+        if prov.keyless and base_url and not P.proxy_erlaubt(base_url):   # lokaler Server: am System-Proxy vorbei
+            from openai import DefaultAsyncHttpxClient
+            extra["http_client"] = DefaultAsyncHttpxClient(trust_env=False)
+        # Frist je Verbindungsaufbau und je Lesepause (Denk-Modelle schweigen vor dem ersten Stück lange).
+        # ChatGPT-Konto ohne Wiederholung: das SDK wiederholte jedes 429, auch „Kontingent aufgebraucht“.
+        import openai
+        frist = openai.Timeout(FRIST_S, connect=VERBINDEN_S) if hasattr(openai, "Timeout") else FRIST_S
+        self.client = AsyncOpenAI(base_url=base_url, api_key=key, default_headers=headers or None, timeout=frist,
+                                  max_retries=0 if getattr(prov, "kind", "") == "chatgpt" else 1, **extra)
+
+    def reset(self) -> None:
+        self.messages = []
+        self.stand = ""
+        self._gesendet = {}
+        if self._puffer is not None and not self._puffer.done():
+            self._puffer.cancel()
+        self._puffer, self._puffer_hinweis = None, ""
+
+    @property
+    def denkt_selbst(self) -> bool:
+        """Denkt das Modell selbst (bekannte Denkstufe an, oder schon eigenes Nachdenken geliefert)?"""
+        if self._hat_gedacht:
+            return True
+        art = reasoning.profile(self.model)
+        if art in ("openai_effort", "kimi", "ollama_effort"):
+            return self.strength != "schnell"
+        if art == "ollama_cloud":
+            familie = reasoning.ollama_family(self.model_id)
+            info = reasoning.cloud_info(familie) or {}
+            if not info.get("think"):
+                return False
+            stufe = reasoning.cloud_effort(familie, reasoning.normalize_strength(self.strength))
+            return bool(info.get("default")) if stufe is None else stufe != "none"
+        return False
+
+    async def schliessen(self, warten_s: float = 5.0) -> None:
+        """Modellwechsel: ein laufendes Hintergrund-Aufräumen abbrechen."""
+        puffer, self._puffer = self._puffer, None
+        if puffer is not None and not puffer.done():
+            puffer.cancel()
+            await asyncio.wait({puffer}, timeout=warten_s)
+
+    # -- Stand des Gesprächs: lokales Ollama räumt selbst auf, /compact geht bei jedem Anbieter ----------
+    def _mit_stand(self, verlauf: list[dict]) -> list[dict]:
+        """Der Verlauf, wie er gesendet wird: der Stand des Gesprächs vor der ersten Nachricht."""
+        if not self.stand:
+            return verlauf
+        i = next((i for i, m in enumerate(verlauf) if m.get("role") == "user"), -1)
+        if i < 0:
+            return verlauf
+        m, vorsatz = verlauf[i], GS.vorsatz(self.stand)
+        inhalt = m.get("content")
+        neu = (vorsatz + inhalt if isinstance(inhalt, str)
+               else [{"type": "text", "text": vorsatz}] + list(inhalt or []))
+        return verlauf[:i] + [dict(m, content=neu)] + verlauf[i + 1:]
+
+    def _senden_als(self, verlauf: list[dict]) -> list[dict]:
+        """Der Verlauf, wie er gesendet wird: Nachrichten mit ihrem Hintergrund (Treffer, nachgereichte
+        Anleitungen) und der Stand des Gesprächs vor der ersten. Gespeichert bleibt nur die Nachricht selbst."""
+        raus = []
+        for m in verlauf:
+            g = self._gesendet.get(id(m))
+            if g is not None and g[0] is m:
+                inhalt = m.get("content")
+                m = dict(m, content=g[1] if isinstance(inhalt, str) else
+                         [{"type": "text", "text": g[1]}] + [b for b in inhalt or []
+                                                             if not (isinstance(b, dict) and b.get("type") == "text")])
+            raus.append(m)
+        return self._mit_stand(raus)
+
+    async def _hintergrund_anhaengen(self, frage: dict, text: str) -> None:
+        """Lokales Ollama: Gedächtnis-Treffer und passende Anleitungen vor die neue Nachricht – die kompakte
+        Anleitung im Systemprompt bleibt so jede Runde gleich, Ollama liest sie nicht neu ein."""
+        self._gesendet = {k: v for k, v in self._gesendet.items() if any(v[0] is m for m in self.messages)}
+        teile = []
+        if not GS.ohne_treffer(text) and not GS.ist_ergebnis(text):
+            try:
+                teile.append(await asyncio.to_thread(persona.gedaechtnis_treffer, text, GS.TREFFER_WARTEN_S))
+            except Exception:
+                pass
+        try:
+            teile.append(GS.anleitungen_fuer(text, [g for _, g in self._gesendet.values()]))
+        except Exception:
+            pass
+        teile = [x.strip() for x in teile if x and x.strip()]
+        if teile:
+            self._gesendet[id(frage)] = (frage, "\n\n".join(teile + [GS.NACHRICHT_MARKE + text]))
+
+    async def _kontext_messen(self) -> None:
+        """Den Kontext übernehmen, mit dem Ollama das Modell geladen hat – sonst gälte der Richtwert nach
+        dem Namen (oft 128k), und Ollama schnitte selbst ab, bevor NemiCLI zusammenfasst."""
+        if not self._lokal or self._kontext_gemessen:
+            return
+        try:
+            n = await asyncio.to_thread(P.ollama_kontext, self.model_id)
+        except Exception:
+            return
+        if n:
+            pricing.kontext_merken(self.model, n)
+            self._kontext_gemessen = True
+
+    def _budget(self) -> int:
+        """So viele Token darf der Verlauf belegen (wie pricing.trim_history)."""
+        return max(2048, int(pricing.context_window(self.model) * pricing.HISTORY_SHARE))
+
+    def _verlauf_tokens(self) -> int:
+        return sum(pricing.est_tokens(m.get("content")) for m in self.messages)
+
+    async def _fragen(self, system: str, text: str) -> str:
+        """Einzel-Anfrage für den Stand – bei Ollama ohne Denken."""
+        kwargs = dict(model=self.model_id,
+                      messages=[{"role": "system", "content": system}, {"role": "user", "content": text}],
+                      **reasoning.request_options(self.provider_id, self.model_id, self.strength, helper=True))
+        if self._lokal:
+            kwargs["extra_body"] = {"think": False}
+        r = await self.client.chat.completions.create(**kwargs)
+        return (r.choices[0].message.content or "") if r.choices else ""
+
+    async def _aufraeumen(self, behalten: int, fehler_melden: bool = False) -> int:
+        """Älteres in den Stand des Gesprächs (und über `weggefallen` ins Gedächtnis); die neuesten Nachrichten,
+        zusammen höchstens `behalten` Token (mindestens zwei), bleiben. Erst der Stand, dann der Schnitt: klappt
+        die Zusammenfassung nicht, bleibt der Verlauf, wie er war. Gibt die Zahl der ausgelagerten zurück."""
+        alt = self.messages
+        ab = GS.behalten_ab(alt, behalten, lambda m: pricing.est_tokens(m.get("content")))
+        n = pricing.schnitt(alt, max(ab, len(alt) - pricing.HARD_MAX // 2))
+        if n <= 0:
+            return 0
+        grenze = max(4000, min(120_000, int((pricing.context_window(self.model) - 3000) * 2.5)))   # Zeichen
+        try:
+            neu = await GS.fortschreiben(self._fragen, self.stand, alt[:n], grenze)
+        except Exception:
+            if fehler_melden:
+                raise
+            return 0
+        if not neu or self.messages is not alt:
+            if fehler_melden and not neu:
+                raise RuntimeError("Das Modell hat keine Zusammenfassung geschrieben – der Verlauf bleibt, wie er war.")
+            return 0
+        self.stand = neu
+        gezaehlt = getattr(self, "aufgeraeumt", 0)
+        pricing.abschneiden(self, n)
+        self.aufgeraeumt = gezaehlt                  # eigener Hinweis statt „Kontext voll“
+        return n
+
+    async def _hintergrund(self) -> None:
+        """Nach einer Antwort (lokales Ollama): ab PUFFER_AB des Budgets im Hintergrund aufräumen – die nächste
+        Nachricht wartet darauf (`_puffer_abwarten`), statt dass der Verlauf auf drei Nachrichten schrumpft."""
+        try:
+            await self._kontext_messen()
+            budget = self._budget()
+            if (self._verlauf_tokens() <= GS.PUFFER_AB * budget
+                    and len(self.messages) <= GS.PUFFER_AB * pricing.HARD_MAX):
+                return
+            if (n := await self._aufraeumen(int(GS.PUFFER_BEHALTEN * budget))):
+                self._puffer_hinweis = (f"📌 Kontext im Hintergrund aufgeräumt: {n} ältere Nachrichten stehen jetzt "
+                                        f"im Stand des Gesprächs (und im Gedächtnis), {len(self.messages)} bleiben.")
+        except asyncio.CancelledError:
+            return
+        except Exception as exc:                       # ein Bonus: nie das Gespräch stören
+            self._puffer_hinweis = f"⚠ Kontext im Hintergrund zusammenfassen ging nicht: {exc}"
+
+    async def _puffer_abwarten(self) -> AsyncIterator[dict]:
+        """Vor einer neuen Nachricht: ein laufendes Aufräumen erst fertig werden lassen. Wird die eigene Task
+        abgebrochen (ESC), endet auch das Aufräumen und der Abbruch geht weiter; nur ein Abbruch des
+        Aufräumens selbst (reset, Modellwechsel) wird geschluckt."""
+        puffer = self._puffer
+        if puffer is not None:
+            if not puffer.done():
+                yield {"type": "note", "text": "📌 einen Moment – der Kontext wird gerade zusammengefasst …"}
+            eigene = asyncio.current_task()
+            vorher = eigene.cancelling() if eigene is not None else 0
+            try:
+                await puffer
+            except asyncio.CancelledError:
+                if eigene is not None and eigene.cancelling() > vorher:
+                    puffer.cancel()
+                    self._puffer = None
+                    raise
+            except Exception:
+                pass
+            self._puffer = None
+            if eigene is not None and eigene.cancelling() > vorher:   # _hintergrund schluckt den Abbruch selbst
+                raise asyncio.CancelledError()
+        if self._puffer_hinweis:
+            yield {"type": "note", "text": self._puffer_hinweis}
+            self._puffer_hinweis = ""
+
+    async def kompakt(self) -> str:
+        """/compact: jetzt zusammenfassen – Älteres in den Stand des Gesprächs, nur die neuesten Nachrichten
+        (KOMPAKT_BEHALTEN des Budgets, mindestens zwei) bleiben. "" = nichts zu tun."""
+        async for _ in self._puffer_abwarten():
+            pass
+        if len(self.messages) < 3:
+            return ""
+        await self._kontext_messen()
+        vorher = self._verlauf_tokens()
+        n = await self._aufraeumen(int(GS.KOMPAKT_BEHALTEN * self._budget()), fehler_melden=True)
+        if not n:
+            return ""
+        return (f"📌 Zusammengefasst: {n} ältere Nachrichten stehen jetzt im Stand des Gesprächs (und im "
+                f"Gedächtnis), {len(self.messages)} bleiben – Verlauf ~{vorher:,} → ~{self._verlauf_tokens():,} "
+                "Token.").replace(",", ".")
+
+    async def ask_once(self, prompt: str, system: str) -> str:
+        """Fokussierte Einzel-Antwort (für Helfer-Agenten), ohne den Hauptverlauf."""
+        r = await self.client.chat.completions.create(
+            model=self.model_id,
+            messages=[{"role": "system", "content": system},
+                      {"role": "user", "content": prompt}],
+            **reasoning.request_options(self.provider_id, self.model_id,
+                                        self.strength, helper=True),
+        )
+        if not r.choices:                                  # z. B. Inhaltsfilter des Anbieters
+            raise RuntimeError("Der Anbieter hat keine Antwort geliefert (leere Auswahl).")
+        grund = getattr(r.choices[0], "finish_reason", None)
+        if grund == "length":
+            raise RuntimeError("Tokenbudget erreicht: Die Helferantwort ist unvollständig.")
+        if grund == "content_filter" and not r.choices[0].message.content:
+            raise RuntimeError(FILTER_TEXT)
+        return r.choices[0].message.content or ""
+
+    async def ask_messages(self, system: str, messages: list[dict]) -> str:
+        """Eine Antwort auf einen EIGENEN Verlauf (Helfer-Agent mit mehreren
+        Schritten) – der Hauptverlauf bleibt unberührt.
+
+        Helfer-Budget (reasoning.HELPER_BUDGET, 4096): Helfer helfen kurz und
+        berichten – Romane schreibt der Haupt-Agent. Reicht es nicht, kommt das
+        Vorhandene mit Hinweis zurück statt eines Fehlers."""
+        r = await self.client.chat.completions.create(
+            model=self.model_id,
+            messages=[{"role": "system", "content": system}] + messages,
+            **reasoning.request_options(self.provider_id, self.model_id,
+                                        self.strength, helper=True),
+        )
+        text = (r.choices[0].message.content or "") if r.choices else ""
+        if r.choices and getattr(r.choices[0], "finish_reason", None) == "length":
+            text = (text.rstrip() + "\n\n[System] Antwort abgeschnitten – Tokenbudget erreicht. "
+                    "Fasse dich kürzer.")
+        return text
+
+    async def _open(self, msgs, model_id: str | None = None):
+        """Öffnet den Stream. Mit include_usage liefert der letzte Chunk echte
+        Token-Zahlen; kennt der Anbieter die Option nicht -> ohne sie erneut.
+
+        `model_id` überschreibt das Modell nur für DIESEN Aufruf (Auto-Stark)."""
+        mid = model_id or self.model_id
+        kwargs = dict(model=mid, messages=msgs, stream=True,
+                      **reasoning.request_options(self.provider_id, mid, self.strength))
+        if (temperatur := _waechter_temperatur(self.provider_id, mid, kwargs)) is not None:
+            kwargs["temperature"] = temperatur
+        try:
+            return await self.client.chat.completions.create(
+                **kwargs, stream_options={"include_usage": True})
+        except Exception as exc:
+            if "temperature" in kwargs and "temperature" in str(exc).lower():
+                kwargs.pop("temperature")                 # Modell nimmt keine Temperatur: ohne sie
+                return await self._ohne_temperatur(kwargs)
+            if not _usage_option_rejected(exc):
+                raise
+            # Denkparameter und Budget bleiben bei diesem einen Retry erhalten.
+            return await self.client.chat.completions.create(**kwargs)
+
+    async def _ohne_temperatur(self, kwargs: dict):
+        try:
+            return await self.client.chat.completions.create(**kwargs, stream_options={"include_usage": True})
+        except Exception as exc:
+            if not _usage_option_rejected(exc):
+                raise
+            return await self.client.chat.completions.create(**kwargs)
+
+    async def _auswerten(self, stream) -> AsyncIterator[dict]:
+        """Stücke des Anbieter-Streams einheitlich: usage · thinking · text · length (Budget erreicht) ·
+        filter (Inhaltsfilter des Anbieters).
+        Der Responses-Motor (openai_responses.py) liest seine Ereignisse hier anders."""
+        async for chunk in stream:
+            u = getattr(chunk, "usage", None)
+            if u:
+                yield {"type": "usage",
+                       "input": getattr(u, "prompt_tokens", 0) or 0,
+                       "output": getattr(u, "completion_tokens", 0) or 0}
+            if not chunk.choices:
+                continue
+            choice = chunk.choices[0]
+            grund = getattr(choice, "finish_reason", None)
+            if grund == "length":
+                yield {"type": "length"}
+            elif grund == "content_filter":
+                yield {"type": "filter"}
+            d = choice.delta
+            think = getattr(d, "reasoning_content", None) or getattr(d, "reasoning", None)
+            if think:
+                yield {"type": "thinking", "text": think}
+            if d.content:
+                yield {"type": "text", "text": d.content}
+            refusal = getattr(d, "refusal", None)        # Ablehnung: als Text, sonst „(keine Antwort)“ ohne Grund
+            if isinstance(refusal, str) and refusal:
+                yield {"type": "text", "text": refusal}
+
+    async def _ist_schwer(self, user_text: str) -> bool:
+        """Fragt das LEICHTE Modell selbst, ob die Anfrage schwer ist. Ein kurzer
+        Ein-Wort-Aufruf (~1 s) – bei einem Ja übernimmt danach das große Modell.
+        Im Zweifel (Fehler, leerer Text) bleiben wir beim leichten Modell."""
+        text = (user_text or "").strip()
+        if len(text) < 8:                    # „hi", „danke" usw. sind nie schwer
+            return False
+        sys = (
+            "Du bist ein Einstufer. Antworte mit GENAU EINEM Wort, sonst nichts:\n"
+            "SCHWER = Programmieren/Code, Mathe/Rechnen, mehrschrittige Logik, "
+            "Analyse, Recherche, Planung, Übersetzung, oder eine lange bzw. "
+            "knifflige Erklärung.\n"
+            "EINFACH = Smalltalk, Begrüßung, Gefühle, kurze Frage, kurze Fakten."
+        )
+        try:
+            r = await self.client.chat.completions.create(
+                model=self.model_id, temperature=0, max_tokens=4,
+                messages=[{"role": "system", "content": sys},
+                          {"role": "user", "content": text[:2000]}])
+            ans = (r.choices[0].message.content or "").strip().lower()
+            return "schwer" in ans or "hard" in ans or "komplex" in ans
+        except Exception:
+            return False
+
+    async def stream(self, user_text: str, images: list[str] | None = None) -> AsyncIterator[dict]:
+        async for hinweis in self._puffer_abwarten():
+            yield hinweis
+        self.messages.append({"role": "user", "content": _user_content(user_text, images)})
+        zeiten = []                              # Vorarbeit bis zur Antwort des Anbieters (Debugbericht)
+        t = time.monotonic()
+
+        # Verlauf auf das Kontextfenster dieses Modells kürzen – lokales Ollama fasst vorher zusammen,
+        # kuerzen bleibt die Notbremse (Zusammenfassung ging nicht)
+        if self._lokal and GS.an():
+            await self._kontext_messen()
+            if self._verlauf_tokens() > self._budget() or len(self.messages) > pricing.HARD_MAX:
+                yield {"type": "note", "text": "📌 Kontext voll – ich schreibe den Stand des Gesprächs fort …"}
+                if (n := await self._aufraeumen(int(GS.PUFFER_BEHALTEN * self._budget()))):
+                    yield {"type": "note", "text": f"📌 {n} ältere Nachrichten stehen jetzt im Stand des Gesprächs "
+                                                   f"(und im Gedächtnis), {len(self.messages)} bleiben."}
+        pricing.kuerzen(self)
+        zeiten.append(("kürzen", time.monotonic() - t))
+        if hinweis := pricing.aufraeum_hinweis(self):
+            yield {"type": "note", "text": hinweis}
+
+        use_model = self.model_id
+        if self.auto_stark and self.auto_ziel and not images:
+            # Auto-Stark: bei schweren Fragen für DIESE Antwort das große Modell nehmen.
+            t = time.monotonic()
+            schwer = await self._ist_schwer(user_text)
+            zeiten.append(("Einstufung", time.monotonic() - t))
+            if schwer:
+                use_model = self.auto_ziel
+                kurz = self.auto_ziel.split(":")[-1].split("-")[0]   # z.B. "12b"
+                yield {"type": "note",
+                       "text": f"🧠 knifflige Frage – ich schalte auf {kurz} hoch"}
+
+        t = time.monotonic()
+        if self._lokal:
+            await self._hintergrund_anhaengen(self.messages[-1], user_text)
+        hinweis, self.denk_hinweis = self.denk_hinweis, ""
+        anker, self.rollen_anker = self.rollen_anker, ""
+        gebeten = bool(hinweis) and not self.denkt_selbst    # <think> im Text ist dann erbetenes Nachdenken
+        if (zusatz := "\n\n".join(t for t in (hinweis, anker) if t)):
+            frage = self.messages[-1]
+            self._gesendet = {k: v for k, v in self._gesendet.items() if any(v[0] is m for m in self.messages)}
+            g = self._gesendet.get(id(frage))
+            self._gesendet[id(frage)] = (frage, denkwerk.mit_hinweis(g[1] if g else user_text, zusatz))
+        schlank = not self._lokal and persona.anleitung_schlank()
+        sys_msg = {"role": "system",
+                   "content": await persona.build_system_prompt_async(
+                       "" if self._lokal else user_text, kompakt_fuer_lokal=self._lokal or schlank,
+                       mit_gedaechtnis=not self._lokal, nachreichen=schlank)}
+        zeiten.append(("Systemprompt", time.monotonic() - t))
+        full = ""
+        t = time.monotonic()
+        try:
+            stream = await self._open([sys_msg] + self._senden_als(self.messages), model_id=use_model)
+            zeiten.append(("Anbieter antwortet", time.monotonic() - t))
+            _zeiten_melden(zeiten)
+        except Exception as exc:
+            # Anfrage zu groß (HTTP 413): ältere Bilder raus, nur das neueste bleibt – ein Versuch.
+            if pricing.zu_gross(exc) and pricing.bilder_begrenzen(self.messages, 0):
+                yield {"type": "note", "text": "🖼 Anfrage war zu groß – ältere Bilder aus dem Verlauf "
+                                               "genommen, neuer Versuch."}
+                try:
+                    stream = await self._open([sys_msg] + self._senden_als(self.messages), model_id=use_model)
+                except Exception:
+                    if self.messages and self.messages[-1]["role"] == "user":
+                        self.messages.pop()
+                    raise
+            # Modell ohne Vision lehnt das Bild ab -> ohne Bild als reinen Text nachreichen.
+            elif images and "image" in str(exc).lower():
+                alt = self.messages[-1]
+                self.messages[-1] = {"role": "user", "content": user_text}
+                if (g := self._gesendet.pop(id(alt), None)) is not None:
+                    self._gesendet[id(self.messages[-1])] = (self.messages[-1], g[1])
+                try:
+                    stream = await self._open([sys_msg] + self._senden_als(self.messages))
+                except Exception:
+                    self.messages.pop()
+                    raise
+                note = ("⚠ Dieses Modell kann keine Bilder ansehen – ich gehe nur "
+                        "auf den Text ein.\n\n")
+                full += note
+                yield {"type": "text", "text": note}
+            else:
+                if self.messages and self.messages[-1]["role"] == "user":
+                    self.messages.pop()
+                raise
+        # Denk-Modelle liefern ihr Nachdenken auf zwei Wegen: als eigenes Feld
+        # (DeepSeek & Co: reasoning_content) oder als <think>…</think> mitten im
+        # Text (viele offene Modelle, auch über Ollama). Beides trennen wir ab,
+        # damit im Verlauf nur die echte Antwort landet.
+        feed, flush = think_splitter()
+        truncated = gefiltert = False
+        try:
+            async for teil in self._auswerten(stream):
+                art = teil["type"]
+                if art == "usage":
+                    yield teil
+                    continue
+                if art == "length":
+                    truncated = True
+                    continue
+                if art == "filter":
+                    gefiltert = True
+                    continue
+                if art == "thinking":
+                    self._hat_gedacht = True
+                    yield teil
+                    continue
+                delta = teil["text"]
+                if delta:
+                    for kind, txt in feed(delta):
+                        if kind == "text":
+                            full += txt
+                        elif not gebeten and txt.strip():
+                            self._hat_gedacht = True
+                        yield {"type": kind, "text": txt}
+            for kind, txt in flush():
+                if kind == "text":
+                    full += txt
+                yield {"type": kind, "text": txt}
+            if truncated:
+                yield {"type": "note", "text": (
+                    "⚠ Tokenbudget erreicht – die Antwort ist möglicherweise unvollständig."
+                    if full else
+                    "⚠ Tokenbudget erreicht, bevor eine Antwort fertig war.")}
+            if gefiltert:
+                yield {"type": "note", "text": "⚠ " + FILTER_TEXT}
+        except Exception:
+            if self.messages and self.messages[-1]["role"] == "user":
+                self.messages.pop()
+            raise
+
+        placeholder = ("(vom Inhaltsfilter des Anbieters angehalten)" if gefiltert else
+                       "(Tokenbudget erreicht, keine fertige Antwort)" if truncated else "(keine Antwort)")
+        self.messages.append({"role": "assistant", "content": full or placeholder})
+        if self._lokal and GS.an():
+            self._puffer = asyncio.get_running_loop().create_task(self._hintergrund())
