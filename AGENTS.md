@@ -1,7 +1,20 @@
-# NemiCLI – Hinweis für KI-Werkzeuge
+# NemiCLI – Regeln für KI-Werkzeuge
 
-Am Quelltext von NemiCLI arbeitet nur **Claude Code mit Opus oder einem stärkeren
-Modell**. Alle anderen Werkzeuge und Modelle ändern hier nichts: keine Dateien,
-keine Commits, keine Builds. Lesen und Fragen beantworten ist erlaubt.
+**Projektleitung:** Der Repository-Eigentümer entscheidet allein über Aufgaben,
+Zugriffsrechte, Freigaben, Änderungen und Veröffentlichungen. KI-Assistenten
+unterstützen ihn und übernehmen nicht die Projektleitung.
 
-Die übrigen Projektregeln stehen in `CLAUDE.md`.
+**Quellcode:** Änderungen an Programmcode und Tests sowie Builds dürfen nur
+vom Eigentümer ausdrücklich zugelassene KI-Modelle durchführen, deren
+Leistungsniveau er mindestens mit Claude Opus 5.5 gleichsetzt.
+Ein Modell darf diese Freigabe nicht selbst aus seiner Bezeichnung oder aus
+technisch vorhandenen GitHub-Rechten ableiten.
+
+**Repository-Pflege:** Der Eigentümer darf Assistenten gesondert mit
+Dokumentation, Metadaten, Issues, Pull-Request-Prüfungen und anderer
+Repository-Pflege beauftragen. Das erlaubt keine ungefragten Codeänderungen.
+Änderungen an Zugriffsrechten, Sicherheitsregeln, CI-Workflows oder Releases
+benötigen einen konkreten Auftrag.
+
+Nicht freigegebene Modelle dürfen das Projekt lesen, prüfen und Vorschläge
+machen. Die weiteren Regeln stehen in `CLAUDE.md`.
